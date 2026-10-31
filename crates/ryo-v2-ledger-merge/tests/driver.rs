@@ -83,3 +83,108 @@ fn bad_arguments_exit_2_and_leave_ours_unchanged() {
     assert_eq!(fs::read_to_string(&o).expect("read ours"), ours);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The driver command `just ledger-merge-install` registers, with the binary at `bin`: the line
+/// is taken from the `Justfile`, so what this test runs is what a checkout runs.
+fn driver_command(bin: &std::path::Path) -> String {
+    let justfile =
+        fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Justfile"))
+            .expect("Justfile");
+    let line = justfile
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("git config merge.ledger.driver \""))
+        .expect("the driver line of ledger-merge-install");
+    let quoted = &line["git config merge.ledger.driver \"".len()..line.len() - 1];
+    quoted
+        .replace("\\$", "$")
+        .replace("'$dest'", &format!("'{}'", bin.display()))
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .output()
+        .unwrap_or_else(|e| panic!("git is needed on the path: {e}"))
+}
+
+fn ok(out: std::process::Output) {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+const TABLE: &str =
+    "# L\n\n| id | state |\n|---|---|\n| A-1 | open |\n| A-2 | open |\n| A-3 | open |\n";
+
+/// `git merge` of two branches that edit adjacent rows (a line conflict), with the driver line
+/// pointing at `bin`; the exit status of the merge and the merged file.
+fn git_merge(name: &str, bin: &std::path::Path) -> (bool, String) {
+    let dir = scratch(name);
+    ok(git(&dir, &["init", "-q", "-b", "main"]));
+    fs::write(dir.join(".gitattributes"), "L.md merge=ledger\n").expect("attributes");
+    fs::write(dir.join("L.md"), TABLE).expect("base");
+    ok(git(&dir, &["add", "-A"]));
+    ok(git(&dir, &["commit", "-q", "-m", "base"]));
+    ok(git(&dir, &["checkout", "-q", "-b", "x"]));
+    fs::write(
+        dir.join("L.md"),
+        TABLE.replace("| A-2 | open |", "| A-2 | done |"),
+    )
+    .expect("x");
+    ok(git(&dir, &["commit", "-q", "-am", "x"]));
+    ok(git(&dir, &["checkout", "-q", "main"]));
+    fs::write(
+        dir.join("L.md"),
+        TABLE.replace("| A-3 | open |", "| A-3 | done |"),
+    )
+    .expect("main");
+    ok(git(&dir, &["commit", "-q", "-am", "main"]));
+    let driver = format!("merge.ledger.driver={}", driver_command(bin));
+    let merged = git(&dir, &["-c", &driver, "merge", "-q", "--no-edit", "x"]);
+    let text = fs::read_to_string(dir.join("L.md")).expect("merged");
+    let _ = fs::remove_dir_all(&dir);
+    (merged.status.success(), text)
+}
+
+#[test]
+fn git_merges_adjacent_row_edits_through_the_installed_driver_line() {
+    let (clean, text) = git_merge(
+        "git-real",
+        std::path::Path::new(env!("CARGO_BIN_EXE_ledger-merge")),
+    );
+    assert!(clean, "{text}");
+    assert_eq!(
+        text,
+        TABLE
+            .replace("| A-2 | open |", "| A-2 | done |")
+            .replace("| A-3 | open |", "| A-3 | done |")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_or_failing_driver_falls_back_to_the_line_merge_with_markers() {
+    use std::os::unix::fs::PermissionsExt;
+    let (clean, text) = git_merge(
+        "git-missing",
+        std::path::Path::new("/nonexistent/ledger-merge"),
+    );
+    assert!(!clean && text.contains("<<<<<<<"), "{text}");
+    let dir = scratch("failing-bin");
+    let bin = dir.join("ledger-merge");
+    fs::write(&bin, "#!/bin/sh\nexit 2\n").expect("script");
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let (clean, text) = git_merge("git-failing", &bin);
+    assert!(!clean && text.contains("<<<<<<<"), "{text}");
+    let _ = fs::remove_dir_all(&dir);
+}

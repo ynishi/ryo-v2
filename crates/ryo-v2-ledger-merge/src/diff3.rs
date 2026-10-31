@@ -235,11 +235,12 @@ mod tests {
         ours.push("o".to_owned());
         assert!(n * (n + 2) > MAX_CELLS);
         assert!(align(&base, &ours).iter().all(Option::is_none));
-        assert!(
-            align(&base[..100], &ours[..102])
-                .iter()
-                .skip(1)
-                .any(Option::is_some)
-        );
+        // Just below the ceiling (3999 x 4001 cells) the middle is still aligned.
+        let base: Vec<String> = (0..3_999).map(|i| i.to_string()).collect();
+        let mut ours = base.clone();
+        ours.insert(0, "o".to_owned());
+        ours.push("o".to_owned());
+        assert!(base.len() * ours.len() <= MAX_CELLS);
+        assert!(align(&base, &ours).iter().all(Option::is_some));
     }
 }

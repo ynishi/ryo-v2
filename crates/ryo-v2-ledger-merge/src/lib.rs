@@ -99,10 +99,16 @@ fn split(text: &str) -> Vec<String> {
 ///   changed the table as well, the whole table is one conflict.
 ///   tested: tests::a_changed_header_makes_a_table_conflict_as_a_whole
 /// - C8: a section both sides added under the same heading, and any two insertions at one place
-///   in a section, are merged against what the two share (the lines both have; of a table both
-///   have, its header and the rows equal on both sides): the rows each side adds are kept, and
-///   lines that differ conflict.
+///   in a section, are merged against the tables both have (each with its header and the rows
+///   equal on both sides): the rows each side adds are kept. Text that differs conflicts as a
+///   whole, also when the two texts share a line, and a stretch both sides changed that had text
+///   in `base` is never merged this way. A block both insert that the two place differently
+///   makes the two insertions one conflict, and a table both add whose header lines differ
+///   conflicts on its header.
 ///   tested: tests::a_section_added_on_both_sides_with_different_bodies_merges_its_lines
+///   tested: tests::insertions_of_the_same_lines_in_another_order_conflict_instead_of_doubling
+///   tested: tests::a_table_both_add_with_different_delimiter_lines_conflicts_on_the_header
+///   tested: tests::different_insertions_sharing_a_blank_line_conflict
 /// - C7 [free]: line ends: a `\r` stays part of its line, and a merged text (one that is not
 ///   one side unchanged) ends with a line end.
 pub fn merge(base: &str, ours: &str, theirs: &str, marker_size: usize) -> Merged {
@@ -180,9 +186,12 @@ fn merge_blocks(base: &[Block], ours: &[Block], theirs: &[Block], out: &mut Out)
             // Two insertions at one place: merged against what they share, so that a table both
             // add keeps the rows of each. The common part is not empty, so the stretches left
             // are smaller and the recursion ends.
+            // A block both sides insert that the alignment does not pair (the two put it in a
+            // different order around the shared ones) would be taken from each side and written
+            // twice, so then the two insertions are one conflict.
             Chunk::Conflict { base, ours, theirs } if base.is_empty() => {
                 let common = shared(ours, theirs);
-                if common.is_empty() {
+                if common.is_empty() || unpaired_in_both(ours, theirs) {
                     out.conflict(&flat(ours), &flat(theirs));
                 } else {
                     merge_blocks(&common, ours, theirs, out);
@@ -193,30 +202,54 @@ fn merge_blocks(base: &[Block], ours: &[Block], theirs: &[Block], out: &mut Out)
     }
 }
 
-/// What two insertions at one place share, as the base to merge them against: the blocks both
-/// have (aligned by key, in order); of a table both have, its header and the rows equal on both
-/// sides.
+/// Whether a key that the alignment of `ours` with `theirs` leaves unpaired is in both.
+fn unpaired_in_both(ours: &[Block], theirs: &[Block]) -> bool {
+    use diff3::Item as _;
+    let aligned = diff3::align(ours, theirs);
+    let mut paired = vec![false; theirs.len()];
+    for j in aligned.iter().flatten() {
+        paired[*j] = true;
+    }
+    let theirs_unpaired: std::collections::HashSet<&str> = theirs
+        .iter()
+        .zip(&paired)
+        .filter(|(_, p)| !**p)
+        .map(|(t, _)| t.key())
+        .collect();
+    ours.iter()
+        .zip(&aligned)
+        .any(|(o, j)| j.is_none() && theirs_unpaired.contains(o.key()))
+}
+
+/// What two insertions at one place share, as the base to merge them against: the tables both
+/// have (aligned by key, in order), each with its header and the rows equal on both sides. Text
+/// lines are not shared: two different texts anchored on a common line (a blank line) would be
+/// interleaved without a conflict, so text that differs conflicts as a whole. When the two headers
+/// differ (the key is the trimmed header line, so whitespace or the delimiter line can differ) the
+/// shared table is empty, so the header conflicts instead of one side's being taken.
 fn shared(ours: &[Block], theirs: &[Block]) -> Vec<Block> {
     diff3::align(ours, theirs)
         .into_iter()
         .zip(ours)
         .filter_map(|(j, o)| Some((o, &theirs[j?])))
-        .map(|(o, t)| match (o, t) {
+        .filter_map(|(o, t)| match (o, t) {
             (Block::Table { key, lines: lo }, Block::Table { lines: lt, .. }) => {
                 let theirs_rows = markdown::rows(lt);
+                let ours_rows = markdown::rows(lo);
                 let mut lines = Vec::new();
-                for (k, row) in markdown::rows(lo) {
-                    let head = lines.is_empty();
-                    if head || theirs_rows.iter().any(|(tk, tr)| *tk == k && *tr == row) {
-                        lines.extend(row);
+                if ours_rows.first() == theirs_rows.first() {
+                    for (k, row) in ours_rows {
+                        if theirs_rows.iter().any(|(tk, tr)| *tk == k && *tr == row) {
+                            lines.extend(row);
+                        }
                     }
                 }
-                Block::Table {
+                Some(Block::Table {
                     key: key.clone(),
                     lines,
-                }
+                })
             }
-            _ => o.clone(),
+            _ => None,
         })
         .collect()
 }
@@ -488,13 +521,62 @@ Corpus: 5 workspaces.
         let m = run(BASE, &ours, &theirs);
         assert_eq!(m.conflicts, 0, "{}", m.text);
         assert_eq!(m.text, notes("| N-1 | a |\n| N-2 | b |\n", "Shared text."));
-        // Different text in the two new sections is a line conflict inside the section.
+        // Different text in the two new sections conflicts as a whole; the table still merges.
         let theirs = notes("| N-2 | b |\n", "Other text.");
+        let m = run(BASE, &ours, &theirs);
+        assert_eq!(m.conflicts, 1, "{}", m.text);
+        assert_eq!(
+            m.text,
+            format!(
+                "{BASE}\n<<<<<<< ours\n## Notes\n\nShared text.\n\n=======\n## Notes\n\nOther text.\n\n>>>>>>> theirs\n| id | note |\n|---|---|\n| N-1 | a |\n| N-2 | b |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn different_insertions_sharing_a_blank_line_conflict() {
+        // Both add "## Notes": ours a blank line then foo, theirs bar then a blank line. Merged
+        // around the shared blank line they would interleave as bar, blank, foo.
+        let ours = format!("{BASE}\n## Notes\n\nfoo\n");
+        let theirs = format!("{BASE}\n## Notes\nbar\n\n");
+        let m = run(BASE, &ours, &theirs);
+        assert_eq!(m.conflicts, 1, "{}", m.text);
+        // A stretch that had text in base is not merged around a table both put there: ours
+        // replaced "Intro text." by a line and a table, theirs by the table and another line.
+        let t = "| k | v |\n|---|---|\n| K-1 | x |\n";
+        let ours = BASE.replacen("Intro text.\n", &format!("Intro B.\n{t}"), 1);
+        let theirs = BASE.replacen("Intro text.\n", &format!("{t}Intro D.\n"), 1);
+        let m = run(BASE, &ours, &theirs);
+        assert_eq!(m.conflicts, 1, "{}", m.text);
+    }
+
+    #[test]
+    fn insertions_of_the_same_lines_in_another_order_conflict_instead_of_doubling() {
+        // Both add "## Notes" with the lines x and y, in opposite orders: x is not written twice.
+        let ours = format!("{BASE}\n## Notes\n\nx\ny\n");
+        let theirs = format!("{BASE}\n## Notes\n\ny\nx\n");
+        let m = run(BASE, &ours, &theirs);
+        assert_eq!(m.conflicts, 1, "{}", m.text);
+        assert!(
+            m.text.ends_with(
+                "<<<<<<< ours\n## Notes\n\nx\ny\n=======\n## Notes\n\ny\nx\n>>>>>>> theirs\n"
+            ),
+            "{}",
+            m.text
+        );
+    }
+
+    #[test]
+    fn a_table_both_add_with_different_delimiter_lines_conflicts_on_the_header() {
+        let notes =
+            |delim: &str, row: &str| format!("{BASE}\n## Notes\n\n| id | note |\n{delim}\n{row}");
+        let ours = notes("|---|---|", "| N-1 | a |\n");
+        let theirs = notes("|:--|---|", "| N-2 | b |\n");
         let m = run(BASE, &ours, &theirs);
         assert_eq!(m.conflicts, 1, "{}", m.text);
         assert!(
             m.text.contains(
-                "## Notes\n\n<<<<<<< ours\nShared text.\n=======\nOther text.\n>>>>>>> theirs\n"
+                "<<<<<<< ours\n| id | note |\n|---|---|\n=======\n| id | note |\n|:--|---|\n>>>>>>> theirs\n| N-1 | a |\n| N-2 | b |\n"
             ),
             "{}",
             m.text
@@ -510,6 +592,8 @@ Corpus: 5 workspaces.
             (BASE, other.as_str(), BASE, other.as_str()),
             (BASE, other.as_str(), other.as_str(), other.as_str()),
             (BASE, no_end.as_str(), BASE, no_end.as_str()),
+            (BASE, BASE, no_end.as_str(), no_end.as_str()),
+            (BASE, no_end.as_str(), no_end.as_str(), no_end.as_str()),
         ] {
             assert_eq!(
                 run(b, o, t),

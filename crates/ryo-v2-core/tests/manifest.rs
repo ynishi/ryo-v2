@@ -33,7 +33,7 @@
 //!    `branch-check`), and `base-check` refuses a branch that `origin/main`, or the local `main`,
 //!    is no ancestor of (`merge-base --is-ancestor`), saying in one line that it skipped outside
 //!    a git checkout; `ledger-merge-install` sets `merge.ledger.driver` to the driver with git's
-//!    arguments `%O %A %B %L %P`, falling back to `git merge-file`. The lines that carry these
+//!    arguments `%O %A %B %L %P`, falling back to `git merge-file` when it is missing or fails. The lines that carry these
 //!    decisions are pinned verbatim and in order ([`BASE_CHECK_LINES`], [`LEDGER_INSTALL_LINES`]),
 //!    so a negated or reversed check fails the rule, not only a missing word.
 //!
@@ -474,9 +474,12 @@ const BASE_CHECK_LINES: [&[&str]; 5] = [
 
 /// Rule 8, the driver lines of `ledger-merge-install`.
 const LEDGER_INSTALL_LINES: [&[&str]; 2] = [
-    &[r#"install -m 755 "$built" "$dest""#],
     &[
-        r#"git config merge.ledger.driver "if [ -x '$dest' ]; then '$dest' %O %A %B %L %P; else git merge-file --marker-size=%L %A %O %B; fi""#,
+        r#"dest="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/ledger-merge""#,
+        r#"install -m 755 "$built" "$dest""#,
+    ],
+    &[
+        r#"git config merge.ledger.driver "if [ -x '$dest' ]; then '$dest' %O %A %B %L %P; s=\$?; [ \$s -le 1 ] && exit \$s; fi; git merge-file --marker-size=%L %A %O %B""#,
     ],
 ];
 

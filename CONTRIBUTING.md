@@ -72,7 +72,8 @@ a row or section both sides changed differently gets conflict markers around it
 alone. Which command a driver runs is set in each checkout's own git config,
 not in the tree, so a checkout registers it once with
 `just ledger-merge-install` (it builds the driver; worktrees of the checkout
-share it). A checkout without it merges the ledgers line by line, as before.
+share it; run it again after the driver's code changes). A checkout without it,
+or a driver that fails, merges the ledgers line by line, as before.
 `just ledger-merge-try <base> <ours> <theirs> [<expected>]` runs the driver on
 three files without git.
 

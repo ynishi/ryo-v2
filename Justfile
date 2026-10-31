@@ -157,8 +157,10 @@ base-check:
 
 # Registers the ledger merge driver (`.gitattributes`, crates/ryo-v2-ledger-merge) in this
 # checkout's git config, which all its worktrees share: builds `ledger-merge`, copies it into the
-# git directory and points `merge.ledger.driver` at the copy. Where the copy is missing the driver
-# falls back to `git merge-file`, the line merge, with its conflict markers.
+# git directory and points `merge.ledger.driver` at the copy. Where the copy is missing, or it
+# cannot merge (exit 2, the file untouched), the driver falls back to `git merge-file`, the line
+# merge, with its conflict markers: a failed run never leaves ours without markers. Re-run it after
+# the driver's code changes; the copy is not rebuilt by itself.
 ledger-merge-install:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -168,7 +170,7 @@ ledger-merge-install:
     dest="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/ledger-merge"
     install -m 755 "$built" "$dest"
     git config merge.ledger.name "ledger rows and sections (crates/ryo-v2-ledger-merge)"
-    git config merge.ledger.driver "if [ -x '$dest' ]; then '$dest' %O %A %B %L %P; else git merge-file --marker-size=%L %A %O %B; fi"
+    git config merge.ledger.driver "if [ -x '$dest' ]; then '$dest' %O %A %B %L %P; s=\$?; [ \$s -le 1 ] && exit \$s; fi; git merge-file --marker-size=%L %A %O %B"
     echo "ledger-merge-install: merge.ledger.driver set"
 
 # Runs the ledger merge driver on three files as git would, on a copy of <ours>; prints the exit

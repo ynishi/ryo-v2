@@ -42,7 +42,8 @@ impl Fence {
                 self.0 = Some(c);
                 true
             }
-            (Some(open), Some(c)) if open == c => {
+            // A closing fence has nothing after its marks; "```rust" inside a block is code.
+            (Some(open), Some(c)) if open == c && t.trim_end().chars().all(|x| x == c) => {
                 self.0 = None;
                 true
             }
@@ -179,6 +180,10 @@ mod tests {
         let keys: Vec<String> = sections(&doc).into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, ["", "# A", "## B", "## B\u{0}2"]);
         assert_eq!(sections(&doc)[1].1.len(), 5);
+        // A fence line with an info string inside a block does not close it.
+        let doc = lines("# A\n```\n```rust\n# not a heading\n```\n# B\n");
+        let keys: Vec<String> = sections(&doc).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["", "# A", "# B"]);
     }
 
     #[test]
@@ -196,5 +201,8 @@ mod tests {
         assert_eq!(keys, [HEAD, "M-1", "M-2", "M-1\u{0}2"]);
         assert_eq!(first_cell("| a \\| b | c |"), "a \\| b");
         assert_eq!(bs[3], Block::Line("| not | a table |".to_owned()));
+        // A table inside a code fence is text.
+        let fenced = lines("```\n| a | b |\n|---|---|\n```\n");
+        assert!(blocks(&fenced).iter().all(|b| matches!(b, Block::Line(_))));
     }
 }
