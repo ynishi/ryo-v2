@@ -34,6 +34,10 @@ pub enum Group {
     Privacy,
     /// E0080, E0015.
     ConstEval,
+    /// E0255: an item and a `use` define the same name in the same namespace of one module.
+    DuplicateName,
+    /// E0204: a `Copy` impl (derived or written) on a type with a field that is not `Copy`.
+    CopyImpl,
     /// A reference to a cfg-disabled item. The group is the cause, not the
     /// code: the codes overlap other groups.
     Cfg,
@@ -57,7 +61,7 @@ pub enum Group {
 
 impl Group {
     /// Every group, in declaration order.
-    pub const ALL: [Group; 19] = [
+    pub const ALL: [Group; 21] = [
         Group::UnresolvedImport,
         Group::UnresolvedName,
         Group::UnresolvedType,
@@ -69,6 +73,8 @@ impl Group {
         Group::Borrow,
         Group::Privacy,
         Group::ConstEval,
+        Group::DuplicateName,
+        Group::CopyImpl,
         Group::Cfg,
         Group::CfgTest,
         Group::MacroDerive,
@@ -102,6 +108,8 @@ impl Group {
             Group::Borrow => "borrow",
             Group::Privacy => "privacy",
             Group::ConstEval => "const-eval",
+            Group::DuplicateName => "duplicate-name",
+            Group::CopyImpl => "copy-impl",
             Group::Cfg => "cfg",
             Group::CfgTest => "cfg-test",
             Group::MacroDerive => "macro-derive",
@@ -148,6 +156,8 @@ impl Group {
             Group::Borrow => &["E0382", "E0499", "E0502", "E0505", "E0506"],
             Group::Privacy => &["E0603", "E0616", "E0624"],
             Group::ConstEval => &["E0080", "E0015"],
+            Group::DuplicateName => &["E0255"],
+            Group::CopyImpl => &["E0204"],
             Group::Cfg => &["E0425", "E0432", "E0433", "E0412", "E0599"],
             Group::CfgTest => &["E0425", "E0433", "E0308", "E0599"],
             Group::MacroDerive => &["E0599"],
@@ -653,7 +663,7 @@ mod tests {
             assert_eq!(Group::parse(g.id()), Some(g));
         }
         assert_eq!(Group::parse("nope"), None);
-        assert_eq!(Group::ALL.len(), 19);
+        assert_eq!(Group::ALL.len(), 21);
         assert!(Group::Valid.codes().is_empty());
         assert!(Group::PRIMARY.iter().all(|g| Group::ALL.contains(g)));
     }
