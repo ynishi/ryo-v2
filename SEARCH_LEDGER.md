@@ -300,7 +300,7 @@ impl on a type with a field that is not `Copy`) at `crates/ryo-agent/src/decide.
 inside ryo-rs). The harness counts 1 of the 10 first candidates of a decision as failed: candidate
 0 of `misplace-item-0`, a decision whose planted best was not generated. rust-analyzer's
 diagnostics passed both candidates and only the outer `cargo check` rejected them: two more errors
-the search's check misses (CHECK_LEDGER Open work N-3).
+the search's check misses (CHECK_LEDGER Open work M-10).
 
 ## ryo-rs (large run)
 
@@ -350,7 +350,7 @@ both pairs it is full at both depths, and the obscure-name pair keeps its best a
 Generation is 6 of 11 (0.55; the small bases give 0.79). The five decisions whose best is never
 generated are `inline-variable-0` (no candidate at all, fate `no-candidates`), `inline-variable-2`,
 `misplace-item-0`, `misplace-item-1` and the pair `obscure-name` plus `inline-variable`. Their
-cause is not investigated (CHECK_LEDGER Open work N-2); whether the inline-variable ones are the
+cause is not investigated (CHECK_LEDGER Open work S-4); whether the inline-variable ones are the
 `let`-initializer gap of section "Generation" is not checked.
 
 Run 2 (`--exhaustive --limit 10`: beam 200, no wall limit, the first 10 cases, which leaves out
@@ -362,7 +362,7 @@ depth 2) and still does not generate its best, so that miss is the expander's, n
 
 Each of the three runs hit one panic inside rust-analyzer's syntax factory, raised from the
 expander, and went on past it; the harness does not count it, so the tables above do not show it
-(CHECK_LEDGER Open work N-1 and R-5).
+(CHECK_LEDGER Open work S-3 and R-5).
 
 ## Perf triggers (decision D4)
 
@@ -392,7 +392,7 @@ states trigger 4 for one recall run in CI; none of the three runs ran in CI, and
 without the outer check (run 1) is below the limit. By D4's text, trigger 4 therefore opens no perf
 task, and none of the steps (a) to (d) of its work order would shorten the outer check. Whether a
 run with `--outer-check` counts for trigger 4 is not stated by D4, and the harness prints it as
-fired whatever the run (CHECK_LEDGER Open work N-4).
+fired whatever the run (CHECK_LEDGER Open work S-5).
 
 ## Large runs (not run in the default test suite)
 
