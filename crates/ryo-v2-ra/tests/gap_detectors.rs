@@ -340,10 +340,65 @@ pub struct E {
     );
 }
 
+/// A derived `Clone` beside a derived `Copy` on a type without type or const parameters is
+/// reported as E0277 at each field without `Clone`, next to the E0204 at the head: a struct, an
+/// enum variant and a tuple struct with the derives in either order (measured: breakage-lab
+/// `derive-copy-clone-0..2`). A field that is `Clone` but not `Copy` gives only the E0204.
+#[test]
+fn derive_clone_beside_copy_reports_fields_without_clone() {
+    let text = r#"pub struct Raw;
+
+#[derive(Clone, Copy)]
+pub struct Holder {
+    pub id: u32,
+    pub raw_h: Raw,
+}
+
+#[derive(Clone, Copy)]
+pub enum Token {
+    Number(u32),
+    Word(String),
+    Blob(Raw),
+}
+
+#[derive(Copy, Clone)]
+pub struct Pair(pub String, pub Raw);
+
+#[derive(Clone, Copy)]
+pub struct Note {
+    pub text: String,
+}
+"#;
+    let p = Probe::new("clone-beside-copy");
+    let got = p.errors_of(true, text);
+    let mut want77: Vec<(String, u32)> = ["pub raw_h: Raw", "Blob(Raw)", "pub struct Pair"]
+        .iter()
+        .map(|n| ("E0277".to_owned(), line_of(text, n)))
+        .collect();
+    want77.sort();
+    assert_eq!(codes_of(&got, "E0277"), want77, "got {got:?}");
+    let mut want04: Vec<(String, u32)> = [
+        "pub struct Holder",
+        "pub enum Token",
+        "pub struct Pair",
+        "pub struct Note",
+    ]
+    .iter()
+    .map(|n| ("E0204".to_owned(), line_of(text, n)))
+    .collect();
+    want04.sort();
+    assert_eq!(codes_of(&got, "E0204"), want04, "got {got:?}");
+    let off = p.errors_of(false, text);
+    assert!(
+        codes_of(&off, "E0277").is_empty() && codes_of(&off, "E0204").is_empty(),
+        "got {off:?}"
+    );
+}
+
 /// Nothing is reported for a hand-written impl, a generic type, fields that have the traits, Clone
-/// next to Copy (over a field without `Clone` only the E0204 is reported), a `#[default]` enum
-/// variant with another variant that holds a field without the trait, a cfg-disabled type and a
-/// field of unknown type; for `PartialEq, Eq` over a bare field only the E0369 is reported.
+/// next to Copy over fields that are `Copy`, a `#[default]` enum variant with another variant that
+/// holds a field without the trait, a cfg-disabled type and a field of unknown type; for
+/// `PartialEq, Eq` over a bare field only the E0369 is reported.
 #[test]
 fn derive_field_skips_what_needs_nothing() {
     let text = r#"pub struct Raw;
@@ -386,11 +441,6 @@ pub struct Both {
     pub raw_both: Raw,
 }
 
-#[derive(Clone, Copy)]
-pub struct CopyRaw {
-    pub raw_copy: Raw,
-}
-
 #[cfg(any())]
 #[derive(Debug, Clone, Copy)]
 pub struct Gone {
@@ -405,11 +455,7 @@ pub struct Unknown {
     let p = Probe::new("field-negative");
     let got = p.errors_of(true, text);
     assert!(codes_of(&got, "E0277").is_empty(), "got {got:?}");
-    assert_eq!(
-        codes_of(&got, "E0204"),
-        at("E0204", line_of(text, "pub struct CopyRaw")),
-        "got {got:?}"
-    );
+    assert!(codes_of(&got, "E0204").is_empty(), "got {got:?}");
     assert_eq!(
         codes_of(&got, "E0369"),
         at("E0369", line_of(text, "pub raw_both: Raw")),
