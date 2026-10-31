@@ -183,8 +183,9 @@ ledger-merge-try base ours theirs expected="":
     cp "{{ours}}" "$out"
     cargo run -q --locked -p ryo-v2-ledger-merge --bin ledger-merge -- "{{base}}" "$out" "{{theirs}}" 7 "{{ours}}"
     code=$?
-    echo "ledger-merge-try: exit $code, $(grep -cE '^(<{7}|={7}$|>{7})' "$out") marker lines"
-    grep -nE '^(<{7}|={7}$|>{7})' "$out" || true
+    markers=$'^((<{7,}|>{7,}|\\|{7,})( |\r?$)|={7,}\r?$)'
+    echo "ledger-merge-try: exit $code, $(grep -cE "$markers" "$out") marker lines"
+    grep -nE "$markers" "$out" || true
     if [ -n "{{expected}}" ]; then
         if d="$(diff "{{expected}}" "$out")"; then
             echo "ledger-merge-try: equal to {{expected}}"

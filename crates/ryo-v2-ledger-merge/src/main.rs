@@ -56,10 +56,19 @@ fn run(args: &[String]) -> Result<usize, DriverError> {
         PathBuf::from(theirs),
     );
     let merged = merge(&read(&base)?, &read(&ours)?, &read(&theirs)?, marker_size);
-    fs::write(&ours, &merged.text).map_err(|source| DriverError::Write {
-        path: ours.clone(),
-        source,
-    })?;
+    // Written beside `<ours>` and renamed over it, so a failed write leaves `<ours>` unchanged.
+    let mut tmp = ours.clone().into_os_string();
+    tmp.push(".ledger-merge");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, &merged.text)
+        .and_then(|()| fs::rename(&tmp, &ours))
+        .map_err(|source| {
+            let _ = fs::remove_file(&tmp);
+            DriverError::Write {
+                path: ours.clone(),
+                source,
+            }
+        })?;
     Ok(merged.conflicts)
 }
 

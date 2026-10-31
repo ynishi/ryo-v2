@@ -67,9 +67,10 @@ The ledgers (`CHECK_LEDGER.md`, `SEARCH_LEDGER.md`) gain and lose table rows and
 sections on every branch, and a line merge reports a conflict wherever two such
 edits touch. `.gitattributes` gives them a merge driver
 (`crates/ryo-v2-ledger-merge`) that merges by section and by table row, keyed by
-the heading and by the row's first cell: a change made on one side is taken, and
-a row or section both sides changed differently gets conflict markers around it
-alone. Which command a driver runs is set in each checkout's own git config,
+the heading and by the row's first cell: a change made on one side is taken, a
+row both sides changed differently gets conflict markers around it alone, and a
+section both sides changed is merged line by line inside (a section one side
+removed and the other changed is marked as a whole). Which command a driver runs is set in each checkout's own git config,
 not in the tree, so a checkout registers it once with
 `just ledger-merge-install` (it builds the driver; worktrees of the checkout
 share it; run it again after the driver's code changes). A checkout without it,

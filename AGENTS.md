@@ -14,8 +14,9 @@
   fetch. `just worktree-new <type> <slug>` from the main checkout does that and
   runs `just branch-check`.
 - `just check` is green. [CONTRIBUTING.md](CONTRIBUTING.md#verification) says
-  what it covers; it refuses a branch that does not contain `main`, so merge
-  `main` into the branch before the final check.
+  what it covers; it refuses a branch that does not contain `origin/main` (the
+  local `main` where there is none), so merge it into the branch before the
+  final check.
 - `just ledger-merge-install`, once per checkout, makes the ledgers merge by
   section and table row ([CONTRIBUTING.md](CONTRIBUTING.md#branches)).
 - Review a change locally before it goes up — by a person or an AI agent — and

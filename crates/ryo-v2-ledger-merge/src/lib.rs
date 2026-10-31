@@ -194,8 +194,9 @@ fn merge_blocks(base: &[Block], ours: &[Block], theirs: &[Block], out: &mut Out)
                 ours,
                 theirs,
             } => {
-                let common = shared(ours, theirs);
-                if common.is_empty() || unpaired_in_both(ours, theirs) {
+                let aligned = diff3::align(ours, theirs);
+                let common = shared(ours, theirs, &aligned);
+                if common.is_empty() || unpaired_in_both(ours, theirs, &aligned) {
                     out.conflict(&flat(ours), &flat(theirs));
                 } else {
                     merge_blocks(&common, ours, theirs, out);
@@ -206,10 +207,10 @@ fn merge_blocks(base: &[Block], ours: &[Block], theirs: &[Block], out: &mut Out)
     }
 }
 
-/// Whether a key that the alignment of `ours` with `theirs` leaves unpaired is in both.
-fn unpaired_in_both(ours: &[Block], theirs: &[Block]) -> bool {
+/// Whether a key that `aligned` (the alignment of `ours` with `theirs`) leaves unpaired is in
+/// both.
+fn unpaired_in_both(ours: &[Block], theirs: &[Block], aligned: &[Option<usize>]) -> bool {
     use diff3::Item as _;
-    let aligned = diff3::align(ours, theirs);
     let mut paired = vec![false; theirs.len()];
     for j in aligned.iter().flatten() {
         paired[*j] = true;
@@ -221,7 +222,7 @@ fn unpaired_in_both(ours: &[Block], theirs: &[Block]) -> bool {
         .map(|(t, _)| t.key())
         .collect();
     ours.iter()
-        .zip(&aligned)
+        .zip(aligned)
         .any(|(o, j)| j.is_none() && theirs_unpaired.contains(o.key()))
 }
 
@@ -230,12 +231,13 @@ fn unpaired_in_both(ours: &[Block], theirs: &[Block]) -> bool {
 /// lines are not shared: two different texts anchored on a common line (a blank line) would be
 /// interleaved without a conflict, so text that differs conflicts as a whole. When the two headers
 /// differ (the key is the trimmed header line, so whitespace or the delimiter line can differ) the
-/// shared table is empty, so the header conflicts instead of one side's being taken.
-fn shared(ours: &[Block], theirs: &[Block]) -> Vec<Block> {
-    diff3::align(ours, theirs)
-        .into_iter()
+/// shared table is empty, so the header conflicts instead of one side's being taken. `aligned` is
+/// the alignment of `ours` with `theirs`.
+fn shared(ours: &[Block], theirs: &[Block], aligned: &[Option<usize>]) -> Vec<Block> {
+    aligned
+        .iter()
         .zip(ours)
-        .filter_map(|(j, o)| Some((o, &theirs[j?])))
+        .filter_map(|(j, o)| Some((o, &theirs[(*j)?])))
         .filter_map(|(o, t)| match (o, t) {
             (Block::Table { key, lines: lo }, Block::Table { lines: lt, .. }) => {
                 let theirs_rows = markdown::rows(lt);
