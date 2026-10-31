@@ -6,6 +6,7 @@
 //! fork. Nothing here runs cargo or rustc per candidate.
 #![warn(missing_docs)]
 
+mod check;
 mod diagnostics;
 mod fork;
 mod rev_deps;
@@ -31,6 +32,20 @@ pub struct RaConfig {
     pub assert_revert: bool,
     /// ra が診断しない未解決の型名と path 先頭を検出する (E0405/E0425/E0433)。
     pub unresolved_paths: bool,
+    /// `Verifier::check` が n 回に 1 回、巻き戻し後の診断を baseline と突き合わせる。None = 突き合わせない。
+    ///
+    /// # Contract
+    /// - C1: `Some(n)` makes every n-th `Verifier::check` re-diagnose after the revert (the 1st
+    ///   of `Some(2)` does not, the 2nd does); `None` never does through this field.
+    ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
+    pub assert_revert_every: Option<std::num::NonZeroU32>,
+    /// `CargoConfig::set_test`: `#[cfg(test)]` code of workspace members is enabled, so it is diagnosed.
+    ///
+    /// # Contract
+    /// - C1: with `true` an error inside a `#[cfg(test)]` module is in the baseline; with the
+    ///   default `false` it is not.
+    ///   tested: tests/verifier.rs cfg_test_config_diagnoses_test_module
+    pub cfg_test: bool,
 }
 
 impl Default for RaConfig {
@@ -40,6 +55,8 @@ impl Default for RaConfig {
             threads: None,
             assert_revert: false,
             unresolved_paths: true,
+            assert_revert_every: None,
+            cfg_test: false,
         }
     }
 }

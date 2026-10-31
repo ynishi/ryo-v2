@@ -19,3 +19,6 @@ ryo-v2-core.workspace = true
 ryo-v2-ra.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v7", "std"] }

@@ -2,24 +2,74 @@
 //!
 //! Pure: nothing here touches the file system, a process, the environment, the
 //! network, the clock or a random source. A value that comes from outside
-//! (a file's contents, the current time) is passed in by the caller.
+//! (a file's contents, the current time, a fresh id) is passed in by the caller.
 //! A value with rules is a type, not a `String`: an enum for a closed set,
 //! a newtype that checks its input for anything else.
+//!
+//! # Glossary
+//! Format and checking: crates/ryo-v2-core/tests/doc_contract.rs.
+//!
+//! - Blueprint: one proposed change: an intent call, mutation specs against base text, the
+//!   read ranges it rests on, spec refs and a decision record.
+//! - BlueprintSet: the blueprints submitted together in one apply, the candidates for one decision.
+//! - MutationSpec: one splice on one file of a text range of the base text.
+//!   includes: Replace, Insert, Delete
+//! - TextRange: a half-open UTF-8 byte range `[start, end)` of one file's base text.
+//! - ReadRange: a path, a text range and its fingerprint: the text the proposer read, checked
+//!   before anything is written.
+//! - Fingerprint: an algorithm-tagged hash of the bytes of a range, a pure function of the text.
+//! - Freshness: the result of checking a read range against the current text.
+//!   includes: Fresh, Stale, OutOfRange
+//! - Edit: the whole new text of one file, built by splicing; what the verifier consumes.
+//! - IntentKind: a typed action of the one-layer action space.
+//!   includes: RenameLocal, ExtractVariable, AddDerive
+//! - IntentCall: one use of an intent in a blueprint: its kind and validated parameters.
+//! - RiskMark: a reason the engine's own verification is not enough.
+//!   includes: Borrow, BuildScript, ProcMacroCrate, Behaviour
+//! - FileRole: what a touched file is to the crate graph.
+//!   includes: Source, BuildScript, ProcMacroSource, Manifest
+//! - Rule: the record of one review done at registration, allowing auto-apply of one intent kind.
+//! - RuleCatalog: the registered rules, at most one per intent kind.
+//! - Verdict: the new errors relative to the baseline; passed if and only if there are none.
+//! - DecisionRecord: the proposer's identity and rationale, carried in the blueprint.
+//! - SpecRef: an opaque label linking a blueprint to a spec item.
 
 pub mod baseline;
+pub mod blueprint;
 pub mod diagnostic;
 pub mod edit;
 pub mod error;
 pub mod error_code;
+pub mod file_role;
 pub mod finding;
+pub mod ids;
+pub mod intent;
+pub mod mutation;
+pub mod non_empty;
 pub mod rel_path;
+pub mod resolution;
+pub mod rule;
 pub mod scope;
+pub mod text;
 pub mod verdict;
+pub use blueprint::{Blueprint, BlueprintError, BlueprintSet, DecisionRecord, SpecRef};
 pub use diagnostic::{Diagnostic, Diagnostics, UnmappedDiagnostic};
 pub use edit::Edit;
 pub use error::DomainError;
 pub use error_code::ErrorCode;
+pub use file_role::{FileFacts, FileRole};
 pub use finding::{Finding, FindingCode, ScopedFindings};
+pub use ids::{BlueprintId, RuleId};
+pub use intent::{DeriveName, Ident, IntentCall, IntentKind, IntentSpec, Nonconformance, RiskMark};
+pub use mutation::{MutationSpec, SpecKind};
+pub use non_empty::NonEmpty;
 pub use rel_path::RelPath;
+pub use resolution::{
+    Blocking, Candidate, DEFAULT_BUDGET, DecisionBudget, DecisionLog, Disposition, Evidence,
+    Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, OUTER_CHECK_MAX, OuterCheck, OuterCheckReason,
+    Resolution, ReviewReason, SpecMismatch, Stage,
+};
+pub use rule::{ReviewRecord, Rule, RuleCatalog, RuleError};
 pub use scope::Scope;
+pub use text::{Fingerprint, FpAlgo, Freshness, ReadRange, SpliceError, TextRange};
 pub use verdict::Verdict;

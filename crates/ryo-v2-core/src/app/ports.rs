@@ -34,6 +34,65 @@ pub enum AnalyzerError {
     RevertMismatch,
 }
 
+pub use crate::domain::FileFacts;
+
+/// Failure of a [`Verifier`] check.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CheckError {
+    /// An edit could not be applied.
+    #[error("edit rejected: {path}: {reason}")]
+    Edit {
+        /// The offending file.
+        path: RelPath,
+        /// Why.
+        reason: String,
+    },
+    /// The check was cancelled.
+    #[error("check cancelled")]
+    Cancelled,
+    /// The analyzer panicked.
+    #[error("analyzer panicked: {0}")]
+    Panicked(String),
+    /// The session did not return to its base state after the check.
+    #[error("revert did not restore the base state of: {}", join_paths(.paths))]
+    RevertMismatch {
+        /// The files whose text differs from before the check.
+        paths: Vec<RelPath>,
+    },
+    /// The session can no longer be used.
+    #[error("session poisoned: {0}")]
+    Poisoned(String),
+}
+
+fn join_paths(paths: &[RelPath]) -> String {
+    paths
+        .iter()
+        .map(RelPath::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What `apply_blueprints` needs from the analyzer: the texts it holds, and a check of edits
+/// that leaves no trace.
+pub trait Verifier {
+    /// A loaded workspace.
+    type Session;
+    /// The analyzer's current text of `path`; `None` if it is not a workspace file.
+    fn text(&self, s: &Self::Session, path: &RelPath) -> Option<String>;
+    /// What the workspace model says about `path`.
+    fn facts(&self, s: &Self::Session, path: &RelPath) -> FileFacts;
+    /// Every Error at load (all local files), message included.
+    fn baseline(&self, s: &Self::Session) -> Vec<Finding>;
+    /// Applies `edits`, diagnoses the files of `scope`, and reverts. The observable state of
+    /// the session afterwards is the state before.
+    fn check(
+        &self,
+        s: &mut Self::Session,
+        edits: &[Edit],
+        scope: Scope,
+    ) -> Result<ScopedFindings, CheckError>;
+}
+
 /// 計測・進捗の event。時間は Clock::now_ms の差 (ms)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {

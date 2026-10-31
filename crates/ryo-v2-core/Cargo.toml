@@ -12,6 +12,7 @@ readme.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 arch-lint.workspace = true

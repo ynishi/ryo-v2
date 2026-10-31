@@ -49,7 +49,7 @@ fn guarded<T>(poisoned: &mut Option<String>, f: impl FnOnce() -> T) -> Result<T,
 
 /// The text of `id` as the database holds it now. `Files::file_text` panics on an unknown id,
 /// so this is wrapped.
-fn db_text(host: &AnalysisHost, id: FileId) -> Result<String, AnalyzerError> {
+pub(crate) fn db_text(host: &AnalysisHost, id: FileId) -> Result<String, AnalyzerError> {
     catch_unwind(AssertUnwindSafe(|| {
         let db = host.raw_database();
         db.file_text(id).text(db).to_string()

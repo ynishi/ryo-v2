@@ -6,14 +6,19 @@
 //! from it, not from a second hand-kept table.
 #![warn(missing_docs)]
 
+mod apply;
 mod bench;
+mod blueprint_json;
+mod resolution_json;
 mod rss;
+mod rules_json;
 
 use anyhow::Result;
 use bench::BenchArgs;
 use clap::{Parser, Subcommand};
-use ryo_v2_core::domain::Scope;
+use ryo_v2_core::domain::{Scope, TextRange};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(name = "ryo-v2", version, about)]
@@ -48,6 +53,47 @@ enum Command {
         #[arg(long)]
         no_assert_revert: bool,
     },
+    /// Verify BLUEPRINTS against the workspace and print the Resolution as JSON (a dry run: nothing is written).
+    Apply {
+        /// The workspace to load.
+        workspace: PathBuf,
+        /// The blueprints JSON file.
+        blueprints: PathBuf,
+        /// Rules JSON file; without it every candidate needs review.
+        #[arg(long, value_name = "FILE")]
+        rules: Option<PathBuf>,
+        /// How far the check reaches.
+        #[arg(long, value_enum, default_value_t = ApplyScopeArg::Affected)]
+        scope: ApplyScopeArg,
+        /// Do not start the proc-macro server.
+        #[arg(long)]
+        no_proc_macro: bool,
+    },
+    /// Print the `reads` entry (path, range, fingerprint) of a byte range of a file, read from disk.
+    Fingerprint {
+        /// The workspace root.
+        workspace: PathBuf,
+        /// The file, relative to the workspace.
+        path: String,
+        /// Byte range `START..END`.
+        #[arg(value_parser = parse_range)]
+        range: TextRange,
+    },
+}
+
+fn parse_range(s: &str) -> Result<TextRange, String> {
+    let (a, b) = s
+        .split_once("..")
+        .ok_or_else(|| format!("{s:?}: expected START..END"))?;
+    let start: u32 = a.parse().map_err(|e| format!("start {a:?}: {e}"))?;
+    let end: u32 = b.parse().map_err(|e| format!("end {b:?}: {e}"))?;
+    TextRange::new(start, end).map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ApplyScopeArg {
+    Affected,
+    Workspace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -57,8 +103,39 @@ enum ScopeArg {
     Both,
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run() -> Result<ExitCode> {
     match Cli::parse().command {
+        Command::Apply {
+            workspace,
+            blueprints,
+            rules,
+            scope,
+            no_proc_macro,
+        } => apply::run_apply(&apply::ApplyArgs {
+            workspace,
+            blueprints,
+            rules,
+            scope: match scope {
+                ApplyScopeArg::Affected => Scope::Affected,
+                ApplyScopeArg::Workspace => Scope::Workspace,
+            },
+            proc_macro: !no_proc_macro,
+        }),
+        Command::Fingerprint {
+            workspace,
+            path,
+            range,
+        } => apply::run_fingerprint(&workspace, &path, range),
         Command::Bench {
             base,
             variants,
@@ -103,6 +180,7 @@ fn main() -> Result<()> {
                 proc_macro: !no_proc_macro,
                 assert_revert: !no_assert_revert,
             })
+            .map(|()| ExitCode::SUCCESS)
         }
     }
 }
@@ -127,6 +205,45 @@ mod tests {
     #[test]
     fn cli_rejects_repeat_zero() {
         assert!(Cli::try_parse_from(["ryo-v2", "bench", "b", "v", "--repeat", "0"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_apply() {
+        let r = Cli::try_parse_from([
+            "ryo-v2",
+            "apply",
+            "/ws",
+            "b.json",
+            "--rules",
+            "r.json",
+            "--scope",
+            "workspace",
+            "--no-proc-macro",
+        ]);
+        assert!(r.is_ok());
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--scope", "both"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_fingerprint_range() {
+        let ok = Cli::try_parse_from(["ryo-v2", "fingerprint", "/ws", "src/lib.rs", "3..9"])
+            .map_err(|e| e.to_string())
+            .expect("parses");
+        match ok.command {
+            Command::Fingerprint { range, .. } => {
+                assert_eq!((range.start(), range.end()), (3, 9));
+            }
+            _ => panic!("not fingerprint"),
+        }
+        assert!(Cli::try_parse_from(["ryo-v2", "fingerprint", "/ws", "p", "3-9"]).is_err());
+    }
+
+    #[test]
+    fn cli_rejects_reversed_range() {
+        assert!(Cli::try_parse_from(["ryo-v2", "fingerprint", "/ws", "p", "9..3"]).is_err());
     }
 
     #[test]

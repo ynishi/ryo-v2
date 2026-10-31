@@ -5,5 +5,6 @@
 //! here, by its consumer, and implemented in [`crate::infra`]. Code here calls
 //! ports, never the file system, a process or the environment directly.
 
+pub mod apply;
 pub mod ports;
 pub mod verify;

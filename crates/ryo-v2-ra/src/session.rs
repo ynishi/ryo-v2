@@ -2,7 +2,7 @@
 
 use crate::RaAnalyzer;
 use crate::diagnostics::{collect_errors_par, panic_message};
-use crate::rev_deps::{RevDeps, build_rev_deps};
+use crate::rev_deps::{PathFacts, RevDeps, build_rev_deps};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use ra_ap_project_model::{CargoConfig, RustLibSource};
@@ -31,6 +31,10 @@ pub struct RaSession {
     /// Whether `unresolved::find` runs; baseline and fork diagnostics must agree on it.
     pub(crate) unresolved_paths: bool,
     pub(crate) live_fork: bool,
+    /// Build-script sources and proc-macro member dirs, from `cargo metadata`.
+    pub(crate) path_facts: PathFacts,
+    /// Number of `Verifier::check` calls so far.
+    pub(crate) check_count: u32,
 }
 
 /// Relative path of `path` under `root`, as a [`RelPath`].
@@ -52,6 +56,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
 
     let cargo_config = CargoConfig {
         sysroot: Some(RustLibSource::Discover),
+        set_test: a.config.cfg_test,
         ..CargoConfig::default()
     };
     let load_config = LoadCargoConfig {
@@ -89,7 +94,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
     }
     let load_ms = a.clock.now_ms().saturating_sub(t0);
 
-    let rev_deps = build_rev_deps(&root).unwrap_or_default();
+    let (rev_deps, path_facts) = build_rev_deps(&root).unwrap_or_default();
     let threads = a
         .config
         .threads
@@ -117,5 +122,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         assert_revert: a.config.assert_revert,
         unresolved_paths: a.config.unresolved_paths,
         live_fork: false,
+        path_facts,
+        check_count: 0,
     })
 }

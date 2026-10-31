@@ -52,8 +52,11 @@ deny = [
     "tokio::fs", "tokio::fs::**", "tokio::process", "tokio::process::**", "tokio::net", "tokio::net::**",
     "rand", "rand::**", "git2", "git2::**", "reqwest", "reqwest::**",
     "chrono::Utc::now", "chrono::Local::now",
+    # Ids arrive as values; the core never generates one.
+    "uuid::Uuid::now_v7", "uuid::Uuid::new_v7", "uuid::Uuid::new_v4",
+    "uuid::Uuid::now_v6", "uuid::Uuid::now_v1", "uuid::Uuid::new_v1",
 ]
-message = "domain is pure: take I/O, time and randomness as values, or through a port of app implemented in infra."
+message = "domain is pure: take I/O, time, randomness and id generation as values, or through a port of app implemented in infra."
 
 [[restrict-use]]
 name = "no-io-in-app"
@@ -67,5 +70,8 @@ deny = [
     "tokio::fs", "tokio::fs::**", "tokio::process", "tokio::process::**", "tokio::net", "tokio::net::**",
     "rand", "rand::**", "git2", "git2::**", "reqwest", "reqwest::**",
     "chrono::Utc::now", "chrono::Local::now",
+    # Ids arrive as values; the core never generates one.
+    "uuid::Uuid::now_v7", "uuid::Uuid::new_v7", "uuid::Uuid::new_v4",
+    "uuid::Uuid::now_v6", "uuid::Uuid::now_v1", "uuid::Uuid::new_v1",
 ]
 message = "app reaches the outside world through its ports; implement them in infra."

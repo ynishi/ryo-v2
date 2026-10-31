@@ -9,3 +9,39 @@ pub enum Scope {
     /// workspace の local file 全部。
     Workspace,
 }
+
+impl Scope {
+    /// Whether a check at `self` reaches at least as far as one at `other`.
+    ///
+    /// # Contract
+    /// - C1: `Workspace` covers both scopes; `Affected` covers `Affected` only.
+    ///   tested: domain::scope::tests::workspace_covers_both_affected_only_itself
+    pub fn covers(self, other: Scope) -> bool {
+        matches!(
+            (self, other),
+            (Scope::Workspace, _) | (Scope::Affected, Scope::Affected)
+        )
+    }
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Scope::Affected => "affected",
+            Scope::Workspace => "workspace",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_covers_both_affected_only_itself() {
+        assert!(Scope::Workspace.covers(Scope::Workspace));
+        assert!(Scope::Workspace.covers(Scope::Affected));
+        assert!(Scope::Affected.covers(Scope::Affected));
+        assert!(!Scope::Affected.covers(Scope::Workspace));
+    }
+}

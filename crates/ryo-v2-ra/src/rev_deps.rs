@@ -12,8 +12,18 @@ use std::path::{Path, PathBuf};
 /// Member crate dir (relative to the root) -> dirs of the members that depend on it, transitively, itself included.
 pub(crate) type RevDeps = HashMap<PathBuf, Vec<PathBuf>>;
 
-/// Builds the closure; the caller treats failure as "empty" (every file in scope).
-pub(crate) fn build_rev_deps(root: &Path) -> Result<RevDeps> {
+/// Paths that decide how risky an edit is, relative to the root.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PathFacts {
+    /// Sources of `custom-build` targets of members.
+    pub(crate) build_scripts: Vec<PathBuf>,
+    /// Dirs of members that have a `proc-macro` target.
+    pub(crate) proc_macro_dirs: Vec<PathBuf>,
+}
+
+/// Builds the closure and the path facts from one `cargo metadata`; the caller treats failure
+/// as "empty" (every file in scope, no facts).
+pub(crate) fn build_rev_deps(root: &Path) -> Result<(RevDeps, PathFacts)> {
     let out = std::process::Command::new("cargo")
         .args(["metadata", "--format-version", "1"])
         .current_dir(root)
@@ -32,6 +42,7 @@ pub(crate) fn build_rev_deps(root: &Path) -> Result<RevDeps> {
     let packages = meta["packages"].as_array().context("no packages")?;
     let mut dir_of = HashMap::new();
     let mut name_of = HashMap::new();
+    let mut facts = PathFacts::default();
     for pkg in packages {
         let id = pkg["id"].as_str().unwrap_or_default();
         if !members.contains(&id) {
@@ -44,6 +55,22 @@ pub(crate) fn build_rev_deps(root: &Path) -> Result<RevDeps> {
             .and_then(|d| d.strip_prefix(root).ok())
             .map(|d| d.to_path_buf())
             .unwrap_or_default();
+        for target in pkg["targets"].as_array().into_iter().flatten() {
+            let has_kind = |k: &str| {
+                target["kind"]
+                    .as_array()
+                    .is_some_and(|ks| ks.iter().any(|v| v.as_str() == Some(k)))
+            };
+            if has_kind("custom-build")
+                && let Some(src) = target["src_path"].as_str()
+                && let Ok(rel) = Path::new(src).strip_prefix(root)
+            {
+                facts.build_scripts.push(rel.to_path_buf());
+            }
+            if has_kind("proc-macro") && !facts.proc_macro_dirs.contains(&dir) {
+                facts.proc_macro_dirs.push(dir.clone());
+            }
+        }
         dir_of.insert(name.clone(), dir);
         name_of.insert(id.to_string(), name);
     }
@@ -80,7 +107,7 @@ pub(crate) fn build_rev_deps(root: &Path) -> Result<RevDeps> {
             seen.iter().filter_map(|n| dir_of.get(n).cloned()).collect(),
         );
     }
-    Ok(rev_deps)
+    Ok((rev_deps, facts))
 }
 
 /// Files to diagnose for a set of edited files: the edited crates and their transitive dependents.
