@@ -263,6 +263,16 @@ contributors use the same context without repeatedly reclassifying it.
 - **Code documentation:** state the current contract, invariants, rationale,
   examples, compatibility notes, and migration path.
 
+While the repository uses no issue tracker
+([CONTRIBUTING.md](CONTRIBUTING.md#development-flow) says when), a row of the
+"Open work" section of `CHECK_LEDGER.md`, or the task's contract, is the issue
+as a unit of work: what this document says of an issue applies to it, an
+umbrella is split into rows rather than child issues, and the hand-over note
+([CONTRIBUTING.md](CONTRIBUTING.md#pull-requests)) does the work of a pull
+request body. A disclosure record is the exception: a row is removed once its
+work is done, and the record must stay readable after it closes, so it is kept
+in a file of its own under `docs/`.
+
 There is no separate discussion venue. Exploration belongs in the issue next to
 the change it argues for, and what is still unsettled stays there in an `Open`
 section rather than moving somewhere else to be resolved. Reading an issue
