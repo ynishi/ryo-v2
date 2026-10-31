@@ -3,12 +3,18 @@ name = "ryo-v2"
 description = "Speculative refactoring engine for Rust: Blueprints explored and verified in-process on rust-analyzer, built once after commit"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/ryo-v2"
 readme.workspace = true
+keywords = ["refactoring", "rust-analyzer", "codemod", "static-analysis", "code-search"]
+categories = ["development-tools"]
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[lints]
+workspace = true
 
 [dependencies]
 ryo-v2-core.workspace = true

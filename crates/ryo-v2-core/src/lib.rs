@@ -12,7 +12,6 @@
 //! A layer that does not fit this crate (a device driver has no domain worth
 //! the name, for example) is deleted, module and `arch-lint.toml` scope
 //! together. The rest stays.
-#![warn(missing_docs)]
 
 pub mod app;
 pub mod domain;

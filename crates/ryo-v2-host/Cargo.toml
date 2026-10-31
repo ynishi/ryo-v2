@@ -3,12 +3,18 @@ name = "ryo-v2-host"
 description = "Host of ryo-v2: the `ryo-v2` binary, which runs the engine behind a front such as the command line"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/ryo-v2-host"
 readme.workspace = true
+keywords = ["refactoring", "rust-analyzer", "cli", "codemod"]
+categories = ["development-tools", "command-line-utilities"]
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "ryo-v2"

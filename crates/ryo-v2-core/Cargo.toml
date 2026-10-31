@@ -1,14 +1,20 @@
 [package]
 name = "ryo-v2-core"
-description = "Core (SDK) of ryo-v2: Speculative refactoring engine for Rust: Blueprints explored and verified in-process on rust-analyzer, built once after commit"
+description = "Core of ryo-v2: the domain types, use cases and ports of the speculative refactoring engine (Blueprints, verdicts, search), free of rust-analyzer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/ryo-v2-core"
 readme.workspace = true
+keywords = ["refactoring", "blueprint", "verification", "code-search"]
+categories = ["development-tools"]
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[lints]
+workspace = true
 
 [dependencies]
 thiserror.workspace = true
@@ -16,5 +22,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 arch-lint.workspace = true
+toml.workspace = true
 # Crate-local on purpose; move to [workspace.dependencies] when a second crate needs syn.
 syn = { version = "2", features = ["full", "visit"] }

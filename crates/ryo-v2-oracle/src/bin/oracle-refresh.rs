@@ -6,7 +6,6 @@
 //! `Cargo.lock`) is never touched by cargo.
 //!
 //! Usage: `oracle-refresh <ws> [--case <id>]...`
-#![warn(missing_docs)]
 
 use std::path::Path;
 
