@@ -13,6 +13,10 @@
 //! the tables are tested without a language server. [`run_case`] is generic over the ports of
 //! `ryo-v2-core`; the rust-analyzer instances live in the `search-recall` binary.
 //!
+//! A run also reports the panics its sessions contained and went on past ([`ContainedPanics`]):
+//! a detector or expander panic costs one file or one call, and a measurement that hid it would
+//! read a lower recall as a weaker search.
+//!
 //! Adopt at recall >= [`ADOPT_AT`], discard below [`DISCARD_BELOW`], hold between, and say
 //! nothing below [`MIN_DECISIONS`] compared decisions. With 0 misses in 30 the true miss rate
 //! is at most 0.1 at 95 % (the rule of three).
@@ -31,6 +35,7 @@ use ryo_v2_core::domain::{
     RuleCatalog, Scope, SearchBudget, Stage, Target, TextRange, Verdict,
 };
 use ryo_v2_core::infra::overlay::{OverlayError, overlay_edits};
+use ryo_v2_ra::{DetectorPanic, ExpanderPanic};
 use serde_json::{Value, json};
 
 use crate::planted::{PlantKind, texts_match};
@@ -996,6 +1001,88 @@ pub fn terminal(rows: &[DecisionRow], t: RunInfo) -> String {
     markdown(rows, t)
 }
 
+/// The panics a run contained and went on past, by workspace.
+///
+/// Sessions record the panics of the detector and of the expander instead of failing; the run
+/// collects them here so the count is printed, zero included.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainedPanics {
+    detector: BTreeSet<(String, DetectorPanic)>,
+    expander: BTreeSet<(String, ExpanderPanic)>,
+}
+
+impl ContainedPanics {
+    /// Adds what a session recorded; adding the same session twice counts each panic once.
+    pub fn absorb(&mut self, ws: &str, detector: &[DetectorPanic], expander: &[ExpanderPanic]) {
+        for d in detector {
+            self.detector.insert((ws.to_owned(), d.clone()));
+        }
+        for e in expander {
+            self.expander.insert((ws.to_owned(), e.clone()));
+        }
+    }
+
+    /// No panic recorded.
+    pub fn is_empty(&self) -> bool {
+        self.detector.is_empty() && self.expander.is_empty()
+    }
+
+    /// Number of distinct detector panics.
+    pub fn detector(&self) -> usize {
+        self.detector.len()
+    }
+
+    /// Number of distinct expander panics.
+    pub fn expander(&self) -> usize {
+        self.expander.len()
+    }
+
+    /// `contained panics: {d} detector, {e} expander` followed by one line per panic:
+    /// `detector panic {ws} {path}: {message}` / `expander panic {ws} {kind|-} {path|-}: {message}`
+    /// (message: first line only). Always at least the first line.
+    pub fn lines(&self) -> Vec<String> {
+        let first = |m: &str| m.lines().next().unwrap_or("").to_owned();
+        let mut out = vec![format!(
+            "contained panics: {} detector, {} expander",
+            self.detector(),
+            self.expander()
+        )];
+        for (ws, d) in &self.detector {
+            out.push(format!(
+                "detector panic {ws} {}: {}",
+                d.path,
+                first(&d.message)
+            ));
+        }
+        for (ws, e) in &self.expander {
+            out.push(format!(
+                "expander panic {ws} {} {}: {}",
+                e.kind.map_or("-", |k| k.id()),
+                e.path.as_ref().map_or("-", |p| p.as_str()),
+                first(&e.message)
+            ));
+        }
+        out
+    }
+
+    /// The JSON of `--report`: `{"detector": [{ws,path,message}], "expander": [{ws,kind,path,message}]}`.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "detector": self.detector.iter().map(|(ws, d)| json!({
+                "ws": ws,
+                "path": d.path.as_str(),
+                "message": d.message,
+            })).collect::<Vec<_>>(),
+            "expander": self.expander.iter().map(|(ws, e)| json!({
+                "ws": ws,
+                "kind": e.kind.map(|k| k.id()),
+                "path": e.path.as_ref().map(|p| p.as_str()),
+                "message": e.message,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 /// The whole run as JSON.
 pub fn report_json(rows: &[DecisionRow], t: RunInfo) -> Value {
     let all = Counts::of(rows);
@@ -1025,6 +1112,38 @@ mod tests {
         BlueprintId, Fingerprint, Infeasible, IntentKind, Prior, ProposalId, Reward, SearchTree,
         StateFp,
     };
+
+    #[test]
+    fn contained_panics_lines_count_and_list() {
+        let mut p = ContainedPanics::default();
+        assert!(p.is_empty());
+        assert_eq!(p.lines(), vec!["contained panics: 0 detector, 0 expander"]);
+        let d = [DetectorPanic {
+            path: RelPath::parse("src/a.rs").unwrap(),
+            message: "boom\nmore".to_owned(),
+        }];
+        let e = [ExpanderPanic {
+            kind: Some(IntentKind::ExtractVariable),
+            path: None,
+            message: "bang".to_owned(),
+        }];
+        p.absorb("ws1", &d, &e);
+        p.absorb("ws1", &d, &e);
+        assert!(!p.is_empty());
+        assert_eq!((p.detector(), p.expander()), (1, 1));
+        let lines = p.lines();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "contained panics: 1 detector, 1 expander");
+        assert_eq!(lines[1], "detector panic ws1 src/a.rs: boom");
+        assert_eq!(
+            lines[2],
+            format!(
+                "expander panic ws1 {} -: bang",
+                IntentKind::ExtractVariable.id()
+            )
+        );
+        assert_eq!(p.to_json()["expander"][0]["ws"], "ws1");
+    }
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()

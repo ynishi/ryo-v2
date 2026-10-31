@@ -94,6 +94,12 @@ fn one_planted_case_runs_end_to_end() {
         "{}",
         markdown(std::slice::from_ref(&row), RunInfo::default())
     );
+    assert!(
+        session.detector_panics().is_empty() && session.expander_panics().is_empty(),
+        "no panic was contained: {:?} {:?}",
+        session.detector_panics(),
+        session.expander_panics()
+    );
     assert_eq!(row.skipped, None, "the planted state verifies: {row:?}");
     assert!(
         !row.candidates.is_empty() && row.candidates[0] > 0,

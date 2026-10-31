@@ -9,7 +9,7 @@
 //! The expected files are `cargo check --workspace --all-targets`, so the floors hold only with
 //! proc-macro on, the detector on and cfg-test on. Independent of those switches, an unfiltered
 //! run also asserts that the primary denominator holds its floor and that no case is skipped or
-//! misgrouped.
+//! misgrouped, and that no detector or expander panic was contained.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_oracle::case::{Case, load_gap_tags};
 use ryo_v2_oracle::groups::{CaseOutcome, Counts, Group, Outcome, Report, compare};
 use ryo_v2_oracle::materials::Materials;
+use ryo_v2_oracle::search_recall::ContainedPanics;
 use ryo_v2_ra::{RaAnalyzer, RaConfig};
 
 // Floors: the least number of recall hits (`hit`; `exact` for valid) a group
@@ -138,6 +139,7 @@ fn oracle() {
     println!("cfg-test: {}", if cfg_test_on { "on" } else { "off" });
     let observer = Arc::new(RecordingObserver::default());
     let mut infra_errors: Vec<String> = Vec::new();
+    let mut panics = ContainedPanics::default();
 
     let mut by_ws: BTreeMap<String, Vec<&Case>> = BTreeMap::new();
     for c in &cases {
@@ -214,6 +216,7 @@ fn oracle() {
                 check_ms,
             });
         }
+        panics.absorb(ws, &session.detector_panics(), &session.expander_panics());
     }
 
     let filtered = !report.excluded.is_empty();
@@ -287,6 +290,9 @@ fn oracle() {
             codes.join(",")
         );
     }
+    for line in panics.lines() {
+        println!("{line}");
+    }
     let full = std::env::var_os("RYO_V2_ORACLE_FULL").is_some();
     for o in &report.outcomes {
         if let Outcome::Fail {
@@ -322,6 +328,12 @@ fn oracle() {
             .unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
     }
 
+    // Independent of the switches and of filtering: a contained panic is a defect to fix.
+    assert!(
+        panics.is_empty(),
+        "contained panics, each a defect to fix:\n{}",
+        panics.lines().join("\n")
+    );
     assert!(
         infra_errors.is_empty(),
         "infrastructure errors:\n{}",
