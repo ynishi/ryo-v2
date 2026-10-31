@@ -7,7 +7,9 @@
 
 mod assess;
 mod check;
+mod copy_impl;
 mod diagnostics;
+mod duplicate;
 mod expand;
 mod fork;
 mod rev_deps;
@@ -32,7 +34,9 @@ pub struct RaConfig {
     pub threads: Option<usize>,
     /// discard ごとに巻き戻し後の診断が baseline と一致するか検査する。
     pub assert_revert: bool,
-    /// ra が診断しない未解決の型名と path 先頭を検出する (E0405/E0425/E0433)。
+    /// ra が診断しない error の detector を走らせる: 未解決の型名と path 先頭 (E0405/E0425/E0433)、
+    /// item と `use` が同じ module で同じ名前を定義する (E0255)、`Copy` でない field を持つ型の
+    /// `Copy` impl (E0204)。名前は最初の detector のまま。
     pub unresolved_paths: bool,
     /// `Verifier::check` が n 回に 1 回、巻き戻し後の診断を baseline と突き合わせる。None = 突き合わせない。
     ///

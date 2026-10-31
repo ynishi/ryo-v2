@@ -251,7 +251,7 @@ fn imported_names(file: &ast::SourceFile) -> HashSet<String> {
 }
 
 /// The path a `self` leaf imports: `a::b` in `use a::b::self` and in `use a::b::{self}`.
-fn self_import_base(tree: &ast::UseTree, path: &ast::Path) -> Option<ast::Path> {
+pub(crate) fn self_import_base(tree: &ast::UseTree, path: &ast::Path) -> Option<ast::Path> {
     path.qualifier().or_else(|| {
         tree.syntax()
             .ancestors()
