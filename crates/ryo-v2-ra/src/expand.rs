@@ -7,6 +7,9 @@
 //! conformance check accepts, so a shape that rust-analyzer produces differently is dropped, not
 //! forced. Candidates are produced lazily, round-robin over the targets and then the kinds, so a
 //! small `max` costs few analyzer calls.
+//!
+//! Extract-variable offers calls, indexes, binary expressions and fields of fields, and also a
+//! reference or literal that is a whole argument of a call (see `is_variable_shape`).
 
 use crate::RaAnalyzer;
 use crate::check::{fingerprints, map_error};
@@ -296,15 +299,19 @@ fn blocks_move(node: &SyntaxNode) -> bool {
     })
 }
 
-/// Start of the first element of an item that is not an attribute, comment or whitespace: where
-/// its visibility (or keyword) begins.
+/// Whether a syntax kind is a comment: rust-analyzer gives a `///` comment its own kind
+/// (`DOC_COMMENT`), apart from a plain `//` comment (`COMMENT`), and both are comments to the
+/// readers of an item's start ([`keyword_offset`], [`after_leading_comments`]).
+fn is_comment(kind: SyntaxKind) -> bool {
+    matches!(kind, SyntaxKind::COMMENT | SyntaxKind::DOC_COMMENT)
+}
+
+/// Start of the first element of an item that is not an attribute, comment (plain or doc) or
+/// whitespace: where its visibility (or keyword) begins.
 fn keyword_offset(node: &SyntaxNode) -> u32 {
     node.children_with_tokens()
         .find(|e| {
-            !matches!(
-                e.kind(),
-                SyntaxKind::ATTR | SyntaxKind::COMMENT | SyntaxKind::WHITESPACE
-            )
+            !is_comment(e.kind()) && !matches!(e.kind(), SyntaxKind::ATTR | SyntaxKind::WHITESPACE)
         })
         .map_or_else(
             || u32::from(node.text_range().start()),
@@ -1349,14 +1356,27 @@ impl<'a> Env<'a> {
     }
 }
 
-/// Whether an expression is worth offering to extract-variable.
+/// Whether an expression is worth offering to extract-variable: a call, method call, index or
+/// binary expression (not an assignment), a field of a field, or a reference (`&e`, `&mut e`) or
+/// literal that is a whole argument of a call or method call. rust-analyzer names such an
+/// argument after the parameter of the callee, so folding `let pattern = &a.b; f(pattern)` into
+/// `f(&a.b)` is restorable. A path, a `?` expression or a macro call as an argument is not
+/// offered, nor is a reference or literal anywhere else.
 fn is_variable_shape(e: &ast::Expr) -> bool {
     match e {
         ast::Expr::CallExpr(_) | ast::Expr::MethodCallExpr(_) | ast::Expr::IndexExpr(_) => true,
         ast::Expr::BinExpr(b) => !matches!(b.op_kind(), Some(ast::BinaryOp::Assignment { .. })),
         ast::Expr::FieldExpr(f) => matches!(f.expr(), Some(ast::Expr::FieldExpr(_))),
+        ast::Expr::RefExpr(_) | ast::Expr::Literal(_) => is_whole_argument(e),
         _ => false,
     }
+}
+
+/// Whether `e` is a whole argument of a call or method call (its parent is an argument list).
+fn is_whole_argument(e: &ast::Expr) -> bool {
+    e.syntax()
+        .parent()
+        .is_some_and(|p| ast::ArgList::can_cast(p.kind()))
 }
 
 /// The statement (or tail expression) of a block that an extracted `let` goes before. `None`
@@ -1423,12 +1443,12 @@ fn record_field_of(e: &ast::Expr) -> Option<(u32, String)> {
         .then(|| (start, name.text().to_string()))
 }
 
-/// Start of the code of `node` after the comments rust-analyzer attaches in front of it; `None`
-/// when an attribute comes first.
+/// Start of the code of `node` after the comments (plain or doc, see [`is_comment`]) rust-analyzer
+/// attaches in front of it; `None` when an attribute comes first.
 fn after_leading_comments(node: &SyntaxNode) -> Option<u32> {
     let first = node
         .children_with_tokens()
-        .find(|e| !matches!(e.kind(), SyntaxKind::COMMENT | SyntaxKind::WHITESPACE))?;
+        .find(|e| !is_comment(e.kind()) && e.kind() != SyntaxKind::WHITESPACE)?;
     (first.kind() != SyntaxKind::ATTR).then(|| u32::from(first.text_range().start()))
 }
 
@@ -1605,6 +1625,19 @@ fn generate(
 ///   would shadow it for the later reads).
 ///   tested: tests/expand_gen.rs extract_variable_refuses_a_name_the_block_still_reads
 ///   tested: expand::tests::a_mention_is_a_whole_word
+/// - C14: the reverse move of C6 also restores an item with `///` doc lines (they move with it),
+///   and the forward move of a documented item without visibility writes `pub(crate)` after its
+///   doc lines.
+///   tested: tests/expand_gen.rs move_item_collapses_a_documented_item
+///   tested: tests/expand_gen.rs move_item_forward_keeps_the_doc_above_the_visibility
+///   tested: expand::tests::a_doc_comment_is_a_comment
+/// - C15: extract-variable offers, beyond the shapes before, a reference (`&e`, `&mut e`) or a
+///   literal that is a whole argument of a call or method call, and no path, `?` expression or
+///   macro call.
+///   tested: tests/expand_gen.rs extract_variable_restores_a_reference_argument
+///   tested: tests/expand_gen.rs extract_variable_restores_a_literal_argument
+///   tested: tests/expand_gen.rs extract_variable_offers_no_path_argument
+///   tested: expand::tests::a_reference_or_literal_argument_is_a_variable_shape
 impl Expander for RaAnalyzer {
     type Session = RaSession;
 
@@ -1763,6 +1796,69 @@ mod tests {
             uses("// c\n#[allow(unused)]\nuse crate::a::B;\n"),
             vec![None]
         );
+    }
+
+    #[test]
+    fn a_doc_comment_is_a_comment() {
+        assert!(is_comment(SyntaxKind::COMMENT));
+        assert!(is_comment(SyntaxKind::DOC_COMMENT));
+        assert!(!is_comment(SyntaxKind::WHITESPACE));
+        assert!(!is_comment(SyntaxKind::ATTR));
+        let src = "/// d\u{e9}\n#[inline]\nfn f() {}\n";
+        let file = ast::SourceFile::parse(src, ra_ap_syntax::Edition::CURRENT).tree();
+        let item = file.items().next().expect("an item");
+        assert_eq!(
+            keyword_offset(item.syntax()) as usize,
+            src.find("fn").unwrap()
+        );
+        let uses = ast::SourceFile::parse(
+            "/// d\npub use crate::a::B;\n",
+            ra_ap_syntax::Edition::CURRENT,
+        )
+        .tree();
+        let u = uses.items().next().expect("a use");
+        assert_eq!(after_leading_comments(u.syntax()), Some(6));
+    }
+
+    /// The shape verdict of every expression of `src` that `want` selects, by its text.
+    fn shapes(src: &str, want: impl Fn(&ast::Expr) -> bool) -> Vec<(String, bool)> {
+        let file = ast::SourceFile::parse(src, ra_ap_syntax::Edition::CURRENT).tree();
+        file.syntax()
+            .descendants()
+            .filter_map(ast::Expr::cast)
+            .filter(|e| want(e))
+            .map(|e| (e.syntax().text().to_string(), is_variable_shape(&e)))
+            .collect()
+    }
+
+    #[test]
+    fn a_reference_or_literal_argument_is_a_variable_shape() {
+        let refs_and_lits = |e: &ast::Expr| {
+            matches!(
+                e,
+                ast::Expr::RefExpr(_) | ast::Expr::Literal(_) | ast::Expr::PathExpr(_)
+            )
+        };
+        let got = shapes(
+            "fn g() { f(&a.b, 20); x.m(&mut c, \"s\"); f(x); }",
+            refs_and_lits,
+        );
+        let verdict = |t: &str| got.iter().find(|(s, _)| s == t).map(|(_, v)| *v);
+        assert_eq!(verdict("&a.b"), Some(true));
+        assert_eq!(verdict("20"), Some(true));
+        assert_eq!(verdict("&mut c"), Some(true));
+        assert_eq!(verdict("\"s\""), Some(true));
+        // A path argument is not offered.
+        assert_eq!(verdict("x"), Some(false));
+        // A reference inside a binary expression, a literal in an initializer or an operand are
+        // not whole arguments.
+        let got = shapes("fn g() { g(h(&a.b) + 1); let y = 3; }", refs_and_lits);
+        let verdict = |t: &str| got.iter().find(|(s, _)| s == t).map(|(_, v)| *v);
+        assert_eq!(verdict("&a.b"), Some(true), "`&a.b` is the argument of h");
+        assert_eq!(verdict("1"), Some(false));
+        assert_eq!(verdict("3"), Some(false));
+        let got = shapes("fn g() { g(&a.b + 1); }", refs_and_lits);
+        assert!(got.iter().all(|(t, v)| t != "&a.b" || !v), "{got:?}");
     }
 
     #[test]
