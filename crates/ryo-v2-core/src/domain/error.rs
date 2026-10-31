@@ -27,6 +27,9 @@ pub enum DomainError {
     /// A mutation spec that changes nothing or is malformed.
     #[error("invalid mutation: {0}")]
     Mutation(String),
+    /// Not `<doc>#<item>`.
+    #[error("not a spec reference (<doc>#<item>): {0:?}")]
+    SpecRef(String),
     /// A required text was empty.
     #[error("empty value: {0}")]
     Empty(String),

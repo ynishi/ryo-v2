@@ -3,12 +3,17 @@
 //! The central rule is [`disposition`]: whether a passing candidate may be applied without a
 //! human, needs a build first, or needs a review. It is a table, read top to bottom, and an
 //! outer check that is required is never skipped by an auto-apply.
+//!
+//! The marks and the Rule that feed the table are derived here, from the Blueprints of a path
+//! and the roles of the files it edits ([`risk_marks`], [`covering_rule`]); a caller never
+//! hands them over.
 
 use super::{
-    BlueprintId, Edit, FileRole, Freshness, NonEmpty, Nonconformance, ReadRange, RelPath, RiskMark,
-    Rule, RuleId, Scope, SpliceError, Verdict,
+    Blueprint, BlueprintId, DomainError, Edit, FileRole, Fingerprint, Freshness, IntentKind,
+    NonEmpty, Nonconformance, ReadRange, RelPath, RiskMark, Rule, RuleCatalog, RuleId, Scope,
+    SpliceError, Verdict,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Why a build or test must run before a candidate is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -165,10 +170,65 @@ pub fn disposition(marks: &BTreeSet<RiskMark>, rule: Option<&Rule>, scope: Scope
     }
 }
 
-/// A Blueprint that passed the analyzer, with the edits it would make and what to do next.
+/// The marks of a change made by `kinds` to files of `roles`.
+///
+/// # Contract
+/// - C1: the marks are the union of the catalog risks of `kinds` and, for the roles, `BuildScript`
+///   for `FileRole::BuildScript` and `ProcMacroCrate` for `FileRole::ProcMacroSource`; `Source`
+///   and `Manifest` add nothing.
+///   tested: domain::resolution::tests::risk_marks_are_intent_risks_plus_roles
+pub fn risk_marks(
+    kinds: impl IntoIterator<Item = IntentKind>,
+    roles: impl IntoIterator<Item = FileRole>,
+) -> BTreeSet<RiskMark> {
+    let mut marks = BTreeSet::new();
+    for kind in kinds {
+        marks.extend(kind.spec().risks);
+    }
+    for role in roles {
+        match role {
+            FileRole::BuildScript => {
+                marks.insert(RiskMark::BuildScript);
+            }
+            FileRole::ProcMacroSource => {
+                marks.insert(RiskMark::ProcMacroCrate);
+            }
+            FileRole::Source | FileRole::Manifest => {}
+        }
+    }
+    marks
+}
+
+/// The Rule that covers every intent of `kinds` (root first, leaf last), or `None`.
+///
+/// # Contract
+/// - C1: `None` for no kinds and when any kind has no Rule in `rules` (the catalog holds each
+///   Rule under its own intent, `RuleCatalog` C2); otherwise the Rule with the widest
+///   `min_scope`, the later one (the leaf's) on a tie.
+///   tested: domain::resolution::tests::covering_rule_needs_every_kind
+pub fn covering_rule<'r>(kinds: &[IntentKind], rules: &'r RuleCatalog) -> Option<&'r Rule> {
+    let mut best: Option<&Rule> = None;
+    for kind in kinds {
+        let rule = rules.for_intent(*kind)?;
+        best = match best {
+            Some(b) if !rule.min_scope().covers(b.min_scope()) => Some(b),
+            _ => Some(rule),
+        };
+    }
+    best
+}
+
+/// A Blueprint, or a path of them, that passed the analyzer, with the edits it would make and
+/// what to do next.
+///
+/// ```compile_fail
+/// use ryo_v2_core::domain::Candidate;
+/// // Only the engine builds a candidate: its marks and Rule are derived, never handed over.
+/// let _ = Candidate::new;
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
-    blueprint: BlueprintId,
+    path: NonEmpty<Blueprint>,
     edits: Vec<Edit>,
     verdict: Verdict,
     marks: BTreeSet<RiskMark>,
@@ -179,25 +239,34 @@ pub struct Candidate {
 impl Candidate {
     /// Builds the candidate of a passing verdict.
     ///
+    /// `path` holds the Blueprints that lead to it, the root first and the leaf last (one for
+    /// an apply); `roles` the roles of every file the path edits.
+    ///
     /// # Contract
     /// - C1: returns `Err(verdict)` unless `verdict.passed()`.
     ///   tested: domain::resolution::tests::candidate_refuses_failed_verdict
-    /// - C2: `outer_check` and `disposition` are those of [`outer_check`] and [`disposition`]
-    ///   for `marks`, `rule` and `scope`.
+    /// - C2: the marks are [`risk_marks`] of the intent kinds of `path` and `roles`, the Rule is
+    ///   [`covering_rule`] of those kinds, and `outer_check` and `disposition` follow from them
+    ///   with [`outer_check`] and [`disposition`]; a path with an intent whose catalog risks hold
+    ///   `Behaviour` is `NeedsReview{Behaviour}` whatever the catalog holds.
+    ///   tested: domain::resolution::tests::candidate_derives_marks_and_rule
     ///   tested: domain::resolution::tests::crate_graph_edits_never_pass_silently
-    pub fn new(
-        blueprint: BlueprintId,
+    pub(crate) fn new(
+        path: NonEmpty<Blueprint>,
+        roles: &BTreeSet<FileRole>,
         edits: Vec<Edit>,
         verdict: Verdict,
-        marks: BTreeSet<RiskMark>,
-        rule: Option<&Rule>,
+        rules: &RuleCatalog,
         scope: Scope,
     ) -> Result<Self, Verdict> {
         if !verdict.passed() {
             return Err(verdict);
         }
+        let kinds: Vec<IntentKind> = path.iter().map(|b| b.intent().kind()).collect();
+        let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
+        let rule = covering_rule(&kinds, rules);
         Ok(Self {
-            blueprint,
+            path,
             edits,
             verdict,
             outer_check: outer_check(&marks),
@@ -206,9 +275,14 @@ impl Candidate {
         })
     }
 
-    /// The Blueprint it came from.
+    /// The Blueprint it came from: the last of its path.
     pub fn blueprint(&self) -> BlueprintId {
-        self.blueprint
+        self.path.last().id()
+    }
+
+    /// The Blueprints that lead to it, the root first and the leaf last.
+    pub fn path(&self) -> &[Blueprint] {
+        self.path.as_slice()
     }
 
     /// Whole-file edits it would make. Nothing is written to disk.
@@ -481,14 +555,47 @@ impl std::fmt::Display for Stage {
 /// One step of the decision on one Blueprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
+    blueprint: BlueprintId,
+    stage: Stage,
+    ok: bool,
+    note: String,
+}
+
+impl LogEntry {
+    /// An entry of the decision on `blueprint`.
+    pub(crate) fn new(
+        blueprint: BlueprintId,
+        stage: Stage,
+        ok: bool,
+        note: impl Into<String>,
+    ) -> Self {
+        Self {
+            blueprint,
+            stage,
+            ok,
+            note: note.into(),
+        }
+    }
+
     /// The Blueprint.
-    pub blueprint: BlueprintId,
+    pub fn blueprint(&self) -> BlueprintId {
+        self.blueprint
+    }
+
     /// The stage.
-    pub stage: Stage,
+    pub fn stage(&self) -> Stage {
+        self.stage
+    }
+
     /// Whether it passed. A `false` is the last entry of its Blueprint.
-    pub ok: bool,
+    pub fn ok(&self) -> bool {
+        self.ok
+    }
+
     /// What happened, in a few words.
-    pub note: String,
+    pub fn note(&self) -> &str {
+        &self.note
+    }
 }
 
 /// The steps taken, in order.
@@ -497,7 +604,7 @@ pub struct DecisionLog(Vec<LogEntry>);
 
 impl DecisionLog {
     /// Appends an entry.
-    pub fn push(&mut self, entry: LogEntry) {
+    pub(crate) fn push(&mut self, entry: LogEntry) {
         self.0.push(entry);
     }
 
@@ -525,19 +632,167 @@ pub const DEFAULT_BUDGET: DecisionBudget = DecisionBudget {
     per_candidate_ms: 6_000,
 };
 
+/// What a decision can be reproduced from: the analyzer, its configuration and the workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    analyzer: String,
+    version: String,
+    config: BTreeMap<String, String>,
+    files: BTreeMap<RelPath, Fingerprint>,
+}
+
+impl Provenance {
+    /// Builds the provenance of a decision. The domain never reads these values: the verifier
+    /// supplies them.
+    ///
+    /// # Contract
+    /// - C1: refuses an analyzer name or version that is empty after trimming, and a config key
+    ///   that is empty after trimming, with [`DomainError::Empty`].
+    ///   tested: domain::resolution::tests::provenance_refuses_empty
+    /// - C2: [`Provenance::workspace`] is the [`workspace_fingerprint`] of [`Provenance::files`].
+    ///   tested: domain::resolution::tests::provenance_workspace_is_of_its_files
+    pub fn new(
+        analyzer: &str,
+        version: &str,
+        config: BTreeMap<String, String>,
+        files: BTreeMap<RelPath, Fingerprint>,
+    ) -> Result<Self, DomainError> {
+        if analyzer.trim().is_empty() {
+            return Err(DomainError::Empty("analyzer".to_owned()));
+        }
+        if version.trim().is_empty() {
+            return Err(DomainError::Empty("analyzer version".to_owned()));
+        }
+        if config.keys().any(|k| k.trim().is_empty()) {
+            return Err(DomainError::Empty("config key".to_owned()));
+        }
+        Ok(Self {
+            analyzer: analyzer.to_owned(),
+            version: version.to_owned(),
+            config,
+            files,
+        })
+    }
+
+    /// The provenance of an analyzer that recorded nothing: named `unknown`, with no
+    /// configuration and no files. For an adapter whose own values fail [`Provenance::new`],
+    /// which a constant name and version never do.
+    pub fn unrecorded() -> Self {
+        Self {
+            analyzer: "unknown".to_owned(),
+            version: "unknown".to_owned(),
+            config: BTreeMap::new(),
+            files: BTreeMap::new(),
+        }
+    }
+
+    /// The analyzer's name.
+    pub fn analyzer(&self) -> &str {
+        &self.analyzer
+    }
+
+    /// The analyzer's version.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// The analyzer's configuration.
+    pub fn config(&self) -> &BTreeMap<String, String> {
+        &self.config
+    }
+
+    /// The fingerprint of each file of the workspace the analyzer saw.
+    pub fn files(&self) -> &BTreeMap<RelPath, Fingerprint> {
+        &self.files
+    }
+
+    /// The fingerprint of the workspace the analyzer saw.
+    pub fn workspace(&self) -> Fingerprint {
+        workspace_fingerprint(self.files.iter().map(|(p, f)| (p, *f)))
+    }
+}
+
+/// The fingerprint of a workspace: the fingerprints of its files, by path.
+///
+/// # Contract
+/// - C1: independent of the order of `files`; it changes when a path or a file's fingerprint
+///   changes and when a file is added or removed. It is the [`Fingerprint`] of, for each file in
+///   path order, the length of the path (8 bytes, little endian), the path, and the text form of
+///   the file's fingerprint.
+///   tested: domain::resolution::tests::workspace_fingerprint_follows_files
+pub fn workspace_fingerprint<'a>(
+    files: impl IntoIterator<Item = (&'a RelPath, Fingerprint)>,
+) -> Fingerprint {
+    let sorted: BTreeMap<&RelPath, Fingerprint> = files.into_iter().collect();
+    let mut bytes = Vec::new();
+    for (path, fp) in sorted {
+        bytes.extend_from_slice(&(path.as_str().len() as u64).to_le_bytes());
+        bytes.extend_from_slice(path.as_str().as_bytes());
+        bytes.extend_from_slice(fp.to_string().as_bytes());
+    }
+    Fingerprint::of(&bytes)
+}
+
 /// What the decision rested on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
+    scope: Scope,
+    fingerprints_checked: usize,
+    baseline_size: usize,
+    verdicts: Vec<(BlueprintId, Verdict)>,
+    budget: DecisionBudget,
+    provenance: Provenance,
+}
+
+impl Evidence {
+    /// The evidence of a decision.
+    pub(crate) fn new(
+        scope: Scope,
+        fingerprints_checked: usize,
+        baseline_size: usize,
+        verdicts: Vec<(BlueprintId, Verdict)>,
+        budget: DecisionBudget,
+        provenance: Provenance,
+    ) -> Self {
+        Self {
+            scope,
+            fingerprints_checked,
+            baseline_size,
+            verdicts,
+            budget,
+            provenance,
+        }
+    }
+
     /// The scope the checks ran at.
-    pub scope: Scope,
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
     /// How many reads were compared with the current text.
-    pub fingerprints_checked: usize,
+    pub fn fingerprints_checked(&self) -> usize {
+        self.fingerprints_checked
+    }
+
     /// How many baseline findings there were.
-    pub baseline_size: usize,
+    pub fn baseline_size(&self) -> usize {
+        self.baseline_size
+    }
+
     /// The verdict of every check that ran.
-    pub verdicts: Vec<(BlueprintId, Verdict)>,
+    pub fn verdicts(&self) -> &[(BlueprintId, Verdict)] {
+        &self.verdicts
+    }
+
     /// The budget.
-    pub budget: DecisionBudget,
+    pub fn budget(&self) -> DecisionBudget {
+        self.budget
+    }
+
+    /// What the decision can be reproduced from.
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
 }
 
 /// The outcome of resolving a set of Blueprints.
@@ -561,7 +816,11 @@ pub enum Resolution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Diagnostic, Diagnostics, ErrorCode, IntentKind, ReviewRecord};
+    use crate::domain::DeriveName;
+    use crate::domain::{
+        DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident, IntentCall, MutationSpec,
+        ReviewRecord, TextRange,
+    };
 
     const ALL_MARKS: [RiskMark; 5] = [
         RiskMark::Borrow,
@@ -582,16 +841,90 @@ mod tests {
     fn bid() -> BlueprintId {
         BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap()
     }
+    fn review() -> ReviewRecord {
+        ReviewRecord {
+            reviewer: "me".to_owned(),
+            reviewed_at_ms: 1,
+            note: String::new(),
+        }
+    }
+    fn rid(n: u8) -> RuleId {
+        RuleId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap()
+    }
     fn rule() -> Rule {
-        Rule::register(
-            RuleId::parse("01890a5d-ac96-774b-bcce-b302099a8058").unwrap(),
-            IntentKind::MoveItem,
-            ReviewRecord {
-                reviewer: "me".to_owned(),
-                reviewed_at_ms: 1,
-                note: String::new(),
+        Rule::register(rid(0x58), IntentKind::MoveItem, review(), Scope::Workspace).unwrap()
+    }
+    fn call(kind: IntentKind) -> IntentCall {
+        match kind {
+            IntentKind::RenameLocal => IntentCall::RenameLocal {
+                from: Ident::parse("a").unwrap(),
+                to: Ident::parse("b").unwrap(),
             },
-            Scope::Workspace,
+            IntentKind::ExtractVariable => IntentCall::ExtractVariable {
+                name: Ident::parse("t").unwrap(),
+            },
+            IntentKind::AddDerive => IntentCall::AddDerive {
+                derives: NonEmpty::one(DeriveName::parse("Clone").unwrap()),
+            },
+            IntentKind::ExtractFunction => IntentCall::ExtractFunction {
+                name: Ident::parse("h").unwrap(),
+            },
+            IntentKind::MoveItem => IntentCall::MoveItem {
+                item: Ident::parse("i").unwrap(),
+                to: RelPath::parse("b.rs").unwrap(),
+            },
+        }
+    }
+    /// A Blueprint of `kind`; the intent is not checked against its specs when it is built.
+    fn blueprint(n: u8, kind: IntentKind) -> Blueprint {
+        let path = RelPath::parse("a.rs").unwrap();
+        let range = TextRange::new(0, 1).unwrap();
+        Blueprint::new(
+            BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap(),
+            call(kind),
+            vec![MutationSpec::replace(path.clone(), range, "y").unwrap()],
+            vec![ReadRange::capture(path, "x", range).unwrap()],
+            vec![],
+            DecisionRecord::new("agent", "why").unwrap(),
+        )
+        .unwrap()
+    }
+    fn path_of(kinds: &[IntentKind]) -> NonEmpty<Blueprint> {
+        NonEmpty::new(
+            kinds
+                .iter()
+                .zip(1u8..)
+                .map(|(k, n)| blueprint(n, *k))
+                .collect(),
+        )
+        .unwrap()
+    }
+    const ALL_ROLES: [FileRole; 4] = [
+        FileRole::Source,
+        FileRole::BuildScript,
+        FileRole::ProcMacroSource,
+        FileRole::Manifest,
+    ];
+    fn role_subsets() -> Vec<BTreeSet<FileRole>> {
+        (0..16u8)
+            .map(|mask| {
+                ALL_ROLES
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, r)| *r)
+                    .collect()
+            })
+            .collect()
+    }
+    /// A catalog holding a Rule of `scope` for each of `kinds`, registration checks aside.
+    fn unchecked(kinds: &[IntentKind], scope: Scope) -> RuleCatalog {
+        RuleCatalog::new(
+            kinds
+                .iter()
+                .zip(0x60u8..)
+                .map(|(k, n)| Rule::unchecked_for_tests(rid(n), *k, review(), scope))
+                .collect(),
         )
         .unwrap()
     }
@@ -627,9 +960,6 @@ mod tests {
                     if matches!(d, Disposition::AutoApplicable { .. }) {
                         assert!(oc.is_none() && r.is_some() && !m.contains(&RiskMark::Behaviour));
                     }
-                    let c = Candidate::new(bid(), vec![], passing(), m.clone(), r, scope).unwrap();
-                    assert_eq!(c.disposition(), d);
-                    assert_eq!(c.outer_check(), oc.as_ref());
                 }
             }
         }
@@ -735,12 +1065,18 @@ mod tests {
     #[test]
     fn crate_graph_edits_never_pass_silently() {
         // The pure half; `app::apply::tests` drives the same cases through `apply_blueprints`.
-        let rule = rule();
-        for mark in [RiskMark::BuildScript, RiskMark::ProcMacroCrate] {
-            let m = BTreeSet::from([mark]);
-            let c =
-                Candidate::new(bid(), vec![], passing(), m, Some(&rule), Scope::Workspace).unwrap();
-            assert!(c.outer_check().is_some(), "{mark}");
+        let rules = RuleCatalog::new(vec![rule()]).unwrap();
+        for role in [FileRole::BuildScript, FileRole::ProcMacroSource] {
+            let c = Candidate::new(
+                path_of(&[IntentKind::MoveItem]),
+                &BTreeSet::from([role]),
+                vec![],
+                passing(),
+                &rules,
+                Scope::Workspace,
+            )
+            .unwrap();
+            assert!(c.outer_check().is_some(), "{role}");
             assert!(!matches!(
                 c.disposition(),
                 Disposition::AutoApplicable { .. }
@@ -751,29 +1087,230 @@ mod tests {
     #[test]
     fn candidate_refuses_failed_verdict() {
         let v = failing();
+        let none = RuleCatalog::default();
         let err = Candidate::new(
-            bid(),
+            path_of(&[IntentKind::MoveItem]),
+            &BTreeSet::new(),
             vec![],
             v.clone(),
-            BTreeSet::new(),
-            None,
+            &none,
             Scope::Affected,
         )
         .unwrap_err();
         assert_eq!(err, v);
         let ok = Candidate::new(
-            bid(),
+            path_of(&[IntentKind::RenameLocal, IntentKind::MoveItem]),
+            &BTreeSet::new(),
             vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
             passing(),
-            BTreeSet::new(),
-            None,
+            &none,
             Scope::Affected,
         )
         .unwrap();
-        assert_eq!(ok.blueprint(), bid());
+        assert_eq!(ok.blueprint(), ok.path()[1].id());
+        assert_eq!(ok.path().len(), 2);
         assert_eq!(ok.edits().len(), 1);
         assert!(ok.verdict().passed());
-        assert!(ok.marks().is_empty());
+        assert_eq!(ok.marks(), &BTreeSet::from([RiskMark::Visibility]));
+    }
+
+    #[test]
+    fn candidate_derives_marks_and_rule() {
+        let registrable: Vec<IntentKind> = IntentKind::ALL
+            .into_iter()
+            .filter(|k| Rule::register(rid(1), *k, review(), Scope::Affected).is_ok())
+            .collect();
+        let catalogs = [
+            RuleCatalog::default(),
+            unchecked(&registrable, Scope::Workspace),
+            unchecked(&IntentKind::ALL, Scope::Workspace),
+            unchecked(&IntentKind::ALL, Scope::Affected),
+        ];
+        let mut paths: Vec<Vec<IntentKind>> = IntentKind::ALL.iter().map(|k| vec![*k]).collect();
+        for a in IntentKind::ALL {
+            for b in IntentKind::ALL {
+                paths.push(vec![a, b]);
+            }
+        }
+        let mut seen_auto = false;
+        for kinds in &paths {
+            for roles in role_subsets() {
+                for rules in &catalogs {
+                    for scope in [Scope::Affected, Scope::Workspace] {
+                        let c =
+                            Candidate::new(path_of(kinds), &roles, vec![], passing(), rules, scope)
+                                .unwrap();
+                        let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
+                        let rule = covering_rule(kinds, rules);
+                        assert_eq!(c.marks(), &marks);
+                        assert_eq!(c.outer_check(), outer_check(&marks).as_ref());
+                        assert_eq!(c.disposition(), disposition(&marks, rule, scope));
+                        let kinds_of: Vec<_> = c.path().iter().map(|b| b.intent().kind()).collect();
+                        assert_eq!(&kinds_of, kinds);
+                        if kinds
+                            .iter()
+                            .any(|k| k.spec().risks.contains(&RiskMark::Behaviour))
+                        {
+                            assert_eq!(
+                                c.disposition(),
+                                Disposition::NeedsReview {
+                                    reason: ReviewReason::Behaviour
+                                },
+                                "{kinds:?} {roles:?}"
+                            );
+                        }
+                        seen_auto |= matches!(c.disposition(), Disposition::AutoApplicable { .. });
+                    }
+                }
+            }
+        }
+        assert!(seen_auto, "the table has an auto-applicable row to guard");
+    }
+
+    #[test]
+    fn risk_marks_are_intent_risks_plus_roles() {
+        assert!(risk_marks([], []).is_empty());
+        for kind in IntentKind::ALL {
+            assert_eq!(risk_marks([kind], []), kind.spec().risks, "{kind}");
+        }
+        for role in ALL_ROLES {
+            let expected = match role {
+                FileRole::BuildScript => BTreeSet::from([RiskMark::BuildScript]),
+                FileRole::ProcMacroSource => BTreeSet::from([RiskMark::ProcMacroCrate]),
+                FileRole::Source | FileRole::Manifest => BTreeSet::new(),
+            };
+            assert_eq!(risk_marks([], [role]), expected, "{role}");
+            for kind in IntentKind::ALL {
+                let mut all = kind.spec().risks;
+                all.extend(expected.iter().copied());
+                assert_eq!(risk_marks([kind], [role]), all, "{kind} {role}");
+            }
+        }
+        assert_eq!(
+            risk_marks(
+                [IntentKind::MoveItem, IntentKind::ExtractVariable],
+                [FileRole::Source, FileRole::BuildScript]
+            ),
+            BTreeSet::from([
+                RiskMark::Visibility,
+                RiskMark::Borrow,
+                RiskMark::Behaviour,
+                RiskMark::BuildScript
+            ])
+        );
+    }
+
+    #[test]
+    fn covering_rule_needs_every_kind() {
+        use IntentKind::{AddDerive, MoveItem, RenameLocal};
+        let narrow_and_wide = RuleCatalog::new(vec![
+            Rule::unchecked_for_tests(rid(1), RenameLocal, review(), Scope::Affected),
+            Rule::unchecked_for_tests(rid(2), MoveItem, review(), Scope::Workspace),
+        ])
+        .unwrap();
+        let ids =
+            |kinds: &[IntentKind], rules: &RuleCatalog| covering_rule(kinds, rules).map(Rule::id);
+        // no kinds, or a kind without a rule
+        assert_eq!(ids(&[], &narrow_and_wide), None);
+        assert_eq!(ids(&[AddDerive], &narrow_and_wide), None);
+        assert_eq!(ids(&[MoveItem, AddDerive], &narrow_and_wide), None);
+        assert_eq!(ids(&[AddDerive, MoveItem], &narrow_and_wide), None);
+        assert_eq!(ids(&[MoveItem], &RuleCatalog::default()), None);
+        // one rule per kind: the wider min_scope wins, whatever the order
+        assert_eq!(ids(&[MoveItem], &narrow_and_wide), Some(rid(2)));
+        assert_eq!(
+            ids(&[RenameLocal, MoveItem], &narrow_and_wide),
+            Some(rid(2))
+        );
+        assert_eq!(
+            ids(&[MoveItem, RenameLocal], &narrow_and_wide),
+            Some(rid(2))
+        );
+        // a tie goes to the leaf, the later one
+        let tie = unchecked(&[RenameLocal, MoveItem], Scope::Workspace);
+        assert_eq!(
+            ids(&[RenameLocal, MoveItem], &tie),
+            tie.for_intent(MoveItem).map(Rule::id)
+        );
+        assert_eq!(
+            ids(&[MoveItem, RenameLocal], &tie),
+            tie.for_intent(RenameLocal).map(Rule::id)
+        );
+    }
+
+    fn files_of(list: &[(&str, &str)]) -> BTreeMap<RelPath, Fingerprint> {
+        list.iter()
+            .map(|(p, t)| (RelPath::parse(p).unwrap(), Fingerprint::of(t.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn provenance_refuses_empty() {
+        let files = files_of(&[("a.rs", "x")]);
+        let cfg = BTreeMap::from([("k".to_owned(), "v".to_owned())]);
+        let p = Provenance::new("ra", "1.0", cfg.clone(), files.clone()).unwrap();
+        assert_eq!((p.analyzer(), p.version()), ("ra", "1.0"));
+        assert_eq!(p.config(), &cfg);
+        assert_eq!(p.files(), &files);
+        for (a, v) in [("", "1"), (" \t", "1"), ("ra", ""), ("ra", "  ")] {
+            assert!(
+                matches!(
+                    Provenance::new(a, v, cfg.clone(), files.clone()),
+                    Err(DomainError::Empty(_))
+                ),
+                "{a:?} {v:?}"
+            );
+        }
+        let blank_key = BTreeMap::from([(" ".to_owned(), "v".to_owned())]);
+        assert!(matches!(
+            Provenance::new("ra", "1", blank_key, files.clone()),
+            Err(DomainError::Empty(_))
+        ));
+        let none = Provenance::unrecorded();
+        assert_eq!((none.analyzer(), none.version()), ("unknown", "unknown"));
+        assert!(none.config().is_empty() && none.files().is_empty());
+        // an empty value is allowed, and so is an empty config
+        assert!(Provenance::new("ra", "1", BTreeMap::new(), files.clone()).is_ok());
+        let empty_value = BTreeMap::from([("k".to_owned(), String::new())]);
+        assert!(Provenance::new("ra", "1", empty_value, files).is_ok());
+    }
+
+    #[test]
+    fn provenance_workspace_is_of_its_files() {
+        let files = files_of(&[("a.rs", "x"), ("b.rs", "y")]);
+        let p = Provenance::new("ra", "1", BTreeMap::new(), files.clone()).unwrap();
+        assert_eq!(
+            p.workspace(),
+            workspace_fingerprint(files.iter().map(|(p, f)| (p, *f)))
+        );
+        let other = Provenance::new("ra", "1", BTreeMap::new(), files_of(&[("a.rs", "x")]));
+        assert_ne!(p.workspace(), other.unwrap().workspace());
+    }
+
+    #[test]
+    fn workspace_fingerprint_follows_files() {
+        let p = |s: &str| RelPath::parse(s).unwrap();
+        let f = |s: &str| Fingerprint::of(s.as_bytes());
+        let (a, b, c) = (p("a.rs"), p("b.rs"), p("c.rs"));
+        let fp = |files: &[(&RelPath, Fingerprint)]| workspace_fingerprint(files.iter().copied());
+        let base = fp(&[(&a, f("x")), (&b, f("y"))]);
+        // order does not matter
+        assert_eq!(base, fp(&[(&b, f("y")), (&a, f("x"))]));
+        // a file's fingerprint, a path, an added file and a removed file each move it
+        assert_ne!(base, fp(&[(&a, f("x")), (&b, f("z"))]));
+        assert_ne!(base, fp(&[(&a, f("x")), (&c, f("y"))]));
+        assert_ne!(base, fp(&[(&a, f("x")), (&b, f("y")), (&c, f(""))]));
+        assert_ne!(base, fp(&[(&a, f("x"))]));
+        assert_ne!(fp(&[]), fp(&[(&a, f(""))]));
+        // the definition
+        let mut bytes = Vec::new();
+        for (path, text) in [("a.rs", "x"), ("b.rs", "y")] {
+            bytes.extend_from_slice(&(path.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(path.as_bytes());
+            bytes.extend_from_slice(f(text).to_string().as_bytes());
+        }
+        assert_eq!(base, Fingerprint::of(&bytes));
+        assert_eq!(fp(&[]), Fingerprint::of(&[]));
     }
 
     #[test]

@@ -79,8 +79,8 @@ impl Rule {
         }
     }
 
-    /// A Rule without the registration checks, for the path-rule tests of `app::search`
-    /// only (they need two kinds with a Rule; production can register only move-item).
+    /// A Rule without the registration checks, for the tests of the derived Rule of a path
+    /// (they need kinds with a Rule that production cannot register; only move-item can be).
     #[cfg(test)]
     pub(crate) fn unchecked_for_tests(
         id: RuleId,
@@ -122,6 +122,8 @@ impl RuleCatalog {
     /// # Contract
     /// - C1: a second rule of one kind gives `Duplicate`.
     ///   tested: domain::rule::tests::one_rule_per_intent
+    /// - C2 [invariant]: `for_intent(k)` is `None` or a Rule whose intent is `k`.
+    ///   tested: domain::rule::tests::catalog_keys_rules_by_intent
     pub fn new(rules: Vec<Rule>) -> Result<Self, RuleError> {
         let mut map = BTreeMap::new();
         for r in rules {
@@ -152,6 +154,22 @@ mod tests {
     }
     fn rid(n: u8) -> RuleId {
         RuleId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap()
+    }
+
+    #[test]
+    fn catalog_keys_rules_by_intent() {
+        let all = RuleCatalog::new(
+            IntentKind::ALL
+                .iter()
+                .zip(1u8..)
+                .map(|(k, n)| Rule::unchecked_for_tests(rid(n), *k, review(), Scope::Affected))
+                .collect(),
+        )
+        .unwrap();
+        for k in IntentKind::ALL {
+            assert_eq!(all.for_intent(k).map(Rule::intent), Some(k));
+            assert!(RuleCatalog::default().for_intent(k).is_none());
+        }
     }
 
     #[test]

@@ -340,6 +340,12 @@ pub enum Nonconformance {
     /// The destination does not receive the text of the item.
     #[error("the destination does not receive the item's text")]
     NotMoved,
+    /// Spec number `spec` replaces text by the same text.
+    #[error("spec {spec} writes the bytes it replaces: it changes nothing")]
+    NoOp {
+        /// Index of the spec.
+        spec: usize,
+    },
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -515,6 +521,11 @@ impl IntentCall {
     /// Checks that `specs` carry out this call against the `base` texts.
     ///
     /// # Contract
+    /// - C7: checked before every other clause and for every intent, `MoveItem` included: the
+    ///   first spec that is a `Replace` writing the bytes of the base text it replaces (when
+    ///   `base` has its path and the range lies inside it) gives `NoOp`; inserts and deletes
+    ///   are never no-ops.
+    ///   tested: domain::intent::tests::no_op_replace_is_refused
     /// - C1: for every intent except `MoveItem`, all specs are on one path and `base` has a
     ///   text for it, else `ManyFiles` or `MissingBase`.
     ///   tested: domain::intent::tests::conforms_needs_one_file_and_its_base
@@ -550,6 +561,15 @@ impl IntentCall {
         specs: &[super::MutationSpec],
         base: &BTreeMap<RelPath, String>,
     ) -> Result<(), Nonconformance> {
+        if let Some(spec) = specs.iter().position(|s| {
+            s.kind() == SpecKind::Replace
+                && base
+                    .get(s.path())
+                    .and_then(|text| base_slice(text, s))
+                    .is_some_and(|old| old == s.text())
+        }) {
+            return Err(Nonconformance::NoOp { spec });
+        }
         if let IntentCall::MoveItem { item, to } = self {
             return conforms_move(item, to, specs, base);
         }
@@ -884,6 +904,61 @@ mod tests {
     }
 
     #[test]
+    fn no_op_replace_is_refused() {
+        let same = IntentCall::RenameLocal {
+            from: id("a"),
+            to: id("a"),
+        };
+        assert_eq!(
+            same.conforms(&[rep(4, 5, "a")], &base("let a = 1;")),
+            Err(Nonconformance::NoOp { spec: 0 })
+        );
+        // the lowest index wins, before every other check
+        let call = IntentCall::RenameLocal {
+            from: id("a"),
+            to: id("bb"),
+        };
+        assert_eq!(
+            call.conforms(&[rep(4, 5, "bb"), rep(8, 9, "a")], &base("let a = a + c;")),
+            Err(Nonconformance::NoOp { spec: 1 })
+        );
+        // an insert or a delete is never a no-op; a range outside the base is not judged here
+        assert_ne!(
+            call.conforms(&[ins(0, "z")], &base("a")),
+            Err(Nonconformance::NoOp { spec: 0 })
+        );
+        assert_ne!(
+            call.conforms(&[rep(40, 41, "a")], &base("a")),
+            Err(Nonconformance::NoOp { spec: 0 })
+        );
+        // a no-op is found before the file count and the missing base are
+        let other = MutationSpec::replace(
+            RelPath::parse("b.rs").unwrap(),
+            TextRange::new(0, 1).unwrap(),
+            "z",
+        )
+        .unwrap();
+        assert_eq!(
+            same.conforms(&[rep(4, 5, "a"), other.clone()], &base("let a = 1;")),
+            Err(Nonconformance::NoOp { spec: 0 })
+        );
+        assert_eq!(
+            same.conforms(&[other, rep(4, 5, "a")], &base("let a = 1;")),
+            Err(Nonconformance::NoOp { spec: 1 })
+        );
+        // a move whose source Replace writes back its own text
+        let b = two("pub fn foo() {}\n", "");
+        let back = [
+            rep_at("a.rs", 0, 15, "pub fn foo() {}"),
+            ins_at("b.rs", 0, "pub fn foo() {}\n"),
+        ];
+        assert_eq!(
+            mv("foo", "b.rs").conforms(&back, &b),
+            Err(Nonconformance::NoOp { spec: 0 })
+        );
+    }
+
+    #[test]
     fn rename_local_rejects_replace_of_other_text() {
         let call = IntentCall::RenameLocal {
             from: id("a"),
@@ -1181,7 +1256,7 @@ mod tests {
             "pub use foo;",
             "pub use crate::b::foo",
             "pub(in x) use crate::b::foo;",
-            "pub fn foo() {}",
+            "pub fn foo() { }",
         ] {
             assert_eq!(
                 call.conforms(&[rep_at("a.rs", 0, 15, bad), ok[1].clone()], &b),
@@ -1189,6 +1264,14 @@ mod tests {
                 "{bad}"
             );
         }
+        // writing the item back is a no-op, which is refused first
+        assert_eq!(
+            call.conforms(
+                &[rep_at("a.rs", 0, 15, "pub fn foo() {}"), ok[1].clone()],
+                &b
+            ),
+            Err(Nonconformance::NoOp { spec: 0 })
+        );
         for good in [
             "use crate::b::foo;",
             "pub(crate) use crate::b::foo;",

@@ -18,6 +18,11 @@ impl<T> NonEmpty<T> {
         }
     }
 
+    /// A list of one element.
+    pub fn one(item: T) -> Self {
+        Self(vec![item])
+    }
+
     /// The elements, in order.
     pub fn as_slice(&self) -> &[T] {
         &self.0
@@ -26,6 +31,11 @@ impl<T> NonEmpty<T> {
     /// The first element, which always exists.
     pub fn first(&self) -> &T {
         &self.0[0]
+    }
+
+    /// The last element, which always exists.
+    pub fn last(&self) -> &T {
+        &self.0[self.0.len() - 1]
     }
 
     /// How many elements there are (at least 1).
@@ -62,6 +72,9 @@ mod tests {
         assert!(!n.is_empty());
         assert_eq!(n.iter().count(), 2);
         assert_eq!(n.as_slice(), &[3, 4]);
+        assert_eq!(*n.last(), 4);
         assert_eq!(n.into_vec(), vec![3, 4]);
+        let one = NonEmpty::one(9);
+        assert_eq!((*one.first(), *one.last(), one.len()), (9, 9, 1));
     }
 }
