@@ -180,6 +180,7 @@ fn blocking_json(b: &Blocking) -> Value {
 /// - C1: a `Decided` resolution lists each candidate's disposition, rule id (or `null`),
 ///   `outer_check` reasons (or `null`), marks and edits, in that vocabulary and sorted order.
 ///   tested: resolution_json::tests::outer_check_lists_reasons
+///   tested: resolution_json::tests::decided_lists_the_rule_id
 ///   tested: tests/apply.rs apply_rename_local_is_decided
 /// - C2: a `Failed` resolution lists each blocker with its `kind` and the blueprint; a stale
 ///   read carries its freshness.
@@ -249,7 +250,7 @@ mod tests {
     use super::*;
     use ryo_v2_core::domain::{
         BlueprintId, DEFAULT_BUDGET, DecisionLog, Edit, Evidence, Fingerprint, Infeasible,
-        NonEmpty, ReadRange, RelPath, TextRange,
+        IntentKind, NonEmpty, ReadRange, RelPath, ReviewRecord, Rule, RuleId, TextRange,
     };
     use std::collections::BTreeSet;
 
@@ -258,13 +259,17 @@ mod tests {
     }
 
     fn decided(marks: BTreeSet<RiskMark>) -> Resolution {
+        decided_with(marks, None)
+    }
+
+    fn decided_with(marks: BTreeSet<RiskMark>, rule: Option<&Rule>) -> Resolution {
         let b = id();
         let c = Candidate::new(
             b,
             vec![Edit::write(RelPath::parse("src/lib.rs").unwrap(), "x")],
             Verdict::from_diagnostics(Diagnostics::default()),
             marks,
-            None,
+            rule,
             Scope::Affected,
         )
         .expect("a passing verdict");
@@ -279,6 +284,27 @@ mod tests {
                 budget: DEFAULT_BUDGET,
             },
         }
+    }
+
+    #[test]
+    fn decided_lists_the_rule_id() {
+        let rule_id = RuleId::from_uuid(uuid::Uuid::now_v7()).expect("v7");
+        let review = ReviewRecord {
+            reviewer: "me".to_owned(),
+            reviewed_at_ms: 1,
+            note: "n".to_owned(),
+        };
+        let rule = Rule::register(rule_id, IntentKind::MoveItem, review, Scope::Affected)
+            .expect("move-item is registrable");
+        let v = resolution_to_json(&decided_with(BTreeSet::new(), Some(&rule)));
+        let c = &v["candidates"][0];
+        assert_eq!(c["disposition"], "auto_applicable");
+        assert_eq!(c["rule"], rule_id.to_string());
+        let marks: BTreeSet<RiskMark> = [RiskMark::BuildScript].into();
+        let v = resolution_to_json(&decided_with(marks, Some(&rule)));
+        let c = &v["candidates"][0];
+        assert_eq!(c["disposition"], "after_outer_check");
+        assert_eq!(c["rule"], rule_id.to_string());
     }
 
     #[test]

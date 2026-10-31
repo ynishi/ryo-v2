@@ -41,6 +41,9 @@ enum ScopeJson {
 ///   `behaviour`, and nothing is loaded for it.
 ///   tested: rules_json::tests::extract_variable_rule_is_refused
 ///   tested: tests/apply.rs apply_extract_variable_needs_review_behaviour
+/// - C2: a rule for an intent that is checked by text match only (rename-local, add-derive) is an
+///   error that names `text match`, and nothing is loaded for it.
+///   tested: rules_json::tests::text_match_rule_is_refused
 pub(crate) fn parse_rules(json: &str) -> Result<RuleCatalog> {
     let input: Input = serde_json::from_str(json).context("rules JSON")?;
     let mut rules = Vec::new();
@@ -84,7 +87,15 @@ mod tests {
     fn extract_variable_rule_is_refused() {
         let err = parse_rules(&json("extract-variable")).expect_err("refused");
         assert!(format!("{err:#}").contains("behaviour"), "{err:#}");
-        let ok = parse_rules(&json("rename-local")).expect("rename-local rule");
-        assert!(ok.for_intent(IntentKind::RenameLocal).is_some());
+        let ok = parse_rules(&json("move-item")).expect("move-item rule");
+        assert!(ok.for_intent(IntentKind::MoveItem).is_some());
+    }
+
+    #[test]
+    fn text_match_rule_is_refused() {
+        for intent in ["rename-local", "add-derive"] {
+            let err = parse_rules(&json(intent)).expect_err("refused");
+            assert!(format!("{err:#}").contains("text match"), "{err:#}");
+        }
     }
 }
