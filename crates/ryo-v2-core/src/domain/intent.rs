@@ -190,6 +190,17 @@ impl IntentKind {
         IntentSpec { kind: self, risks }
     }
 
+    /// Whether [`IntentCall::conforms`] checks this intent by matching text only, so a
+    /// Blueprint can pass it with a rename inside a string literal, a name capture, one side
+    /// of a shadowing pair or a struct-field rename (CHECK_LEDGER M-1).
+    ///
+    /// # Contract
+    /// - C1: true for `RenameLocal` and `AddDerive`, false for every other kind.
+    ///   tested: domain::intent::tests::text_match_only_is_rename_local_and_add_derive
+    pub fn text_match_only(self) -> bool {
+        matches!(self, IntentKind::RenameLocal | IntentKind::AddDerive)
+    }
+
     /// The stable name: `rename-local`, `extract-variable`, `add-derive`, `extract-function` or
     /// `move-item`.
     pub fn id(self) -> &'static str {
@@ -831,6 +842,17 @@ mod tests {
             IntentKind::ExtractVariable.spec().risks,
             BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
         );
+    }
+
+    #[test]
+    fn text_match_only_is_rename_local_and_add_derive() {
+        for k in IntentKind::ALL {
+            assert_eq!(
+                k.text_match_only(),
+                matches!(k, IntentKind::RenameLocal | IntentKind::AddDerive),
+                "{k}"
+            );
+        }
     }
 
     #[test]
