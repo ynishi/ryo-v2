@@ -361,8 +361,15 @@ best and all 5 survive (recall@200 1.00, generation 0.50, top-3 0.30, verdict in
 depth 2) and still does not generate its best, so that miss is the expander's, not the beam's.
 
 Each of the three runs hit one panic inside rust-analyzer's syntax factory, raised from the
-expander, and went on past it; the harness does not count it, so the tables above do not show it
-(CHECK_LEDGER Open work S-3 and R-5).
+expander, and went on past it; the harness did not count it then, so the tables above do not show
+it. The producer is extract-variable: rust-analyzer names the variable after the whole text of
+the struct-literal field whose value it extracts, and a field behind `#[cfg(..)]` makes that text
+no identifier. The panic then ended the whole expansion of that parent state with no child.
+Whether that parent was the planted state of a measured case (CHECK_LEDGER S-4 lists
+`inline-variable-0` with no candidate at all) is not checked; a new run shows it. The expander now
+refuses such a value, contains a panic per call of one edit kind, and records it on the session.
+`search-recall run` prints the line `contained panics: <n> detector, <n> expander`, and the oracle
+fails on any contained panic.
 
 ## Perf triggers (decision D4)
 
