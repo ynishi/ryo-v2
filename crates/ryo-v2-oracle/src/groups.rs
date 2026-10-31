@@ -46,6 +46,9 @@ pub enum Group {
     CfgTest,
     /// A derive-generated method is missing (E0599 at the use site). A cause.
     MacroDerive,
+    /// A derived impl whose trait a field does not implement (E0277; E0369 for `PartialEq`) at
+    /// the field. A cause: the codes are those of trait-bound and type-mismatch.
+    DeriveField,
     /// A type error inside the body of an attribute-macro item (E0308). A cause.
     MacroAttr,
     /// An error inside a `macro_rules!` expansion (E0599, E0308). A cause.
@@ -61,7 +64,7 @@ pub enum Group {
 
 impl Group {
     /// Every group, in declaration order.
-    pub const ALL: [Group; 21] = [
+    pub const ALL: [Group; 22] = [
         Group::UnresolvedImport,
         Group::UnresolvedName,
         Group::UnresolvedType,
@@ -78,6 +81,7 @@ impl Group {
         Group::Cfg,
         Group::CfgTest,
         Group::MacroDerive,
+        Group::DeriveField,
         Group::MacroAttr,
         Group::MacroRules,
         Group::MacroTokens,
@@ -113,6 +117,7 @@ impl Group {
             Group::Cfg => "cfg",
             Group::CfgTest => "cfg-test",
             Group::MacroDerive => "macro-derive",
+            Group::DeriveField => "derive-field",
             Group::MacroAttr => "macro-attr",
             Group::MacroRules => "macro-rules",
             Group::MacroTokens => "macro-tokens",
@@ -122,7 +127,7 @@ impl Group {
     }
 
     /// The group is a cause, not a set of codes (its codes overlap other
-    /// groups): Cfg, CfgTest and the 5 macro groups. `breakage::group_for` never maps a
+    /// groups): Cfg, CfgTest, DeriveField and the 5 macro groups. `breakage::group_for` never maps a
     /// code to one.
     pub fn is_cause(self) -> bool {
         matches!(
@@ -130,6 +135,7 @@ impl Group {
             Group::Cfg
                 | Group::CfgTest
                 | Group::MacroDerive
+                | Group::DeriveField
                 | Group::MacroAttr
                 | Group::MacroRules
                 | Group::MacroTokens
@@ -161,6 +167,7 @@ impl Group {
             Group::Cfg => &["E0425", "E0432", "E0433", "E0412", "E0599"],
             Group::CfgTest => &["E0425", "E0433", "E0308", "E0599"],
             Group::MacroDerive => &["E0599"],
+            Group::DeriveField => &["E0277", "E0369"],
             Group::MacroAttr => &["E0308"],
             Group::MacroRules => &["E0599", "E0308"],
             Group::MacroTokens => &["E0599", "E0308"],
@@ -663,7 +670,7 @@ mod tests {
             assert_eq!(Group::parse(g.id()), Some(g));
         }
         assert_eq!(Group::parse("nope"), None);
-        assert_eq!(Group::ALL.len(), 21);
+        assert_eq!(Group::ALL.len(), 22);
         assert!(Group::Valid.codes().is_empty());
         assert!(Group::PRIMARY.iter().all(|g| Group::ALL.contains(g)));
     }
@@ -922,6 +929,7 @@ mod tests {
                 Group::Cfg,
                 Group::CfgTest,
                 Group::MacroDerive,
+                Group::DeriveField,
                 Group::MacroAttr,
                 Group::MacroRules,
                 Group::MacroTokens,

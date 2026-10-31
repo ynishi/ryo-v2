@@ -2,7 +2,7 @@
 
 use crate::session::DetectorPanic;
 use crate::unresolved::{self, Hit};
-use crate::{copy_impl, duplicate};
+use crate::{duplicate, field_bounds};
 use ra_ap_base_db::salsa::Cancelled;
 use ra_ap_hir::PrefixKind;
 use ra_ap_ide::{
@@ -126,12 +126,12 @@ type Detect = fn(&RootDatabase, FileId, &[TextRange], &dyn Fn(TextSize) -> u32) 
 const UNRESOLVED: &str = "unresolved-path";
 
 /// The detectors a collect runs when it has a database, in this order: unresolved type names and
-/// path prefixes (E0405, E0425, E0433), names an item and a `use` both define (E0255), and `Copy`
-/// impls on types with a field that is not `Copy` (E0204).
+/// path prefixes (E0405, E0425, E0433), names an item and a `use` both define (E0255), and the
+/// trait a field owes to a derived impl or a written `Copy` impl (E0204, E0277, E0369).
 const DETECTORS: [(&str, Detect); 3] = [
     (UNRESOLVED, unresolved::find),
     ("duplicate-name", duplicate::find),
-    ("copy-impl", copy_impl::find),
+    ("field-bounds", field_bounds::find),
 ];
 
 /// What a collect needs to run, and to report on, the detectors of [`DETECTORS`].
@@ -145,7 +145,7 @@ pub(crate) struct Detector<'a> {
 }
 
 /// Error diagnostics of the files, sorted. With `db`, the errors ra does not diagnose are added
-/// by the [`DETECTORS`] ([`crate::unresolved`], [`crate::duplicate`], [`crate::copy_impl`]). With `deadline`, stops with `Cancelled`
+/// by the [`DETECTORS`] ([`crate::unresolved`], [`crate::duplicate`], [`crate::field_bounds`]). With `deadline`, stops with `Cancelled`
 /// before the first file it finds the deadline reached.
 fn collect_errors(
     analysis: &Analysis,
