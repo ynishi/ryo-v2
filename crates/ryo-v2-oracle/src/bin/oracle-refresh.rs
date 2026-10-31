@@ -74,7 +74,20 @@ fn refresh(m: &Materials, case: &Case, target_dir: &Path) -> Result<()> {
         }
     }
 
-    let diags = cargo_check(&build, target_dir).with_context(|| case.id.clone())?;
+    let out = cargo_check(&build, target_dir).with_context(|| case.id.clone())?;
+    if !out.codeless.is_empty() {
+        let lines: Vec<String> = out
+            .codeless
+            .iter()
+            .map(|c| format!("{}:{} {}", c.path, c.line, c.message))
+            .collect();
+        anyhow::bail!(
+            "{}: error(s) without a code:\n{}",
+            case.id,
+            lines.join("\n")
+        );
+    }
+    let diags = out.errors;
     if let Some(dir) = case.expected_path.parent() {
         std::fs::create_dir_all(dir)?;
     }

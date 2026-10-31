@@ -436,17 +436,59 @@ impl Report {
         (of > 0).then_some((hit, of))
     }
 
-    /// Compared non-Valid cases whose expected set has no code of their group
-    /// (printed as MISGROUPED).
+    /// Compared cases whose expected set has no code of their group, and Valid cases whose
+    /// expected set is not empty (printed as MISGROUPED).
+    ///
+    /// # Contract
+    /// - C1: a compared case other than Valid is listed when no expected diagnostic has a code
+    ///   of its group.
+    ///   tested: groups::tests::misgrouped_lists_cases_without_a_group_code
+    /// - C2: a compared Valid case is listed when its expected set is not empty.
+    ///   tested: groups::tests::misgrouped_lists_valid_case_with_an_error
     pub fn misgrouped(&self) -> Vec<&CaseOutcome> {
         self.outcomes
             .iter()
             .filter(|o| {
-                o.group != Group::Valid
-                    && !matches!(o.outcome, Outcome::Skip(_))
-                    && !o.expected.iter().any(|d| in_codes(o.group, d))
+                if matches!(o.outcome, Outcome::Skip(_)) {
+                    return false;
+                }
+                if o.group == Group::Valid {
+                    !o.expected.is_empty()
+                } else {
+                    !o.expected.iter().any(|d| in_codes(o.group, d))
+                }
             })
             .collect()
+    }
+
+    /// Why the run cannot stand as the H7 measurement, one line each: the primary `of` below
+    /// `primary_of_floor`, every skipped case, every misgrouped case. Empty = it stands.
+    ///
+    /// # Contract
+    /// - C1: a primary denominator below the floor, each skipped case and each misgrouped case
+    ///   give one line naming it; a run with none of these gives no line.
+    ///   tested: groups::tests::ratchet_names_short_denominator_skip_and_misgrouped
+    pub fn ratchet_problems(&self, primary_of_floor: usize) -> Vec<String> {
+        let mut problems = Vec::new();
+        let of = self.primary_recall().map_or(0, |(_, of)| of);
+        if of < primary_of_floor {
+            problems.push(format!("H7 primary of {of} < {primary_of_floor}"));
+        }
+        for o in &self.outcomes {
+            if let Outcome::Skip(why) = &o.outcome {
+                problems.push(format!("skipped {} [{}]: {why}", o.id, o.group.id()));
+            }
+        }
+        for o in self.misgrouped() {
+            let codes: Vec<&str> = o.expected.iter().map(|d| d.code.as_str()).collect();
+            problems.push(format!(
+                "misgrouped {} [{}] expected codes: {}",
+                o.id,
+                o.group.id(),
+                codes.join(",")
+            ));
+        }
+        problems
     }
 
     /// Every outcome as JSON, for `RYO_V2_ORACLE_REPORT`.
@@ -795,6 +837,70 @@ mod tests {
         };
         assert_eq!(report.misgrouped().len(), 1);
         assert_eq!(report.counts()[&Group::NoMethod].of, 0);
+    }
+
+    #[test]
+    fn misgrouped_lists_valid_case_with_an_error() {
+        let report = Report {
+            outcomes: vec![
+                outcome(
+                    "v-bad",
+                    Group::Valid,
+                    vec![d("E0308", "a/src/lib.rs", 1)],
+                    Outcome::Pass,
+                ),
+                outcome("v-ok", Group::Valid, vec![], Outcome::Pass),
+            ],
+            excluded: vec![],
+        };
+        let ids: Vec<&str> = report.misgrouped().iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, ["v-bad"]);
+    }
+
+    #[test]
+    fn ratchet_names_short_denominator_skip_and_misgrouped() {
+        let report = Report {
+            outcomes: vec![
+                outcome(
+                    "p",
+                    Group::NoMethod,
+                    vec![d("E0599", "a/src/lib.rs", 1)],
+                    Outcome::Pass,
+                ),
+                outcome(
+                    "s",
+                    Group::NoMethod,
+                    vec![],
+                    Outcome::Skip("no overlay".into()),
+                ),
+                outcome(
+                    "v",
+                    Group::Valid,
+                    vec![d("E0308", "a/src/lib.rs", 2)],
+                    Outcome::Pass,
+                ),
+            ],
+            excluded: vec![],
+        };
+        let problems = report.ratchet_problems(2);
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems[0].contains("primary of 1 < 2"), "{problems:?}");
+        assert!(
+            problems[1].contains("skipped s [no-method]"),
+            "{problems:?}"
+        );
+        assert!(problems[2].contains("misgrouped v [valid]"), "{problems:?}");
+
+        let good = Report {
+            outcomes: vec![outcome(
+                "p",
+                Group::NoMethod,
+                vec![d("E0599", "a/src/lib.rs", 1)],
+                Outcome::Pass,
+            )],
+            excluded: vec![],
+        };
+        assert!(good.ratchet_problems(1).is_empty());
     }
 
     #[test]

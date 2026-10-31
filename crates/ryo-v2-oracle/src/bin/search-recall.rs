@@ -27,11 +27,11 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use ryo_v2_core::app::ports::{Analyzer, Event};
 use ryo_v2_core::app::search::{ASSERT_REVERT_EVERY, DEFAULT_SEARCH_BUDGET};
-use ryo_v2_core::domain::{Diagnostic, Edit};
+use ryo_v2_core::domain::Edit;
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::judge::MetricJudge;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_oracle::cargo_check::cargo_check;
+use ryo_v2_oracle::cargo_check::{CheckOutput, cargo_check};
 use ryo_v2_oracle::materials::Materials;
 use ryo_v2_oracle::planted::{PlantKind, generate, generate_pair, read_clean, sites, write_case};
 use ryo_v2_oracle::search_recall::{
@@ -213,15 +213,16 @@ impl Outer {
     }
 }
 
-/// Runs `cargo check` on a copy of `workspace` with `edits` written; the errors it reports that
-/// the unedited copy did not.
+/// Runs `cargo check` on a copy of `workspace` with `edits` written; the problems it reports that
+/// the unedited copy did not: `"{code} {path}:{line}"` for a coded error and
+/// `"<no code> {path}:{line}"` for an error without a code.
 fn outer_new_errors(
     workspace: &Path,
     edits: &[Edit],
-    baseline: &[Diagnostic],
+    baseline: &CheckOutput,
     tmp: &Path,
     n: usize,
-) -> Result<Vec<Diagnostic>> {
+) -> Result<Vec<String>> {
     let dir = tmp.join(format!("copy-{n}"));
     let _ = std::fs::remove_dir_all(&dir);
     copy_workspace(workspace, &dir)?;
@@ -241,10 +242,17 @@ fn outer_new_errors(
     }
     let found = cargo_check(&dir, &tmp.join("build")).context("outer cargo check")?;
     let _ = std::fs::remove_dir_all(&dir);
-    Ok(found
-        .into_iter()
-        .filter(|d| !baseline.contains(d))
-        .collect())
+    let coded = found
+        .errors
+        .iter()
+        .filter(|d| !baseline.errors.contains(d))
+        .map(|d| format!("{} {}:{}", d.code, d.path, d.line));
+    let codeless = found
+        .codeless
+        .iter()
+        .filter(|c| !baseline.codeless.contains(c))
+        .map(|c| format!("<no code> {}:{}", c.path, c.line));
+    Ok(coded.chain(codeless).collect())
 }
 
 fn run(root: &str, rest: &[String]) -> Result<()> {
@@ -349,7 +357,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         let baseline = if outer {
             cargo_check(workspace, &tmp.join("build-base")).unwrap_or_default()
         } else {
-            Vec::new()
+            CheckOutput::default()
         };
         for case in ws_cases {
             done += 1;
@@ -392,11 +400,8 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                                 Ok(new) => {
                                     outer_counts.failed += 1;
                                     outer_counts.best_failed += usize::from(nth == 0);
-                                    let shown: Vec<String> = new
-                                        .iter()
-                                        .take(3)
-                                        .map(|d| format!("{} {}:{}", d.code, d.path, d.line))
-                                        .collect();
+                                    let shown: Vec<&str> =
+                                        new.iter().take(3).map(String::as_str).collect();
                                     eprintln!(
                                         "outer check failed: {}/{} candidate {nth}: {}",
                                         case.ws,
