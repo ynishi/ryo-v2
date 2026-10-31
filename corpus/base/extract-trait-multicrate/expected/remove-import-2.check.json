@@ -1,5 +1,10 @@
 [
   {
+    "code": "E0422",
+    "path": "viewer/src/lib.rs",
+    "line": 24
+  },
+  {
     "code": "E0425",
     "path": "viewer/src/lib.rs",
     "line": 11

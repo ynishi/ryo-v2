@@ -1,0 +1,4 @@
+workspace = "base/cfg-test-lab"
+overlay = "base/cfg-test-lab/overlays/cfgtest-valid-0"
+group = "valid"
+origin = "hand"

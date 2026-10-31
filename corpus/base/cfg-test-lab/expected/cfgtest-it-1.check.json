@@ -1,0 +1,12 @@
+[
+  {
+    "code": "E0425",
+    "path": "lab/src/lib.rs",
+    "line": 23
+  },
+  {
+    "code": "E0432",
+    "path": "lab/tests/it.rs",
+    "line": 1
+  }
+]

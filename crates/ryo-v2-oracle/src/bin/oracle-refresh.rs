@@ -1,4 +1,4 @@
-//! Rewrites `corpus/<ws>/expected/<id>.check.json` from `cargo check`.
+//! Rewrites `corpus/<ws>/expected/<id>.check.json` from `cargo check --workspace --all-targets`.
 //!
 //! The only place the corpus is built. Each case is composed (base workspace
 //! plus overlay) under `oracle-refresh/<id>/` in the repo's Cargo build directory, so that the
@@ -8,12 +8,10 @@
 //! Usage: `oracle-refresh <ws> [--case <id>]...`
 #![warn(missing_docs)]
 
-use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use ryo_v2_core::domain::{Diagnostic, ErrorCode, RelPath};
+use ryo_v2_oracle::cargo_check::cargo_check;
 use ryo_v2_oracle::case::{Case, render_expected};
 use ryo_v2_oracle::materials::Materials;
 
@@ -76,56 +74,7 @@ fn refresh(m: &Materials, case: &Case, target_dir: &Path) -> Result<()> {
         }
     }
 
-    let out = Command::new("cargo")
-        .args(["check", "--workspace", "--message-format=json"])
-        .current_dir(&build)
-        .env("CARGO_TARGET_DIR", target_dir)
-        .output()
-        .context("run cargo check")?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut found: BTreeSet<Diagnostic> = BTreeSet::new();
-    for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if v["reason"] != "compiler-message" || v["message"]["level"] != "error" {
-            continue;
-        }
-        let Some(code) = v["message"]["code"]["code"]
-            .as_str()
-            .and_then(|c| ErrorCode::parse(c).ok())
-        else {
-            continue;
-        };
-        let Some(span) = v["message"]["spans"]
-            .as_array()
-            .and_then(|s| s.iter().find(|s| s["is_primary"] == true))
-        else {
-            continue;
-        };
-        let Some(file) = span["file_name"].as_str() else {
-            continue;
-        };
-        let rel = match Path::new(file).strip_prefix(&build) {
-            Ok(p) => p.to_string_lossy().replace('\\', "/"),
-            Err(_) => file.to_string(),
-        };
-        let path = RelPath::parse(&rel).with_context(|| format!("path of a diagnostic: {file}"))?;
-        let line = span["line_start"].as_u64().context("line_start")? as u32;
-        found.insert(Diagnostic { code, path, line });
-    }
-    if found.is_empty() && !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: Vec<&str> = stderr.lines().rev().take(20).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        bail!(
-            "{}: cargo check failed without a rustc error code:\n{}",
-            case.id,
-            tail.join("\n")
-        );
-    }
-
-    let diags: Vec<Diagnostic> = found.into_iter().collect();
+    let diags = cargo_check(&build, target_dir).with_context(|| case.id.clone())?;
     if let Some(dir) = case.expected_path.parent() {
         std::fs::create_dir_all(dir)?;
     }

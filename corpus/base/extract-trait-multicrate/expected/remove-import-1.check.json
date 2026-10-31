@@ -1,5 +1,20 @@
 [
   {
+    "code": "E0422",
+    "path": "user/src/lib.rs",
+    "line": 57
+  },
+  {
+    "code": "E0422",
+    "path": "user/src/lib.rs",
+    "line": 64
+  },
+  {
+    "code": "E0422",
+    "path": "user/src/lib.rs",
+    "line": 80
+  },
+  {
     "code": "E0425",
     "path": "user/src/lib.rs",
     "line": 18
@@ -28,6 +43,11 @@
     "code": "E0425",
     "path": "user/src/lib.rs",
     "line": 47
+  },
+  {
+    "code": "E0425",
+    "path": "user/src/lib.rs",
+    "line": 74
   },
   {
     "code": "E0433",

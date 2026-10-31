@@ -4,7 +4,10 @@
 //! Env: `RYO_V2_ORACLE_ONLY=<group>,..`, `RYO_V2_ORACLE_LIMIT=<n>`,
 //! `RYO_V2_ORACLE_FULL` (list every diagnostic), `RYO_V2_ORACLE_REPORT=<file>`,
 //! `RYO_V2_ORACLE_PROC_MACRO=off` (print the table, ignore floors),
-//! `RYO_V2_ORACLE_UNRESOLVED=off` (switch the unresolved-path detector off; ignore floors).
+//! `RYO_V2_ORACLE_UNRESOLVED=off` (switch the unresolved-path detector off; ignore floors),
+//! `RYO_V2_ORACLE_CFG_TEST=off` (ra without `cfg(test)`, as before the V2 decision; ignore floors).
+//! The expected files are `cargo check --workspace --all-targets`, so the floors hold only with
+//! proc-macro on, the detector on and cfg-test on.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +37,7 @@ const FLOOR_BORROW: usize = 0;
 const FLOOR_PRIVACY: usize = 4;
 const FLOOR_CONST_EVAL: usize = 0;
 const FLOOR_CFG: usize = 1;
+const FLOOR_CFG_TEST: usize = 4;
 const FLOOR_MACRO_DERIVE: usize = 2;
 const FLOOR_MACRO_ATTR: usize = 2;
 const FLOOR_MACRO_RULES: usize = 0;
@@ -55,6 +59,7 @@ fn floor(g: Group) -> usize {
         Group::Privacy => FLOOR_PRIVACY,
         Group::ConstEval => FLOOR_CONST_EVAL,
         Group::Cfg => FLOOR_CFG,
+        Group::CfgTest => FLOOR_CFG_TEST,
         Group::MacroDerive => FLOOR_MACRO_DERIVE,
         Group::MacroAttr => FLOOR_MACRO_ATTR,
         Group::MacroRules => FLOOR_MACRO_RULES,
@@ -126,6 +131,8 @@ fn oracle() {
         "unresolved-paths: {}",
         if unresolved_on { "on" } else { "off" }
     );
+    let cfg_test_on = std::env::var("RYO_V2_ORACLE_CFG_TEST").map_or(true, |v| v != "off");
+    println!("cfg-test: {}", if cfg_test_on { "on" } else { "off" });
     let observer = Arc::new(RecordingObserver::default());
     let mut infra_errors: Vec<String> = Vec::new();
 
@@ -140,6 +147,8 @@ fn oracle() {
                 threads: None,
                 assert_revert: true,
                 unresolved_paths: unresolved_on,
+                assert_revert_every: None,
+                cfg_test: cfg_test_on,
             },
             Arc::new(MonotonicClock::new()),
             observer.clone(),
@@ -317,7 +326,7 @@ fn oracle() {
     );
 
     // A filtered run sees fewer cases than the floors count, so it skips them.
-    if m.proc_macro && unresolved_on && report.excluded.is_empty() {
+    if m.proc_macro && unresolved_on && cfg_test_on && report.excluded.is_empty() {
         let below: Vec<String> = Group::ALL
             .into_iter()
             .filter_map(|g| {

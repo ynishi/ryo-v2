@@ -37,6 +37,9 @@ pub enum Group {
     /// A reference to a cfg-disabled item. The group is the cause, not the
     /// code: the codes overlap other groups.
     Cfg,
+    /// An error inside `#[cfg(test)]` code or a `tests/` file (E0425, E0433, E0308, E0599). A
+    /// cause: the verifier sees it only with `cfg(test)` enabled.
+    CfgTest,
     /// A derive-generated method is missing (E0599 at the use site). A cause.
     MacroDerive,
     /// A type error inside the body of an attribute-macro item (E0308). A cause.
@@ -54,7 +57,7 @@ pub enum Group {
 
 impl Group {
     /// Every group, in declaration order.
-    pub const ALL: [Group; 18] = [
+    pub const ALL: [Group; 19] = [
         Group::UnresolvedImport,
         Group::UnresolvedName,
         Group::UnresolvedType,
@@ -67,6 +70,7 @@ impl Group {
         Group::Privacy,
         Group::ConstEval,
         Group::Cfg,
+        Group::CfgTest,
         Group::MacroDerive,
         Group::MacroAttr,
         Group::MacroRules,
@@ -99,6 +103,7 @@ impl Group {
             Group::Privacy => "privacy",
             Group::ConstEval => "const-eval",
             Group::Cfg => "cfg",
+            Group::CfgTest => "cfg-test",
             Group::MacroDerive => "macro-derive",
             Group::MacroAttr => "macro-attr",
             Group::MacroRules => "macro-rules",
@@ -109,12 +114,13 @@ impl Group {
     }
 
     /// The group is a cause, not a set of codes (its codes overlap other
-    /// groups): Cfg and the 5 macro groups. `breakage::group_for` never maps a
+    /// groups): Cfg, CfgTest and the 5 macro groups. `breakage::group_for` never maps a
     /// code to one.
     pub fn is_cause(self) -> bool {
         matches!(
             self,
             Group::Cfg
+                | Group::CfgTest
                 | Group::MacroDerive
                 | Group::MacroAttr
                 | Group::MacroRules
@@ -143,6 +149,7 @@ impl Group {
             Group::Privacy => &["E0603", "E0616", "E0624"],
             Group::ConstEval => &["E0080", "E0015"],
             Group::Cfg => &["E0425", "E0432", "E0433", "E0412", "E0599"],
+            Group::CfgTest => &["E0425", "E0433", "E0308", "E0599"],
             Group::MacroDerive => &["E0599"],
             Group::MacroAttr => &["E0308"],
             Group::MacroRules => &["E0599", "E0308"],
@@ -604,7 +611,7 @@ mod tests {
             assert_eq!(Group::parse(g.id()), Some(g));
         }
         assert_eq!(Group::parse("nope"), None);
-        assert_eq!(Group::ALL.len(), 18);
+        assert_eq!(Group::ALL.len(), 19);
         assert!(Group::Valid.codes().is_empty());
         assert!(Group::PRIMARY.iter().all(|g| Group::ALL.contains(g)));
     }
@@ -797,6 +804,7 @@ mod tests {
             causes,
             [
                 Group::Cfg,
+                Group::CfgTest,
                 Group::MacroDerive,
                 Group::MacroAttr,
                 Group::MacroRules,

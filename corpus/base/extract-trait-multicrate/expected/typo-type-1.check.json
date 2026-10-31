@@ -3,5 +3,10 @@
     "code": "E0425",
     "path": "lib/src/lib.rs",
     "line": 129
+  },
+  {
+    "code": "E0599",
+    "path": "lib/src/lib.rs",
+    "line": 218
   }
 ]

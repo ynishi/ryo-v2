@@ -1,6 +1,11 @@
 [
   {
     "code": "E0599",
+    "path": "lib/src/lib.rs",
+    "line": 193
+  },
+  {
+    "code": "E0599",
     "path": "user/src/lib.rs",
     "line": 33
   }

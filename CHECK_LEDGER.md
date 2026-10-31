@@ -12,12 +12,19 @@ Run: `just oracle` (`RYO_V2_ORACLE_REPORT=<file>` writes every outcome).
 
 ## Counts
 
-Corpus: 3 workspaces, `base/extract-trait-multicrate` (8 hand cases + 18
-breakage cases), `base/breakage-lab` (38 breakage cases) and `base/macro-lab`
+Corpus: 4 workspaces, `base/extract-trait-multicrate` (8 hand cases + 18
+breakage cases), `base/breakage-lab` (38 breakage cases), `base/macro-lab`
 (11 hand cases: a local proc-macro crate, a derive, two attribute macros and a
-`macro_rules!`), 75 cases in all (`just oracle`; expected from `just
-oracle-refresh`; breakage cases from `just breakage-gen`, groups from `just
-breakage-regroup`). Groups with no case (arity) are omitted.
+`macro_rules!`) and `base/cfg-test-lab` (5 hand cases: errors inside a
+`#[cfg(test)]` module and an integration test), 80 cases in all (`just oracle`;
+expected from `just oracle-refresh`; breakage cases from `just breakage-gen`,
+groups from `just breakage-regroup`). Groups with no case (arity) are omitted.
+
+Expected diagnostics are `cargo check --workspace --all-targets --keep-going`
+(since the V2 change below; before, `--workspace` alone, lib and bins). The
+tables from "after: V2" down are the current ones; the older tables ("after:
+HEAD 1d5a2a6" and below) are the history of the 75-case corpus and stay as they
+were.
 
 Definition (since the macro-lab change). Per compared (not skipped) case, over
 the expected diagnostics whose code is in the case's group (`Group::codes()`):
@@ -36,6 +43,144 @@ unresolved-path detector (`ryo-v2-ra/src/unresolved.rs`) then raised
 unresolved-import 4 to 7 and unresolved-name 0 to 5, the measured `hit`; the
 floors are checked only with proc-macro on and the detector on
 (`RYO_V2_ORACLE_UNRESOLVED=off` skips them).
+
+### after: V2 (oracle truth = the CI gate), cfg-test on, proc-macro on
+
+Command: `just oracle` (`RaConfig.cfg_test = true`, expected from `--all-targets`).
+Floors hold; no case is MISGROUPED. The floor column is the checked floor,
+`cfg-test` 4 being new (the measured `hit`).
+
+| group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| unresolved-import | 7 | 0 | 7 | 7 | 0 | 5 | 2 | 7 | 1.00 | 0.91 |
+| unresolved-name | 5 | 0 | 5 | 5 | 0 | 2 | 1 | 5 | 1.00 | 1.00 |
+| unresolved-type | 2 | 0 | 2 | 0 | 2 | 0 | 1 | 0 | 0.00 | - |
+| no-method | 10 | 0 | 10 | 10 | 0 | 9 | 1 | 10 | 1.00 | 0.93 |
+| type-mismatch | 7 | 0 | 7 | 7 | 0 | 3 | 4 | 7 | 1.00 | 0.71 |
+| trait-bound | 3 | 0 | 3 | 3 | 0 | 3 | 0 | 3 | 1.00 | 1.00 |
+| field | 7 | 0 | 7 | 1 | 6 | 0 | 7 | 1 | 0.14 | 0.14 |
+| borrow | 10 | 0 | 10 | 0 | 10 | 0 | 0 | 0 | 0.00 | - |
+| privacy | 5 | 0 | 5 | 4 | 1 | 4 | 0 | 4 | 0.80 | 1.00 |
+| const-eval | 2 | 0 | 2 | 0 | 2 | 0 | 0 | 0 | 0.00 | - |
+| cfg | 2 | 0 | 2 | 1 | 1 | 1 | 0 | 1 | 0.50 | 1.00 |
+| cfg-test | 4 | 0 | 4 | 4 | 0 | 3 | 1 | 4 | 1.00 | 0.80 |
+| macro-derive | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-attr | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-rules | 2 | 0 | 2 | 0 | 2 | 0 | 2 | 0 | 0.00 | 0.20 |
+| macro-tokens | 3 | 0 | 3 | 2 | 1 | 2 | 1 | 2 | 0.67 | 0.75 |
+| proc-macro-edit | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0.00 | - |
+| valid | 6 | 0 | 0 | 0 | 0 | 6 | 0 | 5 | - | - |
+
+| other code | missed | extra | cases |
+|---|---|---|---|
+| E0277 | 0 | 4 | 3 |
+| E0282 | 0 | 2 | 2 |
+| E0392 | 1 | 0 | 1 |
+| E0422 | 4 | 0 | 2 |
+| E0599 | 0 | 2 | 2 |
+
+H7 primary recall 32/32 = 1.00. The same run with the proc-macro server off
+(`just oracle-off`, cfg-test on) differs from the table above only in
+macro-derive (hit 0, exact 0, FP 0), macro-attr (hit 1, exact 1, FP 1, precision
+0.50), as in the proc-macro-off table below.
+
+Against the table of the 75-case corpus ("after: HEAD 1d5a2a6 ... proc-macro
+on"): every old row keeps its `hit` and its floor. What changed is `exact` and
+FP, from diagnostics that the all-targets expected files added and ra reports
+differently: field FP 6 to 7 (extract-trait-multicrate broken-06, G-A-2),
+field exact 1 to 0, unresolved-name exact 4 to 2 (remove-import-1, -2 now expect
+an E0422 that ra does not report, G-B-5), and the precision cells that follow.
+The new rows are cfg-test (5 cases of the new workspace, 4 in the group, 1
+valid) and valid 5 to 6 (`cfgtest-valid-0`).
+
+### after: V2, cfg-test off, proc-macro on
+
+Command: `RYO_V2_ORACLE_CFG_TEST=off just oracle`. Floors are not checked
+(the floor column is the on value). This is ra as it was before the change
+(`CargoConfig::set_test` false) against the new expected files.
+
+| group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| unresolved-import | 7 | 0 | 7 | 6 | 1 | 4 | 2 | 7 | 0.86 | 0.90 |
+| unresolved-name | 5 | 0 | 5 | 4 | 1 | 2 | 1 | 5 | 0.80 | 1.00 |
+| unresolved-type | 2 | 0 | 2 | 0 | 2 | 0 | 1 | 0 | 0.00 | - |
+| no-method | 10 | 0 | 10 | 6 | 4 | 5 | 1 | 10 | 0.60 | 0.91 |
+| type-mismatch | 7 | 0 | 7 | 6 | 1 | 3 | 4 | 7 | 0.86 | 0.69 |
+| trait-bound | 3 | 0 | 3 | 3 | 0 | 3 | 0 | 3 | 1.00 | 1.00 |
+| field | 7 | 0 | 7 | 1 | 6 | 1 | 6 | 1 | 0.14 | 0.07 |
+| borrow | 10 | 0 | 10 | 0 | 10 | 0 | 0 | 0 | 0.00 | - |
+| privacy | 5 | 0 | 5 | 4 | 1 | 4 | 0 | 4 | 0.80 | 1.00 |
+| const-eval | 2 | 0 | 2 | 0 | 2 | 0 | 0 | 0 | 0.00 | - |
+| cfg | 2 | 0 | 2 | 1 | 1 | 1 | 0 | 1 | 0.50 | 1.00 |
+| cfg-test | 4 | 0 | 4 | 0 | 4 | 0 | 0 | 4 | 0.00 | - |
+| macro-derive | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-attr | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-rules | 2 | 0 | 2 | 0 | 2 | 0 | 2 | 0 | 0.00 | 0.20 |
+| macro-tokens | 3 | 0 | 3 | 2 | 1 | 2 | 1 | 2 | 0.67 | 0.75 |
+| proc-macro-edit | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0.00 | - |
+| valid | 6 | 0 | 0 | 0 | 0 | 5 | 0 | 5 | - | - |
+
+| other code | missed | extra | cases |
+|---|---|---|---|
+| E0277 | 2 | 4 | 5 |
+| E0282 | 0 | 2 | 2 |
+| E0392 | 1 | 0 | 1 |
+| E0422 | 4 | 0 | 2 |
+| E0599 | 2 | 2 | 3 |
+
+H7 primary recall 25/32 = 0.78. With cfg-test off ra misses the errors inside
+test code that the all-targets expected files now hold: the four cfg-test cases
+(`cfgtest-mod-0`, `-mod-1`, `-it-0`, `-it-1`: hit 0 of 4, against 4 of 4 with it
+on), and the 18 diagnostics added to extract-trait-multicrate (all inside
+`#[cfg(test)]` modules), which account for no-method 6 of 10, unresolved-import
+6 of 7, unresolved-name 4 of 5, type-mismatch 6 of 7, and for `valid-02` (its
+overlay breaks the lib test module, E0599 at lib/src/lib.rs:182: exact only with
+cfg-test on). The two integration-test cases are missed with it off as well; the
+cause was not isolated (their errors sit inside `#[test]` functions). This is the
+measured proof of G-C-1 below.
+
+### changed expected (V2: `--all-targets --keep-going`, `just oracle-refresh`)
+
+Counted against the expected files of HEAD 1a6d103, copied before the refresh.
+
+| workspace | expected files | changed files | diags before | diags after | added | removed |
+|---|---|---|---|---|---|---|
+| extract-trait-multicrate | 26 | 14 | 51 | 69 | 18 | 0 |
+| breakage-lab | 38 | 0 | 52 | 52 | 0 | 0 |
+| macro-lab | 11 | 0 | 14 | 14 | 0 | 0 |
+| cfg-test-lab (new) | 5 | - | - | 5 | - | - |
+
+The 18 added diagnostics are at 14 places, all inside the `#[cfg(test)]` modules
+of the workspace's own crates (lib/src/lib.rs:179-218, user/src/lib.rs:57-80,
+viewer/src/lib.rs:24): the lib, user and viewer test modules call the
+functions the breakage cases change. Nothing was removed: breakage-lab and
+macro-lab have no test code. Without `--keep-going` a refresh and two later
+manual runs of cfg-test-lab `cfgtest-it-1` reported different sets (cargo stops
+scheduling units after the first failed one), which is why the flag is part of
+`CHECK_ARGS`; for the three older workspaces the table above did not change
+with it.
+
+`just breakage-regroup` on the two breakage workspaces moves 5 cases
+(extract-trait-multicrate change-type-0 and -1: type-mismatch to trait-bound,
+remove-import-1 and -2: unresolved-name to unresolved-type, typo-type-1:
+unresolved-name to no-method), because the test-module errors change which
+group has the highest-priority code. It is **not applied**: with the moved
+groups the checked floors fail (unresolved-name hit 2 < 5, type-mismatch hit
+5 < 7; no case lost a hit, the cases left the group). The groups of those 5
+cases are therefore the old ones, and the table above is measured with them.
+A floor is raised, never lowered. **Decided (2026-10-31): keep the old
+groups.** A case's group names what its edit breaks; the errors that
+`--all-targets` adds are follow-on errors in the crate's `#[cfg(test)]` code
+and must not reclassify the case. They are counted in the other-codes table.
+`breakage gen` keeps an existing group, so a later gen does not undo this.
+
+### with the old expected files (before V2), cfg-test off, proc-macro on
+
+Command: the corpus of HEAD 1a6d103 (`git archive`, `RYO_V2_CORPUS`) with
+`RYO_V2_ORACLE_CFG_TEST=off just oracle`. It equals the table "after: HEAD
+1d5a2a6 plus the unresolved-path detector, proc-macro on" row for row, other
+codes included (H7 32/32), so the old numbers are reproducible and V2 is a change
+of the expected files and of ra's setting, not of the code.
 
 ### after: HEAD 1d5a2a6 plus the unresolved-path detector, proc-macro on
 
@@ -264,6 +409,39 @@ proc-macro on and off alike; the old definition gave 18/26 = 0.69):
 
 Which definition H7 uses is the user's decision; this ledger does not choose.
 
+### precision on history
+
+False positives of the verifier on real commits. A pair is a commit (child) and
+its first parent: the base is the parent's tree with the child's non-`.rs`
+files (manifests, lock files), the overlay is the child's `.rs` files under
+the workspace member dirs. Only pairs whose child builds cleanly under `cargo
+check --workspace --all-targets` count (`valid`), so every error the verifier
+reports on them is a false positive; a pair is one case, however many errors it
+reports. A pair with a deleted or renamed `.rs` file, or an added or deleted
+`Cargo.toml` at the root or in a member dir, is skipped (an overlay cannot delete
+a file; the crate graph changed). A `.rs` change outside every member dir (the
+fixture workspaces under `corpus/`) is dropped and counted, because ra does not
+index it. Commands: `just history-export <repo> <range> <name> <out> <max>`
+(git only), `just history-expect <out>/<name>`, `just oracle-history <out>`
+(`<out>` has no `target` component). No floor: this is the first measurement.
+
+| set | rev range | pairs | skip | valid | FP cases | FP rate | extra | unmapped |
+|---|---|---|---|---|---|---|---|---|
+| ryo-v2 | 9a0d816..1a6d103 | 5 | 0 | 5 | 0 | 0.00 | 0 | 0 |
+| ryo-rs | 67b0ebfb~20..67b0ebfb | pending: <ENV> | | | | | | |
+
+ryo-v2: all 5 pairs are used, all with changed manifests (`manifest_from_child`);
+overlay files 11, 14, 5, 9, 3; `.rs` changes dropped as outside the member dirs
+59 (f11f5f1) and 13 (1d5a2a6), the corpus fixtures. 5 pairs give a wide error
+(0 of 5 is compatible with a true rate of up to about 0.5 at 95%); read the
+0.00 as "no false positive seen", not as a measured zero. The commits are
+large (squashed milestones). Cost, measured: export 0.7 s and 9.9 MB; `expect` 89
+s wall and 870 MB peak RSS for the 5 children (all build cleanly); the history
+run 63 s and 1.66 GB peak for 1 pair and 232 s wall for the 5. ra's load builds
+the proc-macros and build scripts of the dependency graph under `<base>/target`,
+so the set grows to 1.6 GB after the run (9.9 MB before). ryo-rs (about 5 GB
+per load) runs on the <ENV>.
+
 ## Classes
 
 - G-A: a gap of ryo-v2 (fix).
@@ -283,17 +461,18 @@ Which definition H7 uses is the user's decision; this ledger does not choose.
 |---|---|---|---|---|---|---|
 | G-B-1 | borrow | 10 cases (E0382 2, E0499 2, E0502 2, E0505 2, E0506 2) | breakage-lab store/src/lib.rs:37 (use-after-move-0), :49 (double-mut-borrow-0), :63 (shared-then-mut-0), :75 (move-while-borrowed-0), :88 (assign-while-borrowed-0) | Diagnostic: ra's semantic diagnostics do not report MIR borrowck results (E0382/E0499/E0502/E0505/E0506) as Errors; ra reported nothing for any of the 10 | keep (outside automatic application; commit-time CI catches it) | open |
 | G-B-2 | const-eval | 2 cases (E0080 2) | breakage-lab shapes/src/lib.rs:62 (const-eval-0), :63 (const-eval-1) | Diagnostic: ra does not report a failed const evaluation (overflow, out-of-bounds index) as an Error | keep (commit-time CI catches it) | open |
-| G-B-5 | unresolved-type | 2 cases, 7 diagnostics (E0422 7) | breakage-lab app/src/lib.rs:16,21,25,29,44 (remove-import-0), app/src/lib.rs:22,45 (typo-type-0, `Rectt { w, h }`) | Diagnostic: ra reports nothing for an unresolved struct name in a struct literal (E0422). The E0405 of remove-import-0 (app/src/lib.rs:9, `impl<T: Area>`) is found by the detector | keep | open |
+| G-B-5 | unresolved-type, unresolved-name | 4 cases, 11 diagnostics (E0422 11) | breakage-lab app/src/lib.rs:16,21,25,29,44 (remove-import-0), app/src/lib.rs:22,45 (typo-type-0, `Rectt { w, h }`); extract-trait-multicrate user/src/lib.rs:57,64,80 (remove-import-1), viewer/src/lib.rs:24 (remove-import-2), both in test modules and in group unresolved-name (V2 added them) | Diagnostic: ra reports nothing for an unresolved struct name in a struct literal (E0422). The E0405 of remove-import-0 (app/src/lib.rs:9, `impl<T: Area>`) is found by the detector | keep | open |
 | G-B-6 | privacy | 1 case (E0603) | breakage-lab app/src/lib.rs:34 (call-private-2, `lab_shapes::scale` made private) | Diagnostic: ra reports no private-item error for a path into another crate (private methods, E0624, are reported: extract-trait-multicrate call-private-0..2 and broken-03 pass) | keep | open |
-| G-B-7 | cfg | 1 case (E0425) | breakage-lab app/src/lib.rs:49 (cfg-gate-0, `lab_shapes::extra_only()` across crates). The same-crate bare call, shapes/src/lib.rs:75 (cfg-gate-1), is reported and passes | Diagnostic: ra is silent on a path to a cfg-disabled item in another crate, and reports E0425 for the bare name in the same crate | keep | open |
+| G-B-7 | cfg | 1 case (E0425) | breakage-lab app/src/lib.rs:49 (cfg-gate-0, `lab_shapes::extra_only()` across crates). The same-crate bare call, shapes/src/lib.rs:75 (cfg-gate-1), is reported and passes. The same silence holds for a path to an item that does not exist in another crate: with cfg-test on ra reported nothing for `lab::missing_fn()` in cfg-test-lab `tests/it.rs` (E0425 missed once; that variant was measured while the case was built and replaced by a bare call, so it is not in the corpus) | Diagnostic: ra is silent on a path to a cfg-disabled item in another crate, and reports E0425 for the bare name in the same crate | keep | open |
 | G-B-8 | field | 1 case (E0392) | breakage-lab app/src/lib.rs:6 (remove-field-0, `Wrapper<T>` with no field of type T). The code is in no group of the table | Diagnostic: ra does not report an unused type parameter | keep | open |
 | G-A-1 | field | 6 cases, 21 diagnostics (E0609 missed, E0559 extra at the same lines) | breakage-lab shapes/src/lib.rs:24,30,42 and app/src/lib.rs:11; extract-trait-multicrate lib/src/lib.rs:25-37 (remove-field-0), :48-64 (remove-field-1, -2) | Diagnostic: ra's unresolved_field handler (ra_ap_ide_diagnostics 0.0.358, unresolved_field.rs:34) labels a field access as E0559; rustc says E0609 | fix: normalize in ryo-v2-ra (field access to E0609) | open |
-| G-A-2 | type-mismatch, field, no-method, unresolved-import, unresolved-name | 9 cases, 16 diagnostics | breakage-lab app/src/lib.rs:34 (change-type-1 E0308), app/src/lib.rs:18,26,30 (drop-trait-impl-0), app/src/lib.rs:17,26,30,45 (remove-field-1 E0560), :22,45 (remove-field-2); extract-trait-multicrate user/src/lib.rs:20 (change-type-0), :34,36 (change-type-1), viewer/src/lib.rs:13 (change-type-2), viewer/src/lib.rs:10 (typo-type-0), user/src/lib.rs:49 (typo-type-1) | CrateGraph: cargo does not build a crate whose dependency failed, so rustc reports no errors there; ra reports them (true errors, but not in the oracle) | fix: drop errors of crates downstream of a crate with expected errors when comparing | open |
-| G-D-1 | unresolved-type, unresolved-import, field, unresolved-name | 4 cases, 4 diagnostics | breakage-lab app/src/lib.rs:11 (remove-import-0 E0599), shapes/src/lib.rs:51 (remove-import-2 E0277), app/src/lib.rs:29 (remove-field-0 E0282); extract-trait-multicrate lib/src/lib.rs:146 (typo-type-1 E0282) | Diagnostic: after an unresolved name rustc suppresses the follow-on error; ra infers on the unknown type and reports one | keep (a cascade; the baseline diff cannot cancel a new error) | open |
+| G-A-2 | type-mismatch, field, no-method, unresolved-import, unresolved-name | 13 cases, 20 diagnostics | breakage-lab app/src/lib.rs:34 (change-type-1 E0308), app/src/lib.rs:18,26,30 (drop-trait-impl-0), app/src/lib.rs:17,26,30,45 (remove-field-1 E0560), :22,45 (remove-field-2); extract-trait-multicrate user/src/lib.rs:20 (change-type-0), :34,36 (change-type-1), viewer/src/lib.rs:13 (change-type-2), viewer/src/lib.rs:10 (typo-type-0), user/src/lib.rs:49 (typo-type-1); V2 added the test modules of user: user/src/lib.rs:58 (remove-field-0 E0560), :66 (remove-field-1 E0560), :67 (remove-field-2 E0560), :81 (broken-06 E0063) | CrateGraph: cargo does not build a crate whose dependency failed, so rustc reports no errors there; ra reports them (true errors, but not in the oracle) | fix: drop errors of crates downstream of a crate with expected errors when comparing | open |
+| G-D-1 | unresolved-type, unresolved-import, field, unresolved-name, cfg-test | 5 cases, 5 diagnostics | breakage-lab app/src/lib.rs:11 (remove-import-0 E0599), shapes/src/lib.rs:51 (remove-import-2 E0277), app/src/lib.rs:29 (remove-field-0 E0282); extract-trait-multicrate lib/src/lib.rs:146 (typo-type-1 E0282); cfg-test-lab lab/tests/it.rs:5 (cfgtest-it-1 E0425: ra reports the call of `helper` after the failed `use lab::helper`, rustc reports only the E0432) | Diagnostic: after an unresolved name rustc suppresses the follow-on error; ra infers on the unknown type and reports one | keep (a cascade; the baseline diff cannot cancel a new error) | open |
 | G-D-2 | macro-rules, macro-tokens | 3 cases (rules-body-0 E0599, rules-body-1 E0308, tokens-rules-0 E0308): 3 missed, 5 extra diagnostics; on and off alike | macro-lab model/src/lib.rs:19 (rustc, inside the `getter!` definition) against :25 and :26 (ra, the two `getter!(..)` calls) in rules-body-0 and rules-body-1; tokens-rules-0 gets :26 from ra and :19 from rustc (its :54 in `listed` matches) | Diagnostic: for an error inside a `macro_rules!` expansion rustc's primary span is the definition token, while ra reports the macro call, once per call (2 calls give 2 diagnostics, rustc gives 1 distinct). G-D and not G-A because ra's diagnostic range is already the call site; whether ra exposes the definition span was not checked | keep (mapping it back would need ra's expansion info; not investigated) | open |
 | G-E-1 | macro-derive | 2 cases (E0599 2), proc-macro off only | macro-lab model/src/lib.rs:29 (derive-removed-0), :34 (derive-removed-1) | Baseline: with the server off the derive is not expanded, so the baseline already holds an E0599 at each `describe()` call and removing the derive adds nothing new (inferred from "missed, no extra"; the baseline itself was not printed) | keep (the rule catalog must say that an edit touching a derive needs the proc-macro server) | open |
 | G-E-2 | macro-attr | 1 case (E0308: 1 missed, 2 extra), proc-macro off only | macro-lab model/src/lib.rs:43 (attr-reparse-0: rustc and ra-on report the `#[reparse]` line) against :45 and :46 (ra-off, the lines as written); attr-keep-0 is the same on and off | CodeState: without the server the attribute is not applied, so the item keeps its own spans; with it, `#[reparse]` gives every token the call-site span, and ra-on follows | keep (use the server on) | open |
 | G-E-3 | proc-macro-edit | 1 case (E0599 2 missed), on and off | macro-lab model/src/lib.rs:30,34 (pm-edit-0: the derive output renamed in macros/src/lib.rs) | CodeState: ra keeps the proc-macro dylib it built at load, so an edit of a proc-macro crate changes nothing the macros expand to and ra reports nothing | keep: an edit of a proc-macro crate is outside automatic application (ra keeps the load-time dylib); FN is the correct outcome. tests/oracle.rs fails if ra ever reports it | open |
+| G-C-1 | cfg-test | 4 cases, 5 diagnostics (E0425 4, E0432 1): `cfgtest-mod-0` lab/src/lib.rs:24, `cfgtest-mod-1` lab/src/lib.rs:18, `cfgtest-it-1` lab/src/lib.rs:23 (E0425) and lab/tests/it.rs:1 (E0432), `cfgtest-it-0` lab/tests/it.rs:6; plus the 18 diagnostics V2 added to extract-trait-multicrate | cfg-test-lab; extract-trait-multicrate lib/src/lib.rs:179-218, user/src/lib.rs:57-80, viewer/src/lib.rs:24. `valid-02`'s overlay breaks the lib test module (E0599 lib/src/lib.rs:182), so that case is valid for lib and bins only | CodeState: the CI gate (`clippy --all-targets`, `cargo test`) compiles `#[cfg(test)]` code and `tests/` targets, but the oracle expected files were `cargo check --workspace` (lib and bins) and ra's `CargoConfig::set_test` was false, so ra diagnosed no `#[cfg(test)]` item (ra_ap_project_model 0.0.358, `workspace.rs` inserts the `test` cfg for local crates only when `set_test`; the earlier guess that ra enables it for members was wrong). Measured: hit 0 of 4 with cfg-test off, 4 of 4 with it on | **decided (V2)**: both sides see what CI sees: oracle truth = `cargo check --workspace --all-targets --keep-going`, the oracle runs ra with `RaConfig.cfg_test = true` (`RYO_V2_ORACLE_CFG_TEST=off` keeps the old setting, floors unchecked); `apply` loads with it too. The group floor `cfg-test` is 4. Open: `just breakage-regroup` would move 5 cases and fail the floors unresolved-name 5 and type-mismatch 7 (hit 2 and 5, no case lost a hit); not applied; decided 2026-10-31 to keep the old groups (see Counts) | fixed |
 
 Macro cases that match rustc exactly (no row): with the server on, the derive
 (macro-derive 2/2), the attribute macros (macro-attr 2/2, `#[keep]` at the

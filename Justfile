@@ -30,9 +30,21 @@ oracle:
 oracle-off:
     RYO_V2_ORACLE_PROC_MACRO=off cargo test -p ryo-v2-oracle --test oracle -- --nocapture
 
-# Rewrites corpus/<ws>/expected/*.check.json from cargo check: the only recipe that runs cargo check on the corpus.
+# Rewrites corpus/<ws>/expected/*.check.json from `cargo check --workspace --all-targets`: the only recipe that runs cargo check on the corpus.
 oracle-refresh ws="base/extract-trait-multicrate":
     cargo run -p ryo-v2-oracle --bin oracle-refresh -- {{ws}}
+
+# History precision, step 1 (git only): writes the (parent, child) pairs of <repo> <range> under <out>/<name>. <out> must have no `target` component.
+history-export repo range name out max="20":
+    cargo run -q -p ryo-v2-oracle --bin history-cases -- export {{repo}} {{range}} --name {{name}} --out {{out}} --max {{max}}
+
+# History precision, step 2: cargo check --all-targets on each child of <out>/<name>; writes expected.check.json per pair.
+history-expect dir:
+    cargo run -q -p ryo-v2-oracle --bin history-cases -- expect {{dir}}
+
+# History precision, step 3: the verifier on every pair under <out>; prints the false-positive rate per set.
+oracle-history out:
+    RYO_V2_HISTORY_DIR={{out}} cargo test -p ryo-v2-oracle --test history -- --nocapture
 
 # Writes breakage cases and overlays for corpus/<ws> (deterministic; commit the output).
 breakage-gen ws kinds="all" seeds="3":
