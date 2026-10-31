@@ -1,0 +1,11 @@
+# planted: inline-function geo/src/shapes.rs:95 inline helper `wider` into fn fits
+workspace = "search/base/search-lab"
+overlay = "planted/inline-function-1"
+kinds = ["inline-function"]
+depth = 1
+origin = "planted:inline-function:1"
+targets = [
+    { path = "geo/src/shapes.rs", start = 1724, end = 1893 },
+]
+probes = []
+original_fn = "wider"

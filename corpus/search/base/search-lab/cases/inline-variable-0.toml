@@ -1,0 +1,10 @@
+# planted: inline-variable app/src/lib.rs:34 inline `report` into the next line of fn run
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-0"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:0"
+targets = [
+    { path = "app/src/lib.rs", start = 601, end = 765 },
+]
+probes = []

@@ -1,0 +1,13 @@
+# planted: obscure-name app/src/lib.rs:33 rename local `shapes` to `v1` in fn run
+# planted: misplace-item app/src/plan.rs:7 move `Slot` to app/src/lib.rs
+workspace = "search/base/search-lab"
+overlay = "planted/pair-obscure-name-misplace-item-0"
+kinds = ["obscure-name", "misplace-item"]
+depth = 2
+origin = "planted:obscure-name+misplace-item:0"
+targets = [
+    { path = "app/src/lib.rs", start = 601, end = 782 },
+    { path = "app/src/lib.rs", start = 1016, end = 1068 },
+    { path = "app/src/plan.rs", start = 66, end = 87 },
+]
+probes = []

@@ -1,0 +1,11 @@
+# planted: misplace-item geo/src/shapes.rs:7 move `Bounds` to geo/src/store.rs
+workspace = "search/base/search-lab"
+overlay = "planted/misplace-item-7"
+kinds = ["misplace-item"]
+depth = 1
+origin = "planted:misplace-item:7"
+targets = [
+    { path = "geo/src/shapes.rs", start = 89, end = 119 },
+    { path = "geo/src/store.rs", start = 1470, end = 1574 },
+]
+probes = []

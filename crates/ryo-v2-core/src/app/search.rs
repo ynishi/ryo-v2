@@ -5,8 +5,8 @@
 //! once per depth and pruned to a beam; only the beam reaches the analyzer. The search ends with
 //! a [`Resolution`], the ranking of every verified node and a trace of every child.
 //!
-//! The numbers of the budget are the decided ones, one per concern: ADR-1 (time), ADR-2 (revert audit),
-//! ADR-3 (memory per session) and ADR-4 (the triggers that call for a redesign).
+//! The numbers of the budget are those of the decisions in force in `SEARCH_LEDGER.md`: D1 (time),
+//! D2 (revert audit), D3 (memory per session) and D4 (the triggers that call for perf work).
 
 use crate::app::apply::{Acc, Prepared, Ready, prepare};
 use crate::app::ports::{
@@ -27,9 +27,9 @@ use std::num::NonZeroU16;
 /// depth 3, 6 s per check, 300 s soft and 360 s hard per decision, one audited flaw in ten.
 ///
 /// # Contract
-/// - C1: the numbers are the decided ones listed above, and `decision_budget()` of them is
+/// - C1: the numbers are those of decision D1 in SEARCH_LEDGER.md, and `decision_budget()` of it is
 ///   `DEFAULT_BUDGET`.
-///   tested: app::search::tests::default_search_budget_is_the_adr_numbers
+///   tested: app::search::tests::default_search_budget_is_the_decided_numbers
 pub const DEFAULT_SEARCH_BUDGET: SearchBudget = SearchBudget {
     beam: 20,
     max_expand: 200,
@@ -41,27 +41,27 @@ pub const DEFAULT_SEARCH_BUDGET: SearchBudget = SearchBudget {
     audit_every: NonZeroU16::MIN.saturating_add(9),
 };
 
-/// ADR-2: the revert is asserted by a diagnostic re-check on every 50th check.
+/// Decision D2 (SEARCH_LEDGER.md): the revert is asserted by a diagnostic re-check on every 50th check.
 pub const ASSERT_REVERT_EVERY: u32 = 50;
-/// ADR-1: expansion and assessment of one depth take at most this long. Recorded, not enforced.
+/// Decision D1 (SEARCH_LEDGER.md): expansion and assessment of one depth take at most this long. Recorded, not enforced.
 pub const EXPAND_DEPTH_MS: u64 = 10_000;
-/// ADR-1: the one judge call of a depth takes at most this long. Recorded, not enforced.
+/// Decision D1 (SEARCH_LEDGER.md): the one judge call of a depth takes at most this long. Recorded, not enforced.
 pub const JUDGE_DEPTH_MS: u64 = 30_000;
-/// ADR-3: memory of one analyzer session, in GB.
+/// Decision D3 (SEARCH_LEDGER.md): memory of one analyzer session, in GB.
 pub const SESSION_RAM_GB: u64 = 6;
-/// ADR-3: memory left to everything that is not a session, in GB.
+/// Decision D3 (SEARCH_LEDGER.md): memory left to everything that is not a session, in GB.
 pub const RESERVED_RAM_GB: u64 = 8;
-/// ADR-4 trigger 1: a decision whose median time passes this calls for a redesign.
+/// Decision D4 (SEARCH_LEDGER.md), trigger 1: a decision whose median time passes this calls for a redesign.
 pub const TRIGGER_DECISION_MEDIAN_MS: u64 = 300_000;
-/// ADR-4 trigger 2: a warm check at the affected scope whose median time passes this.
+/// Decision D4 (SEARCH_LEDGER.md), trigger 2: a warm check at the affected scope whose median time passes this.
 pub const TRIGGER_CHECK_MEDIAN_MS: u64 = 5_000;
-/// ADR-4 trigger 3: resident memory in kB, read after [`TRIGGER_AFTER_CHECKS`] checks.
+/// Decision D4 (SEARCH_LEDGER.md), trigger 3: resident memory in kB, read after [`TRIGGER_AFTER_CHECKS`] checks.
 pub const TRIGGER_RSS_KB: u64 = 8 * 1024 * 1024;
-/// ADR-4 trigger 3: check time relative to the first checks, in thousandths (x1.5).
+/// Decision D4 (SEARCH_LEDGER.md), trigger 3: check time relative to the first checks, in thousandths (x1.5).
 pub const TRIGGER_CHECK_GROWTH_PERMILLE: u64 = 1_500;
-/// ADR-4 trigger 3: how many checks pass before memory and growth are looked at.
+/// Decision D4 (SEARCH_LEDGER.md), trigger 3: how many checks pass before memory and growth are looked at.
 pub const TRIGGER_AFTER_CHECKS: u32 = 1_000;
-/// ADR-4 trigger 4: one run of the recall harness takes longer than this.
+/// Decision D4 (SEARCH_LEDGER.md), trigger 4: one run of the recall harness takes longer than this.
 pub const TRIGGER_HARNESS_MS: u64 = 600_000;
 
 /// How many sessions fit in `ram_gb` of memory.
@@ -69,7 +69,7 @@ pub const TRIGGER_HARNESS_MS: u64 = 600_000;
 /// # Contract
 /// - C1: `max(1, (ram_gb - RESERVED_RAM_GB) / SESSION_RAM_GB)` with the subtraction saturating
 ///   at zero, so 30 GB gives 3 and no machine gives fewer than 1.
-///   tested: app::search::tests::max_sessions_follows_adr3
+///   tested: app::search::tests::max_sessions_follows_decision_d3
 pub fn max_sessions(ram_gb: u64) -> u64 {
     (ram_gb.saturating_sub(RESERVED_RAM_GB) / SESSION_RAM_GB).max(1)
 }
@@ -1837,7 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn max_sessions_follows_adr3() {
+    fn max_sessions_follows_decision_d3() {
         assert_eq!(max_sessions(30), 3);
         assert_eq!(max_sessions(0), 1);
         assert_eq!(max_sessions(8), 1);
@@ -1848,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn default_search_budget_is_the_adr_numbers() {
+    fn default_search_budget_is_the_decided_numbers() {
         let b = DEFAULT_SEARCH_BUDGET;
         assert_eq!(
             (b.beam, b.max_expand, b.beam_parents, b.max_depth),

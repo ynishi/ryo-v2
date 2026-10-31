@@ -1,0 +1,10 @@
+# planted: inline-variable geo/src/report.rs:94 inline `count` into the next line of fn summary
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-5"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:5"
+targets = [
+    { path = "geo/src/report.rs", start = 1843, end = 1982 },
+]
+probes = []

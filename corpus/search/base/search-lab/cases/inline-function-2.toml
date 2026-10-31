@@ -1,0 +1,11 @@
+# planted: inline-function geo/src/store.rs:54 inline helper `free_room` into fn load
+workspace = "search/base/search-lab"
+overlay = "planted/inline-function-2"
+kinds = ["inline-function"]
+depth = 1
+origin = "planted:inline-function:2"
+targets = [
+    { path = "geo/src/store.rs", start = 901, end = 1129 },
+]
+probes = []
+original_fn = "free_room"

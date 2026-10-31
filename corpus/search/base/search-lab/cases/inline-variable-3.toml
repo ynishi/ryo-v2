@@ -1,0 +1,10 @@
+# planted: inline-variable app/src/plan.rs:29 inline `width` into the next line of fn pack
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-3"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:3"
+targets = [
+    { path = "app/src/plan.rs", start = 399, end = 514 },
+]
+probes = []

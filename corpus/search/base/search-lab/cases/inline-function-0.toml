@@ -1,0 +1,11 @@
+# planted: inline-function app/src/lib.rs:35 inline helper `finish` into fn run
+workspace = "search/base/search-lab"
+overlay = "planted/inline-function-0"
+kinds = ["inline-function"]
+depth = 1
+origin = "planted:inline-function:0"
+targets = [
+    { path = "app/src/lib.rs", start = 601, end = 791 },
+]
+probes = []
+original_fn = "finish"

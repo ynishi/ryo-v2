@@ -1,0 +1,10 @@
+# planted: inline-variable geo/src/report.rs:84 inline `bounds` into the next line of fn describe
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-2"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:2"
+targets = [
+    { path = "geo/src/report.rs", start = 1636, end = 1717 },
+]
+probes = []

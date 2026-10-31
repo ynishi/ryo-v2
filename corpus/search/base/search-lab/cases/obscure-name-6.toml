@@ -1,0 +1,10 @@
+# planted: obscure-name geo/src/report.rs:70 rename local `area` to `v1` in fn line_for
+workspace = "search/base/search-lab"
+overlay = "planted/obscure-name-6"
+kinds = ["obscure-name"]
+depth = 1
+origin = "planted:obscure-name:6"
+targets = [
+    { path = "geo/src/report.rs", start = 1297, end = 1420 },
+]
+probes = []

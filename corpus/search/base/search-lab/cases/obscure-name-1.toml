@@ -1,0 +1,10 @@
+# planted: obscure-name app/src/lib.rs:46 rename local `shapes` to `v1` in fn total
+workspace = "search/base/search-lab"
+overlay = "planted/obscure-name-1"
+kinds = ["obscure-name"]
+depth = 1
+origin = "planted:obscure-name:1"
+targets = [
+    { path = "app/src/lib.rs", start = 873, end = 1011 },
+]
+probes = []

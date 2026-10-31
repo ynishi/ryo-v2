@@ -12,6 +12,8 @@ mod blueprint_json;
 mod resolution_json;
 mod rss;
 mod rules_json;
+mod search;
+mod search_json;
 
 use anyhow::Result;
 use bench::BenchArgs;
@@ -63,6 +65,22 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         rules: Option<PathBuf>,
         /// How far the check reaches.
+        #[arg(long, value_enum, default_value_t = ApplyScopeArg::Affected)]
+        scope: ApplyScopeArg,
+        /// Do not start the proc-macro server.
+        #[arg(long)]
+        no_proc_macro: bool,
+    },
+    /// Search for the best verified changes of one decision and print the report as JSON (a dry run: nothing is written).
+    Search {
+        /// The workspace to load.
+        workspace: PathBuf,
+        /// The request JSON file: targets, probes, roots, budget, judge.
+        request: PathBuf,
+        /// Rules JSON file; without it every candidate needs review.
+        #[arg(long, value_name = "FILE")]
+        rules: Option<PathBuf>,
+        /// How far each check reaches.
         #[arg(long, value_enum, default_value_t = ApplyScopeArg::Affected)]
         scope: ApplyScopeArg,
         /// Do not start the proc-macro server.
@@ -124,6 +142,22 @@ fn run() -> Result<ExitCode> {
         } => apply::run_apply(&apply::ApplyArgs {
             workspace,
             blueprints,
+            rules,
+            scope: match scope {
+                ApplyScopeArg::Affected => Scope::Affected,
+                ApplyScopeArg::Workspace => Scope::Workspace,
+            },
+            proc_macro: !no_proc_macro,
+        }),
+        Command::Search {
+            workspace,
+            request,
+            rules,
+            scope,
+            no_proc_macro,
+        } => search::run_search(&search::SearchArgs {
+            workspace,
+            request,
             rules,
             scope: match scope {
                 ApplyScopeArg::Affected => Scope::Affected,
@@ -225,6 +259,26 @@ mod tests {
             Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--scope", "both"]).is_err()
         );
         assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_search() {
+        let r = Cli::try_parse_from([
+            "ryo-v2",
+            "search",
+            "/ws",
+            "req.json",
+            "--rules",
+            "r.json",
+            "--scope",
+            "workspace",
+            "--no-proc-macro",
+        ]);
+        assert!(r.is_ok());
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "search", "/ws", "r.json", "--scope", "both"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["ryo-v2", "search", "/ws"]).is_err());
     }
 
     #[test]

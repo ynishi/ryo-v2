@@ -1,0 +1,10 @@
+# planted: inline-variable geo/src/store.rs:65 inline `key` into the next line of fn fill_from
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-7"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:7"
+targets = [
+    { path = "geo/src/store.rs", start = 1213, end = 1344 },
+]
+probes = []

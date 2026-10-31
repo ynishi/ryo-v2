@@ -1,0 +1,12 @@
+# planted: obscure-name app/src/lib.rs:33 rename local `shapes` to `v1` in fn run
+# planted: inline-variable geo/src/report.rs:77 inline `line` into the next line of fn report_for
+workspace = "search/base/search-lab"
+overlay = "planted/pair-obscure-name-inline-variable-0"
+kinds = ["obscure-name", "inline-variable"]
+depth = 2
+origin = "planted:obscure-name+inline-variable:0"
+targets = [
+    { path = "app/src/lib.rs", start = 601, end = 782 },
+    { path = "geo/src/report.rs", start = 1425, end = 1610 },
+]
+probes = []

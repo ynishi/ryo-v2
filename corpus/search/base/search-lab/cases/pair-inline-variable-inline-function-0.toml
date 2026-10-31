@@ -1,0 +1,13 @@
+# planted: inline-variable app/src/lib.rs:34 inline `report` into the next line of fn run
+# planted: inline-function geo/src/store.rs:54 inline helper `free_room` into fn load
+workspace = "search/base/search-lab"
+overlay = "planted/pair-inline-variable-inline-function-0"
+kinds = ["inline-variable", "inline-function"]
+depth = 2
+origin = "planted:inline-variable+inline-function:0"
+targets = [
+    { path = "app/src/lib.rs", start = 601, end = 765 },
+    { path = "geo/src/store.rs", start = 901, end = 1129 },
+]
+probes = []
+original_fn = "free_room"

@@ -1,0 +1,11 @@
+# planted: misplace-item geo/src/report.rs:5 move `MAX_LINES` to geo/src/shapes.rs
+workspace = "search/base/search-lab"
+overlay = "planted/misplace-item-1"
+kinds = ["misplace-item"]
+depth = 1
+origin = "planted:misplace-item:1"
+targets = [
+    { path = "geo/src/report.rs", start = 66, end = 100 },
+    { path = "geo/src/shapes.rs", start = 2408, end = 2441 },
+]
+probes = []

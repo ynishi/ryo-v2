@@ -1,0 +1,10 @@
+# planted: inline-variable geo/src/shapes.rs:94 inline `inner` into the next line of fn fits
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-8"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:8"
+targets = [
+    { path = "geo/src/shapes.rs", start = 1724, end = 1833 },
+]
+probes = []

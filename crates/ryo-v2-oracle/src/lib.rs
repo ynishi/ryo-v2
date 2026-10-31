@@ -15,3 +15,5 @@ pub mod case;
 pub mod groups;
 pub mod history;
 pub mod materials;
+pub mod planted;
+pub mod search_recall;

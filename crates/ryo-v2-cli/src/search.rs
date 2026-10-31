@@ -1,0 +1,107 @@
+//! `ryo-v2 search`: the search of one decision as a dry run (nothing is written).
+
+use crate::resolution_json::exit_code;
+use crate::rules_json::parse_rules;
+use crate::search_json::{JudgeSpec, Request, parse_replay, parse_request, report_to_json};
+use anyhow::{Context, Result};
+use ryo_v2_core::app::ports::{Analyzer, Judge};
+use ryo_v2_core::app::search::{ASSERT_REVERT_EVERY, SearchInput, search_decision};
+use ryo_v2_core::domain::{DEFAULT_WEIGHTS, RuleCatalog, Scope};
+use ryo_v2_core::infra::clock::MonotonicClock;
+use ryo_v2_core::infra::judge::MetricJudge;
+use ryo_v2_core::infra::observer::RecordingObserver;
+use ryo_v2_ra::{RaAnalyzer, RaConfig, SyntaxAssessor};
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+/// Arguments of one `search` invocation.
+pub(crate) struct SearchArgs {
+    pub(crate) workspace: PathBuf,
+    pub(crate) request: PathBuf,
+    pub(crate) rules: Option<PathBuf>,
+    pub(crate) scope: Scope,
+    pub(crate) proc_macro: bool,
+}
+
+/// Searches the workspace as the request says and prints the `SearchReport` as JSON. Writes
+/// nothing to disk. Exit code 0 for `Decided`, 2 for `Failed`; an error (no candidate at all
+/// included) is 1.
+pub(crate) fn run_search(args: &SearchArgs) -> Result<ExitCode> {
+    // JSON errors surface before the (slow) load.
+    let rules = match &args.rules {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read rules {}", path.display()))?;
+            parse_rules(&text)?
+        }
+        None => RuleCatalog::default(),
+    };
+    let text = std::fs::read_to_string(&args.request)
+        .with_context(|| format!("read request {}", args.request.display()))?;
+    let request = parse_request(&text)?;
+    for (index, bp) in request.roots.iter().enumerate() {
+        if request.generated.contains(&bp.id()) {
+            eprintln!("generated id {} for root {index}", bp.id());
+        }
+    }
+    match &request.judge {
+        JudgeSpec::Metric => search_with(args, &request, &rules, &MetricJudge),
+        JudgeSpec::Replay(file) => {
+            let fixture = std::fs::read_to_string(file)
+                .with_context(|| format!("read replay fixture {file}"))?;
+            search_with(args, &request, &rules, &parse_replay(&fixture)?)
+        }
+    }
+}
+
+fn search_with<J: Judge>(
+    args: &SearchArgs,
+    request: &Request,
+    rules: &RuleCatalog,
+    judge: &J,
+) -> Result<ExitCode> {
+    let clock = Arc::new(MonotonicClock::new());
+    let analyzer = RaAnalyzer::new(
+        RaConfig {
+            proc_macro: args.proc_macro,
+            threads: None,
+            assert_revert: false,
+            unresolved_paths: true,
+            assert_revert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
+            cfg_test: true,
+        },
+        clock.clone(),
+        Arc::new(RecordingObserver::default()),
+    )
+    .with_check_timeout(Some(request.budget.per_candidate_ms));
+    let mut session = analyzer
+        .load(&args.workspace)
+        .with_context(|| format!("load {}", args.workspace.display()))?;
+    let input = SearchInput {
+        start: &[],
+        roots: &request.roots,
+        targets: &request.targets,
+        probes: &request.probes,
+        rules,
+        scope: args.scope,
+        budget: request.budget,
+        weights: DEFAULT_WEIGHTS,
+        keep_trace_edits: false,
+    };
+    let report = search_decision(
+        &analyzer,
+        &analyzer,
+        &SyntaxAssessor,
+        judge,
+        &*clock,
+        &mut session,
+        &input,
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report_to_json(&report))?
+    );
+    Ok(ExitCode::from(exit_code(&report.resolution)))
+}

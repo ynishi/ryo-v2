@@ -1,0 +1,10 @@
+# planted: obscure-name geo/src/lib.rs:35 rename local `perimeter` to `v1` in fn total_perimeter
+workspace = "search/base/search-lab"
+overlay = "planted/obscure-name-4"
+kinds = ["obscure-name"]
+depth = 1
+origin = "planted:obscure-name:4"
+targets = [
+    { path = "geo/src/lib.rs", start = 656, end = 830 },
+]
+probes = []

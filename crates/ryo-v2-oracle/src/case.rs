@@ -203,7 +203,8 @@ fn find_cases_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CaseError> 
             continue;
         }
         match path.file_name().and_then(|n| n.to_str()) {
-            Some("target" | ".git") => {}
+            // `search` holds the planted corpus, whose cases have their own shape.
+            Some("target" | ".git" | "search") => {}
             Some("cases") => out.push(path),
             _ => find_cases_dirs(&path, out)?,
         }

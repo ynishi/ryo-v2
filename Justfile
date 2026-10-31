@@ -50,6 +50,14 @@ oracle-history out:
 breakage-gen ws kinds="all" seeds="3":
     cargo run -p ryo-v2-oracle --bin breakage -- gen {{ws}} --kinds {{kinds}} --seeds {{seeds}}
 
+# Writes planted cases for <ws> (corpus-relative, e.g. base/breakage-lab or search/base/search-lab) under corpus/search (deterministic; commit the output).
+search-recall-gen ws seeds="3":
+    cargo run -q -p ryo-v2-oracle --bin search-recall -- gen {{ws}} --seeds {{seeds}}
+
+# H6: recall@20 of the search on the planted cases under <dir>; prints the table (SEARCH_LEDGER.md has the numbers).
+search-recall dir="corpus/search":
+    cargo run -q -p ryo-v2-oracle --bin search-recall -- run {{dir}}
+
 # Sets the group of breakage cases from their expected files.
 breakage-regroup ws:
     cargo run -p ryo-v2-oracle --bin breakage -- regroup {{ws}}

@@ -41,6 +41,23 @@ enum IntentJson {
     ExtractVariable(ExtractVariableJson),
     #[serde(rename = "add-derive")]
     AddDerive(AddDeriveJson),
+    #[serde(rename = "extract-function")]
+    ExtractFunction(ExtractFunctionJson),
+    #[serde(rename = "move-item")]
+    MoveItem(MoveItemJson),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractFunctionJson {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveItemJson {
+    item: String,
+    to: String,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +159,13 @@ fn intent(index: usize, j: IntentJson) -> Result<IntentCall> {
                 .ok_or_else(|| anyhow!("blueprint {index}: intent.derives: must not be empty"))?;
             IntentCall::AddDerive { derives }
         }
+        IntentJson::ExtractFunction(e) => IntentCall::ExtractFunction {
+            name: field(index, "intent.name", Ident::parse(&e.name))?,
+        },
+        IntentJson::MoveItem(m) => IntentCall::MoveItem {
+            item: field(index, "intent.item", Ident::parse(&m.item))?,
+            to: rel(index, "intent.to", &m.to)?,
+        },
     })
 }
 
@@ -190,9 +214,26 @@ fn read(index: usize, j: ReadJson) -> Result<ReadRange> {
 ///   tested: blueprint_json::tests::uncovered_spec_is_a_parse_error
 pub(crate) fn parse_blueprints(json: &str) -> Result<ParsedBlueprints> {
     let input: Input = serde_json::from_str(json).context("blueprint JSON")?;
+    build(input.blueprints)
+}
+
+/// Parses blueprint objects already read out of a larger document (the `roots` of a search
+/// request) with the rules of [`parse_blueprints`]; a list must not be empty.
+pub(crate) fn parse_blueprint_values(values: Vec<serde_json::Value>) -> Result<ParsedBlueprints> {
+    let list = values
+        .into_iter()
+        .enumerate()
+        .map(|(index, v)| {
+            serde_json::from_value::<BlueprintJson>(v).with_context(|| format!("blueprint {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    build(list)
+}
+
+fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
     let mut generated = Vec::new();
     let mut items = Vec::new();
-    for (index, bp) in input.blueprints.into_iter().enumerate() {
+    for (index, bp) in list.into_iter().enumerate() {
         let id = match bp.id {
             Some(s) => field(index, "id", BlueprintId::parse(&s))?,
             None => {
@@ -280,6 +321,32 @@ mod tests {
             parsed.set.iter().next().expect("one").id(),
             parsed.generated[0]
         );
+    }
+
+    #[test]
+    fn new_intent_kinds_parse() {
+        let extract = "{\"kind\":\"extract-function\",\"name\":\"helper\"}";
+        let parsed = parse_blueprints(&json(extract, true, true)).expect("extract-function");
+        let bp = parsed.set.iter().next().expect("one");
+        assert_eq!(bp.intent().to_string(), "extract-function helper");
+        let mv = "{\"kind\":\"move-item\",\"item\":\"Shape\",\"to\":\"geo/src/shapes.rs\"}";
+        let parsed = parse_blueprints(&json(mv, true, true)).expect("move-item");
+        let bp = parsed.set.iter().next().expect("one");
+        assert_eq!(
+            bp.intent().to_string(),
+            "move-item Shape -> geo/src/shapes.rs"
+        );
+        // An unknown field and a bad path are refused.
+        let extra = extract.replace('}', ",\"extra\":1}");
+        assert!(parse_blueprints(&json(&extra, true, true)).is_err());
+        let bad = mv.replace("geo/src/shapes.rs", "../x.rs");
+        assert!(parse_blueprints(&json(&bad, true, true)).is_err());
+        // A list of blueprint objects is parsed like the `blueprints` array.
+        let doc: serde_json::Value =
+            serde_json::from_str(&json(extract, true, true)).expect("json");
+        let list = doc["blueprints"].as_array().cloned().expect("array");
+        assert_eq!(parse_blueprint_values(list).expect("list").set.len(), 1);
+        assert!(parse_blueprint_values(Vec::new()).is_err());
     }
 
     #[test]

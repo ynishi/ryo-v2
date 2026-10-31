@@ -1,0 +1,14 @@
+# planted: inline-function app/src/lib.rs:35 inline helper `finish` into fn run
+# planted: misplace-item app/src/plan.rs:7 move `Slot` to app/src/lib.rs
+workspace = "search/base/search-lab"
+overlay = "planted/pair-inline-function-misplace-item-0"
+kinds = ["inline-function", "misplace-item"]
+depth = 2
+origin = "planted:inline-function+misplace-item:0"
+targets = [
+    { path = "app/src/lib.rs", start = 601, end = 791 },
+    { path = "app/src/lib.rs", start = 943, end = 995 },
+    { path = "app/src/plan.rs", start = 66, end = 87 },
+]
+probes = []
+original_fn = "finish"

@@ -1,0 +1,14 @@
+# planted: misplace-item app/src/lib.rs:7 move `NAME` to app/src/plan.rs
+# planted: misplace-item geo/src/lib.rs:12 move `LIMIT` to geo/src/store.rs
+workspace = "search/base/search-lab"
+overlay = "planted/pair-misplace-item-misplace-item-0"
+kinds = ["misplace-item", "misplace-item"]
+depth = 2
+origin = "planted:misplace-item+misplace-item:0"
+targets = [
+    { path = "app/src/lib.rs", start = 98, end = 125 },
+    { path = "app/src/plan.rs", start = 827, end = 864 },
+    { path = "geo/src/lib.rs", start = 305, end = 334 },
+    { path = "geo/src/store.rs", start = 1470, end = 1499 },
+]
+probes = []

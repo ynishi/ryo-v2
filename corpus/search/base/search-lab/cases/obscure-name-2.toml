@@ -1,0 +1,10 @@
+# planted: obscure-name app/src/plan.rs:22 rename local `bounds` to `v1` in fn needed_width
+workspace = "search/base/search-lab"
+overlay = "planted/obscure-name-2"
+kinds = ["obscure-name"]
+depth = 1
+origin = "planted:obscure-name:2"
+targets = [
+    { path = "app/src/plan.rs", start = 216, end = 390 },
+]
+probes = []

@@ -1,0 +1,12 @@
+# planted: obscure-name app/src/lib.rs:46 rename local `shapes` to `v1` in fn total
+# planted: obscure-name geo/src/report.rs:69 rename local `name` to `v2` in fn line_for
+workspace = "search/base/search-lab"
+overlay = "planted/pair-obscure-name-obscure-name-1"
+kinds = ["obscure-name", "obscure-name"]
+depth = 2
+origin = "planted:obscure-name+obscure-name:1"
+targets = [
+    { path = "app/src/lib.rs", start = 873, end = 1011 },
+    { path = "geo/src/report.rs", start = 1297, end = 1420 },
+]
+probes = []

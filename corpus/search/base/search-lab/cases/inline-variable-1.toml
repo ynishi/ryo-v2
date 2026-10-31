@@ -1,0 +1,10 @@
+# planted: inline-variable geo/src/shapes.rs:107 inline `bounds` into the next line of fn weight
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-1"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:1"
+targets = [
+    { path = "geo/src/shapes.rs", start = 1991, end = 2139 },
+]
+probes = []

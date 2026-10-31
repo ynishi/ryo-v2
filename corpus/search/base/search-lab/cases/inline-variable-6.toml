@@ -1,0 +1,10 @@
+# planted: inline-variable geo/src/lib.rs:42 inline `value` into the next line of fn limited_area
+workspace = "search/base/search-lab"
+overlay = "planted/inline-variable-6"
+kinds = ["inline-variable"]
+depth = 1
+origin = "planted:inline-variable:6"
+targets = [
+    { path = "geo/src/lib.rs", start = 845, end = 931 },
+]
+probes = []

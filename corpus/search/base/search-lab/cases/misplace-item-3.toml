@@ -1,0 +1,11 @@
+# planted: misplace-item app/src/plan.rs:7 move `Slot` to app/src/lib.rs
+workspace = "search/base/search-lab"
+overlay = "planted/misplace-item-3"
+kinds = ["misplace-item"]
+depth = 1
+origin = "planted:misplace-item:3"
+targets = [
+    { path = "app/src/lib.rs", start = 1024, end = 1076 },
+    { path = "app/src/plan.rs", start = 66, end = 87 },
+]
+probes = []
