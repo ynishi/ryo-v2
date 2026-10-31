@@ -81,7 +81,7 @@ fn is_published(m: &Member) -> bool {
     package(m).get("publish").and_then(Value::as_bool) != Some(false)
 }
 
-fn strings<'a>(v: Option<&'a Value>) -> Option<Vec<&'a str>> {
+fn strings(v: Option<&Value>) -> Option<Vec<&str>> {
     v?.as_array()?.iter().map(Value::as_str).collect()
 }
 
