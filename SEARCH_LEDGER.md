@@ -56,7 +56,7 @@ large sample.
 
 ## Counts
 
-Corpus and runs of the small bases: 2026-11-01, branch `fix/expander-gen` (L7) over main 63db161,
+Corpus and runs of the small bases: 2026-11-01, branch `fix/expander-gen` over main 63db161,
 rustc 1.98.1, ra_ap 0.0.358, 16 cores and 30 GiB with other runs possibly on the machine,
 proc-macro on, `RaConfig.assert_revert_every = 50` (decision D2), `MetricJudge`,
 `SyntaxAssessor`, Affected scope, one session per workspace, with probes. "before" is the expander
