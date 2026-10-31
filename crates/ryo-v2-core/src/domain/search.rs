@@ -677,6 +677,7 @@ mod tests {
             bases: vec![BaseFp::capture(rel("a.rs"), "let a = a;")],
             spec_refs: vec![],
             record: DecisionRecord::new("agent", "because").unwrap(),
+            builds_on: None,
         })
         .unwrap()
     }

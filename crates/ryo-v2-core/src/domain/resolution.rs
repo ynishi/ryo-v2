@@ -383,13 +383,21 @@ pub enum Blocking {
         /// The limit, in milliseconds.
         limit_ms: u64,
     },
+    /// The Blueprint it builds on did not pass, so it was not checked.
+    ParentFailed {
+        /// The Blueprint.
+        blueprint: BlueprintId,
+        /// The Blueprint it builds on.
+        parent: BlueprintId,
+    },
 }
 
 impl Blocking {
     /// The Blueprint that was blocked.
     ///
     /// # Contract
-    /// - C1: every variant, `BudgetExhausted` included, names the Blueprint it was made for.
+    /// - C1: every variant, `BudgetExhausted` and `ParentFailed` included, names the Blueprint it
+    ///   was made for.
     ///   tested: domain::resolution::tests::budget_exhausted_names_its_blueprint
     pub fn blueprint(&self) -> BlueprintId {
         match self {
@@ -399,7 +407,8 @@ impl Blocking {
             | Blocking::Nonconforming { blueprint, .. }
             | Blocking::Splice { blueprint, .. }
             | Blocking::NewErrors { blueprint, .. }
-            | Blocking::BudgetExhausted { blueprint, .. } => *blueprint,
+            | Blocking::BudgetExhausted { blueprint, .. }
+            | Blocking::ParentFailed { blueprint, .. } => *blueprint,
         }
     }
 }
@@ -445,6 +454,9 @@ impl std::fmt::Display for Blocking {
                 blueprint,
                 limit_ms,
             } => write!(f, "{blueprint}: check cut off after {limit_ms} ms"),
+            Blocking::ParentFailed { blueprint, parent } => {
+                write!(f, "{blueprint}: builds on {parent}, which did not pass")
+            }
         }
     }
 }
@@ -950,6 +962,7 @@ mod tests {
             bases: vec![BaseFp::capture(path, "x")],
             spec_refs: vec![],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap()
     }
@@ -1075,6 +1088,17 @@ mod tests {
         );
         let i = Infeasible::new(vec![b.clone()], vec![], false).unwrap();
         assert_eq!(i.blocking(), std::slice::from_ref(&b));
+        // A child of a failed parent names the child, not the parent.
+        let parent = BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a80ff").unwrap();
+        let pf = Blocking::ParentFailed {
+            blueprint: bid(),
+            parent,
+        };
+        assert_eq!(pf.blueprint(), bid());
+        assert_eq!(
+            pf.to_string(),
+            format!("{}: builds on {parent}, which did not pass", bid())
+        );
     }
 
     #[test]

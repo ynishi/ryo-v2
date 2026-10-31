@@ -10,12 +10,13 @@
 //! Format and checking: crates/ryo-v2-core/tests/doc_contract.rs.
 //!
 //! - Blueprint: one proposed change: an intent call, mutation specs against base text, the
-//!   read ranges it rests on, the base fingerprint of each file it edits, spec refs and a
-//!   decision record.
+//!   read ranges it rests on, the base fingerprint of each file it edits, spec refs, a
+//!   decision record and, optionally, the blueprint it builds on.
 //! - BlueprintParts: the parts of a blueprint before they are checked against each other.
 //! - BaseFp: the fingerprint of the whole base text of one file a blueprint edits; the file is
 //!   fresh only while its whole text is unchanged.
-//! - BlueprintSet: the blueprints submitted together in one apply, the candidates for one decision.
+//! - BlueprintSet: the blueprints submitted together in one apply; those not on one chain are
+//!   alternatives, a blueprint with `builds_on` is against its parent's result.
 //! - MutationSpec: one splice on one file of a text range of the base text.
 //!   includes: Replace, Insert, Delete
 //! - TextRange: a half-open UTF-8 byte range `[start, end)` of one file's base text.
@@ -48,7 +49,8 @@
 //! - Disposition: what may happen to a passing candidate.
 //!   includes: AutoApplicable, AfterOuterCheck, NeedsReview
 //! - Blocking: why a blueprint was not made a candidate.
-//!   includes: Unverifiable, Stale, MissingFile, Nonconforming, Splice, NewErrors, BudgetExhausted
+//!   includes: Unverifiable, Stale, MissingFile, Nonconforming, Splice, NewErrors, BudgetExhausted,
+//!   ParentFailed
 //! - CheckError: failure of a verifier check.
 //!   includes: Edit, Cancelled, Panicked, RevertMismatch, Poisoned, TimedOut
 //! - Verdict: the new errors relative to the baseline; passed if and only if there are none.

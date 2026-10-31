@@ -195,6 +195,7 @@ mod tests {
             bases,
             spec_refs: vec![SpecRef::parse("spec#1").unwrap()],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap()
     }
