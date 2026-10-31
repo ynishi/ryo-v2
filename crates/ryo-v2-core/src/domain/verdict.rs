@@ -20,11 +20,19 @@ impl Verdict {
     }
 
     /// `Diagnostics::from_findings(&new_findings(baseline, checked))`.
+    ///
+    /// # Contract
+    /// - C1: rustc codes land in `new_errors.errors`, analyzer codes in `new_errors.unmapped`.
+    ///   tested: domain::verdict::tests::from_baseline_splits_codes
     pub fn from_baseline(baseline: &[Finding], checked: &ScopedFindings) -> Self {
         Self::from_diagnostics(Diagnostics::from_findings(&new_findings(baseline, checked)))
     }
 
     /// `new_errors.is_empty()`.
+    ///
+    /// # Contract
+    /// - C1: passed if and only if `new_errors` is empty.
+    ///   tested: domain::verdict::tests::passed_iff_no_new_errors
     pub fn passed(&self) -> bool {
         self.new_errors.is_empty()
     }

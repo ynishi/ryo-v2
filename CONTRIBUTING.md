@@ -87,6 +87,11 @@ rule. The test is whether deleting it lets somebody repeat the mistake. If
 deleting it costs nothing it is a report on how a change went, and that belongs
 in the commit message.
 
+A promise a caller may rely on is written as a clause under a `# Contract`
+heading in the rustdoc, with the tests that check it named beside it. The
+convention is stated in `crates/ryo-v2-core/tests/doc_contract.rs`, and
+`cargo test` fails when a named test does not exist.
+
 Decisions that outlive a single change are recorded under `docs/adr/`, one decision per file, with the measurement that
 settled it.
 
@@ -133,10 +138,12 @@ issue -> just worktree-new -> implement -> just check
 ```
 
 Review the change locally before it goes up, by a person or by an AI agent —
-whichever you have. Three questions are worth asking of every diff: does it do
+whichever you have. Four questions are worth asking of every diff: does it do
 what its issue asked, may everything in it be published
-([PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#agent-publication-check)), and
-are the comments beside the code still true. Say in the PR body who or what
+([PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#agent-publication-check)), are
+the comments beside the code still true, and does each test a changed
+`# Contract` clause names actually check that clause (would it fail if the
+promise broke). Say in the PR body who or what
 reviewed it, or that nobody did.
 
 Releases and publishes (crates, the repository's own settings) are performed by

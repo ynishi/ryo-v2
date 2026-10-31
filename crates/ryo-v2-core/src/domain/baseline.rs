@@ -10,6 +10,10 @@ fn key(f: &Finding) -> Key {
 }
 
 /// The findings whose path is in `files` (order kept).
+///
+/// # Contract
+/// - C1: keeps only the findings whose path is in `files`, in their original order.
+///   tested: domain::baseline::tests::restrict_keeps_listed_paths_in_order
 pub fn restrict(findings: &[Finding], files: &[RelPath]) -> Vec<Finding> {
     let set: HashSet<&RelPath> = files.iter().collect();
     findings
@@ -29,6 +33,20 @@ pub fn restrict(findings: &[Finding], files: &[RelPath]) -> Vec<Finding> {
 ///    Which line a new duplicate is reported on is not guaranteed when lines moved.
 ///
 /// Result sorted (Ord).
+///
+/// # Contract
+/// - C1: a baseline finding outside `checked.files` is ignored.
+///   tested: domain::baseline::tests::baseline_outside_scope_is_ignored
+/// - C2: a pre-existing error that moved to another line is not new.
+///   tested: domain::baseline::tests::moved_existing_error_is_not_new
+/// - C3: an added copy of an existing error is new.
+///   tested: domain::baseline::tests::added_copy_of_existing_error_is_new
+/// - C4: the same code and path with another message is new.
+///   tested: domain::baseline::tests::other_message_is_new
+/// - C5: analyzer codes are diffed by the same rule as rustc codes.
+///   tested: domain::baseline::tests::analyzer_codes_are_diffed_too
+/// - C6: the result is sorted.
+///   untested: no case has several keys; owed by the backfill
 pub fn new_findings(baseline: &[Finding], checked: &ScopedFindings) -> Vec<Finding> {
     let base = restrict(baseline, &checked.files);
     let mut groups: BTreeMap<Key, (Vec<u32>, Vec<u32>)> = BTreeMap::new();
@@ -64,6 +82,12 @@ pub fn new_findings(baseline: &[Finding], checked: &ScopedFindings) -> Vec<Findi
 }
 
 /// Same multiset of keys (code, message, path), lines ignored. Used by the revert assertion.
+///
+/// # Contract
+/// - C1: lines are ignored.
+///   tested: domain::baseline::tests::same_findings_ignores_lines_counts_copies
+/// - C2: copies are counted.
+///   tested: domain::baseline::tests::same_findings_ignores_lines_counts_copies
 pub fn same_findings(a: &[Finding], b: &[Finding]) -> bool {
     let mut ka: Vec<Key> = a.iter().map(key).collect();
     let mut kb: Vec<Key> = b.iter().map(key).collect();
@@ -95,6 +119,19 @@ mod tests {
             files: files(paths),
             findings,
         }
+    }
+
+    #[test]
+    fn restrict_keeps_listed_paths_in_order() {
+        let input = vec![
+            f("E0599", "m", "b.rs", 3),
+            f("E0599", "m", "a.rs", 9),
+            f("E0308", "n", "a.rs", 2),
+        ];
+        assert_eq!(
+            restrict(&input, &files(&["a.rs"])),
+            vec![f("E0599", "m", "a.rs", 9), f("E0308", "n", "a.rs", 2)]
+        );
     }
 
     #[test]

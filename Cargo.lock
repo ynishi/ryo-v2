@@ -2165,6 +2165,7 @@ name = "ryo-v2-core"
 version = "0.1.0"
 dependencies = [
  "arch-lint",
+ "syn 2.0.119",
  "thiserror",
 ]
 
