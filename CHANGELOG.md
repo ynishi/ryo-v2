@@ -21,8 +21,8 @@ and this project adheres to
   options, in `SEARCH_LEDGER.md` ("Decisions in force"); they replace the former `docs/adr`
   files, which are removed.
 - `CONTRIBUTING.md`: the "Development flow" section (worktree per implementer, local merge by the
-  maintainer, open work in the ledgers, a guard for every decision, no execution environment in
-  files, test strength managed as a measured risk).
+  maintainer, open work in `CHECK_LEDGER.md`, a guard for every decision, no execution environment
+  in files, test strength managed as a measured risk).
 - `CHECK_LEDGER.md`: the sections "Test strength (risk)" and "Open work".
 - `corpus/README.md`: the provenance of the fixtures.
 
@@ -30,3 +30,9 @@ and this project adheres to
 
 - Details of private execution environments are removed from the documentation; commands use the
   placeholders `<BASE>` and `<OUT>`.
+- `PUBLIC_DEVELOPMENT.md`, `CONTRIBUTING.md` and `AGENTS.md` agree with the development flow:
+  while no issue tracker is used, a `CHECK_LEDGER.md` "Open work" row stands for the issue and the
+  hand-over note for the pull request body; the review questions are one numbered list, including
+  which test or ceiling guards each decision; branch types include `refactor` and `chore`.
+- `docs/bench-m2.md`: the large-run steps export ryo-rs with `git archive` as the run did, with
+  placeholders instead of a path.
