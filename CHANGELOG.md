@@ -25,6 +25,9 @@ and this project adheres to
   in files, test strength managed as a measured risk).
 - `CHECK_LEDGER.md`: the sections "Test strength (risk)" and "Open work".
 - `corpus/README.md`: the provenance of the fixtures.
+- `SEARCH_LEDGER.md`: the first search-recall runs on ryo-rs (a verification repository used as a
+  large sample): recall, generation, outer check and perf triggers, verdict insufficient;
+  `CHECK_LEDGER.md` "Open work" holds what they found.
 
 ### Changed
 
