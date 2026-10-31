@@ -1,0 +1,21 @@
+[package]
+name = "ryo-v2-ledger-merge"
+description = "Merge driver of the ryo-v2 ledgers: a three-way merge of Markdown by section and by table row"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ledger-merge"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
