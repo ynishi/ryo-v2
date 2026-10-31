@@ -55,7 +55,7 @@ large sample.
 
 ## Counts
 
-Corpus and runs: 2026-10-31, repo HEAD 64dcbfb plus the uncommitted M4 work (T1 to T4), rustc
+Corpus and runs of the small bases: 2026-10-31, repo HEAD 64dcbfb plus the uncommitted M4 work (T1 to T4), rustc
 1.98.1, ra_ap 0.0.358, 12 threads, 30 GiB, proc-macro on,
 `RaConfig.assert_revert_every = 50` (decision D2), `MetricJudge`, `SyntaxAssessor`, Affected scope,
 one session per workspace, no probes.
@@ -63,9 +63,10 @@ one session per workspace, no probes.
 | corpus | decisions | depth 2 | skipped | generated | hit | recall@20 | generation | status |
 |---|---|---|---|---|---|---|---|---|
 | small bases (below) | 39 | 10 | 0 | 31 | 30 | 0.97 | 0.79 | verdict adopt, 31 compared |
-| ryo-rs | - | - | - | - | - | - | - | pending: large run |
+| ryo-rs | 11 | 2 | 0 | 6 | 6 | 1.00 | 0.55 | verdict insufficient, 6 compared |
 
-ryo-rs here is ryo-rs (a verification repository used as a large sample).
+ryo-rs here is ryo-rs (a verification repository used as a large sample); its run, with the
+machine it ran on, is in section "ryo-rs (large run)".
 
 The small bases are tiny (the four `corpus/base` workspaces hold 691 lines in all) and give almost
 no site; most decisions come from `search-lab`, a hand-written workspace of two crates (`geo`: 4
@@ -279,7 +280,7 @@ report an error the unedited workspace does not:
 | corpus | decided candidates | failed | rate |
 |---|---|---|---|
 | small bases | 114 | 14 | 0.12 |
-| ryo-rs | - | - | pending: large run |
+| ryo-rs | 30 | 2 | 0.07 |
 
 All 14 failures are E0255 (a name defined by an item and by a `use` in the same module), in 11
 decisions: the 9 single `misplace-item` decisions and 2 pairs that contain one. They are the 2nd
@@ -291,17 +292,107 @@ decision that plants no `misplace-item` had no failing candidate. (The pairs `in
 plus `misplace-item` and `inline-variable` plus `misplace-item` had none either: their `Decided`
 candidates did not include the bad move.)
 
-## Perf triggers (decision D4, small bases)
+On ryo-rs (a verification repository used as a large sample; run 3 of section "ryo-rs (large
+run)") 2 of 30 decided candidates failed, in 10 decisions (`inline-variable-0` had no candidate),
+both in `misplace-item` decisions: candidate 0 of `misplace-item-0` reports E0255 at
+`crates/ryo-agent/src/decide.rs:147`, candidate 1 of `misplace-item-2` reports E0204 (a `Copy`
+impl on a type with a field that is not `Copy`) at `crates/ryo-agent/src/decide.rs:150` (paths
+inside ryo-rs). The harness counts 1 of the 10 first candidates of a decision as failed: candidate
+0 of `misplace-item-0`, a decision whose planted best was not generated. rust-analyzer's
+diagnostics passed both candidates and only the outer `cargo check` rejected them: two more errors
+the search's check misses (CHECK_LEDGER Open work M-10).
+
+## ryo-rs (large run)
+
+ryo-rs is a verification repository used as a large sample. The 11 cases of step 1 of section
+"Large runs" (ryo-rs at its commit 67b0ebfb, `probes = []`) were run on 2026-11-01 with the
+options of steps 2 and 3, on 16 cores and 30 GiB with the machine otherwise idle, three runs one
+after the other (no two at once): run 1 at beam 20, run 2 with `--exhaustive --limit 10`, run 3 as
+run 1 with `--outer-check`. Run 3 gives the same table and the same beam rank, fate and final rank
+for every decision as run 1; its outer check is in section "Outer check". The numbers of this
+section are from run 1 unless a run is named.
+
+Run 1 (360,538 ms, 172 checks):
+
+| set | decisions | skipped | generated | hit | recall@20 | hit/all | generation | top-3 |
+|---|---|---|---|---|---|---|---|---|
+| all | 11 | 0 | 6 | 6 | 1.00 | 0.55 | 0.55 | 0.27 |
+| kind inline-variable | 4 | 0 | 1 | 1 | 1.00 | 0.25 | 0.25 | 0.25 |
+| kind misplace-item | 3 | 0 | 1 | 1 | 1.00 | 0.33 | 0.33 | 0.33 |
+| kind obscure-name | 6 | 0 | 5 | 5 | 1.00 | 0.83 | 0.83 | 0.17 |
+| depth 1 | 9 | 0 | 5 | 5 | 1.00 | 0.56 | 0.56 | 0.33 |
+| depth 2 | 2 | 0 | 1 | 1 | 1.00 | 0.50 | 0.50 | 0.00 |
+
+(The one workspace row, `ws ryo-rs`, equals `all`.)
+
+Verdict: **insufficient**: recall@20 1.00 over 6 generated decisions, fewer than the 30 compared
+decisions that decide anything. 0 misses in 6 put the true miss rate at most 0.39 at 95 % (exact
+binomial, one-sided), so the run adds no evidence for or against H6 beyond the small bases.
+
+| decision | kinds | depth | generated | hit | beam rank | fate | final rank | proposed | kept | wall ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ryo-rs/inline-variable-0 | inline-variable | 1 | no | no | - | no-candidates | - |  |  | 1504 |
+| ryo-rs/inline-variable-1 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 6845 |
+| ryo-rs/inline-variable-2 | inline-variable | 1 | no | no | - | - | - | 15 | 15 | 4668 |
+| ryo-rs/misplace-item-0 | misplace-item | 1 | no | no | - | - | - | 5 | 5 | 4741 |
+| ryo-rs/misplace-item-1 | misplace-item | 1 | no | no | - | - | - | 3 | 3 | 3642 |
+| ryo-rs/misplace-item-2 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 7 | 7 | 8986 |
+| ryo-rs/obscure-name-0 | obscure-name | 1 | yes | yes | 3 | passed | 3 | 17 | 17 | 13086 |
+| ryo-rs/obscure-name-1 | obscure-name | 1 | yes | yes | 2 | passed | 5 | 16 | 16 | 44457 |
+| ryo-rs/obscure-name-2 | obscure-name | 1 | yes | yes | 1 | passed | 1 | 12 | 12 | 32150 |
+| ryo-rs/pair-obscure-name-inline-variable-0 | obscure-name+inline-variable | 2 | no | no | - | - | - | 44/175 | 20/20 | 79077 |
+| ryo-rs/pair-obscure-name-obscure-name-0 | obscure-name+obscure-name | 2 | yes | yes | 13 | passed | 12 | 27/107 | 20/20 | 90682 |
+
+Every generated best survived the pruning (dropped at: none), and the noul audit is empty (0
+flawed children checked anyway). At depth 1 the beam does not fill (at most 17 children proposed); in
+both pairs it is full at both depths, and the obscure-name pair keeps its best at beam rank 13.
+
+Generation is 6 of 11 (0.55; the small bases give 0.79). The five decisions whose best is never
+generated are `inline-variable-0` (no candidate at all, fate `no-candidates`), `inline-variable-2`,
+`misplace-item-0`, `misplace-item-1` and the pair `obscure-name` plus `inline-variable`. Their
+cause is not investigated (CHECK_LEDGER Open work S-4); whether the inline-variable ones are the
+`let`-initializer gap of section "Generation" is not checked.
+
+Run 2 (`--exhaustive --limit 10`: beam 200, no wall limit, the first 10 cases, which leaves out
+`pair-obscure-name-obscure-name-0`; 466,780 ms, 304 checks): 5 of the 10 decisions generate the
+best and all 5 survive (recall@200 1.00, generation 0.50, top-3 0.30, verdict insufficient). The
+9 depth-1 decisions have the same generated, beam rank and final rank as in run 1. The pair
+`obscure-name` plus `inline-variable` keeps every child at depth 1 (44 of 44, and 169 of 175 at
+depth 2) and still does not generate its best, so that miss is the expander's, not the beam's.
+
+Each of the three runs hit one panic inside rust-analyzer's syntax factory, raised from the
+expander, and went on past it; the harness does not count it, so the tables above do not show it
+(CHECK_LEDGER Open work S-3 and R-5).
+
+## Perf triggers (decision D4)
 
 The table is filled by every run; the small bases cannot fire trigger 1 to 3 (they are tiny). The
-ryo-rs run decides them.
+ryo-rs column is run 1 of section "ryo-rs (large run)" (ryo-rs is a verification repository used
+as a large sample; 16 cores, 30 GiB, the machine otherwise idle).
 
 | trigger | limit | small bases | ryo-rs |
 |---|---|---|---|
-| 1 median decision | 300,000 ms | 138 ms (not fired) | pending |
-| 2 median warm check (Affected) | 5,000 ms | 5 ms over 565 checks (not fired) | pending |
-| 3 RSS after 1,000 checks, or check time x1.5 | 8 GiB, or 1,500 permille of the first 100 checks | 595,024 kB after 565 checks; both halves not measured: fewer than 1,000 checks | pending |
-| 4 one recall run | 600,000 ms | 14,556 ms (not fired) | pending |
+| 1 median decision | 300,000 ms | 138 ms (not fired) | 8,986 ms (not fired) |
+| 2 median warm check (Affected) | 5,000 ms | 5 ms over 565 checks (not fired) | 1,476 ms over 172 checks (not fired) |
+| 3 RSS after 1,000 checks, or check time x1.5 | 8 GiB, or 1,500 permille of the first 100 checks | 595,024 kB after 565 checks; both halves not measured: fewer than 1,000 checks | 5,653,460 kB after 172 checks; both halves not measured: fewer than 1,000 checks |
+| 4 one recall run | 600,000 ms | 14,556 ms (not fired) | 360,538 ms (not fired) |
+
+The other two ryo-rs runs: run 2 (`--exhaustive --limit 10`) 9,810 ms, 847 ms over 304 checks,
+5,701,156 kB after 304 checks (both halves of trigger 3 not measured) and 466,780 ms, none fired;
+run 3 (`--outer-check`) 10,149 ms, 1,265 ms over 172 checks, 5,645,592 kB after 172 checks (not
+measured) and 983,033 ms, trigger 4 printed as fired. Triggers 1 and 2 fired in no run, and
+trigger 3 is not measured on ryo-rs: no run reached 1,000 checks.
+
+Trigger 4 in run 3: the decisions of run 3 take about as long as those of run 1 (their wall times
+sum to 277,368 ms against 289,838 ms), and the rest of the run is 705,665 ms against 70,700 ms
+in run 1. The difference, 634,965 ms, is the outer `cargo check` of the 30 decided candidates
+(about 21 s per candidate, derived from these sums, not measured per candidate), which runs after
+each search and outside it. D4
+states trigger 4 for one recall run in CI; none of the three runs ran in CI, and the recall run
+without the outer check (run 1) is below the limit. By D4's text, trigger 4 therefore opens no perf
+task, and none of the steps (a) to (d) of its work order would shorten the outer check. Whether a
+run with `--outer-check` counts for trigger 4 is not stated by D4, and the harness prints it as
+fired whatever the run (CHECK_LEDGER Open work S-5).
 
 ## Large runs (not run in the default test suite)
 
@@ -318,7 +409,12 @@ tree and `<OUT>` a directory without a `target` path component:
    committed (they name `<BASE>`) and have `probes = []`.
 2. The run (longer than 10 minutes): `cargo run -q -p ryo-v2-oracle --bin
    search-recall -- run <OUT>/ryo-rs --report <OUT>/ryo-rs.json --markdown <OUT>/ryo-rs.md`.
+   Done 2026-11-01 on ryo-rs (a verification repository used as a large sample) with the 11
+   cases of step 1, in 360,538 ms, on 16 cores and 30 GiB with the machine otherwise idle.
 3. The same with `--exhaustive --limit 10`, and with `--outer-check`, then paste the tables here.
+   Done 2026-11-01 on the same machine, after step 2 and one after the other (no two runs at
+   once): `--exhaustive --limit 10` in 466,780 ms, `--outer-check` in 983,033 ms. The tables are
+   in sections "ryo-rs (large run)", "Outer check" and "Perf triggers".
 
 ## KNOWN LIMITATIONS
 
@@ -341,6 +437,7 @@ tree and `<OUT>` a directory without a `target` path component:
 - **Score weights are untuned** (`DEFAULT_WEIGHTS`): the restore of an inline-function plant is
   never the top reward (above). They are to be set from this table, not before.
 - **A small corpus.** 39 decisions on tiny code, 28 of them depth 1 where the beam does not fill;
-  the narrow-beam runs and the depth-2 pairs carry the evidence. A larger base is the large run.
+  the narrow-beam runs and the depth-2 pairs carry the evidence. A larger base is the large run,
+  whose 11 decisions on ryo-rs (6 compared) decide nothing either.
 - **The `let`-initializer gap of the expander** limits which inline-variable plants are generated
   (above).
