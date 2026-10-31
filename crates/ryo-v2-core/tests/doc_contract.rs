@@ -153,7 +153,7 @@ struct Stats {
 const UNTESTED_CEILING: usize = 1;
 
 /// Only goes down. Equals the number of glossary gaps in the workspace.
-const GLOSSARY_GAP_CEILING: usize = 10;
+const GLOSSARY_GAP_CEILING: usize = 0;
 
 /// (package, file) holding the `# Glossary`; its module doc is owned by `domain`.
 const GLOSSARY_AT: (&str, &str) = ("ryo-v2-core", "src/domain/mod.rs");
@@ -935,6 +935,7 @@ fn workspace_sources() -> Vec<Source> {
 }
 
 #[test]
+#[allow(clippy::absurd_extreme_comparisons)] // the ceiling is 0 when no glossary gap remains; the check stays so a gap cannot return
 fn workspace_doc_contracts_hold() {
     let started = Instant::now();
     let sources = workspace_sources();

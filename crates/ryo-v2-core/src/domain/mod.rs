@@ -30,6 +30,14 @@
 //!   includes: Source, BuildScript, ProcMacroSource, Manifest
 //! - Rule: the record of one review done at registration, allowing auto-apply of one intent kind.
 //! - RuleCatalog: the registered rules, at most one per intent kind.
+//! - Resolution: the outcome of resolving a set of blueprints.
+//!   includes: Decided, Stopped, Failed
+//! - Disposition: what may happen to a passing candidate.
+//!   includes: AutoApplicable, AfterOuterCheck, NeedsReview
+//! - Blocking: why a blueprint was not made a candidate.
+//!   includes: Unverifiable, Stale, MissingFile, Nonconforming, Splice
+//! - CheckError: failure of a verifier check.
+//!   includes: Edit, Cancelled, Panicked, RevertMismatch, Poisoned
 //! - Verdict: the new errors relative to the baseline; passed if and only if there are none.
 //! - DecisionRecord: the proposer's identity and rationale, carried in the blueprint.
 //! - SpecRef: an opaque label linking a blueprint to a spec item.
