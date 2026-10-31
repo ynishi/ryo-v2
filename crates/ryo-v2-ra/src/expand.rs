@@ -12,7 +12,7 @@ use crate::RaAnalyzer;
 use crate::check::{fingerprints, map_error};
 use crate::diagnostics::{diagnostics_config, panic_message};
 use crate::fork::db_text;
-use crate::session::RaSession;
+use crate::session::{ExpanderPanic, RaSession};
 use ra_ap_hir::{Crate, PrefixKind};
 use ra_ap_ide::TextRange as RaRange;
 use ra_ap_ide::{
@@ -692,7 +692,11 @@ impl<'a> Env<'a> {
                 let Some(e) = ast::Expr::cast(n) else {
                     continue;
                 };
-                if !is_variable_shape(&e) || is_simple_let_init(&e) || is_assign_target(&e) {
+                if !is_variable_shape(&e)
+                    || is_simple_let_init(&e)
+                    || is_assign_target(&e)
+                    || !is_nameable_field_value(&e)
+                {
                     continue;
                 }
                 let r = e.syntax().text_range();
@@ -1160,33 +1164,74 @@ impl<'a> Env<'a> {
 
     // ---- driver ----
 
+    /// Runs one call unit of `kind` on `file`: the seeds of a target, or a call that reaches
+    /// rust-analyzer (`call`: realizing one seed, or the candidates of a target). A panic inside
+    /// it is recorded on the session and gives `T::default()` (no seeds, no candidates), so one
+    /// bad shape costs that unit and not the other kinds' Blueprints nor the whole generation.
+    /// The injected test fault fires only in `call` units.
+    fn contained<T: Default>(
+        &self,
+        kind: IntentKind,
+        file: FileId,
+        call: bool,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let fault = call && self.sess.expander_fault == Some(kind);
+        let got = catch_unwind(AssertUnwindSafe(|| {
+            assert!(!fault, "expander fault injected on {kind:?}");
+            f()
+        }));
+        match got {
+            Ok(v) => v,
+            Err(p) => {
+                self.sess
+                    .expander_panics
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(ExpanderPanic {
+                        kind: Some(kind),
+                        path: self.by_file.get(&file).cloned(),
+                        message: panic_message(p),
+                    });
+                T::default()
+            }
+        }
+    }
+
     fn lazy<'e>(&'e self, kind: IntentKind, t: &TInfo) -> Box<dyn Iterator<Item = Blueprint> + 'e> {
+        let file = t.file;
         match kind {
             IntentKind::RenameLocal => Box::new(
-                self.rename_seeds(t)
+                self.contained(kind, file, false, || self.rename_seeds(t))
                     .into_iter()
-                    .flat_map(move |s| self.rename_realize(&s))
+                    .flat_map(move |s| {
+                        self.contained(kind, s.file, true, || self.rename_realize(&s))
+                    })
                     .filter_map(move |c| self.finish(c)),
             ),
             IntentKind::ExtractVariable => Box::new(
-                self.extract_var_seeds(t)
+                self.contained(kind, file, false, || self.extract_var_seeds(t))
                     .into_iter()
-                    .flat_map(move |s| self.extract_var_realize(&s))
+                    .flat_map(move |s| {
+                        self.contained(kind, s.file, true, || self.extract_var_realize(&s))
+                    })
                     .filter_map(move |c| self.finish(c)),
             ),
             IntentKind::AddDerive => Box::new(
-                self.add_derive_cands(t)
+                self.contained(kind, file, true, || self.add_derive_cands(t))
                     .into_iter()
                     .filter_map(move |c| self.finish(c)),
             ),
             IntentKind::ExtractFunction => Box::new(
-                self.extract_fn_seeds(t)
+                self.contained(kind, file, false, || self.extract_fn_seeds(t))
                     .into_iter()
-                    .flat_map(move |s| self.extract_fn_realize(&s))
+                    .flat_map(move |s| {
+                        self.contained(kind, s.file, true, || self.extract_fn_realize(&s))
+                    })
                     .filter_map(move |c| self.finish(c)),
             ),
             IntentKind::MoveItem => Box::new(
-                self.move_item_cands(t)
+                self.contained(kind, file, true, || self.move_item_cands(t))
                     .into_iter()
                     .filter_map(move |c| self.finish(c)),
             ),
@@ -1280,6 +1325,20 @@ fn is_simple_let_init(e: &ast::Expr) -> bool {
             matches!(l.pat(), Some(ast::Pat::IdentPat(_)))
                 && l.initializer().is_some_and(|i| i.syntax() == e.syntax())
         })
+}
+
+/// Whether extract-variable may be offered `e`. False for the value of a record-expression field
+/// whose text does not begin with the field's name (an attribute or comment comes first):
+/// rust-analyzer names the variable after the field's whole text, which is then no identifier,
+/// and its syntax factory panics on it.
+fn is_nameable_field_value(e: &ast::Expr) -> bool {
+    let Some(field) = e.syntax().parent().and_then(ast::RecordExprField::cast) else {
+        return true;
+    };
+    let Some(name) = field.name_ref() else {
+        return true;
+    };
+    field.syntax().text().to_string().starts_with(name.text())
 }
 
 /// Whether `e` is the left side of an assignment.
@@ -1376,10 +1435,20 @@ fn generate(
     match got {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(msg)) => Err(ExpandError::Analysis(msg)),
-        Err(p) => Err(ExpandError::Analysis(format!(
-            "rust-analyzer panicked: {}",
-            panic_message(p)
-        ))),
+        Err(p) => {
+            let message = panic_message(p);
+            sess.expander_panics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(ExpanderPanic {
+                    kind: None,
+                    path: None,
+                    message: message.clone(),
+                });
+            Err(ExpandError::Analysis(format!(
+                "rust-analyzer panicked: {message}"
+            )))
+        }
     }
 }
 
@@ -1410,6 +1479,10 @@ fn generate(
 /// - C8: ids are UUID version 7 and the same input gives the same ids; a different state gives
 ///   different ids.
 ///   tested: tests/expand.rs blueprint_ids_are_v7_and_deterministic
+/// - C9: extract-variable never offers the value of a record field whose text does not start with
+///   its name (rust-analyzer would build a name from the whole field text and panic); the other
+///   expressions of the same function are still offered.
+///   tested: tests/expand_panics.rs extract_variable_skips_the_value_of_an_attributed_record_field
 impl Expander for RaAnalyzer {
     type Session = RaSession;
 
@@ -1464,5 +1537,37 @@ impl Expander for RaAnalyzer {
             return Err(ExpandError::Session(map_error(e, &paths)));
         }
         out.unwrap_or_else(|| Ok(Vec::new()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The first call expression of `src` in a function body.
+    fn first_call(src: &str) -> ast::Expr {
+        let file = ast::SourceFile::parse(src, ra_ap_syntax::Edition::CURRENT).tree();
+        file.syntax()
+            .descendants()
+            .filter_map(ast::CallExpr::cast)
+            .map(ast::Expr::CallExpr)
+            .find(|e| e.syntax().text() == "f()")
+            .expect("a call f()")
+    }
+
+    #[test]
+    fn a_field_value_behind_an_attribute_is_not_nameable() {
+        let e = first_call("fn g() { S { #[cfg(x)] a: f() }; }");
+        assert!(!is_nameable_field_value(&e));
+    }
+
+    #[test]
+    fn a_plain_field_value_and_a_non_field_expression_are_nameable() {
+        assert!(is_nameable_field_value(&first_call(
+            "fn g() { S { a: f() }; }"
+        )));
+        assert!(is_nameable_field_value(&first_call(
+            "fn g() { let x = f(); }"
+        )));
     }
 }
