@@ -105,6 +105,16 @@ and this project adheres to
   it, and an item whose line ends with a `//` comment (move-item's reverse move). On the small
   bases the generation rate goes from 0.74 to 1.00 and recall@20 from 0.97 (31 compared) to 0.90
   (42 compared), verdict adopt; `corpus/search/base/gen-lab` holds a case of each new shape.
+- The expander proposes the restore of three more planted shapes, the causes of the misses on
+  ryo-rs (a verification repository used as a large sample): an item with a `///` doc line moved
+  to another module file (rust-analyzer gives a doc comment its own syntax kind, and the reverse
+  move dropped the doc; the forward move of a documented private item wrote `pub(crate)` before
+  the doc line), and a reference or a literal folded into a call argument (extract-variable now
+  offers a reference or literal that is a whole argument of a call or method call, and no other
+  new shape). On the small bases with the new `corpus/search/base/shape-lab` cases the generation
+  rate goes from 0.93 to 1.00 and recall@20 from 0.90 (42 compared) to 0.91 (45 compared), verdict
+  adopt. `SEARCH_LEDGER.md` has the second ryo-rs run (generation 0.64, recall@20 0.86 over 7,
+  verdict insufficient, outer check 0 of 33 failing) with the cause of each miss.
 - Extract-variable no longer proposes a name the block already reads outside the extracted
   expression: rust-analyzer may name the value after a local in scope, and the new `let` would
   shadow it for the later reads.
