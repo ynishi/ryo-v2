@@ -55,13 +55,39 @@ just worktree-new <type> <slug>
 That is `git fetch origin`, then a `git worktree add` of a new `<type>/<slug>`
 branch cut from `origin/main` — one worktree per issue, in a directory
 `.gitignore` covers (the `Justfile` names it) — then `just branch-check` to
-verify the base before you build on it. Run it from the main checkout, and
-remove the worktree once the branch is merged.
+verify the base before you build on it: it refuses `main` and runs
+`base-check` (see [Verification](#verification)). Run it from the main
+checkout, and remove the worktree once the branch is merged.
+
+A branch cut from an older `main` can collide with the current one only in the
+build after the merge, so merge the current `main` into the branch before the
+final check; `just check` refuses the branch until you do.
+
+The ledgers (`CHECK_LEDGER.md`, `SEARCH_LEDGER.md`) gain and lose table rows and
+sections on every branch, and a line merge reports a conflict wherever two such
+edits touch. `.gitattributes` gives them a merge driver
+(`crates/ryo-v2-ledger-merge`) that merges by section and by table row, keyed by
+the heading and by the row's first cell: a change made on one side is taken, and
+a row or section both sides changed differently gets conflict markers around it
+alone. Which command a driver runs is set in each checkout's own git config,
+not in the tree, so a checkout registers it once with
+`just ledger-merge-install` (it builds the driver; worktrees of the checkout
+share it). A checkout without it merges the ledgers line by line, as before.
+`just ledger-merge-try <base> <ours> <theirs> [<expected>]` runs the driver on
+three files without git.
 
 ## Verification
 
-`just check` is the definition of green, and CI is where it runs. It formats,
-lints with warnings denied, tests, and runs `cargo deny`.
+`just check` is the definition of green, and CI is where it runs. It checks
+the base of the branch, formats, lints with warnings denied, tests, and runs
+`cargo deny`.
+
+The base check (`just base-check`) refuses a branch that does not contain
+`origin/main`, or the local `main` where there is no `origin/main`. It passes
+on `main` itself. Where it cannot tell — outside a git checkout of the tree (a
+copy without its history), in a shallow clone, or with neither ref — it says in
+one line that it skipped, and passes. The tests include that no file
+`.gitattributes` routes to the ledger merge driver holds a conflict marker.
 
 Report what was actually run; "I did not verify X" is a usable report, a green
 claim resting on a recipe nobody ran is not.
