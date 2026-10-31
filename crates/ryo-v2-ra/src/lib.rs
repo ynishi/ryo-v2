@@ -6,8 +6,10 @@
 //! fork. Nothing here runs cargo or rustc per candidate.
 #![warn(missing_docs)]
 
+mod assess;
 mod check;
 mod diagnostics;
+mod expand;
 mod fork;
 mod rev_deps;
 mod session;
@@ -18,6 +20,7 @@ use ryo_v2_core::domain::{Edit, Finding, Scope, ScopedFindings};
 use std::path::Path;
 use std::sync::Arc;
 
+pub use assess::SyntaxAssessor;
 pub use fork::RaFork;
 pub use session::RaSession;
 
@@ -66,16 +69,32 @@ pub struct RaAnalyzer {
     pub(crate) config: RaConfig,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) observer: Arc<dyn Observer>,
+    /// Cut-off of the diagnostics of one `Verifier::check`, in ms. A field of the analyzer and
+    /// not of `RaConfig`, so literals of `RaConfig` elsewhere keep compiling.
+    pub(crate) check_timeout_ms: Option<u64>,
 }
 
 impl RaAnalyzer {
-    /// Builds an analyzer; `clock` times the events that go to `observer`.
+    /// Builds an analyzer; `clock` times the events that go to `observer`. No check is cut off.
     pub fn new(config: RaConfig, clock: Arc<dyn Clock>, observer: Arc<dyn Observer>) -> Self {
         Self {
             config,
             clock,
             observer,
+            check_timeout_ms: None,
         }
+    }
+
+    /// Cut-off of the diagnostics of one `Verifier::check`; `None` (the default of `new`) = no
+    /// cut-off. Baseline, revert assert, revert audit and expansion are never cut off.
+    ///
+    /// # Contract
+    /// - C1: with `Some(limit_ms)` a `check` whose diagnostics reach the limit ends in
+    ///   `CheckError::TimedOut`; with `None` it never does.
+    ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
+    pub fn with_check_timeout(mut self, limit_ms: Option<u64>) -> RaAnalyzer {
+        self.check_timeout_ms = limit_ms;
+        self
     }
 }
 

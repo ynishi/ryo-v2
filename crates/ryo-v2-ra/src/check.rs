@@ -2,15 +2,20 @@
 //! session as it found it.
 
 use crate::RaAnalyzer;
+use crate::diagnostics::{Deadline, collect_errors_par};
 use crate::fork;
+use crate::rev_deps::scoped_files;
 use crate::session::RaSession;
-use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, FileFacts, Verifier};
+use ryo_v2_core::app::ports::{
+    Analyzer, AnalyzerError, CheckError, FileFacts, RevertAudit, Verifier,
+};
+use ryo_v2_core::domain::baseline::{restrict, same_findings};
 use ryo_v2_core::domain::text::revert_intact;
 use ryo_v2_core::domain::{Edit, Finding, Fingerprint, RelPath, Scope, ScopedFindings};
 use std::path::Path;
 
 /// Fingerprints of the database text of `paths` that are workspace files.
-fn fingerprints(session: &RaSession, paths: &[RelPath]) -> Vec<(RelPath, Fingerprint)> {
+pub(crate) fn fingerprints(session: &RaSession, paths: &[RelPath]) -> Vec<(RelPath, Fingerprint)> {
     paths
         .iter()
         .filter_map(|p| {
@@ -21,7 +26,7 @@ fn fingerprints(session: &RaSession, paths: &[RelPath]) -> Vec<(RelPath, Fingerp
         .collect()
 }
 
-fn map_error(e: AnalyzerError, edited: &[RelPath]) -> CheckError {
+pub(crate) fn map_error(e: AnalyzerError, edited: &[RelPath]) -> CheckError {
     match e {
         AnalyzerError::Edit { path, reason } => CheckError::Edit { path, reason },
         AnalyzerError::Cancelled => CheckError::Cancelled,
@@ -89,6 +94,11 @@ impl Verifier for RaAnalyzer {
     /// - C2: the diagnostic re-assert runs on every n-th call when `assert_revert_every` is
     ///   `Some(n)`.
     ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
+    /// - C3: with a cut-off set (`with_check_timeout`) a diagnostics step that is still running
+    ///   when the limit is reached ends in `CheckError::TimedOut`; the edits are still reverted,
+    ///   the text fingerprints still compared, and the session stays usable. The limit is
+    ///   looked at before each file, so one slow file can overrun it.
+    ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
     fn check(
         &self,
         s: &mut RaSession,
@@ -101,6 +111,7 @@ impl Verifier for RaAnalyzer {
         let mut edited: Vec<RelPath> = edits.iter().map(|e| e.path.clone()).collect();
         edited.sort();
         edited.dedup();
+        s.edited_since_audit.extend(edited.iter().cloned());
         let before = fingerprints(s, &edited);
 
         s.check_count = s.check_count.wrapping_add(1);
@@ -112,7 +123,7 @@ impl Verifier for RaAnalyzer {
         if sampled {
             s.assert_revert = true;
         }
-        let outcome = run_fork(self, s, edits, scope);
+        let (outcome, timed_out) = run_fork(self, s, edits, scope);
         s.assert_revert = saved_assert;
 
         let after = fingerprints(s, &edited);
@@ -123,27 +134,87 @@ impl Verifier for RaAnalyzer {
             ));
             return Err(CheckError::RevertMismatch { paths });
         }
-        outcome.map_err(|e| map_error(e, &edited))
+        match (outcome, self.check_timeout_ms) {
+            (Err(AnalyzerError::Cancelled), Some(limit_ms)) if timed_out => {
+                Err(CheckError::TimedOut { limit_ms })
+            }
+            (outcome, _) => outcome.map_err(|e| map_error(e, &edited)),
+        }
+    }
+}
+
+/// Re-diagnosing the files edited since the last audit, to catch a revert that left a trace the
+/// text fingerprints cannot show.
+///
+/// # Contract
+/// - C1: after checks whose reverts were clean, `audit_revert` is `Ok` and forgets the paths
+///   it audited; with nothing recorded it is `Ok` and diagnoses nothing.
+///   tested: tests/timeout.rs audit_revert_is_ok_after_checks_and_refuses_poisoned
+/// - C2: a session already poisoned gives `CheckError::Poisoned`.
+///   tested: tests/timeout.rs audit_revert_is_ok_after_checks_and_refuses_poisoned
+impl RevertAudit for RaAnalyzer {
+    fn audit_revert(&self, s: &mut RaSession) -> Result<(), CheckError> {
+        if let Some(msg) = &s.poisoned {
+            return Err(CheckError::Poisoned(msg.clone()));
+        }
+        if s.edited_since_audit.is_empty() {
+            return Ok(());
+        }
+        let edited: Vec<RelPath> = std::mem::take(&mut s.edited_since_audit)
+            .into_iter()
+            .collect();
+        let refs: Vec<&RelPath> = edited.iter().collect();
+        let scope = scoped_files(&s.files, &s.rev_deps, &refs);
+        let found = collect_errors_par(
+            &s.host,
+            &scope,
+            s.threads,
+            s.unresolved_paths,
+            // An audit is never cut off.
+            None,
+        )
+        .map_err(|e| map_error(e, &edited))?;
+        let paths: Vec<RelPath> = scope.iter().map(|(_, r)| r.clone()).collect();
+        if same_findings(&found, &restrict(&s.baseline, &paths)) {
+            Ok(())
+        } else {
+            s.poisoned = Some("diagnostics after revert differ from the baseline".to_owned());
+            Err(CheckError::RevertMismatch { paths: edited })
+        }
     }
 }
 
 /// fork, apply, diagnostics, discard; discard always runs. The `Err` that wins: apply, then
-/// diagnostics, then discard (the same as `app::verify`).
+/// diagnostics, then discard (the same as `app::verify`). The flag says that the cut-off ended
+/// the diagnostics.
 fn run_fork(
     a: &RaAnalyzer,
     s: &mut RaSession,
     edits: &[Edit],
     scope: Scope,
-) -> Result<ScopedFindings, AnalyzerError> {
-    let mut f = a.fork(s)?;
+) -> (Result<ScopedFindings, AnalyzerError>, bool) {
+    let mut f = match a.fork(s) {
+        Ok(f) => f,
+        Err(e) => return (Err(e), false),
+    };
     let applied = a.apply(s, &mut f, edits);
+    let mut timed_out = false;
     let checked = match applied {
-        Ok(()) => Some(a.diagnostics(s, &f, scope)),
+        Ok(()) => {
+            s.deadline = a
+                .check_timeout_ms
+                .map(|ms| Deadline::after(a.clock.clone(), ms));
+            let r = a.diagnostics(s, &f, scope);
+            timed_out = s.deadline.take().is_some_and(|d| d.was_hit());
+            Some(r)
+        }
         Err(_) => None,
     };
     let discarded = a.discard(s, f);
-    applied?;
-    let checked = checked.unwrap_or_else(|| Ok(ScopedFindings::default()))?;
-    discarded?;
-    Ok(checked)
+    let outcome = applied.and_then(|()| {
+        let found = checked.unwrap_or_else(|| Ok(ScopedFindings::default()))?;
+        discarded?;
+        Ok(found)
+    });
+    (outcome, timed_out)
 }

@@ -10,9 +10,11 @@ use ra_ap_ide::{TextRange, TextSize};
 use ra_ap_ide_db::imports::insert_use::{ImportGranularity, InsertUseConfig};
 use ra_ap_ide_db::{RootDatabase, SnippetCap};
 use ra_ap_vfs::FileId;
-use ryo_v2_core::app::ports::AnalyzerError;
+use ryo_v2_core::app::ports::{AnalyzerError, Clock};
 use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Maps a rust-analyzer code to an E-code where it is one.
 pub(crate) fn classify(code: &DiagnosticCode) -> FindingCode {
@@ -78,16 +80,55 @@ pub(crate) fn diagnostics_config() -> DiagnosticsConfig {
     }
 }
 
+/// A point in time after which diagnostics stop. Cooperative: it is looked at before each file,
+/// so one slow file can overrun it.
+pub(crate) struct Deadline {
+    clock: Arc<dyn Clock>,
+    at_ms: u64,
+    hit: AtomicBool,
+}
+
+impl Deadline {
+    /// A deadline `limit_ms` after now on `clock`.
+    pub(crate) fn after(clock: Arc<dyn Clock>, limit_ms: u64) -> Self {
+        let at_ms = clock.now_ms().saturating_add(limit_ms);
+        Self {
+            clock,
+            at_ms,
+            hit: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the deadline is reached; remembers that it was.
+    fn expired(&self) -> bool {
+        let over = self.clock.now_ms() >= self.at_ms;
+        if over {
+            self.hit.store(true, Ordering::Relaxed);
+        }
+        over
+    }
+
+    /// Whether some diagnostics stopped because of this deadline.
+    pub(crate) fn was_hit(&self) -> bool {
+        self.hit.load(Ordering::Relaxed)
+    }
+}
+
 /// Error diagnostics of the files, sorted. With `db`, the unresolved names ra does not
-/// diagnose are added (see [`crate::unresolved`]).
+/// diagnose are added (see [`crate::unresolved`]). With `deadline`, stops with `Cancelled`
+/// before the first file it finds the deadline reached.
 fn collect_errors(
     analysis: &Analysis,
     db: Option<&RootDatabase>,
     files: &[(FileId, RelPath)],
+    deadline: Option<&Deadline>,
 ) -> Result<Vec<Finding>, AnalyzerError> {
     let diag_config = diagnostics_config();
     let mut errors = Vec::new();
     for (file_id, rel) in files {
+        if deadline.is_some_and(Deadline::expired) {
+            return Err(AnalyzerError::Cancelled);
+        }
         let got = catch_unwind(AssertUnwindSafe(|| {
             let diags = analysis
                 .full_diagnostics(&diag_config, AssistResolveStrategy::None, *file_id)
@@ -145,10 +186,11 @@ pub(crate) fn collect_errors_par(
     files: &[(FileId, RelPath)],
     threads: usize,
     unresolved: bool,
+    deadline: Option<&Deadline>,
 ) -> Result<Vec<Finding>, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
         let db = unresolved.then(|| host.raw_database().clone());
-        return collect_errors(&host.analysis(), db.as_ref(), files);
+        return collect_errors(&host.analysis(), db.as_ref(), files, deadline);
     }
     let chunk_size = files.len().div_ceil(threads);
     let chunks: Vec<&[(FileId, RelPath)]> = files.chunks(chunk_size).collect();
@@ -166,7 +208,7 @@ pub(crate) fn collect_errors_par(
             .into_iter()
             .zip(snapshots)
             .map(|(chunk, (analysis, db))| {
-                s.spawn(move || collect_errors(&analysis, db.as_ref(), chunk))
+                s.spawn(move || collect_errors(&analysis, db.as_ref(), chunk, deadline))
             })
             .collect();
         for h in handles {

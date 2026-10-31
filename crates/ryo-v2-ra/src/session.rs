@@ -1,7 +1,7 @@
 //! Loading a workspace into a session.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{collect_errors_par, panic_message};
+use crate::diagnostics::{Deadline, collect_errors_par, panic_message};
 use crate::rev_deps::{PathFacts, RevDeps, build_rev_deps};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -9,6 +9,7 @@ use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{FileId, Vfs};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
 use ryo_v2_core::domain::{Finding, RelPath};
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,20 @@ pub struct RaSession {
     pub(crate) path_facts: PathFacts,
     /// Number of `Verifier::check` calls so far.
     pub(crate) check_count: u32,
+    /// Cut-off of the diagnostics of the `check` that is running; `None` outside the diagnostics
+    /// step of a `check`.
+    pub(crate) deadline: Option<Deadline>,
+    /// Paths edited by every `check` since the last revert audit.
+    pub(crate) edited_since_audit: BTreeSet<RelPath>,
+}
+
+impl RaSession {
+    /// Marks the session unusable, as a panic inside the database would. For the tests of
+    /// callers that must refuse a poisoned session; nothing in the adapter calls it.
+    #[doc(hidden)]
+    pub fn poison(&mut self, reason: &str) {
+        self.poisoned = Some(reason.to_owned());
+    }
 }
 
 /// Relative path of `path` under `root`, as a [`RelPath`].
@@ -101,7 +116,8 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
 
     let t1 = a.clock.now_ms();
-    let baseline = collect_errors_par(&host, &files, threads, a.config.unresolved_paths)?;
+    // The baseline is never cut off.
+    let baseline = collect_errors_par(&host, &files, threads, a.config.unresolved_paths, None)?;
     let baseline_ms = a.clock.now_ms().saturating_sub(t1);
 
     a.observer.observe(Event::Loaded {
@@ -124,5 +140,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         live_fork: false,
         path_facts,
         check_count: 0,
+        deadline: None,
+        edited_since_audit: BTreeSet::new(),
     })
 }

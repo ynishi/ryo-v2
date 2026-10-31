@@ -180,6 +180,7 @@ pub(crate) fn diagnostics(
         &diag_scope,
         session.threads,
         session.unresolved_paths,
+        session.deadline.as_ref(),
     )?;
     let mut files: Vec<RelPath> = diag_scope.iter().map(|(_, r)| r.clone()).collect();
     files.sort();
@@ -242,6 +243,8 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
             &assert_scope,
             session.threads,
             session.unresolved_paths,
+            // Revert is outside the cut-off.
+            None,
         )?;
         Some(same_findings(&after, &want))
     } else {
