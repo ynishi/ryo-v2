@@ -1,7 +1,7 @@
 //! Forks: apply edits in place on the session, diagnose, revert.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{collect_errors_par, panic_message};
+use crate::diagnostics::{Detector, collect_errors_par, panic_message};
 use crate::rev_deps::scoped_files;
 use crate::session::RaSession;
 use ra_ap_base_db::salsa::Durability;
@@ -181,6 +181,10 @@ pub(crate) fn diagnostics(
         session.threads,
         session.unresolved_paths,
         session.deadline.as_ref(),
+        Detector {
+            fault: a.detector_fault.as_ref(),
+            panics: &session.detector_panics,
+        },
     )?;
     let mut files: Vec<RelPath> = diag_scope.iter().map(|(_, r)| r.clone()).collect();
     files.sort();
@@ -245,6 +249,10 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
             session.unresolved_paths,
             // Revert is outside the cut-off.
             None,
+            Detector {
+                fault: a.detector_fault.as_ref(),
+                panics: &session.detector_panics,
+            },
         )?;
         Some(same_findings(&after, &want))
     } else {
@@ -255,6 +263,8 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
         revert_ok,
     });
     if revert_ok == Some(false) {
+        session.poisoned =
+            Some("diagnostics after revert differ from the baseline (re-assert)".to_owned());
         return Err(AnalyzerError::RevertMismatch);
     }
     Ok(())

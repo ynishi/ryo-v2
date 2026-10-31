@@ -2,7 +2,7 @@
 //! session as it found it.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{Deadline, collect_errors_par};
+use crate::diagnostics::{Deadline, Detector, collect_errors_par};
 use crate::fork;
 use crate::rev_deps::scoped_files;
 use crate::session::RaSession;
@@ -99,6 +99,9 @@ impl Verifier for RaAnalyzer {
     ///   the text fingerprints still compared, and the session stays usable. The limit is
     ///   looked at before each file, so one slow file can overrun it.
     ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
+    /// - C4: a diagnostic re-assert that differs from the baseline is `RevertMismatch` and
+    ///   poisons the session; the next call is `Poisoned`.
+    ///   tested: tests/verifier.rs reassert_mismatch_poisons_the_session
     fn check(
         &self,
         s: &mut RaSession,
@@ -172,6 +175,10 @@ impl RevertAudit for RaAnalyzer {
             s.unresolved_paths,
             // An audit is never cut off.
             None,
+            Detector {
+                fault: self.detector_fault.as_ref(),
+                panics: &s.detector_panics,
+            },
         )
         .map_err(|e| map_error(e, &edited))?;
         let paths: Vec<RelPath> = scope.iter().map(|(_, r)| r.clone()).collect();

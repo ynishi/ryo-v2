@@ -1,7 +1,7 @@
 //! Loading a workspace into a session.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{Deadline, collect_errors_par, panic_message};
+use crate::diagnostics::{Deadline, Detector, collect_errors_par, panic_message};
 use crate::rev_deps::{PathFacts, RevDeps, build_rev_deps};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -12,6 +12,17 @@ use ryo_v2_core::domain::{Finding, RelPath};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// A file whose unresolved-path detector panicked: in the collect that hit it the file kept
+/// its rust-analyzer findings and contributed no detector findings.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DetectorPanic {
+    /// The file.
+    pub path: RelPath,
+    /// The panic message.
+    pub message: String,
+}
 
 /// A loaded workspace: the rust-analyzer database, its VFS and the baseline diagnostics.
 pub struct RaSession {
@@ -41,6 +52,8 @@ pub struct RaSession {
     pub(crate) deadline: Option<Deadline>,
     /// Paths edited by every `check` since the last revert audit.
     pub(crate) edited_since_audit: BTreeSet<RelPath>,
+    /// Detector panics contained so far; collects run on several threads and take `&RaSession`.
+    pub(crate) detector_panics: Mutex<BTreeSet<DetectorPanic>>,
 }
 
 impl RaSession {
@@ -49,6 +62,22 @@ impl RaSession {
     #[doc(hidden)]
     pub fn poison(&mut self, reason: &str) {
         self.poisoned = Some(reason.to_owned());
+    }
+
+    /// Every distinct detector panic since load, the baseline's included, sorted.
+    ///
+    /// # Contract
+    /// - C1: a panic of the detector on one file leaves load and the session usable (not
+    ///   poisoned); the file keeps its rust-analyzer findings, has no detector finding in that
+    ///   collect, and is listed here with the message.
+    ///   tested: tests/unresolved.rs detector_panic_is_contained_per_file
+    pub fn detector_panics(&self) -> Vec<DetectorPanic> {
+        self.detector_panics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -117,7 +146,18 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
 
     let t1 = a.clock.now_ms();
     // The baseline is never cut off.
-    let baseline = collect_errors_par(&host, &files, threads, a.config.unresolved_paths, None)?;
+    let detector_panics = Mutex::new(BTreeSet::new());
+    let baseline = collect_errors_par(
+        &host,
+        &files,
+        threads,
+        a.config.unresolved_paths,
+        None,
+        Detector {
+            fault: a.detector_fault.as_ref(),
+            panics: &detector_panics,
+        },
+    )?;
     let baseline_ms = a.clock.now_ms().saturating_sub(t1);
 
     a.observer.observe(Event::Loaded {
@@ -142,5 +182,6 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         check_count: 0,
         deadline: None,
         edited_since_audit: BTreeSet::new(),
+        detector_panics,
     })
 }

@@ -1,6 +1,8 @@
 //! Error diagnostics out of rust-analyzer, as domain [`Finding`]s.
 
+use crate::session::DetectorPanic;
 use crate::unresolved;
+use ra_ap_base_db::salsa::Cancelled;
 use ra_ap_hir::PrefixKind;
 use ra_ap_ide::{
     Analysis, AnalysisHost, AssistResolveStrategy, DiagnosticCode, DiagnosticsConfig,
@@ -12,9 +14,10 @@ use ra_ap_ide_db::{RootDatabase, SnippetCap};
 use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{AnalyzerError, Clock};
 use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath};
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Maps a rust-analyzer code to an E-code where it is one.
 pub(crate) fn classify(code: &DiagnosticCode) -> FindingCode {
@@ -114,6 +117,15 @@ impl Deadline {
     }
 }
 
+/// What a collect needs to run, and to report on, the unresolved-path detector.
+#[derive(Clone, Copy)]
+pub(crate) struct Detector<'a> {
+    /// File on which the detector is made to panic (test hook).
+    pub(crate) fault: Option<&'a RelPath>,
+    /// Where a contained detector panic is recorded.
+    pub(crate) panics: &'a Mutex<BTreeSet<DetectorPanic>>,
+}
+
 /// Error diagnostics of the files, sorted. With `db`, the unresolved names ra does not
 /// diagnose are added (see [`crate::unresolved`]). With `deadline`, stops with `Cancelled`
 /// before the first file it finds the deadline reached.
@@ -122,6 +134,7 @@ fn collect_errors(
     db: Option<&RootDatabase>,
     files: &[(FileId, RelPath)],
     deadline: Option<&Deadline>,
+    detector: Detector<'_>,
 ) -> Result<Vec<Finding>, AnalyzerError> {
     let diag_config = diagnostics_config();
     let mut errors = Vec::new();
@@ -157,7 +170,31 @@ fn collect_errors(
             }
             if let Some(db) = db {
                 let line_of = |at: TextSize| index.line_col(at).line + 1;
-                for (code, message, line) in unresolved::find(db, *file_id, &inactive, &line_of) {
+                // Only the detector is contained: a panic in it costs this file its detector
+                // findings, not the collect.
+                let found_paths = catch_unwind(AssertUnwindSafe(|| {
+                    if detector.fault == Some(rel) {
+                        panic!("unresolved-path detector fault injected on {rel}");
+                    }
+                    unresolved::find(db, *file_id, &inactive, &line_of)
+                }))
+                .unwrap_or_else(|payload| {
+                    // salsa 0.28 raises its cancellation with `resume_unwind`; it is not a
+                    // detector fault, so it goes on to the outer catch as before.
+                    if payload.downcast_ref::<Cancelled>().is_some() {
+                        std::panic::resume_unwind(payload);
+                    }
+                    detector
+                        .panics
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(DetectorPanic {
+                            path: rel.clone(),
+                            message: panic_message(payload),
+                        });
+                    Vec::new()
+                });
+                for (code, message, line) in found_paths {
                     // The same code on the same line: ra already says it.
                     if !ra_keys.contains(&(code.clone(), line)) {
                         found.push(Finding {
@@ -187,10 +224,11 @@ pub(crate) fn collect_errors_par(
     threads: usize,
     unresolved: bool,
     deadline: Option<&Deadline>,
+    detector: Detector<'_>,
 ) -> Result<Vec<Finding>, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
         let db = unresolved.then(|| host.raw_database().clone());
-        return collect_errors(&host.analysis(), db.as_ref(), files, deadline);
+        return collect_errors(&host.analysis(), db.as_ref(), files, deadline, detector);
     }
     let chunk_size = files.len().div_ceil(threads);
     let chunks: Vec<&[(FileId, RelPath)]> = files.chunks(chunk_size).collect();
@@ -208,7 +246,7 @@ pub(crate) fn collect_errors_par(
             .into_iter()
             .zip(snapshots)
             .map(|(chunk, (analysis, db))| {
-                s.spawn(move || collect_errors(&analysis, db.as_ref(), chunk, deadline))
+                s.spawn(move || collect_errors(&analysis, db.as_ref(), chunk, deadline, detector))
             })
             .collect();
         for h in handles {

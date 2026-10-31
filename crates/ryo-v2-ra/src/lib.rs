@@ -16,13 +16,13 @@ mod session;
 mod unresolved;
 
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Clock, Observer};
-use ryo_v2_core::domain::{Edit, Finding, Scope, ScopedFindings};
+use ryo_v2_core::domain::{Edit, Finding, RelPath, Scope, ScopedFindings};
 use std::path::Path;
 use std::sync::Arc;
 
 pub use assess::SyntaxAssessor;
 pub use fork::RaFork;
-pub use session::RaSession;
+pub use session::{DetectorPanic, RaSession};
 
 /// Configuration of [`RaAnalyzer`].
 #[derive(Debug, Clone)]
@@ -72,6 +72,8 @@ pub struct RaAnalyzer {
     /// Cut-off of the diagnostics of one `Verifier::check`, in ms. A field of the analyzer and
     /// not of `RaConfig`, so literals of `RaConfig` elsewhere keep compiling.
     pub(crate) check_timeout_ms: Option<u64>,
+    /// File on which the unresolved-path detector is made to panic; a test hook.
+    pub(crate) detector_fault: Option<RelPath>,
 }
 
 impl RaAnalyzer {
@@ -82,7 +84,16 @@ impl RaAnalyzer {
             clock,
             observer,
             check_timeout_ms: None,
+            detector_fault: None,
         }
+    }
+
+    /// Makes the unresolved-path detector panic on `path` in every collect this analyzer runs.
+    /// For the tests of the containment and of the re-assert; nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_detector_fault(mut self, path: Option<RelPath>) -> RaAnalyzer {
+        self.detector_fault = path;
+        self
     }
 
     /// Cut-off of the diagnostics of one `Verifier::check`; `None` (the default of `new`) = no
@@ -98,6 +109,12 @@ impl RaAnalyzer {
     }
 }
 
+/// The adapter's `Analyzer`.
+///
+/// # Contract
+/// - C1: a `discard` whose re-assert differs from the baseline is `RevertMismatch` and poisons
+///   the session; a later `fork` is refused.
+///   tested: tests/verifier.rs discard_reassert_mismatch_poisons_the_session
 impl Analyzer for RaAnalyzer {
     type Session = RaSession;
     type Fork = RaFork;
