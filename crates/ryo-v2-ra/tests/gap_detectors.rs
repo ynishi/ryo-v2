@@ -6,7 +6,7 @@ use ryo_v2_core::domain::{Diagnostic, Edit, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const BASE: &str = "pub struct S;\n";
@@ -222,6 +222,8 @@ pub enum Token {
     ];
     want.sort();
     assert_eq!(codes_of(&got, "E0204"), want, "got {got:?}");
+    let off = p.errors_of(false, text);
+    assert!(codes_of(&off, "E0204").is_empty(), "got {off:?}");
 }
 
 /// Types whose fields are all `Copy`, generic types, lifetime-only types, fieldless enums, a
@@ -330,11 +332,17 @@ pub struct E {
         at("E0369", line_of(text, "pub raw_d: Raw")),
         "got {got:?}"
     );
+    let off = p.errors_of(false, text);
+    assert!(
+        codes_of(&off, "E0277").is_empty() && codes_of(&off, "E0369").is_empty(),
+        "got {off:?}"
+    );
 }
 
 /// Nothing is reported for a hand-written impl, a generic type, fields that have the traits, Clone
-/// next to Copy, a `#[default]` enum variant with another variant that holds a field without the
-/// trait, and for `PartialEq, Eq` over a bare field only the E0369 is reported.
+/// next to Copy (over a field without `Clone` only the E0204 is reported), a `#[default]` enum
+/// variant with another variant that holds a field without the trait, a cfg-disabled type and a
+/// field of unknown type; for `PartialEq, Eq` over a bare field only the E0369 is reported.
 #[test]
 fn derive_field_skips_what_needs_nothing() {
     let text = r#"pub struct Raw;
@@ -376,10 +384,31 @@ pub enum Pick {
 pub struct Both {
     pub raw_both: Raw,
 }
+
+#[derive(Clone, Copy)]
+pub struct CopyRaw {
+    pub raw_copy: Raw,
+}
+
+#[cfg(any())]
+#[derive(Debug, Clone, Copy)]
+pub struct Gone {
+    pub raw_gone: Raw,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unknown {
+    pub m: Missing,
+}
 "#;
     let p = Probe::new("field-negative");
     let got = p.errors_of(true, text);
     assert!(codes_of(&got, "E0277").is_empty(), "got {got:?}");
+    assert_eq!(
+        codes_of(&got, "E0204"),
+        at("E0204", line_of(text, "pub struct CopyRaw")),
+        "got {got:?}"
+    );
     assert_eq!(
         codes_of(&got, "E0369"),
         at("E0369", line_of(text, "pub raw_both: Raw")),

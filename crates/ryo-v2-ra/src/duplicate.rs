@@ -191,10 +191,11 @@ fn leaves(tree: &ast::UseTree) -> Vec<(String, ast::Path, TextSize)> {
         let Some(path) = t.path() else { continue };
         let at = t.syntax().text_range().start();
         let renamed = t.rename();
-        if let Some(r) = &renamed {
-            if r.underscore_token().is_some() {
-                continue;
-            }
+        if renamed
+            .as_ref()
+            .is_some_and(|r| r.underscore_token().is_some())
+        {
+            continue;
         }
         let Some(segment) = path.segment() else {
             continue;
