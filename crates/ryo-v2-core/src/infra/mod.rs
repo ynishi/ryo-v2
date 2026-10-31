@@ -6,5 +6,6 @@
 //! moves to a crate of its own.
 
 pub mod clock;
+pub mod judge;
 pub mod observer;
 pub mod overlay;

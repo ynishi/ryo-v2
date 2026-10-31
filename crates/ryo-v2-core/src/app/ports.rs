@@ -1,6 +1,9 @@
 //! Ports the use cases need from the outside world.
 
-use crate::domain::{Edit, Finding, RelPath, Scope, ScopedFindings};
+use crate::domain::{
+    Blueprint, ChangeProbe, Edit, Finding, JudgeRequest, Judgement, RelPath, Scope, ScopedFindings,
+    StaticMetrics, Target,
+};
 use std::path::Path;
 
 /// Failure of an [`Analyzer`] operation.
@@ -62,6 +65,12 @@ pub enum CheckError {
     /// The session can no longer be used.
     #[error("session poisoned: {0}")]
     Poisoned(String),
+    /// The check was cut off after its time limit.
+    #[error("check cut off after {limit_ms} ms")]
+    TimedOut {
+        /// The limit that was hit, in milliseconds.
+        limit_ms: u64,
+    },
 }
 
 fn join_paths(paths: &[RelPath]) -> String {
@@ -91,6 +100,61 @@ pub trait Verifier {
         edits: &[Edit],
         scope: Scope,
     ) -> Result<ScopedFindings, CheckError>;
+}
+
+/// A [`Verifier`] that can also audit, on demand, that its checks left no trace.
+pub trait RevertAudit: Verifier {
+    /// Re-diagnoses the files edited since the last audit and compares them with the baseline;
+    /// a difference poisons the session and is `CheckError::RevertMismatch`.
+    fn audit_revert(&self, s: &mut Self::Session) -> Result<(), CheckError>;
+}
+
+/// Failure of an [`Expander`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExpandError {
+    /// This parent yields nothing; the search goes on.
+    #[error("expansion failed: {0}")]
+    Analysis(String),
+    /// The session is unusable; the search ends.
+    #[error("session failure: {0}")]
+    Session(CheckError),
+}
+
+/// Proposes the children of a search state: Blueprints whose reads and specs are against the
+/// text of that state.
+pub trait Expander {
+    /// A loaded workspace.
+    type Session;
+    /// Children of the state `state` (edits over the session base), at most `max`, within
+    /// `targets`. Observable session state afterwards = before. Reads and specs are against
+    /// the state's text.
+    fn expand(
+        &self,
+        s: &mut Self::Session,
+        state: &[Edit],
+        targets: &[Target],
+        max: usize,
+    ) -> Result<Vec<Blueprint>, ExpandError>;
+}
+
+/// Measures what a child changed, from the texts alone.
+pub trait Assessor {
+    /// `before[i]` and `after[i]` are the same path: the parent's and the child's whole text.
+    fn assess(&self, before: &[Edit], after: &[Edit], probes: &[ChangeProbe]) -> StaticMetrics;
+}
+
+/// Failure of a [`Judge`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum JudgeError {
+    /// The provider could not answer.
+    #[error("judge failed: {0}")]
+    Provider(String),
+}
+
+/// Gives priors and objections for proposals that nothing has verified yet.
+pub trait Judge {
+    /// One judgement for the whole request.
+    fn judge(&self, req: &JudgeRequest) -> Result<Judgement, JudgeError>;
 }
 
 /// 計測・進捗の event。時間は Clock::now_ms の差 (ms)。

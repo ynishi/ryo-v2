@@ -7,4 +7,5 @@
 
 pub mod apply;
 pub mod ports;
+pub mod search;
 pub mod verify;

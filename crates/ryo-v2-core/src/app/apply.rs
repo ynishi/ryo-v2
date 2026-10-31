@@ -37,15 +37,22 @@ enum Outcome {
     },
 }
 
+/// What the stages leave behind while a set (or a search) is decided.
 #[derive(Default)]
-struct Acc {
-    log: DecisionLog,
-    verdicts: Vec<(BlueprintId, Verdict)>,
-    fingerprints_checked: usize,
+pub(crate) struct Acc {
+    pub(crate) log: DecisionLog,
+    pub(crate) verdicts: Vec<(BlueprintId, Verdict)>,
+    pub(crate) fingerprints_checked: usize,
 }
 
 impl Acc {
-    fn note(&mut self, blueprint: BlueprintId, stage: Stage, ok: bool, note: impl Into<String>) {
+    pub(crate) fn note(
+        &mut self,
+        blueprint: BlueprintId,
+        stage: Stage,
+        ok: bool,
+        note: impl Into<String>,
+    ) {
         self.log.push(LogEntry {
             blueprint,
             stage,
@@ -55,11 +62,32 @@ impl Acc {
     }
 }
 
-fn blocked(blocking: Blocking) -> Outcome {
-    Outcome::Blocked {
-        blocking,
-        near_miss: None,
-    }
+/// The text of a path in some state: `None` when the state has no such file.
+pub(crate) type View<'a> = dyn Fn(&RelPath) -> Option<String> + 'a;
+
+/// A Blueprint that passed the stages before the analyzer check.
+pub(crate) struct Ready {
+    /// Whole-file edits, spliced against the view.
+    pub(crate) edits: Vec<Edit>,
+    /// The marks of its intent and of the roles of the files it touches.
+    pub(crate) marks: BTreeSet<RiskMark>,
+}
+
+/// Outcome of the stages before the analyzer check.
+pub(crate) enum Prepared {
+    /// All stages passed.
+    Ready(Ready),
+    /// A stage refused it.
+    Blocked {
+        /// The stage that refused.
+        stage: Stage,
+        /// Why.
+        blocking: Blocking,
+    },
+}
+
+fn blocked(stage: Stage, blocking: Blocking) -> Prepared {
+    Prepared::Blocked { stage, blocking }
 }
 
 /// Verifies every Blueprint of `set` against the analyzer and sorts out which may be applied.
@@ -131,15 +159,16 @@ pub fn apply_blueprints<V: Verifier>(
     Ok(Resolution::Failed(infeasible))
 }
 
-fn decide<V: Verifier>(
+/// The stages before the analyzer check, against the texts of `view`: file role, freshness of
+/// the reads, conformance, splice and marks. Each stage logs one entry to `acc`, `ok` false at
+/// the stage that refuses.
+pub(crate) fn prepare<V: Verifier>(
     v: &V,
-    s: &mut V::Session,
+    s: &V::Session,
     bp: &Blueprint,
-    baseline: &[crate::domain::Finding],
-    rules: &RuleCatalog,
-    scope: Scope,
+    view: &View<'_>,
     acc: &mut Acc,
-) -> Result<Outcome, ApplyError> {
+) -> Prepared {
     let id = bp.id();
     let by_file = bp.edits_by_file();
 
@@ -149,11 +178,14 @@ fn decide<V: Verifier>(
         let role = file_role(path, &v.facts(s, path));
         if role == FileRole::Manifest {
             acc.note(id, Stage::FileRole, false, format!("{path} is a {role}"));
-            return Ok(blocked(Blocking::Unverifiable {
-                blueprint: id,
-                path: (*path).clone(),
-                role,
-            }));
+            return blocked(
+                Stage::FileRole,
+                Blocking::Unverifiable {
+                    blueprint: id,
+                    path: (*path).clone(),
+                    role,
+                },
+            );
         }
         roles.push(role);
     }
@@ -167,17 +199,20 @@ fn decide<V: Verifier>(
     // 2. freshness
     let mut stale: Vec<(ReadRange, Freshness)> = Vec::new();
     for read in bp.reads() {
-        let Some(current) = v.text(s, read.path()) else {
+        let Some(current) = view(read.path()) else {
             acc.note(
                 id,
                 Stage::Freshness,
                 false,
                 format!("{} is not in the workspace", read.path()),
             );
-            return Ok(blocked(Blocking::MissingFile {
-                blueprint: id,
-                path: read.path().clone(),
-            }));
+            return blocked(
+                Stage::Freshness,
+                Blocking::MissingFile {
+                    blueprint: id,
+                    path: read.path().clone(),
+                },
+            );
         };
         acc.fingerprints_checked += 1;
         match read.check(&current) {
@@ -192,10 +227,13 @@ fn decide<V: Verifier>(
             false,
             format!("{} read(s) are not fresh", stale.len()),
         );
-        return Ok(blocked(Blocking::Stale {
-            blueprint: id,
-            reads: stale,
-        }));
+        return blocked(
+            Stage::Freshness,
+            Blocking::Stale {
+                blueprint: id,
+                reads: stale,
+            },
+        );
     }
     acc.note(
         id,
@@ -207,11 +245,14 @@ fn decide<V: Verifier>(
     // 3. conformance
     let base: BTreeMap<RelPath, String> = by_file
         .keys()
-        .filter_map(|p| v.text(s, p).map(|t| ((*p).clone(), t)))
+        .filter_map(|p| view(p).map(|t| ((*p).clone(), t)))
         .collect();
     if let Err(why) = bp.intent().conforms(bp.specs(), &base) {
         acc.note(id, Stage::Conformance, false, why.to_string());
-        return Ok(blocked(Blocking::Nonconforming { blueprint: id, why }));
+        return blocked(
+            Stage::Conformance,
+            Blocking::Nonconforming { blueprint: id, why },
+        );
     }
     acc.note(id, Stage::Conformance, true, bp.intent().to_string());
 
@@ -221,16 +262,19 @@ fn decide<V: Verifier>(
         let Some(text) = base.get(*path) else {
             // Cannot happen after the freshness stage; reported as a missing file all the same.
             acc.note(id, Stage::Splice, false, format!("{path} has no text"));
-            return Ok(blocked(Blocking::MissingFile {
-                blueprint: id,
-                path: (*path).clone(),
-            }));
+            return blocked(
+                Stage::Splice,
+                Blocking::MissingFile {
+                    blueprint: id,
+                    path: (*path).clone(),
+                },
+            );
         };
         match splice(text, specs) {
             Ok(new_text) => edits.push(Edit::write((*path).clone(), new_text)),
             Err(err) => {
                 acc.note(id, Stage::Splice, false, err.to_string());
-                return Ok(blocked(Blocking::Splice { blueprint: id, err }));
+                return blocked(Stage::Splice, Blocking::Splice { blueprint: id, err });
             }
         }
     }
@@ -252,6 +296,34 @@ fn decide<V: Verifier>(
     }
     let names: Vec<String> = marks.iter().map(ToString::to_string).collect();
     acc.note(id, Stage::Marks, true, names.join(", "));
+
+    Prepared::Ready(Ready { edits, marks })
+}
+
+fn decide<V: Verifier>(
+    v: &V,
+    s: &mut V::Session,
+    bp: &Blueprint,
+    baseline: &[crate::domain::Finding],
+    rules: &RuleCatalog,
+    scope: Scope,
+    acc: &mut Acc,
+) -> Result<Outcome, ApplyError> {
+    let id = bp.id();
+    let kind = bp.intent().kind();
+    let prepared = {
+        let session: &V::Session = s;
+        prepare(v, session, bp, &|p| v.text(session, p), acc)
+    };
+    let Ready { edits, marks } = match prepared {
+        Prepared::Ready(r) => r,
+        Prepared::Blocked { blocking, .. } => {
+            return Ok(Outcome::Blocked {
+                blocking,
+                near_miss: None,
+            });
+        }
+    };
 
     // 6. check
     let found = v
