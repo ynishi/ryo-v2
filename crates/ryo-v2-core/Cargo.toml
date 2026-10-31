@@ -10,6 +10,7 @@ documentation = "https://docs.rs/ryo-v2-core"
 readme.workspace = true
 keywords = ["refactoring", "blueprint", "verification", "code-search"]
 categories = ["development-tools"]
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lints]
 workspace = true

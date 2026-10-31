@@ -10,6 +10,7 @@ documentation = "https://docs.rs/ryo-v2-ra"
 readme.workspace = true
 keywords = ["rust-analyzer", "refactoring", "diagnostics", "hir"]
 categories = ["development-tools"]
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lints]
 workspace = true
