@@ -2,8 +2,9 @@
 //! rules are stated here, once, and `cargo test -p ryo-v2-core` fails when a manifest breaks one.
 //!
 //! 1. `[workspace.package]` states `rust-version` and has no `authors` (deprecated in Cargo).
-//! 2. Every member opts into the workspace lints with `[lints] workspace = true`; without it
-//!    Cargo inherits none of `[workspace.lints]`.
+//! 2. The root sets `missing_docs` to `warn` or `deny` in `[workspace.lints.rust]`, and every
+//!    member opts into the workspace lints with `[lints] workspace = true`; without it Cargo
+//!    inherits none of `[workspace.lints]`.
 //! 3. A crate that is not `publish = false` has a `description`, a `documentation` URL ending in
 //!    `/<its own name>`, 1 to 5 `keywords` (each at most 20 characters, an ASCII letter first,
 //!    then ASCII letters, digits, `_`, `-` or `+`), and 1 to 5 `categories`.
@@ -11,6 +12,9 @@
 //!    `LICENSE-APACHE` and takes nothing under `tests/`: no entry starts with `tests` and no
 //!    entry is a top-level glob (`*...`), which would take `tests/` too. The tests reach the
 //!    corpus and the workspace root, which are outside the package, so they cannot run from it.
+//!    Both licence files exist in the crate directory (as symlinks to the root copies, which
+//!    `cargo package` flattens) with the content of the root copies; `include` skips a named
+//!    file that is missing without an error.
 //! 5. A dependency on another member (any table of dependencies, target-specific ones included)
 //!    is `<name>.workspace = true`, so the version and path are written once, in the root.
 //!
@@ -104,7 +108,23 @@ fn workspace_package_problems(root: &Table) -> Vec<String> {
     out
 }
 
-/// Rule 2.
+/// Rule 2, the root half.
+fn workspace_lints_problems(root: &Table) -> Vec<String> {
+    let level = root
+        .get("workspace")
+        .and_then(|w| w.get("lints"))
+        .and_then(|l| l.get("rust"))
+        .and_then(|r| r.get("missing_docs"))
+        .and_then(|v| v.as_str().or_else(|| v.get("level")?.as_str()));
+    match level {
+        Some("warn" | "deny") => Vec::new(),
+        other => vec![format!(
+            "root: [workspace.lints.rust] missing_docs is {other:?}, not warn or deny"
+        )],
+    }
+}
+
+/// Rule 2, the member half.
 fn lints_problems(m: &Member) -> Vec<String> {
     let ok = m
         .manifest
@@ -189,6 +209,28 @@ fn include_problems(m: &Member) -> Vec<String> {
     out
 }
 
+/// Rule 4, the files: each licence named in `include` is in `crate_dir` and equals the copy in
+/// `root_dir`.
+fn licence_file_problems(m: &Member, crate_dir: &Path, root_dir: &Path) -> Vec<String> {
+    if !is_published(m) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for licence in ["LICENSE-MIT", "LICENSE-APACHE"] {
+        let here = crate_dir.join(licence);
+        match (fs::read(&here), fs::read(root_dir.join(licence))) {
+            (Ok(a), Ok(b)) if a == b => {}
+            (Ok(_), Ok(_)) => out.push(format!(
+                "crates/{}: {licence} differs from the root copy",
+                m.dir
+            )),
+            (Err(e), _) => out.push(format!("crates/{}: cannot read {licence}: {e}", m.dir)),
+            (_, Err(e)) => out.push(format!("root: cannot read {licence}: {e}")),
+        }
+    }
+    out
+}
+
 /// Rule 5. `internal` is the set of member package names.
 fn internal_dependency_problems(m: &Member, internal: &BTreeSet<String>) -> Vec<String> {
     const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
@@ -243,7 +285,9 @@ fn workspace_package_states_rust_version_and_no_authors() {
 
 #[test]
 fn workspace_members_inherit_the_workspace_lints() {
-    assert_none(members().iter().flat_map(lints_problems).collect());
+    let mut problems = workspace_lints_problems(&root_manifest());
+    problems.extend(members().iter().flat_map(lints_problems));
+    assert_none(problems);
 }
 
 #[test]
@@ -255,7 +299,17 @@ fn workspace_published_crates_carry_their_metadata() {
 
 #[test]
 fn workspace_published_crates_ship_licences_and_no_tests() {
-    assert_none(members().iter().flat_map(include_problems).collect());
+    let root = root();
+    let mut problems = Vec::new();
+    for m in members() {
+        problems.extend(include_problems(&m));
+        problems.extend(licence_file_problems(
+            &m,
+            &root.join("crates").join(&m.dir),
+            &root,
+        ));
+    }
+    assert_none(problems);
 }
 
 #[test]
@@ -309,6 +363,27 @@ fn good_manifest_has_no_problems() {
 fn missing_rust_version_and_authors_are_problems() {
     let root: Table = toml::from_str("[workspace.package]\nauthors = [\"a\"]\n").expect("parses");
     assert_eq!(workspace_package_problems(&root).len(), 2);
+}
+
+#[test]
+fn missing_docs_not_set_in_the_workspace_is_a_problem() {
+    let set: Table =
+        toml::from_str("[workspace.lints.rust]\nmissing_docs = { level = \"deny\" }\n")
+            .expect("parses");
+    assert_none(workspace_lints_problems(&set));
+    let allowed: Table =
+        toml::from_str("[workspace.lints.rust]\nmissing_docs = \"allow\"\n").expect("parses");
+    assert_eq!(workspace_lints_problems(&allowed).len(), 1);
+    assert_eq!(workspace_lints_problems(&Table::new()).len(), 1);
+}
+
+#[test]
+fn missing_licence_file_is_a_problem() {
+    let root = root();
+    let m = member(GOOD);
+    assert_none(licence_file_problems(&m, &root, &root));
+    let absent = root.join("crates").join("no-such-crate");
+    assert_eq!(licence_file_problems(&m, &absent, &root).len(), 2);
 }
 
 #[test]
