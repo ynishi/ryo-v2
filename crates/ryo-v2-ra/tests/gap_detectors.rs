@@ -343,7 +343,8 @@ pub struct E {
 /// A derived `Clone` beside a derived `Copy` on a type without type or const parameters is
 /// reported as E0277 at each field without `Clone`, next to the E0204 at the head: a struct, an
 /// enum variant and a tuple struct with the derives in either order (measured: breakage-lab
-/// `derive-copy-clone-0..2`). A field that is `Clone` but not `Copy` gives only the E0204.
+/// `derive-copy-clone-0..2`). A field that is `Clone` but not `Copy` gives only the E0204; the
+/// tuple fields are on lines of their own so the E0277 shows which one is reported.
 #[test]
 fn derive_clone_beside_copy_reports_fields_without_clone() {
     let text = r#"pub struct Raw;
@@ -362,7 +363,10 @@ pub enum Token {
 }
 
 #[derive(Copy, Clone)]
-pub struct Pair(pub String, pub Raw);
+pub struct Pair(
+    pub String,
+    pub Raw,
+);
 
 #[derive(Clone, Copy)]
 pub struct Note {
@@ -371,7 +375,7 @@ pub struct Note {
 "#;
     let p = Probe::new("clone-beside-copy");
     let got = p.errors_of(true, text);
-    let mut want77: Vec<(String, u32)> = ["pub raw_h: Raw", "Blob(Raw)", "pub struct Pair"]
+    let mut want77: Vec<(String, u32)> = ["pub raw_h: Raw", "Blob(Raw)", "    pub Raw,"]
         .iter()
         .map(|n| ("E0277".to_owned(), line_of(text, n)))
         .collect();
