@@ -3,12 +3,13 @@
 //!
 //! Usage:
 //! - `breakage gen <ws> [--kinds a,b|all] [--seeds N]` (defaults: all kinds, 3 seeds)
-//! - `breakage regroup <ws>`
+//! - `breakage regroup <ws>` (cases listed in `KEPT_GROUPS` keep their group and are reported)
 #![warn(missing_docs)]
 
 use anyhow::{Context, Result, bail};
 use ryo_v2_oracle::breakage::{Kind, generate, group_for, read_sources, sites, write_case};
 use ryo_v2_oracle::case::Case;
+use ryo_v2_oracle::groups::Group;
 use ryo_v2_oracle::materials::Materials;
 
 const USAGE: &str =
@@ -81,26 +82,76 @@ fn gen_cases(m: &Materials, ws: &str, kinds: &[Kind], seeds: u32) -> Result<()> 
     Ok(())
 }
 
+/// Breakage cases whose group stays although `group_for` would move it:
+/// (workspace, case id, the CHECK_LEDGER row that decided it).
+/// The decision (2026-10-31) is recorded in CHECK_LEDGER G-C-1 and Counts.
+const KEPT_GROUPS: &[(&str, &str, &str)] = &[
+    ("base/extract-trait-multicrate", "change-type-0", "G-C-1"),
+    ("base/extract-trait-multicrate", "change-type-1", "G-C-1"),
+    ("base/extract-trait-multicrate", "remove-import-1", "G-C-1"),
+    ("base/extract-trait-multicrate", "remove-import-2", "G-C-1"),
+    ("base/extract-trait-multicrate", "typo-type-1", "G-C-1"),
+];
+
+/// What `regroup` does with one case.
+#[derive(Debug, PartialEq)]
+enum Step {
+    /// The group is already right.
+    Same,
+    /// The group differs but stays, by the named ledger row.
+    Kept(&'static str),
+    /// The group is rewritten.
+    Move(Group),
+}
+
+fn plan(ws: &str, case: &Case, new: Group) -> Step {
+    if new == case.group {
+        return Step::Same;
+    }
+    match KEPT_GROUPS
+        .iter()
+        .find(|(w, id, _)| *w == ws && *id == case.id)
+    {
+        Some((_, _, row)) => Step::Kept(row),
+        None => Step::Move(new),
+    }
+}
+
+/// The group the expected file of a breakage case gives; `None` when it has no expected file.
+fn regroup_target(case: &Case) -> Result<Option<Group>> {
+    let kind = case
+        .origin
+        .split(':')
+        .nth(1)
+        .and_then(Kind::parse)
+        .with_context(|| format!("{}: origin {:?} has no kind", case.id, case.origin))?;
+    let expected = case.expected().with_context(|| case.id.clone())?;
+    Ok(expected.map(|e| group_for(kind, &e)))
+}
+
 fn regroup(m: &Materials, ws: &str) -> Result<()> {
     let cases = Case::load_all(&m.corpus).context("load cases")?;
     for case in cases
         .iter()
         .filter(|c| c.workspace_rel == ws && c.origin.starts_with("breakage:"))
     {
-        let kind = case
-            .origin
-            .split(':')
-            .nth(1)
-            .and_then(Kind::parse)
-            .with_context(|| format!("{}: origin {:?} has no kind", case.id, case.origin))?;
-        let Some(expected) = case.expected().with_context(|| case.id.clone())? else {
+        let Some(new) = regroup_target(case)? else {
             println!("skip {}: no expected", case.id);
             continue;
         };
-        let new = group_for(kind, &expected);
-        if new == case.group {
-            continue;
-        }
+        let new = match plan(ws, case, new) {
+            Step::Same => continue,
+            Step::Kept(row) => {
+                println!(
+                    "kept {}: {} (regroup would give {}, {row})",
+                    case.id,
+                    case.group.id(),
+                    new.id()
+                );
+                continue;
+            }
+            Step::Move(new) => new,
+        };
         let path = m
             .corpus
             .join(ws)
@@ -122,4 +173,78 @@ fn regroup(m: &Materials, ws: &str) -> Result<()> {
         println!("{}: {} -> {}", case.id, case.group.id(), new.id());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const WS: &str = "base/extract-trait-multicrate";
+
+    fn case(id: &str, group: Group) -> Case {
+        Case {
+            id: id.into(),
+            workspace_rel: WS.into(),
+            workspace: PathBuf::new(),
+            overlay: PathBuf::new(),
+            group,
+            origin: "breakage:change-type".into(),
+            skip: None,
+            expected_path: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn kept_case_is_left() {
+        let kept = case("change-type-0", Group::Valid);
+        assert_eq!(plan(WS, &kept, Group::TypeMismatch), Step::Kept("G-C-1"));
+        assert_eq!(
+            plan("base/other", &kept, Group::TypeMismatch),
+            Step::Move(Group::TypeMismatch)
+        );
+        let unlisted = case("change-type-9", Group::Valid);
+        assert_eq!(
+            plan(WS, &unlisted, Group::TypeMismatch),
+            Step::Move(Group::TypeMismatch)
+        );
+        assert_eq!(plan(WS, &kept, Group::Valid), Step::Same);
+    }
+
+    #[test]
+    fn corpus_regroup_moves_nothing() {
+        let m = Materials::find().expect("find materials");
+        let cases = Case::load_all(&m.corpus).expect("load cases");
+        let mut moves = Vec::new();
+        let mut targets = std::collections::BTreeMap::new();
+        for case in cases.iter().filter(|c| c.origin.starts_with("breakage:")) {
+            let Some(new) = regroup_target(case).expect("target") else {
+                continue;
+            };
+            targets.insert(
+                (case.workspace_rel.clone(), case.id.clone()),
+                (case.group, new),
+            );
+            if let Step::Move(to) = plan(&case.workspace_rel, case, new) {
+                moves.push(format!(
+                    "{} {}: {} -> {}",
+                    case.workspace_rel,
+                    case.id,
+                    case.group.id(),
+                    to.id()
+                ));
+            }
+        }
+        assert!(
+            moves.is_empty(),
+            "regroup would move:\n{}",
+            moves.join("\n")
+        );
+        for (ws, id, row) in KEPT_GROUPS {
+            match targets.get(&(ws.to_string(), id.to_string())) {
+                Some((old, new)) if old != new => {}
+                _ => panic!("stale KEPT_GROUPS entry {ws} {id} ({row})"),
+            }
+        }
+    }
 }
