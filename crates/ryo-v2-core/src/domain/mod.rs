@@ -21,8 +21,10 @@
 //! - TextRange: a half-open UTF-8 byte range `[start, end)` of one file's base text.
 //! - ReadRange: a path, a text range and its fingerprint: the text the proposer read, checked
 //!   for the files a blueprint only reads.
-//! - Fingerprint: an algorithm-tagged hash of the bytes of a range or of a whole text, a pure function of the text.
-//! - Freshness: the result of checking a read range or a base fingerprint against the current text.
+//! - Fingerprint: an algorithm-tagged hash of the bytes of a range or of a whole text, a pure
+//!   function of the text.
+//! - Freshness: the result of checking a read range or a base fingerprint against the current
+//!   text.
 //!   includes: Fresh, Stale, OutOfRange
 //! - Edit: the whole new text of one file, built by splicing; what the verifier consumes.
 //! - IntentKind: a typed action of the one-layer action space.
