@@ -428,7 +428,15 @@ index it. Commands: `just history-export <repo> <range> <name> <out> <max>`
 | set | rev range | pairs | skip | valid | FP cases | FP rate | extra | unmapped |
 |---|---|---|---|---|---|---|---|---|
 | ryo-v2 | 9a0d816..1a6d103 | 5 | 0 | 5 | 0 | 0.00 | 0 | 0 |
-| ryo-rs | 67b0ebfb~20..67b0ebfb | pending: <ENV> | | | | | | |
+| ryo-rs | 67b0ebfb~20..67b0ebfb | 20 | 4 | 16 | 0 | 0.00 | 0 | 0 |
+
+ryo-rs (2026-10-31, <ENV>, cfg-test on, proc-macro on, unresolved-paths
+on): the 4 skipped pairs change no member `.rs` file; all 16 valid pairs build
+with 0 errors under `--all-targets` and the verifier reports nothing on any of
+them. Per-pair check 0.5 to 19 s (median about 1.4 s; the slow ones touch
+widely used crates). Together with ryo-v2: 0 of 21. 0 of 21 is compatible with
+a true rate of up to about 0.14 at 95% (rule of three). Not yet measured: edits
+of the kind an engine proposes (these are human commits).
 
 ryo-v2: all 5 pairs are used, all with changed manifests (`manifest_from_child`);
 overlay files 11, 14, 5, 9, 3; `.rs` changes dropped as outside the member dirs
