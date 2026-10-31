@@ -1,0 +1,13 @@
+# hand: misplace-item move `tally`, with its doc lines, to src/plan.rs; `pub(crate)` goes before the keyword, after the doc
+workspace = "search/base/shape-lab"
+overlay = "planted/misplace-item-doc"
+kinds = ["misplace-item"]
+depth = 1
+origin = "hand:misplace-item:misplace-item-doc"
+targets = [
+    { path = "src/lib.rs", start = 406, end = 430 },
+    { path = "src/plan.rs", start = 78, end = 186 },
+]
+probes = [
+    { kind = "add-field", type = "Slot" },
+]

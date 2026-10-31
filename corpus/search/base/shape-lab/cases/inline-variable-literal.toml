@@ -1,0 +1,12 @@
+# hand: inline-variable inline `per_row` into the literal argument of the call in fn build
+workspace = "search/base/shape-lab"
+overlay = "planted/inline-variable-literal"
+kinds = ["inline-variable"]
+depth = 1
+origin = "hand:inline-variable:inline-variable-literal"
+targets = [
+    { path = "src/lib.rs", start = 919, end = 986 },
+]
+probes = [
+    { kind = "add-field", type = "Slot" },
+]

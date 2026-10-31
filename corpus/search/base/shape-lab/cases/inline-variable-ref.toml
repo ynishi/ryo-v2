@@ -1,0 +1,12 @@
+# hand: inline-variable inline `label` into the reference argument of the call in fn scan
+workspace = "search/base/shape-lab"
+overlay = "planted/inline-variable-ref"
+kinds = ["inline-variable"]
+depth = 1
+origin = "hand:inline-variable:inline-variable-ref"
+targets = [
+    { path = "src/lib.rs", start = 713, end = 833 },
+]
+probes = [
+    { kind = "add-field", type = "Slot" },
+]

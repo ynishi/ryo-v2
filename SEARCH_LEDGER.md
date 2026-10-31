@@ -62,14 +62,20 @@ proc-macro on, `RaConfig.assert_revert_every = 50` (decision D2), `MetricJudge`,
 `SyntaxAssessor`, Affected scope, one session per workspace, with probes. "before" is the expander
 of main 63db161 on the same 42 cases; "after" is the expander of this change (section
 "Generation"). The rows of 2026-10-31 (39 cases, before the `gen-lab` cases and the detectors) are
-in the git history of this file.
+in the git history of this file. The two rows marked "second round" are of 2026-11-01, branch
+`fix/ryo-rs-causes` over main fff60ef, on the 45 cases with the three `shape-lab` cases, the same
+settings and machine: the expander of main fff60ef, and the expander after the causes of the
+ryo-rs run (section "Generation, second round").
 
 | corpus | expander | decisions | depth 2 | skipped | generated | hit | recall@20 | generation | status |
 |---|---|---|---|---|---|---|---|---|---|
 | small bases (below) | before | 42 | 10 | 0 | 31 | 30 | 0.97 | 0.74 | verdict adopt, 31 compared |
 | small bases (below) | after | 42 | 10 | 0 | 42 | 38 | 0.90 | 1.00 | verdict adopt, 42 compared |
+| small bases (below) | second round, before (main fff60ef) | 45 | 10 | 0 | 42 | 38 | 0.90 | 0.93 | verdict adopt, 42 compared |
+| small bases (below) | second round, after | 45 | 10 | 0 | 45 | 41 | 0.91 | 1.00 | verdict adopt, 45 compared |
 | ryo-rs | before | 11 | 2 | 0 | 6 | 6 | 1.00 | 0.55 | verdict insufficient, 6 compared |
-| ryo-rs | after | pending | | | | | | | |
+| ryo-rs | after (main fff60ef) | 11 | 2 | 0 | 7 | 6 | 0.86 | 0.64 | verdict insufficient, 7 compared |
+| ryo-rs | second round, after | pending | | | | | | | |
 
 ryo-rs here is ryo-rs (a verification repository used as a large sample); its run, with the
 machine it ran on, is in section "ryo-rs (large run)".
@@ -83,6 +89,7 @@ planted edits) written to hold sites of every kind.
 |---|---|---|
 | `search/base/search-lab` | 38 | 28 at depth 1 (7 obscure-name, 9 inline-variable, 3 inline-function, 9 misplace-item) and 10 pairs |
 | `search/base/gen-lab` | 3 | hand cases, depth 1: two misplace-item (a re-export under a comment, an item with a trailing comment) and one inline-variable into a struct-literal field value, the shapes of section "Generation" |
+| `search/base/shape-lab` | 3 | hand cases, depth 1: one misplace-item of an item with a `///` doc line, one inline-variable of a reference to a nested field and one of a literal, each folded into a call argument; the shapes of section "Generation, second round" |
 | `base/breakage-lab` | 1 | one obscure-name site (`store/src/lib.rs`); no other kind has a site |
 | `base/cfg-test-lab`, `base/macro-lab`, `base/extract-trait-multicrate` | 0 | no site of any kind |
 
@@ -284,7 +291,56 @@ decisions generated before keep their generated, hit, beam rank, fate and final 
 (`--outer-check`, 53 s) finds 0 failures in 117 decided candidates and 0 in the 42 first
 candidates.
 
-## Narrow beams (the pruning, stressed)
+### Generation, second round (the causes of the ryo-rs run)
+
+The ryo-rs run after the fixes above (section "ryo-rs (large run)", subsection "After the four
+generation fixes and the containment") left four decisions whose best was never generated, with
+three causes. Each cause now has a hand case in `shape-lab` (all its code hand-written) that fails
+before the change, and a test of the expander:
+
+| cause | cases on the small bases | fix (`crates/ryo-v2-ra/src/expand.rs`) | test (fails before) |
+|---|---|---|---|
+| 5. rust-analyzer's syntax tree gives a `///` comment the kind `DOC_COMMENT`, apart from a `//` comment (`COMMENT`); the expander skipped only `COMMENT` to find where an item's visibility or keyword starts. For a documented item that start was the doc line, so the reverse move wrote the item without its doc (the conformance check of move-item refused it, `NotMoved`), and the forward move of a documented private item wrote `pub(crate)` in front of the doc line, which does not compile. The `pub(crate)` the planter writes is not the cause: the reverse move takes the visibility of the `use`. | `shape-lab/misplace-item-doc` (ryo-rs `misplace-item-0` and `-1`) | one predicate `is_comment` (either kind) for the start of an item and for the comments read past above a `use` | `tests/expand_gen.rs` `move_item_collapses_a_documented_item`, `move_item_forward_keeps_the_doc_above_the_visibility`; `expand::tests::a_doc_comment_is_a_comment` |
+| 6. the planter folds any one-line initializer into a call argument whose parameter has the variable's name; extract-variable was never offered a reference expression | `shape-lab/inline-variable-ref` (ryo-rs `inline-variable-2`) | extract-variable is also offered a reference (`&e`, `&mut e`) or a literal that is a whole argument of a call or method call; rust-analyzer names it after the parameter | `tests/expand_gen.rs` `extract_variable_restores_a_reference_argument`; `expand::tests::a_reference_or_literal_argument_is_a_variable_shape` |
+| 7. the same for a literal | `shape-lab/inline-variable-literal` (ryo-rs pair `obscure-name` plus `inline-variable`, whose file is a bench target that is indexed and expanded like any other) | as 6 | `tests/expand_gen.rs` `extract_variable_restores_a_literal_argument` |
+
+The new candidate class of 6 and 7 is exactly what the two plants need: a path, a `?` expression
+or a macro call as an argument, and a reference or literal anywhere but as a whole argument, stay
+unoffered (`tests/expand_gen.rs` `extract_variable_offers_no_path_argument` and the shape unit
+test). Offering every argument the planter can fold would add a candidate for nearly every argument.
+
+Run at beam 20 (`search-recall run corpus/search`, 45 cases; before: the expander of main fff60ef,
+29.7 s, 597 checks; after: 28.9 s without the outer check, 613 checks):
+
+| set | decisions | before: generated / hit / recall@20 / top-3 | after: generated | hit | recall@20 | hit/all | generation | top-3 |
+|---|---|---|---|---|---|---|---|---|
+| all | 45 | 42 / 38 / 0.90 / 0.80 | 45 | 41 | 0.91 | 0.91 | 1.00 | 0.87 |
+| ws shape-lab | 3 | 0 / 0 / - / 0.00 | 3 | 3 | 1.00 | 1.00 | 1.00 | 1.00 |
+| kind inline-variable | 17 | 15 / 11 / 0.73 / 0.65 | 17 | 13 | 0.76 | 0.76 | 1.00 | 0.76 |
+| kind misplace-item | 17 | 16 / 15 / 0.94 / 0.82 | 17 | 16 | 0.94 | 0.94 | 1.00 | 0.88 |
+| depth 1 | 35 | 32 / 32 / 1.00 / 0.89 | 35 | 35 | 1.00 | 1.00 | 1.00 | 0.97 |
+| depth 2 | 10 | 10 / 6 / 0.60 / 0.50 | 10 | 6 | 0.60 | 0.60 | 1.00 | 0.50 |
+
+The rows of the other workspaces and kinds are those of section "Counts" (breakage-lab, gen-lab,
+search-lab, inline-function, obscure-name: unchanged). The 42 decisions before `shape-lab` keep
+their generated, hit, beam rank, fate and final rank; the three `shape-lab` decisions are
+generated and hit at beam ranks 1, 1 and 2 (final rank 1 each). Verdict: **adopt** (recall@20 0.91
+over 45 generated decisions; 4 misses in 45, the four depth-2 `dominated` of section "Dropped at").
+
+New candidates: on the 42 decisions before `shape-lab`, 352 children at depth 1 before and 367
+after (+15: one each in `inline-function-0`, `inline-variable-0`, `obscure-name-0`, two in
+`obscure-name-1`, one in each pair but `misplace-item` plus `misplace-item`, two in
+`pair-obscure-name-obscure-name-1`), and 604 at depth 2 before, 645 after (+41). Each `shape-lab`
+decision gained one child, its restore. No fate moved. On ryo-rs (a verification repository used
+as a large sample) the same expansion of the planted states (read once, not a search run) gives
+`inline-variable-0` 118 children instead of 71 and `inline-variable-2` 27 instead of 22: the
+class grows with the number of reference and literal arguments of a long function, and the
+restores of `inline-variable-2` and of the pair are then exposed to the loss of CHECK_LEDGER S-7
+like `inline-variable-0` (an expectation; the large run is pending).
+
+`--outer-check` (55.9 s whole run, 26.9 s of it the outer check): 1 of 125 decided candidates
+fails, 0 of the 45 first candidates (section "Outer check").
+
 
 The same 42 decisions at a smaller beam (`search-recall run corpus/search --beam N`), after the
 change. The default beam prunes almost nothing at depth 1, so these runs are where the ranking is
@@ -298,6 +354,15 @@ pruned, so `generated` falls with the beam.
 | 3 | 41 | 35 | 0.85 | 2/6 | 11/13 | 14/16 | 13/15 | 30/32 | 5/9 | dominated 6 |
 | 1 | 40 | 28 | 0.70 | 0/5 | 6/12 | 14/16 | 12/15 | 24/32 | 4/8 | dominated 11, rank 1 |
 | 1, before the change | 31 | 23 | 0.74 | 0/5 | 3/5 | 12/13 | 12/15 | 19/24 | 4/7 | dominated 8 |
+| 5, second round (45 cases) | 45 | 40 | 0.89 | 3/6 | 13/17 | 15/17 | 14/15 | 35/35 | 5/10 | dominated 5 |
+| 3, second round (45 cases) | 44 | 38 | 0.86 | 2/6 | 13/15 | 15/17 | 13/15 | 33/35 | 5/9 | dominated 6 |
+| 1, second round (45 cases) | 43 | 28 | 0.65 | 0/5 | 6/14 | 14/17 | 12/15 | 24/35 | 4/8 | dominated 13, rank 2 |
+
+The rows "second round" are the expander of section "Generation, second round" on the 45 cases:
+the 42 earlier decisions give the generated and hit of the rows above at each beam, and the three
+`shape-lab` decisions add 3 generated and 3 hits at beams 5 and 3 and 3 generated and no hit at
+beam 1 (`misplace-item-doc` and `inline-variable-literal` `dominated`, `inline-variable-ref`
+`rank`; at beam 20 their bests are at beam rank 2, 1 and 1).
 
 Every miss is `dominated` except one at beam 1 (`gen-lab/inline-variable-field`, `rank`): the
 dominance rule, not the score order, is what removes the heavier restores. Recall at beam 3 is
@@ -308,6 +373,10 @@ and `-8` `dominated`, `inline-variable-field` `rank`: their bests are at beam ra
 20).
 
 ## Exhaustive (secondary truth)
+
+Second round (45 cases, the expander of section "Generation, second round"): `--exhaustive` 34.8 s,
+1002 checks, every generated best survives (45 of 45), the three `shape-lab` bests at final rank 1
+each; the table below is of the 42 earlier cases.
 
 `search-recall run corpus/search --exhaustive` (beam 200, no wall limit, 30.5 s, 929 checks; 897
 before the change): every generated best survives (42 of 42, recall@200 1.00; before 31 of 31), so
@@ -342,8 +411,9 @@ report an error the unedited workspace does not:
 |---|---|---|---|---|
 | small bases | before the duplicate-name and field-bounds detectors | 114 | 14 | 0.12 |
 | small bases | with them (2026-11-01; 47.8 s wall on 16 cores and 30 GiB, other runs possibly on the machine) | 112 | 0 | 0.00 |
+| small bases | second round, 45 cases (2026-11-01; 26.9 s of outer check, same machine) | 125 | 1 | 0.01 |
 | ryo-rs | before them | 30 | 2 | 0.07 |
-| ryo-rs | with them | pending | | |
+| ryo-rs | with them (2026-11-01, main fff60ef; run 3 of section "After the four generation fixes and the containment", 663,825 ms of outer check on 16 cores and 30 GiB, the machine otherwise running other builds) | 33 | 0 | 0.00 |
 
 Before the detectors all 14 failures were E0255 (a name defined by an item and by a `use` in the
 same module), in 11 decisions: the 9 single `misplace-item` decisions and 2 pairs that contain
@@ -369,6 +439,14 @@ rejected move had been one of 3, another passing candidate takes its place if th
 harness prints no per-decision count; the 2 fewer are decisions with no such replacement, an
 inference). The run had 564 checks (565 before), median warm check 9 ms.
 
+In the second round the one failure is candidate 2 of `shape-lab/inline-variable-ref`, E0507
+(a move out of a borrow) at `src/lib.rs:38`, the line of the folded reference: read from the error
+and the line, it is the extract of the nested field without its `&` (`let label = job.spec.label;`),
+a shape offered before this round, not the new class. rust-analyzer does not report MIR borrow-check
+errors (CHECK_LEDGER Gaps G-B-1, whose list of codes does not name E0507 yet); extract-variable
+carries the `Borrow` risk mark, so such a candidate is `AfterOuterCheck`, never auto-applicable
+(CHECK_LEDGER M-6). The best (candidate 0) passes.
+
 On ryo-rs (a verification repository used as a large sample; run 3 of section "ryo-rs (large
 run)", before the detectors) 2 of 30 decided candidates failed, in 10 decisions
 (`inline-variable-0` had no candidate), both in `misplace-item` decisions: candidate 0 of
@@ -376,8 +454,10 @@ run)", before the detectors) 2 of 30 decided candidates failed, in 10 decisions
 `misplace-item-2` reports E0204 (a `Copy` impl on a type with a field that is not `Copy`) at
 `crates/ryo-agent/src/decide.rs:150` (paths inside ryo-rs). The harness counts 1 of the 10
 first candidates of a decision as failed: candidate 0 of `misplace-item-0`, a decision whose
-planted best was not generated. Both codes are now detected (CHECK_LEDGER Gaps G-B-9 and G-B-10);
-the run with the detectors is pending.
+planted best was not generated. Both codes are now detected (CHECK_LEDGER Gaps G-B-9 and G-B-10).
+With the detectors (run 3 at main fff60ef) 0 of 33 decided candidates fail in the 11 decisions, and
+0 of the 11 first candidates; `inline-variable-0` now has candidates, so all 11 decisions are
+decided.
 
 ## ryo-rs (large run)
 
@@ -428,7 +508,8 @@ Generation is 6 of 11 (0.55; the small bases gave 0.79 then). The five decisions
 never generated are `inline-variable-0` (no candidate at all, fate `no-candidates`),
 `inline-variable-2`, `misplace-item-0`, `misplace-item-1` and the pair `obscure-name` plus
 `inline-variable`. The causes found on the small bases since (section "Generation") are fixed;
-which cause each of the five had is a hypothesis until a new run (CHECK_LEDGER Open work S-4).
+which cause each of the five had was read on the run after them (subsection "After the four
+generation fixes and the containment"; CHECK_LEDGER S-4, now removed).
 
 Run 2 (`--exhaustive --limit 10`: beam 200, no wall limit, the first 10 cases, which leaves out
 `pair-obscure-name-obscure-name-0`; 466,780 ms, 304 checks): 5 of the 10 decisions generate the
@@ -442,24 +523,94 @@ expander, and went on past it; the harness did not count it then, so the tables 
 it. The producer is extract-variable: rust-analyzer names the variable after the whole text of
 the struct-literal field whose value it extracts, and a field behind `#[cfg(..)]` makes that text
 no identifier. The panic then ended the whole expansion of that parent state with no child.
-Whether that parent was the planted state of a measured case (CHECK_LEDGER S-4 lists
-`inline-variable-0` with no candidate at all) is not checked; a new run shows it. The expander now
+In the run after the containment no panic is contained and `inline-variable-0`, the one decision
+with no candidate before, has 71 (subsection "After the four generation fixes and the
+containment"), so that parent was most likely its planted state (an inference from the two runs,
+not traced). The expander now
 refuses such a value, contains a panic per call of one edit kind, and records it on the session.
 `search-recall run` prints the line `contained panics: <n> detector, <n> expander`, and the oracle
 fails on any contained panic.
 
+### After the four generation fixes and the containment (2026-11-01, main fff60ef)
+
+The same 11 cases, run again on 2026-11-01 at main fff60ef (the expander of section "Generation"
+and the containment of the panic above), on 16 cores and 30 GiB with the machine otherwise running
+other builds, two runs one after the other: run 1 at beam 20, run 3 the same with `--outer-check`
+(no exhaustive run). Run 3 gives the same table and the same beam rank, fate and final rank for
+every decision as run 1; its outer check is in section "Outer check", its trigger lines in section
+"Perf triggers". The numbers below are from run 1 (380,928 ms, 206 checks).
+
+| set | decisions | skipped | before: generated / hit / recall@20 / top-3 | after: generated | hit | recall@20 | hit/all | generation | top-3 |
+|---|---|---|---|---|---|---|---|---|---|
+| all | 11 | 0 | 6 / 6 / 1.00 / 0.27 | 7 | 6 | 0.86 | 0.55 | 0.64 | 0.18 |
+| kind inline-variable | 4 | 0 | 1 / 1 / 1.00 / 0.25 | 2 | 1 | 0.50 | 0.25 | 0.50 | 0.00 |
+| kind misplace-item | 3 | 0 | 1 / 1 / 1.00 / 0.33 | 1 | 1 | 1.00 | 0.33 | 0.33 | 0.33 |
+| kind obscure-name | 6 | 0 | 5 / 5 / 1.00 / 0.17 | 5 | 5 | 1.00 | 0.83 | 0.83 | 0.17 |
+| depth 1 | 9 | 0 | 5 / 5 / 1.00 / 0.33 | 6 | 5 | 0.83 | 0.56 | 0.67 | 0.22 |
+| depth 2 | 2 | 0 | 1 / 1 / 1.00 / 0.00 | 1 | 1 | 1.00 | 0.50 | 0.50 | 0.00 |
+
+Verdict: **insufficient** (recall@20 0.86 over 7 generated decisions, fewer than 30). Contained
+panics: 0 detector, 0 expander, in both runs (each run before hit one).
+
+| decision | generated | hit | beam rank | fate | final rank | proposed | kept | wall ms |
+|---|---|---|---|---|---|---|---|---|
+| ryo-rs/inline-variable-0 | yes | no | - | dominated | - | 71 | 20 | 38352 |
+| ryo-rs/inline-variable-1 | yes | yes | 4 | passed | 4 | 8 | 8 | 9186 |
+| ryo-rs/inline-variable-2 | no | no | - | - | - | 22 | 20 | 6837 |
+| ryo-rs/misplace-item-0 | no | no | - | - | - | 5 | 5 | 4445 |
+| ryo-rs/misplace-item-1 | no | no | - | - | - | 3 | 3 | 3636 |
+| ryo-rs/misplace-item-2 | yes | yes | 0 | passed | 0 | 7 | 7 | 11156 |
+| ryo-rs/obscure-name-0 | yes | yes | 3 | passed | 3 | 20 | 20 | 12319 |
+| ryo-rs/obscure-name-1 | yes | yes | 2 | passed | 5 | 17 | 17 | 40442 |
+| ryo-rs/obscure-name-2 | yes | yes | 1 | passed | 1 | 15 | 15 | 31674 |
+| ryo-rs/pair-obscure-name-inline-variable-0 | no | no | - | - | - | 47/187 | 20/20 | 63056 |
+| ryo-rs/pair-obscure-name-obscure-name-0 | yes | yes | 13 | passed | 12 | 33/131 | 20/20 | 69300 |
+
+`inline-variable-0` now has candidates (71; before: none, the panic of CHECK_LEDGER S-3 was in its
+planted state) and its best is generated, but the pruning drops it at depth 1. The four decisions
+still not generated have three causes, each read from the expander's output on the planted state
+of ryo-rs (the expansion of each planted state over the case's targets, every Blueprint applied and
+compared with the clean text) and each now with a small-base case (section "Generation, second
+round"):
+
+| decision | what the plant does | cause |
+|---|---|---|
+| `misplace-item-0`, `misplace-item-1` | moves a private item that has a `///` doc line to another module file of the crate, as `pub(crate)`, and leaves a `use` of it | rust-analyzer's syntax tree gives a `///` comment its own kind (`DOC_COMMENT`), apart from a `//` comment (`COMMENT`), and the expander skipped only the second when it looked for the start of the item's visibility or keyword. For a documented item that start was the doc line, so the reverse move wrote the item without its doc and the conformance check of move-item refused it (`NotMoved`): no reverse move was proposed. The visibility is not the cause: the reverse move writes the item with the visibility of the `use` (none here), as it did for the `gen-lab` case with `pub(crate)`. |
+| `inline-variable-2` | folds a reference to a nested field (`&a.b.c`) into a call argument | extract-variable was never offered a reference expression; only the field expression inside it was, and that extract (no `&`) is not the restore. |
+| `pair-obscure-name-inline-variable-0` | renames a local in one file and folds a literal into a call argument in a bench target (`benches/`) | the bench file is indexed and expanded (its renames and extracts are among the 47 children); extract-variable was never offered a literal. The obscure-name half is generated. |
+
+Why `inline-variable-0` is dropped (from the trace of the same expansion, scored with
+`SyntaxAssessor` and the rule of `prune`): its target function is long (about 200 lines), so its
+71 children fill the beam of 20 already at depth 1, where the small bases never fill it (section
+"Counts", reservation 1). The restore writes one `let` line into a function beyond the 25 lines of
+the long-function cost, so its `clean` is -1, as it is for every extract-variable in that function,
+while a rename keeps `clean` at 0; the extensibility term is 0 for every child (CHECK_LEDGER S-2).
+17 children dominate the restore (at least its `clean`, at most its 161 edit bytes and its one file,
+better in one), 9 of the 71 are dominated by none. The 9 come first and the rest go by score, where
+the -1 of `clean` weighs 10 and the bytes 1 per 100: the many renames with `clean` 0 outrank it and
+it falls past the beam. This is the loss of CHECK_LEDGER S-7 (a heavier restore loses to lighter
+siblings under the untuned weights), here at depth 1 and through the long-function cost.
+
 ## Perf triggers (decision D4)
 
 The table is filled by every run; the small bases cannot fire trigger 1 to 3 (they are tiny). The
-ryo-rs column is run 1 of section "ryo-rs (large run)" (ryo-rs is a verification repository used
-as a large sample; 16 cores, 30 GiB, the machine otherwise idle).
+ryo-rs columns are run 1 of section "ryo-rs (large run)" (ryo-rs is a verification repository used
+as a large sample; 16 cores, 30 GiB): "before" the first run (the machine otherwise idle), "after"
+the run at main fff60ef of its subsection "After the four generation fixes and the containment"
+(the machine otherwise running other builds).
 
-| trigger | limit | small bases | ryo-rs |
-|---|---|---|---|
-| 1 median decision | 300,000 ms | 138 ms (not fired) | 8,986 ms (not fired) |
-| 2 median warm check (Affected) | 5,000 ms | 5 ms over 565 checks (not fired) | 1,476 ms over 172 checks (not fired) |
-| 3 RSS after 1,000 checks, or check time x1.5 | 8 GiB, or 1,500 permille of the first 100 checks | 595,024 kB after 565 checks; both halves not measured: fewer than 1,000 checks | 5,653,460 kB after 172 checks; both halves not measured: fewer than 1,000 checks |
-| 4 one recall run without its outer check, default budget | 600,000 ms | 14,556 ms (not fired) | 360,538 ms (not fired) |
+| trigger | limit | small bases | ryo-rs before | ryo-rs after |
+|---|---|---|---|---|
+| 1 median decision | 300,000 ms | 138 ms (not fired) | 8,986 ms (not fired) | 12,319 ms (not fired) |
+| 2 median warm check (Affected) | 5,000 ms | 5 ms over 565 checks (not fired) | 1,476 ms over 172 checks (not fired) | 1,187 ms over 206 checks (not fired) |
+| 3 RSS after 1,000 checks, or check time x1.5 | 8 GiB, or 1,500 permille of the first 100 checks | 595,024 kB after 565 checks; both halves not measured: fewer than 1,000 checks | 5,653,460 kB after 172 checks; both halves not measured: fewer than 1,000 checks | 5,501,608 kB after 206 checks; both halves not measured: fewer than 1,000 checks |
+| 4 one recall run without its outer check, default budget | 600,000 ms | 14,556 ms (not fired) | 360,538 ms (not fired) | 380,928 ms (not fired) |
+
+Run 3 after (`--outer-check`, main fff60ef): 14,288 ms, 1,092 ms over 206 checks, 5,633,336 kB
+after 206 checks (not measured), and 389,913 ms without its outer check (outer check 663,825 ms,
+whole run 1,053,738 ms), not fired: the harness now prints trigger 4 as D4 restates it, and run 3
+is the first run with `--outer-check` judged that way by the harness itself. The outer check of 33
+candidates took about 20 s each (663,825 / 33, derived).
 
 The other two ryo-rs runs: run 2 (`--exhaustive --limit 10`) 9,810 ms, 847 ms over 304 checks,
 5,701,156 kB after 304 checks (both halves of trigger 3 not measured) and 466,780 ms, none fired;
@@ -525,9 +676,11 @@ tree and `<OUT>` a directory without a `target` path component:
   never the top reward (above). They are to be set from this table, not before.
 - **A small corpus.** 39 decisions on tiny code, 28 of them depth 1 where the beam does not fill;
   the narrow-beam runs and the depth-2 pairs carry the evidence. A larger base is the large run,
-  whose 11 decisions on ryo-rs (6 compared) decide nothing either.
+  whose 11 decisions on ryo-rs (6 compared, 7 in the run at main fff60ef) decide nothing either.
 - **The expander offers extract-variable only for some expression shapes**: calls, method calls,
-  index, binary and nested field expressions. The planter folds any one-line initializer into a
-  call argument, so a plant whose initializer is another shape (`&x`, `x?`, `a.b`, a macro call,
-  a path) is never restored. No small-base case has such a plant; whether one of ryo-rs has is
-  open (CHECK_LEDGER S-4).
+  index, binary and nested field expressions, and a reference or literal that is a whole argument
+  of a call (section "Generation, second round"). The planter folds any one-line initializer into
+  a call argument, so a plant whose initializer is another shape (`x?`, `a.b`, a macro call, a
+  path) is never restored. No small-base case has such a plant; on ryo-rs (a verification
+  repository used as a large sample) the two of its 11 cases with another shape were a reference
+  and a literal.
