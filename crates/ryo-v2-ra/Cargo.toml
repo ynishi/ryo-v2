@@ -10,6 +10,9 @@ homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ryo-v2-core.workspace = true
 ra_ap_ide.workspace = true

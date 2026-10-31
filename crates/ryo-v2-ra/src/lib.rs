@@ -4,7 +4,6 @@
 //! `Analyzer` port of `ryo-v2-core`: load a workspace once, fork its in-memory
 //! state per candidate, apply text edits, collect HIR diagnostics, discard the
 //! fork. Nothing here runs cargo or rustc per candidate.
-#![warn(missing_docs)]
 
 mod assess;
 mod check;

@@ -8,7 +8,6 @@
 //!
 //! `OUT` must have no `target` path component: ryo-v2-ra skips every such path, so a base under
 //! one would have no files.
-#![warn(missing_docs)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

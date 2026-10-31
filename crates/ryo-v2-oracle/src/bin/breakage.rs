@@ -4,7 +4,6 @@
 //! Usage:
 //! - `breakage gen <ws> [--kinds a,b|all] [--seeds N]` (defaults: all kinds, 3 seeds)
 //! - `breakage regroup <ws>` (cases listed in `KEPT_GROUPS` keep their group and are reported)
-#![warn(missing_docs)]
 
 use anyhow::{Context, Result, bail};
 use ryo_v2_oracle::breakage::{Kind, generate, group_for, read_sources, sites, write_case};

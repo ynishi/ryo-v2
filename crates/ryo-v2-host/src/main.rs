@@ -4,7 +4,6 @@
 //! The argument parser's definition (clap's derive types) is the only
 //! description of the commands: help, the command list and validation come
 //! from it, not from a second hand-kept table.
-#![warn(missing_docs)]
 
 mod apply;
 mod bench;

@@ -7,7 +7,6 @@
 //! regenerated (`just oracle-refresh`), never in a test. The expected side is
 //! `cargo check --workspace --all-targets`, what the CI gate sees; `history` measures the
 //! verifier's false positives on real commits.
-#![warn(missing_docs)]
 
 pub mod breakage;
 pub mod cargo_check;

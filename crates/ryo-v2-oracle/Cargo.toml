@@ -11,6 +11,9 @@ documentation.workspace = true
 readme.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 ryo-v2-core.workspace = true
 ryo-v2-ra.workspace = true

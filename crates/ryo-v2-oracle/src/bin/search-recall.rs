@@ -16,7 +16,6 @@
 //! `--exhaustive` checks up to 200 children per depth with no wall limit (the full-reward best is
 //! then ranked among everything); `--outer-check` runs `cargo check` on every decided candidate in
 //! a copy of the workspace (server only).
-#![warn(missing_docs)]
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
