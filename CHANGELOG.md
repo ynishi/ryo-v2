@@ -34,6 +34,13 @@ and this project adheres to
 
 ### Changed
 
+- A Blueprint carries the fingerprint of the whole base text of every file it edits (`BaseFp`), and
+  `apply` blocks it as stale when any byte of such a file changed, not only the bytes of a read: an
+  identical line inserted above a read no longer passes. Reads of files the Blueprint only reads
+  keep their exact-offset check. Blueprint JSON requires `"bases": [{"path", "fingerprint"}]`, so
+  input written without it no longer parses; `ryo-v2 fingerprint WORKSPACE PATH` without a range
+  prints such an entry; a `stale` blocking lists `bases` beside `reads`; `fingerprints_checked`
+  counts the bases and the reads of files without one. `Blueprint::new` takes a `BlueprintParts`.
 - A candidate's risk marks and Rule are derived by the domain from its Blueprints and the roles of
   the files they edit; `Candidate`, `Evidence` and decision-log entries can no longer be built
   outside the core crate, and the `Verifier` port gains `provenance`.
