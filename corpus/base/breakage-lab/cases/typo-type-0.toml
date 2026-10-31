@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:3 typo Rect -> Rectt
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/typo-type-0"
+group = "unresolved-type"
+origin = "breakage:typo-type:0"

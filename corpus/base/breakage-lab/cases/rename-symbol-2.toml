@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:22 rename fn count -> count_x
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/rename-symbol-2"
+group = "no-method"
+origin = "breakage:rename-symbol:2"

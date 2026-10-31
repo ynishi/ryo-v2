@@ -7,6 +7,7 @@
 //! regenerated (`just oracle-refresh`), never in a test.
 #![warn(missing_docs)]
 
+pub mod breakage;
 pub mod case;
 pub mod groups;
 pub mod materials;

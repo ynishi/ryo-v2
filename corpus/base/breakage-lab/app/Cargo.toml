@@ -1,0 +1,8 @@
+[package]
+name = "lab-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lab-shapes = { path = "../shapes" }
+lab-store = { path = "../store" }

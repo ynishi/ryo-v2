@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:23 comment out `impl Area for Square`
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/drop-trait-impl-0"
+group = "no-method"
+origin = "breakage:drop-trait-impl:0"

@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:35 typo Bin -> Binn
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/typo-type-2"
+group = "unresolved-name"
+origin = "breakage:typo-type:2"

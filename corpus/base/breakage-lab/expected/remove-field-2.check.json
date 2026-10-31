@@ -1,0 +1,12 @@
+[
+  {
+    "code": "E0609",
+    "path": "shapes/src/lib.rs",
+    "line": 30
+  },
+  {
+    "code": "E0609",
+    "path": "shapes/src/lib.rs",
+    "line": 42
+  }
+]

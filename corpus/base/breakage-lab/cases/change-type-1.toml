@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:65 change return type of fn clamp_side to String
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/change-type-1"
+group = "type-mismatch"
+origin = "breakage:change-type:1"

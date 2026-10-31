@@ -18,7 +18,7 @@ pub enum Group {
     UnresolvedType,
     /// E0599.
     NoMethod,
-    /// E0308.
+    /// E0308, E0369.
     TypeMismatch,
     /// E0277.
     TraitBound,
@@ -30,13 +30,18 @@ pub enum Group {
     Borrow,
     /// E0603, E0616, E0624.
     Privacy,
+    /// E0080, E0015.
+    ConstEval,
+    /// A reference to a cfg-disabled item. The group is the cause, not the
+    /// code: the codes overlap other groups.
+    Cfg,
     /// No error expected.
     Valid,
 }
 
 impl Group {
     /// Every group, in declaration order.
-    pub const ALL: [Group; 11] = [
+    pub const ALL: [Group; 13] = [
         Group::UnresolvedImport,
         Group::UnresolvedName,
         Group::UnresolvedType,
@@ -47,6 +52,8 @@ impl Group {
         Group::Field,
         Group::Borrow,
         Group::Privacy,
+        Group::ConstEval,
+        Group::Cfg,
         Group::Valid,
     ];
 
@@ -72,6 +79,8 @@ impl Group {
             Group::Field => "field",
             Group::Borrow => "borrow",
             Group::Privacy => "privacy",
+            Group::ConstEval => "const-eval",
+            Group::Cfg => "cfg",
             Group::Valid => "valid",
         }
     }
@@ -88,12 +97,14 @@ impl Group {
             Group::UnresolvedName => &["E0425"],
             Group::UnresolvedType => &["E0412", "E0422"],
             Group::NoMethod => &["E0599"],
-            Group::TypeMismatch => &["E0308"],
+            Group::TypeMismatch => &["E0308", "E0369"],
             Group::TraitBound => &["E0277"],
             Group::Arity => &["E0061", "E0107"],
             Group::Field => &["E0609", "E0560", "E0063", "E0559"],
             Group::Borrow => &["E0382", "E0499", "E0502", "E0505", "E0506"],
             Group::Privacy => &["E0603", "E0616", "E0624"],
+            Group::ConstEval => &["E0080", "E0015"],
+            Group::Cfg => &["E0425", "E0432", "E0433", "E0412", "E0599"],
             Group::Valid => &[],
         }
     }
@@ -349,7 +360,7 @@ mod tests {
             assert_eq!(Group::parse(g.id()), Some(g));
         }
         assert_eq!(Group::parse("nope"), None);
-        assert_eq!(Group::ALL.len(), 11);
+        assert_eq!(Group::ALL.len(), 13);
         assert!(Group::Valid.codes().is_empty());
         assert!(Group::PRIMARY.iter().all(|g| Group::ALL.contains(g)));
     }

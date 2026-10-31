@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:44 make fn moved_len private
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/call-private-1"
+group = "valid"
+origin = "breakage:call-private:1"

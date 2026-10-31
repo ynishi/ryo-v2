@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:44 remove field width
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/remove-field-1"
+group = "field"
+origin = "breakage:remove-field:1"

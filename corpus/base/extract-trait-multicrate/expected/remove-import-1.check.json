@@ -1,0 +1,52 @@
+[
+  {
+    "code": "E0425",
+    "path": "user/src/lib.rs",
+    "line": 18
+  },
+  {
+    "code": "E0425",
+    "path": "user/src/lib.rs",
+    "line": 21
+  },
+  {
+    "code": "E0425",
+    "path": "user/src/lib.rs",
+    "line": 27
+  },
+  {
+    "code": "E0425",
+    "path": "user/src/lib.rs",
+    "line": 30
+  },
+  {
+    "code": "E0425",
+    "path": "user/src/lib.rs",
+    "line": 41
+  },
+  {
+    "code": "E0425",
+    "path": "user/src/lib.rs",
+    "line": 47
+  },
+  {
+    "code": "E0433",
+    "path": "user/src/lib.rs",
+    "line": 28
+  },
+  {
+    "code": "E0433",
+    "path": "user/src/lib.rs",
+    "line": 31
+  },
+  {
+    "code": "E0433",
+    "path": "user/src/lib.rs",
+    "line": 32
+  },
+  {
+    "code": "E0433",
+    "path": "user/src/lib.rs",
+    "line": 35
+  }
+]

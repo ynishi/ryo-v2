@@ -295,9 +295,13 @@ mod tests {
     }
 
     #[test]
-    fn load_all_finds_the_eight_hand_cases() {
+    fn load_all_finds_the_hand_cases() {
         let cases = Case::load_all(&real_corpus()).unwrap();
-        let ids: Vec<&str> = cases.iter().map(|c| c.id.as_str()).collect();
+        let ids: Vec<&str> = cases
+            .iter()
+            .filter(|c| c.origin == "hand")
+            .map(|c| c.id.as_str())
+            .collect();
         assert_eq!(
             ids,
             [
@@ -314,8 +318,23 @@ mod tests {
         assert!(
             cases
                 .iter()
+                .filter(|c| c.origin == "hand")
                 .all(|c| c.workspace_rel == "base/extract-trait-multicrate")
         );
+    }
+
+    #[test]
+    fn case_ids_unique_per_workspace() {
+        let cases = Case::load_all(&real_corpus()).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &cases {
+            assert!(
+                seen.insert((c.workspace_rel.clone(), c.id.clone())),
+                "duplicate case {} in {}",
+                c.id,
+                c.workspace_rel
+            );
+        }
     }
 
     #[test]

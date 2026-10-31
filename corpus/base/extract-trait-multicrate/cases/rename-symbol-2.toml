@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:84 rename fn magnitude -> magnitude_x
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/rename-symbol-2"
+group = "no-method"
+origin = "breakage:rename-symbol:2"

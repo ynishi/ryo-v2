@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:49 activate cfg-gate: let _ = lab_shapes::extra_only();
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/cfg-gate-0"
+group = "cfg"
+origin = "breakage:cfg-gate:0"

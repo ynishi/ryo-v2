@@ -1,0 +1,5 @@
+# breakage: facade/src/lib.rs:9 remove `pub use extract_trait_multicrate_lib::Case06;`
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/remove-import-0"
+group = "unresolved-import"
+origin = "breakage:remove-import:0"

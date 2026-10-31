@@ -1,0 +1,5 @@
+# breakage: facade/src/lib.rs:9 typo Case06 -> Case066
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/typo-type-0"
+group = "unresolved-import"
+origin = "breakage:typo-type:0"

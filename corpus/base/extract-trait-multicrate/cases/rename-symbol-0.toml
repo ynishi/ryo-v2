@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:25 rename fn one -> one_x
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/rename-symbol-0"
+group = "no-method"
+origin = "breakage:rename-symbol:0"

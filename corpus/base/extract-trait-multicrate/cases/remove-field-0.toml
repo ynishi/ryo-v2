@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:22 remove field base
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/remove-field-0"
+group = "field"
+origin = "breakage:remove-field:0"

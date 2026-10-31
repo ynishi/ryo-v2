@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:88 activate assign-while-borrowed: n = 5;
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/assign-while-borrowed-0"
+group = "borrow"
+origin = "breakage:assign-while-borrowed:0"

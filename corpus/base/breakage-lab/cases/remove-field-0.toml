@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:7 remove field inner
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-field-0"
+group = "field"
+origin = "breakage:remove-field:0"

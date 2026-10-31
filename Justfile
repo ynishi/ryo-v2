@@ -30,6 +30,14 @@ oracle:
 oracle-refresh ws="base/extract-trait-multicrate":
     cargo run -p ryo-v2-oracle --bin oracle-refresh -- {{ws}}
 
+# Writes breakage cases and overlays for corpus/<ws> (deterministic; commit the output).
+breakage-gen ws kinds="all" seeds="3":
+    cargo run -p ryo-v2-oracle --bin breakage -- gen {{ws}} --kinds {{kinds}} --seeds {{seeds}}
+
+# Sets the group of breakage cases from their expected files.
+breakage-regroup ws:
+    cargo run -p ryo-v2-oracle --bin breakage -- regroup {{ws}}
+
 # One worktree per issue, cut from a freshly fetched origin/main.
 worktree-new type slug:
     git fetch origin

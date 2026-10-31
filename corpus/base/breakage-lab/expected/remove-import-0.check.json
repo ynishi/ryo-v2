@@ -1,0 +1,52 @@
+[
+  {
+    "code": "E0405",
+    "path": "app/src/lib.rs",
+    "line": 9
+  },
+  {
+    "code": "E0422",
+    "path": "app/src/lib.rs",
+    "line": 16
+  },
+  {
+    "code": "E0422",
+    "path": "app/src/lib.rs",
+    "line": 21
+  },
+  {
+    "code": "E0422",
+    "path": "app/src/lib.rs",
+    "line": 25
+  },
+  {
+    "code": "E0422",
+    "path": "app/src/lib.rs",
+    "line": 29
+  },
+  {
+    "code": "E0422",
+    "path": "app/src/lib.rs",
+    "line": 44
+  },
+  {
+    "code": "E0425",
+    "path": "app/src/lib.rs",
+    "line": 16
+  },
+  {
+    "code": "E0425",
+    "path": "app/src/lib.rs",
+    "line": 17
+  },
+  {
+    "code": "E0425",
+    "path": "app/src/lib.rs",
+    "line": 21
+  },
+  {
+    "code": "E0425",
+    "path": "app/src/lib.rs",
+    "line": 25
+  }
+]

@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:19 remove field w
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-field-2"
+group = "field"
+origin = "breakage:remove-field:2"

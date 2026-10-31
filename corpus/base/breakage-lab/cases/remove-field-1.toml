@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:15 remove field side
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-field-1"
+group = "field"
+origin = "breakage:remove-field:1"

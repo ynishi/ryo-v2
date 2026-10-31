@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:11 make fn wrapped_area private
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/call-private-0"
+group = "valid"
+origin = "breakage:call-private:0"

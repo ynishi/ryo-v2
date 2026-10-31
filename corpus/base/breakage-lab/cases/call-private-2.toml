@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:74 make fn scale private
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/call-private-2"
+group = "privacy"
+origin = "breakage:call-private:2"

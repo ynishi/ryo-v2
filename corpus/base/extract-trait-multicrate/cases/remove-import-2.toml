@@ -1,0 +1,5 @@
+# breakage: viewer/src/lib.rs:10 remove `use extract_trait_multicrate_facade::Case06;`
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/remove-import-2"
+group = "unresolved-name"
+origin = "breakage:remove-import:2"

@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:25 change return type of fn one to String
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/change-type-0"
+group = "type-mismatch"
+origin = "breakage:change-type:0"

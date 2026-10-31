@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:44 rename fn moved_len -> moved_len_x
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/rename-symbol-1"
+group = "valid"
+origin = "breakage:rename-symbol:1"

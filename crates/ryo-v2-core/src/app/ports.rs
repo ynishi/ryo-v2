@@ -64,6 +64,12 @@ pub enum Event {
         /// Whether the post-revert diagnostics matched baseline (None = not asserted).
         revert_ok: Option<bool>,
     },
+    /// Resident set size of the process, sampled by the caller after a load or a discard
+    /// (the cli reads `/proc/self/status`; the core never reads it).
+    Memory {
+        /// VmRSS in kB.
+        rss_kb: u64,
+    },
 }
 
 /// Monotonic time source.

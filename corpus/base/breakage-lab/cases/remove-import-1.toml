@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:3 remove `use lab_shapes::{Area, Rect, Square};`
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-import-1"
+group = "unresolved-name"
+origin = "breakage:remove-import:1"

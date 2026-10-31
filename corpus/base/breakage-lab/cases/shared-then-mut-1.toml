@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:69 activate shared-then-mut: b.label.push('!');
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/shared-then-mut-1"
+group = "borrow"
+origin = "breakage:shared-then-mut:1"

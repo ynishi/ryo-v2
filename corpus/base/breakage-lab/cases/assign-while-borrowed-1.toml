@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:94 activate assign-while-borrowed: b.label = String::new();
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/assign-while-borrowed-1"
+group = "borrow"
+origin = "breakage:assign-while-borrowed:1"

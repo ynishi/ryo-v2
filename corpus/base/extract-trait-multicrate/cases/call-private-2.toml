@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:84 make fn magnitude private
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/call-private-2"
+group = "privacy"
+origin = "breakage:call-private:2"

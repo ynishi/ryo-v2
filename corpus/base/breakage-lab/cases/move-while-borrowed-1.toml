@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:81 activate move-while-borrowed: drop(v);
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/move-while-borrowed-1"
+group = "borrow"
+origin = "breakage:move-while-borrowed:1"

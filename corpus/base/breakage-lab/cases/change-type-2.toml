@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:16 change return type of fn squares_total to String
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/change-type-2"
+group = "type-mismatch"
+origin = "breakage:change-type:2"

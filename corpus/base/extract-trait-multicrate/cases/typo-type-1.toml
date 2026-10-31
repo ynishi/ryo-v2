@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:129 typo Case05 -> Case055
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/typo-type-1"
+group = "unresolved-name"
+origin = "breakage:typo-type:1"

@@ -20,17 +20,19 @@ use ryo_v2_ra::{RaAnalyzer, RaConfig};
 
 // Floors: the least number of passing cases a group must keep. Raised, never
 // lowered; lowering one needs the id of its CHECK_LEDGER row written next to it.
-const FLOOR_UNRESOLVED_IMPORT: usize = 2;
+const FLOOR_UNRESOLVED_IMPORT: usize = 3;
 const FLOOR_UNRESOLVED_NAME: usize = 0;
 const FLOOR_UNRESOLVED_TYPE: usize = 0;
-const FLOOR_NO_METHOD: usize = 2;
-const FLOOR_TYPE_MISMATCH: usize = 1;
-const FLOOR_TRAIT_BOUND: usize = 0;
+const FLOOR_NO_METHOD: usize = 9;
+const FLOOR_TYPE_MISMATCH: usize = 3;
+const FLOOR_TRAIT_BOUND: usize = 3;
 const FLOOR_ARITY: usize = 0;
 const FLOOR_FIELD: usize = 1;
 const FLOOR_BORROW: usize = 0;
-const FLOOR_PRIVACY: usize = 1;
-const FLOOR_VALID: usize = 1;
+const FLOOR_PRIVACY: usize = 4;
+const FLOOR_CONST_EVAL: usize = 0;
+const FLOOR_CFG: usize = 1;
+const FLOOR_VALID: usize = 4;
 
 fn floor(g: Group) -> usize {
     match g {
@@ -44,6 +46,8 @@ fn floor(g: Group) -> usize {
         Group::Field => FLOOR_FIELD,
         Group::Borrow => FLOOR_BORROW,
         Group::Privacy => FLOOR_PRIVACY,
+        Group::ConstEval => FLOOR_CONST_EVAL,
+        Group::Cfg => FLOOR_CFG,
         Group::Valid => FLOOR_VALID,
     }
 }
@@ -168,8 +172,9 @@ fn oracle() {
                     }
                 }
             };
+            let ws_name = case.workspace_rel.rsplit('/').next().unwrap_or(ws);
             report.outcomes.push(CaseOutcome {
-                id: case.id.clone(),
+                id: format!("{ws_name}/{}", case.id),
                 group: case.group,
                 outcome,
                 check_ms,

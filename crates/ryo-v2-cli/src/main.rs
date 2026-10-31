@@ -6,17 +6,14 @@
 //! from it, not from a second hand-kept table.
 #![warn(missing_docs)]
 
-use anyhow::{Context, Result};
+mod bench;
+mod rss;
+
+use anyhow::Result;
+use bench::BenchArgs;
 use clap::{Parser, Subcommand};
-use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Event};
-use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::Scope;
-use ryo_v2_core::infra::clock::MonotonicClock;
-use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{RaAnalyzer, RaConfig};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "ryo-v2", version, about)]
@@ -30,14 +27,34 @@ enum Command {
     /// Load BASE once, then verify each VARIANT dir's .rs diff against it (apply, diagnose, revert).
     Bench {
         /// The workspace to load.
-        base: PathBuf,
-        /// Overlay dirs; each file that differs from (or is missing in) BASE is an edit.
-        #[arg(required = true)]
+        #[arg(required_unless_present = "large")]
+        base: Option<PathBuf>,
+        /// Overlay dirs; each .rs that differs from (or is missing in) BASE is an edit.
+        #[arg(required_unless_present = "large")]
         variants: Vec<PathBuf>,
-        /// Do not start the proc-macro server (derives stay unexpanded: many false positives).
+        /// Large mode: BASE = PATH, VARIANTS = corpus/body-01 corpus/body-02 corpus/body-03 (relative to the cwd).
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["base", "variants"])]
+        large: Option<PathBuf>,
+        /// fork/apply/diagnose/discard each variant this many times per scope.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repeat: u32,
+        /// Which scopes to diagnose.
+        #[arg(long, value_enum, default_value_t = ScopeArg::Affected)]
+        scope: ScopeArg,
+        /// Do not start the proc-macro server.
         #[arg(long)]
         no_proc_macro: bool,
+        /// Skip the post-revert re-diagnosis (revert_ms then excludes it; revert_ok prints `-`).
+        #[arg(long)]
+        no_assert_revert: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ScopeArg {
+    Affected,
+    Workspace,
+    Both,
 }
 
 fn main() -> Result<()> {
@@ -45,93 +62,75 @@ fn main() -> Result<()> {
         Command::Bench {
             base,
             variants,
+            large,
+            repeat,
+            scope,
             no_proc_macro,
-        } => bench(&base, &variants, !no_proc_macro),
+            no_assert_revert,
+        } => {
+            let (base, variants) = match large {
+                Some(path) => {
+                    let variants: Vec<PathBuf> =
+                        ["corpus/body-01", "corpus/body-02", "corpus/body-03"]
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect();
+                    for v in &variants {
+                        if !v.is_dir() {
+                            anyhow::bail!(
+                                "--large: {} not found; run from the ryo-v2 repo root",
+                                v.display()
+                            );
+                        }
+                    }
+                    (path, variants)
+                }
+                None => (
+                    base.ok_or_else(|| anyhow::anyhow!("BASE is required without --large"))?,
+                    variants,
+                ),
+            };
+            let scopes = match scope {
+                ScopeArg::Affected => vec![Scope::Affected],
+                ScopeArg::Workspace => vec![Scope::Workspace],
+                ScopeArg::Both => vec![Scope::Affected, Scope::Workspace],
+            };
+            bench::run(&BenchArgs {
+                base,
+                variants,
+                repeat,
+                scopes,
+                proc_macro: !no_proc_macro,
+                assert_revert: !no_assert_revert,
+            })
+        }
     }
 }
 
-fn bench(base: &std::path::Path, variants: &[PathBuf], proc_macro: bool) -> Result<()> {
-    let observer = Arc::new(RecordingObserver::default());
-    let analyzer = RaAnalyzer::new(
-        RaConfig {
-            proc_macro,
-            threads: None,
-            assert_revert: true,
-        },
-        Arc::new(MonotonicClock::new()),
-        observer.clone(),
-    );
-    let mut session = analyzer.load(base)?;
-    for event in observer.take() {
-        if let Event::Loaded {
-            load_ms,
-            baseline_ms,
-            files,
-            baseline_errors,
-        } = event
-        {
-            eprintln!("[load] {load_ms} ms, {files} local files");
-            eprintln!(
-                "[baseline] {baseline_errors} pre-existing errors in {baseline_ms} ms (cold)"
-            );
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_large_and_repeat() {
+        let r = Cli::try_parse_from([
+            "ryo-v2", "bench", "--large", "/x", "--repeat", "3", "--scope", "both",
+        ]);
+        assert!(r.is_ok());
     }
 
-    let mut fail_infra = 0usize;
-    for variant in variants {
-        let edits = overlay_edits(base, variant)
-            .with_context(|| format!("overlay {}", variant.display()))?;
-        let name = variant.display();
-        if edits.is_empty() {
-            println!("{name}: SKIP (no edits vs base)");
-            continue;
-        }
-        let n_edits = edits.len();
-        observer.take();
-        let result = verify(&analyzer, &mut session, &edits, Scope::Affected);
-        let (mut scope, mut total, mut check_ms, mut revert_ms, mut revert_ok) = (0, 0, 0, 0, None);
-        for event in observer.take() {
-            match event {
-                Event::Checked {
-                    scope_files,
-                    total_files,
-                    check_ms: c,
-                } => (scope, total, check_ms) = (scope_files, total_files, c),
-                Event::Reverted {
-                    revert_ms: r,
-                    revert_ok: ok,
-                } => (revert_ms, revert_ok) = (r, ok),
-                Event::Loaded { .. } => {}
-            }
-        }
-        let verdict = match result {
-            Ok(v) => Some(v),
-            Err(AnalyzerError::RevertMismatch) => {
-                fail_infra += 1;
-                None
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let passed = verdict.as_ref().map(|v| v.passed);
-        println!(
-            "{name}: {} ({n_edits} edited, scope {scope}/{total} files, check {check_ms} ms, revert {revert_ms} ms, revert_ok={revert_ok:?})",
-            match passed {
-                Some(true) => "PASS",
-                Some(false) => "FAIL",
-                None => "FAIL",
-            },
-        );
-        if let Some(v) = verdict {
-            for d in &v.new_errors.errors {
-                println!("  + [{}] {}:{}", d.code, d.path, d.line);
-            }
-            for d in &v.new_errors.unmapped {
-                println!("  + [ra:{}] {}:{}", d.ra_code, d.path, d.line);
-            }
-        }
+    #[test]
+    fn cli_rejects_large_with_base() {
+        assert!(Cli::try_parse_from(["ryo-v2", "bench", "b", "v", "--large", "/x"]).is_err());
     }
-    if fail_infra > 0 {
-        anyhow::bail!("{fail_infra} variant(s) failed revert assertion");
+
+    #[test]
+    fn cli_rejects_repeat_zero() {
+        assert!(Cli::try_parse_from(["ryo-v2", "bench", "b", "v", "--repeat", "0"]).is_err());
     }
-    Ok(())
+
+    #[test]
+    fn cli_requires_base_without_large() {
+        assert!(Cli::try_parse_from(["ryo-v2", "bench"]).is_err());
+    }
 }

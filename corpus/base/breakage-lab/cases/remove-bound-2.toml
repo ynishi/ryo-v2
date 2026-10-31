@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:51 remove bound `T: fmt::Display`
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-bound-2"
+group = "trait-bound"
+origin = "breakage:remove-bound:2"

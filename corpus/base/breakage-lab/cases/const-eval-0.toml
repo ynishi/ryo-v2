@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:62 activate const-eval: const _: u8 = MAX_SIDE + 100;
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/const-eval-0"
+group = "const-eval"
+origin = "breakage:const-eval:0"

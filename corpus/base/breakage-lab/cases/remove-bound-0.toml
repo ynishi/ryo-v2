@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:10 remove bound `T: Area`
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-bound-0"
+group = "no-method"
+origin = "breakage:remove-bound:0"

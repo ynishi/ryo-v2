@@ -1,0 +1,17 @@
+[
+  {
+    "code": "E0433",
+    "path": "shapes/src/lib.rs",
+    "line": 40
+  },
+  {
+    "code": "E0433",
+    "path": "shapes/src/lib.rs",
+    "line": 41
+  },
+  {
+    "code": "E0433",
+    "path": "shapes/src/lib.rs",
+    "line": 50
+  }
+]

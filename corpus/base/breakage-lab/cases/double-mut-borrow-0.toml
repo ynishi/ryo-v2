@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:49 activate double-mut-borrow: let b = &mut *v; b.push(1);
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/double-mut-borrow-0"
+group = "borrow"
+origin = "breakage:double-mut-borrow:0"

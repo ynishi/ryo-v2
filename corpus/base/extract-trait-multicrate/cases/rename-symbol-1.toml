@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:54 rename fn is_square -> is_square_x
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/rename-symbol-1"
+group = "no-method"
+origin = "breakage:rename-symbol:1"

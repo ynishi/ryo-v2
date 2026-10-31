@@ -1,0 +1,5 @@
+# breakage: store/src/lib.rs:43 activate use-after-move: let _ = v.len();
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/use-after-move-1"
+group = "borrow"
+origin = "breakage:use-after-move:1"

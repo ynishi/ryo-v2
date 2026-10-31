@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:4 remove `use std::fmt;`
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-import-2"
+group = "unresolved-import"
+origin = "breakage:remove-import:2"

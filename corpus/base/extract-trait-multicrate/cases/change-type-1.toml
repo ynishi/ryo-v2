@@ -1,0 +1,5 @@
+# breakage: lib/src/lib.rs:57 change return type of fn longer_side to String
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/change-type-1"
+group = "type-mismatch"
+origin = "breakage:change-type:1"

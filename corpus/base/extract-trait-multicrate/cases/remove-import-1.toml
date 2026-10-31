@@ -1,0 +1,5 @@
+# breakage: user/src/lib.rs:15 remove `use extract_trait_multicrate_lib::{Case01, Case02, Case03, Case05};`
+workspace = "base/extract-trait-multicrate"
+overlay = "base/extract-trait-multicrate/breakage/remove-import-1"
+group = "unresolved-name"
+origin = "breakage:remove-import:1"

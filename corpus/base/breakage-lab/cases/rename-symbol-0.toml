@@ -1,0 +1,5 @@
+# breakage: app/src/lib.rs:11 rename fn wrapped_area -> wrapped_area_x
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/rename-symbol-0"
+group = "no-method"
+origin = "breakage:rename-symbol:0"

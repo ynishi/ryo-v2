@@ -1,0 +1,5 @@
+# breakage: shapes/src/lib.rs:55 remove bound `T: Named + Area`
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/breakage/remove-bound-1"
+group = "no-method"
+origin = "breakage:remove-bound:1"
