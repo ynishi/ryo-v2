@@ -453,13 +453,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
-    let triggers = RunInfo {
-        beam: budget.beam,
-        harness_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        outer_check_ms: u64::try_from(outer_ms.as_millis()).unwrap_or(u64::MAX),
-        budget: Some(budget),
-        rss_kb: rss_kb(),
-    };
+    let triggers = RunInfo::of_run(budget, started.elapsed(), outer_ms, rss_kb());
     let mut text = terminal(&rows, triggers);
     if outer {
         text.push_str(&outer_counts.summary());

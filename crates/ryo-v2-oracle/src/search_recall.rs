@@ -837,7 +837,31 @@ pub fn trigger_4_judges(budget: &SearchBudget) -> bool {
 }
 
 impl RunInfo {
-    /// The wall time of the run without the outer check: what trigger 4 compares.
+    /// The numbers of one finished `search-recall run`: the budget it searched with, its whole
+    /// wall time, the part of it spent in the outer `cargo check`, and the RSS.
+    ///
+    /// # Contract
+    /// - C1: `beam` is `budget.beam`, `budget` is `Some(budget)`, and both times are whole ms,
+    ///   saturating at `u64::MAX`.
+    ///   tested: search_recall::tests::run_info_of_a_run_carries_budget_and_outer_time
+    pub fn of_run(
+        budget: SearchBudget,
+        whole: std::time::Duration,
+        outer_check: std::time::Duration,
+        rss_kb: Option<u64>,
+    ) -> Self {
+        let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        RunInfo {
+            beam: budget.beam,
+            harness_ms: ms(whole),
+            outer_check_ms: ms(outer_check),
+            budget: Some(budget),
+            rss_kb,
+        }
+    }
+
+    /// The wall time of the run without the outer check: what trigger 4 compares; 0 when the
+    /// outer check is reported longer than the run.
     pub fn search_ms(&self) -> u64 {
         self.harness_ms.saturating_sub(self.outer_check_ms)
     }
@@ -1556,6 +1580,11 @@ mod tests {
             wide.ends_with("(not measured: budget beyond the default)"),
             "an exhaustive run is not judged: {wide}"
         );
+        let skewed = line(5, 9, default);
+        assert!(
+            skewed.contains(": 0 ms (outer check 9 ms, whole run 5 ms) (not fired)"),
+            "an outer time above the whole saturates to 0: {skewed}"
+        );
         let unknown = line(TRIGGER_HARNESS_MS + 1, 0, None);
         assert!(
             unknown.ends_with("(not measured: budget unknown)"),
@@ -1576,12 +1605,45 @@ mod tests {
     }
 
     #[test]
+    fn run_info_of_a_run_carries_budget_and_outer_time() {
+        use std::time::Duration;
+        let mut b = DEFAULT_SEARCH_BUDGET;
+        b.beam = 200;
+        let t = RunInfo::of_run(
+            b,
+            Duration::from_micros(983_033_999),
+            Duration::from_millis(634_965),
+            Some(7),
+        );
+        assert_eq!(
+            t,
+            RunInfo {
+                beam: 200,
+                harness_ms: 983_033,
+                outer_check_ms: 634_965,
+                budget: Some(b),
+                rss_kb: Some(7),
+            }
+        );
+        assert_eq!(t.search_ms(), 348_068);
+        assert_eq!(
+            RunInfo::of_run(b, Duration::MAX, Duration::ZERO, None).harness_ms,
+            u64::MAX
+        );
+    }
+
+    #[test]
     fn trigger_4_judges_runs_within_the_default_budget() {
         let d = DEFAULT_SEARCH_BUDGET;
         assert!(trigger_4_judges(&d));
         let mut depth = d;
         depth.max_depth = u8::MAX;
         assert!(trigger_4_judges(&depth), "max_depth is set per case");
+        let mut audit = d;
+        audit.audit_every = std::num::NonZeroU16::MAX;
+        assert!(trigger_4_judges(&audit), "audit_every costs no time");
+        audit.audit_every = std::num::NonZeroU16::MIN;
+        assert!(trigger_4_judges(&audit), "audit_every costs no time");
         let narrow = SearchBudget {
             beam: 1,
             max_expand: 1,
