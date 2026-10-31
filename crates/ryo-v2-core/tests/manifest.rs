@@ -21,12 +21,14 @@
 //! 5. A dependency on another member (any table of dependencies, target-specific ones and the
 //!    underscore spellings included) is `<name>.workspace = true`, so the version and path are
 //!    written once, in the root.
-//! 6. No source file under `crates/*/src` sets the level of `missing_docs` in an attribute
-//!    (`#![warn(missing_docs)]`, `#[allow(missing_docs)]`, ...); the level is set once, by rule 2.
+//! 6. No Rust file under `crates/` (sources, tests, build scripts; `target` skipped) sets the
+//!    level of `missing_docs` in an attribute (`#![warn(missing_docs)]`, `#[allow(missing_docs)]`,
+//!    one spread over several lines, ...); the level is set once, by rule 2.
 //! 7. The gate recipes in the `Justfile`: `rust-clippy` runs with `CARGO_BUILD_WARNINGS=deny`
 //!    (warnings fail the gate) and `--locked`, `rust-test` with `--locked`, and `check` runs
-//!    both. `rust-clippy` runs first in `check`, so without its own `--locked` it would rewrite
-//!    a stale `Cargo.lock` before `rust-test` could refuse it.
+//!    both (comment lines in a recipe do not count). `rust-clippy` runs before `rust-test` in
+//!    `check`, so without its own `--locked` it would rewrite a stale `Cargo.lock` before
+//!    `rust-test` could refuse it.
 //!
 //! Each rule is a function returning its problems; the `workspace_*` tests run them on the real
 //! manifests, the others show that each rule reports a broken manifest.
@@ -356,21 +358,33 @@ fn internal_dependency_problems(m: &Member, internal: &BTreeSet<String>) -> Vec<
 
 /// Rule 6: the attribute lines of `text` that set a level for `missing_docs`.
 fn missing_docs_attribute_problems(rel_path: &str, text: &str) -> Vec<String> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, l)| {
-            let l = l.trim_start();
-            (l.starts_with("#![") || l.starts_with("#[")) && l.contains("missing_docs")
-        })
-        .map(|(i, _)| format!("{rel_path}:{}: sets missing_docs in an attribute", i + 1))
-        .collect()
+    let mut out = Vec::new();
+    let mut in_attribute = false;
+    for (i, line) in text.lines().enumerate() {
+        let l = line.trim_start();
+        if l.starts_with("#![") || l.starts_with("#[") {
+            in_attribute = true;
+        }
+        if in_attribute && l.contains("missing_docs") {
+            out.push(format!(
+                "{rel_path}:{}: sets missing_docs in an attribute",
+                i + 1
+            ));
+        }
+        if l.contains(']') {
+            in_attribute = false;
+        }
+    }
+    out
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
         if path.is_dir() {
-            rust_files(&path, out);
+            if entry.file_name() != "target" {
+                rust_files(&path, out);
+            }
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
@@ -388,7 +402,11 @@ fn recipe<'a>(justfile: &'a str, name: &str) -> Vec<&'a str> {
         return Vec::new();
     };
     let mut out = vec![header];
-    out.extend(lines.take_while(|l| l.starts_with(' ') || l.starts_with('\t')));
+    out.extend(
+        lines
+            .take_while(|l| l.starts_with(' ') || l.starts_with('\t'))
+            .filter(|l| !l.trim_start().starts_with('#')),
+    );
     out
 }
 
@@ -468,14 +486,14 @@ fn workspace_published_crates_ship_licences_and_no_tests() {
 }
 
 #[test]
-fn workspace_sources_set_no_missing_docs_level() {
+fn workspace_rust_files_set_no_missing_docs_level() {
     let root = root();
     let mut files = Vec::new();
     for entry in fs::read_dir(root.join("crates"))
         .expect("crates/")
         .flatten()
     {
-        rust_files(&entry.path().join("src"), &mut files);
+        rust_files(&entry.path(), &mut files);
     }
     assert!(!files.is_empty(), "no source files found");
     let mut problems = Vec::new();
@@ -578,8 +596,8 @@ fn publishable_set_other_than_expected_is_a_problem() {
 
 #[test]
 fn missing_docs_attribute_in_source_is_a_problem() {
-    let text = "//! Doc.\n#![warn(missing_docs)]\n\n#[allow(missing_docs)]\npub fn f() {}\n// missing_docs in a comment\n";
-    assert_eq!(missing_docs_attribute_problems("lib.rs", text).len(), 2);
+    let text = "//! Doc.\n#![warn(missing_docs)]\n\n#[allow(missing_docs)]\npub fn f() {}\n// missing_docs in a comment\n#[allow(\n    dead_code,\n    missing_docs\n)]\nfn g() {}\n";
+    assert_eq!(missing_docs_attribute_problems("lib.rs", text).len(), 3);
 }
 
 #[test]
@@ -597,6 +615,8 @@ fn gate_recipes_without_deny_or_lock_are_problems() {
         "{:?}",
         gate_recipe_problems(&bad)
     );
+    let commented = good.replace("    CARGO_BUILD_WARNINGS", "    # CARGO_BUILD_WARNINGS");
+    assert_eq!(gate_recipe_problems(&commented).len(), 3);
 }
 
 #[test]
