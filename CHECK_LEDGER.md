@@ -54,6 +54,8 @@ breakage cases), `base/breakage-lab` (38 breakage cases), `base/macro-lab`
 `#[cfg(test)]` module and an integration test), 80 cases in all (`just oracle`;
 expected from `just oracle-refresh`; breakage cases from `just breakage-gen`,
 groups from `just breakage-regroup`). Groups with no case (arity) are omitted.
+oracle-refresh over all bases on 2026-10-31 (`just oracle-refresh-all`, every case, after the
+refusal of errors without a code): no codeless error, expected files unchanged.
 
 Expected diagnostics are `cargo check --workspace --all-targets --keep-going`
 (since the V2 change below; before, `--workspace` alone, lib and bins). The
