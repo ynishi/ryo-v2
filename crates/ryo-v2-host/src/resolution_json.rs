@@ -100,8 +100,22 @@ fn candidate_json(c: &Candidate) -> Value {
         .iter()
         .map(|e| json!({"path": e.path.to_string(), "new_text": e.new_text}))
         .collect();
+    let path: Vec<Value> = c
+        .path()
+        .iter()
+        .map(|b| {
+            json!({
+                "blueprint": b.id().to_string(),
+                "intent": b.intent().to_string(),
+                "proposer": b.record().proposer(),
+                "rationale": b.record().rationale(),
+                "spec_refs": b.spec_refs().iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     json!({
         "blueprint": c.blueprint().to_string(),
+        "path": path,
         "disposition": disposition,
         "rule": rule,
         "outer_check": outer_check,
@@ -112,10 +126,10 @@ fn candidate_json(c: &Candidate) -> Value {
 
 fn log_json(e: &LogEntry) -> Value {
     json!({
-        "blueprint": e.blueprint.to_string(),
-        "stage": stage_str(e.stage),
-        "ok": e.ok,
-        "note": e.note,
+        "blueprint": e.blueprint().to_string(),
+        "stage": stage_str(e.stage()),
+        "ok": e.ok(),
+        "note": e.note(),
     })
 }
 
@@ -187,6 +201,10 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   tested: resolution_json::tests::failed_lists_stale_reads
 ///   tested: tests/apply.rs apply_after_disk_change_is_failed_stale
 ///   tested: resolution_json::tests::budget_exhausted_blocking_is_listed
+/// - C3: a `Decided` resolution lists, per candidate, the Blueprints of its path with intent,
+///   proposer, rationale and spec refs, and the evidence lists the provenance: analyzer,
+///   version, config and workspace fingerprint.
+///   tested: resolution_json::tests::decided_lists_record_and_provenance
 pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
     match r {
         Resolution::Decided {
@@ -194,8 +212,9 @@ pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
             decision_log,
             evidence,
         } => {
+            let provenance = evidence.provenance();
             let verdicts: Vec<Value> = evidence
-                .verdicts
+                .verdicts()
                 .iter()
                 .map(|(id, v)| {
                     let (errors, unmapped) = verdict_json(v);
@@ -207,13 +226,19 @@ pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
                 "candidates": blueprints.iter().map(candidate_json).collect::<Vec<_>>(),
                 "decision_log": decision_log.entries().iter().map(log_json).collect::<Vec<_>>(),
                 "evidence": {
-                    "scope": scope_str(evidence.scope),
-                    "fingerprints_checked": evidence.fingerprints_checked,
-                    "baseline_size": evidence.baseline_size,
+                    "scope": scope_str(evidence.scope()),
+                    "fingerprints_checked": evidence.fingerprints_checked(),
+                    "baseline_size": evidence.baseline_size(),
                     "budget": {
-                        "candidates_per_depth": evidence.budget.candidates_per_depth,
-                        "max_depth": evidence.budget.max_depth,
-                        "per_candidate_ms": evidence.budget.per_candidate_ms,
+                        "candidates_per_depth": evidence.budget().candidates_per_depth,
+                        "max_depth": evidence.budget().max_depth,
+                        "per_candidate_ms": evidence.budget().per_candidate_ms,
+                    },
+                    "provenance": {
+                        "analyzer": provenance.analyzer(),
+                        "version": provenance.version(),
+                        "config": provenance.config(),
+                        "workspace": provenance.workspace().to_string(),
                     },
                     "verdicts": verdicts,
                 },
@@ -248,47 +273,171 @@ pub(crate) fn exit_code(r: &Resolution) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryo_v2_core::app::apply::apply_blueprints;
+    use ryo_v2_core::app::ports::{CheckError, FileFacts, Verifier};
     use ryo_v2_core::domain::{
-        BlueprintId, DEFAULT_BUDGET, DecisionLog, Edit, Evidence, Fingerprint, Infeasible,
-        IntentKind, NonEmpty, ReadRange, RelPath, ReviewRecord, Rule, RuleId, TextRange,
+        Blueprint, BlueprintId, BlueprintSet, DecisionRecord, Edit, Finding, Fingerprint, Ident,
+        Infeasible, IntentCall, IntentKind, MutationSpec, Provenance, ReadRange, RelPath,
+        ReviewRecord, Rule, RuleCatalog, RuleId, ScopedFindings, SpecRef, TextRange,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn id() -> BlueprintId {
         BlueprintId::from_uuid(uuid::Uuid::now_v7()).expect("v7")
     }
-
-    fn decided(marks: BTreeSet<RiskMark>) -> Resolution {
-        decided_with(marks, None)
+    fn rel(s: &str) -> RelPath {
+        RelPath::parse(s).expect("a relative path")
+    }
+    fn tr(a: u32, b: u32) -> TextRange {
+        TextRange::new(a, b).expect("a range")
     }
 
-    fn decided_with(marks: BTreeSet<RiskMark>, rule: Option<&Rule>) -> Resolution {
-        let b = id();
-        let c = Candidate::new(
-            b,
-            vec![Edit::write(RelPath::parse("src/lib.rs").unwrap(), "x")],
-            Verdict::from_diagnostics(Diagnostics::default()),
-            marks,
-            rule,
-            Scope::Affected,
+    /// The provenance every `Fake` gives.
+    fn prov() -> Provenance {
+        Provenance::new(
+            "fake-analyzer",
+            "9.9",
+            BTreeMap::from([("proc_macro".to_owned(), "true".to_owned())]),
+            BTreeMap::from([(rel("src/lib.rs"), Fingerprint::of(b"x"))]),
         )
-        .expect("a passing verdict");
-        Resolution::Decided {
-            blueprints: NonEmpty::new(vec![c]).unwrap(),
-            decision_log: DecisionLog::default(),
-            evidence: Evidence {
-                scope: Scope::Affected,
-                fingerprints_checked: 1,
-                baseline_size: 0,
-                verdicts: vec![(b, Verdict::from_diagnostics(Diagnostics::default()))],
-                budget: DEFAULT_BUDGET,
-            },
+        .expect("a provenance")
+    }
+
+    /// A verifier over fixed texts whose checks always pass.
+    #[derive(Default)]
+    struct Fake {
+        texts: BTreeMap<RelPath, String>,
+        build_scripts: BTreeSet<RelPath>,
+    }
+    impl Fake {
+        fn with(files: &[(&str, &str)]) -> Self {
+            Self {
+                texts: files
+                    .iter()
+                    .map(|(p, t)| (rel(p), (*t).to_owned()))
+                    .collect(),
+                build_scripts: BTreeSet::new(),
+            }
         }
+        fn build_script(mut self, path: &str) -> Self {
+            self.build_scripts.insert(rel(path));
+            self
+        }
+    }
+    impl Verifier for Fake {
+        type Session = ();
+        fn text(&self, _: &(), path: &RelPath) -> Option<String> {
+            self.texts.get(path).cloned()
+        }
+        fn facts(&self, _: &(), path: &RelPath) -> FileFacts {
+            FileFacts {
+                is_build_script: self.build_scripts.contains(path),
+                in_proc_macro_crate: false,
+            }
+        }
+        fn baseline(&self, _: &()) -> Vec<Finding> {
+            vec![]
+        }
+        fn provenance(&self, _: &()) -> Provenance {
+            prov()
+        }
+        fn check(&self, _: &mut (), _: &[Edit], _: Scope) -> Result<ScopedFindings, CheckError> {
+            Ok(ScopedFindings::default())
+        }
+    }
+
+    fn blueprint(
+        intent: IntentCall,
+        specs: Vec<MutationSpec>,
+        reads: Vec<ReadRange>,
+        refs: &[&str],
+    ) -> Blueprint {
+        Blueprint::new(
+            id(),
+            intent,
+            specs,
+            reads,
+            refs.iter()
+                .map(|r| SpecRef::parse(r).expect("a spec ref"))
+                .collect(),
+            DecisionRecord::new("agent", "because").expect("a record"),
+        )
+        .expect("a blueprint")
+    }
+    /// Renames `a` to `b` in `let a = 1;` at `path`.
+    fn rename(path: &str) -> Blueprint {
+        let text = "let a = 1;";
+        blueprint(
+            IntentCall::RenameLocal {
+                from: Ident::parse("a").expect("ident"),
+                to: Ident::parse("b").expect("ident"),
+            },
+            vec![MutationSpec::replace(rel(path), tr(4, 5), "b").expect("a spec")],
+            vec![ReadRange::capture(rel(path), text, tr(0, 10)).expect("a read")],
+            &["docs/m3.md#4"],
+        )
+    }
+    /// Extracts `1 + 2` of `f(1 + 2);` at `path`.
+    fn extract(path: &str) -> Blueprint {
+        let text = "f(1 + 2);";
+        blueprint(
+            IntentCall::ExtractVariable {
+                name: Ident::parse("t").expect("ident"),
+            },
+            vec![
+                MutationSpec::insert(rel(path), 0, "let t = 1 + 2;\n").expect("a spec"),
+                MutationSpec::replace(rel(path), tr(2, 7), "t").expect("a spec"),
+            ],
+            vec![ReadRange::capture(rel(path), text, tr(0, 9)).expect("a read")],
+            &[],
+        )
+    }
+    /// Moves `foo` from `src/a.rs` to `src/b.rs`.
+    fn move_foo() -> Blueprint {
+        let a = "pub fn foo() {}\n";
+        blueprint(
+            IntentCall::MoveItem {
+                item: Ident::parse("foo").expect("ident"),
+                to: rel("src/b.rs"),
+            },
+            vec![
+                MutationSpec::replace(rel("src/a.rs"), tr(0, 15), "pub use crate::b::foo;")
+                    .expect("a spec"),
+                MutationSpec::insert(rel("src/b.rs"), 0, a).expect("a spec"),
+            ],
+            vec![
+                ReadRange::capture(rel("src/a.rs"), a, tr(0, 16)).expect("a read"),
+                ReadRange::capture(rel("src/b.rs"), "", tr(0, 0)).expect("a read"),
+            ],
+            &[],
+        )
+    }
+    fn decided(fake: &Fake, bps: Vec<Blueprint>, rules: &RuleCatalog) -> Resolution {
+        let set = BlueprintSet::new(bps).expect("a set");
+        let r = apply_blueprints(fake, &mut (), &set, rules, Scope::Affected).expect("a run");
+        assert!(matches!(r, Resolution::Decided { .. }), "{r:?}");
+        r
     }
 
     #[test]
     fn decided_lists_the_rule_id() {
         let rule_id = RuleId::from_uuid(uuid::Uuid::now_v7()).expect("v7");
+        // The vocabulary, straight from the dispositions.
+        assert_eq!(
+            disposition_json(Disposition::AutoApplicable { rule: rule_id }),
+            ("auto_applicable", json!(rule_id.to_string()))
+        );
+        assert_eq!(
+            disposition_json(Disposition::AfterOuterCheck { rule: rule_id }),
+            ("after_outer_check", json!(rule_id.to_string()))
+        );
+        assert_eq!(
+            disposition_json(Disposition::NeedsReview {
+                reason: ReviewReason::ScopeTooNarrow
+            }),
+            ("needs_review/scope_too_narrow", Value::Null)
+        );
+        // And through a run: the move-item Rule covers a move, which owes an outer check.
         let review = ReviewRecord {
             reviewer: "me".to_owned(),
             reviewed_at_ms: 1,
@@ -296,31 +445,74 @@ mod tests {
         };
         let rule = Rule::register(rule_id, IntentKind::MoveItem, review, Scope::Affected)
             .expect("move-item is registrable");
-        let v = resolution_to_json(&decided_with(BTreeSet::new(), Some(&rule)));
-        let c = &v["candidates"][0];
-        assert_eq!(c["disposition"], "auto_applicable");
-        assert_eq!(c["rule"], rule_id.to_string());
-        let marks: BTreeSet<RiskMark> = [RiskMark::BuildScript].into();
-        let v = resolution_to_json(&decided_with(marks, Some(&rule)));
+        let rules = RuleCatalog::new(vec![rule]).expect("a catalog");
+        let fake = Fake::with(&[("src/a.rs", "pub fn foo() {}\n"), ("src/b.rs", "")]);
+        let v = resolution_to_json(&decided(&fake, vec![move_foo()], &rules));
         let c = &v["candidates"][0];
         assert_eq!(c["disposition"], "after_outer_check");
         assert_eq!(c["rule"], rule_id.to_string());
+        assert_eq!(c["marks"], json!(["visibility"]));
+        assert_eq!(c["outer_check"], json!(["visibility"]));
     }
 
     #[test]
     fn outer_check_lists_reasons() {
-        let marks: BTreeSet<RiskMark> = [RiskMark::Borrow, RiskMark::BuildScript].into();
-        let v = resolution_to_json(&decided(marks));
+        let fake = Fake::with(&[("build.rs", "f(1 + 2);")]).build_script("build.rs");
+        let v = resolution_to_json(&decided(
+            &fake,
+            vec![extract("build.rs")],
+            &RuleCatalog::default(),
+        ));
         assert_eq!(v["resolution"], "decided");
         let c = &v["candidates"][0];
         assert_eq!(c["outer_check"], json!(["borrow", "build_script"]));
-        assert_eq!(c["marks"], json!(["borrow", "build_script"]));
-        assert_eq!(c["disposition"], "needs_review/no_rule");
+        assert_eq!(c["marks"], json!(["borrow", "build_script", "behaviour"]));
+        assert_eq!(c["disposition"], "needs_review/behaviour");
         assert_eq!(c["rule"], Value::Null);
-        assert_eq!(c["edits"][0]["new_text"], "x");
+        assert_eq!(c["edits"][0]["path"], "build.rs");
+        assert_eq!(c["edits"][0]["new_text"], "let t = 1 + 2;\nf(t);");
         assert_eq!(v["evidence"]["scope"], "affected");
-        let none = resolution_to_json(&decided(BTreeSet::new()));
+        let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
+        let none = resolution_to_json(&decided(
+            &fake,
+            vec![rename("src/lib.rs")],
+            &RuleCatalog::default(),
+        ));
         assert_eq!(none["candidates"][0]["outer_check"], Value::Null);
+        assert_eq!(none["candidates"][0]["marks"], json!([]));
+    }
+
+    #[test]
+    fn decided_lists_record_and_provenance() {
+        let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
+        let bp = rename("src/lib.rs");
+        let bp_id = bp.id();
+        let v = resolution_to_json(&decided(&fake, vec![bp], &RuleCatalog::default()));
+        let path = &v["candidates"][0]["path"];
+        assert_eq!(path.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            path[0],
+            json!({
+                "blueprint": bp_id.to_string(),
+                "intent": "rename-local a -> b",
+                "proposer": "agent",
+                "rationale": "because",
+                "spec_refs": ["docs/m3.md#4"],
+            })
+        );
+        assert_eq!(
+            v["evidence"]["provenance"],
+            json!({
+                "analyzer": "fake-analyzer",
+                "version": "9.9",
+                "config": {"proc_macro": "true"},
+                "workspace": prov().workspace().to_string(),
+            })
+        );
+        // The decision log goes through the getters of its entries.
+        assert_eq!(v["decision_log"][0]["blueprint"], bp_id.to_string());
+        assert_eq!(v["decision_log"][0]["stage"], "file_role");
+        assert_eq!(v["decision_log"][0]["ok"], true);
     }
 
     #[test]
@@ -381,7 +573,9 @@ mod tests {
 
     #[test]
     fn exit_codes_follow_the_resolution() {
-        assert_eq!(exit_code(&decided(BTreeSet::new())), 0);
+        let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
+        let r = decided(&fake, vec![rename("src/lib.rs")], &RuleCatalog::default());
+        assert_eq!(exit_code(&r), 0);
         let inf = Infeasible::new(vec![], vec![], true).expect("budget exhausted");
         assert_eq!(exit_code(&Resolution::Failed(inf)), 2);
     }

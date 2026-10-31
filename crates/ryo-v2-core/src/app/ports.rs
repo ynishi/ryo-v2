@@ -1,8 +1,8 @@
 //! Ports the use cases need from the outside world.
 
 use crate::domain::{
-    Blueprint, ChangeProbe, Edit, Finding, JudgeRequest, Judgement, RelPath, Scope, ScopedFindings,
-    StaticMetrics, Target,
+    Blueprint, ChangeProbe, Edit, Finding, JudgeRequest, Judgement, Provenance, RelPath, Scope,
+    ScopedFindings, StaticMetrics, Target,
 };
 use std::path::Path;
 
@@ -92,6 +92,9 @@ pub trait Verifier {
     fn facts(&self, s: &Self::Session, path: &RelPath) -> FileFacts;
     /// Every Error at load (all local files), message included.
     fn baseline(&self, s: &Self::Session) -> Vec<Finding>;
+    /// The analyzer, its configuration and the fingerprint of each file of the session's base
+    /// workspace. The domain never reads these values; it carries them into the evidence.
+    fn provenance(&self, s: &Self::Session) -> Provenance;
     /// Applies `edits`, diagnoses the files of `scope`, and reverts. The observable state of
     /// the session afterwards is the state before.
     fn check(

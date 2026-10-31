@@ -40,10 +40,12 @@
 //!   includes: Edit, Cancelled, Panicked, RevertMismatch, Poisoned, TimedOut
 //! - Verdict: the new errors relative to the baseline; passed if and only if there are none.
 //! - DecisionRecord: the proposer's identity and rationale, carried in the blueprint.
-//! - SpecRef: an opaque label linking a blueprint to a spec item.
+//! - SpecRef: a reference `<doc>#<item>` to one item of a specification document.
+//! - Provenance: what a decision can be reproduced from: the analyzer, its version and
+//!   configuration, and the fingerprint of the workspace it saw.
 //! - SearchTree: the states reached by the search, each once, with the path of edits that
 //!   reached it first.
-//! - SearchNode: one state of the search tree, with its edits, marks, metrics, prior and reward.
+//! - SearchNode: one state of the search tree, with its edits, file roles, metrics, prior and reward.
 //! - NodeId: the position of a node in its search tree; the root is 0.
 //! - StateFp: a fingerprint of the files an edit path leads to; the same files, the same state.
 //! - Target: a file and, if known, a range of it where a change is wanted.
@@ -121,7 +123,7 @@ pub use rel_path::RelPath;
 pub use resolution::{
     Blocking, Candidate, DEFAULT_BUDGET, DecisionBudget, DecisionLog, Disposition, Evidence,
     Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, OUTER_CHECK_MAX, OuterCheck, OuterCheckReason,
-    Resolution, ReviewReason, SpecMismatch, Stage,
+    Provenance, Resolution, ReviewReason, SpecMismatch, Stage,
 };
 pub use rule::{ReviewRecord, Rule, RuleCatalog, RuleError};
 pub use scope::Scope;

@@ -10,7 +10,7 @@
 //!   tested: domain::search::tests::same_state_fp_is_one_node
 
 use super::judge::{Noul, Prior, ProposalId};
-use super::{Blueprint, DecisionBudget, Edit, Fingerprint, Ident, RelPath, RiskMark, TextRange};
+use super::{Blueprint, DecisionBudget, Edit, FileRole, Fingerprint, Ident, RelPath, TextRange};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
@@ -443,7 +443,7 @@ pub struct SearchNode {
     depth: u8,
     state: StateFp,
     edits: Vec<Edit>,
-    marks: BTreeSet<RiskMark>,
+    roles: BTreeSet<FileRole>,
     metrics: StaticMetrics,
     prior: Prior,
     reward: Option<Reward>,
@@ -480,9 +480,9 @@ impl SearchNode {
         &self.edits
     }
 
-    /// The risks along the way.
-    pub fn marks(&self) -> &BTreeSet<RiskMark> {
-        &self.marks
+    /// The roles of every file edited along the way.
+    pub fn roles(&self) -> &BTreeSet<FileRole> {
+        &self.roles
     }
 
     /// The static metrics of the step into this node.
@@ -510,8 +510,8 @@ pub struct NewNode {
     pub blueprint: Blueprint,
     /// The whole-file edits from the base to the new state.
     pub edits: Vec<Edit>,
-    /// The risks along the way.
-    pub marks: BTreeSet<RiskMark>,
+    /// The roles of every file edited along the way.
+    pub roles: BTreeSet<FileRole>,
     /// The static metrics of the step.
     pub metrics: StaticMetrics,
     /// The judge's prior for the step.
@@ -551,7 +551,7 @@ impl SearchTree {
             depth: 0,
             state,
             edits: start,
-            marks: BTreeSet::new(),
+            roles: BTreeSet::new(),
             metrics: StaticMetrics::default(),
             prior: Prior::NEUTRAL,
             reward: None,
@@ -598,7 +598,7 @@ impl SearchTree {
             depth,
             state,
             edits: n.edits,
-            marks: n.marks,
+            roles: n.roles,
             metrics: n.metrics,
             prior: n.prior,
             reward: None,
@@ -683,7 +683,7 @@ mod tests {
             parent,
             blueprint: bp(),
             edits,
-            marks: BTreeSet::new(),
+            roles: BTreeSet::new(),
             metrics: StaticMetrics::default(),
             prior: Prior::NEUTRAL,
         }
@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(n.id(), a);
         assert_eq!(n.metrics(), &StaticMetrics::default());
         assert_eq!(n.prior(), Prior::NEUTRAL);
-        assert!(n.marks().is_empty());
+        assert!(n.roles().is_empty());
         assert_eq!(n.state(), StateFp::of(&[w("s.rs", "a")]));
     }
 

@@ -6,12 +6,12 @@
 
 use crate::app::ports::{CheckError, Verifier};
 use crate::domain::file_role::file_role;
-use crate::domain::resolution::{DEFAULT_BUDGET, NEAR_MISS_MAX};
+use crate::domain::resolution::{DEFAULT_BUDGET, NEAR_MISS_MAX, risk_marks};
 use crate::domain::text::splice;
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, BlueprintSet, Candidate, DecisionLog, Edit, Evidence,
     FileRole, Freshness, Infeasible, LogEntry, NearMiss, NonEmpty, ReadRange, RelPath, Resolution,
-    RiskMark, RuleCatalog, Scope, Stage, Verdict,
+    RuleCatalog, Scope, Stage, Verdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,12 +53,7 @@ impl Acc {
         ok: bool,
         note: impl Into<String>,
     ) {
-        self.log.push(LogEntry {
-            blueprint,
-            stage,
-            ok,
-            note: note.into(),
-        });
+        self.log.push(LogEntry::new(blueprint, stage, ok, note));
     }
 }
 
@@ -69,8 +64,8 @@ pub(crate) type View<'a> = dyn Fn(&RelPath) -> Option<String> + 'a;
 pub(crate) struct Ready {
     /// Whole-file edits, spliced against the view.
     pub(crate) edits: Vec<Edit>,
-    /// The marks of its intent and of the roles of the files it touches.
-    pub(crate) marks: BTreeSet<RiskMark>,
+    /// The roles of the files it touches.
+    pub(crate) roles: BTreeSet<FileRole>,
 }
 
 /// Outcome of the stages before the analyzer check.
@@ -118,6 +113,15 @@ fn blocked(stage: Stage, blocking: Blocking) -> Prepared {
 /// - C8: a passing Blueprint of rename-local or add-derive is `NeedsReview{NoRule}` under a
 ///   catalog that holds every Rule that can be registered.
 ///   tested: app::apply::tests::text_match_intents_need_review_under_every_rule
+/// - C9: the marks and the Rule of a candidate are derived from its Blueprint's intent and the
+///   roles of the files it edits; a Rule registered for another intent never covers it.
+///   tested: app::apply::tests::rule_of_another_intent_never_covers
+/// - C10: a Blueprint with a spec that writes the bytes it replaces is blocked at the
+///   conformance stage as `Nonconforming` with `Nonconformance::NoOp`, and the check is not
+///   called.
+///   tested: app::apply::tests::no_op_rename_is_refused_and_never_checked
+/// - C11: a `Decided` resolution's evidence carries the verifier's provenance unchanged.
+///   tested: app::apply::tests::evidence_carries_the_provenance
 pub fn apply_blueprints<V: Verifier>(
     v: &V,
     s: &mut V::Session,
@@ -126,6 +130,7 @@ pub fn apply_blueprints<V: Verifier>(
     scope: Scope,
 ) -> Result<Resolution, ApplyError> {
     let baseline = v.baseline(s);
+    let provenance = v.provenance(s);
     let mut acc = Acc::default();
     let mut candidates = Vec::new();
     let mut blocking = Vec::new();
@@ -146,13 +151,14 @@ pub fn apply_blueprints<V: Verifier>(
         return Ok(Resolution::Decided {
             blueprints,
             decision_log: acc.log,
-            evidence: Evidence {
+            evidence: Evidence::new(
                 scope,
-                fingerprints_checked: acc.fingerprints_checked,
-                baseline_size: baseline.len(),
-                verdicts: acc.verdicts,
-                budget: DEFAULT_BUDGET,
-            },
+                acc.fingerprints_checked,
+                baseline.len(),
+                acc.verdicts,
+                DEFAULT_BUDGET,
+                provenance,
+            ),
         });
     }
     // A set has at least one Blueprint and each one ends as a candidate or a blocking, so
@@ -176,7 +182,7 @@ pub(crate) fn prepare<V: Verifier>(
     let by_file = bp.edits_by_file();
 
     // 1. file roles
-    let mut roles = Vec::new();
+    let mut roles = BTreeSet::new();
     for path in by_file.keys() {
         let role = file_role(path, &v.facts(s, path));
         if role == FileRole::Manifest {
@@ -190,13 +196,13 @@ pub(crate) fn prepare<V: Verifier>(
                 },
             );
         }
-        roles.push(role);
+        roles.insert(role);
     }
     acc.note(
         id,
         Stage::FileRole,
         true,
-        format!("{} file(s)", roles.len()),
+        format!("{} file(s)", by_file.len()),
     );
 
     // 2. freshness
@@ -284,23 +290,11 @@ pub(crate) fn prepare<V: Verifier>(
     acc.note(id, Stage::Splice, true, format!("{} edit(s)", edits.len()));
 
     // 5. marks
-    let kind = bp.intent().kind();
-    let mut marks: BTreeSet<RiskMark> = kind.spec().risks;
-    for role in &roles {
-        match role {
-            FileRole::BuildScript => {
-                marks.insert(RiskMark::BuildScript);
-            }
-            FileRole::ProcMacroSource => {
-                marks.insert(RiskMark::ProcMacroCrate);
-            }
-            FileRole::Source | FileRole::Manifest => {}
-        }
-    }
+    let marks = risk_marks([bp.intent().kind()], roles.iter().copied());
     let names: Vec<String> = marks.iter().map(ToString::to_string).collect();
     acc.note(id, Stage::Marks, true, names.join(", "));
 
-    Prepared::Ready(Ready { edits, marks })
+    Prepared::Ready(Ready { edits, roles })
 }
 
 fn decide<V: Verifier>(
@@ -313,12 +307,11 @@ fn decide<V: Verifier>(
     acc: &mut Acc,
 ) -> Result<Outcome, ApplyError> {
     let id = bp.id();
-    let kind = bp.intent().kind();
     let prepared = {
         let session: &V::Session = s;
         prepare(v, session, bp, &|p| v.text(session, p), acc)
     };
-    let Ready { edits, marks } = match prepared {
+    let Ready { edits, roles } = match prepared {
         Prepared::Ready(r) => r,
         Prepared::Blocked { blocking, .. } => {
             return Ok(Outcome::Blocked {
@@ -346,7 +339,14 @@ fn decide<V: Verifier>(
     );
 
     // 7. candidate
-    match Candidate::new(id, edits, verdict, marks, rules.for_intent(kind), scope) {
+    match Candidate::new(
+        NonEmpty::one(bp.clone()),
+        &roles,
+        edits,
+        verdict,
+        rules,
+        scope,
+    ) {
         Ok(c) => {
             acc.note(id, Stage::Candidate, true, c.disposition().to_string());
             Ok(Outcome::Candidate(Box::new(c)))
@@ -373,8 +373,9 @@ mod tests {
     use crate::app::ports::FileFacts;
     use crate::domain::{
         BlueprintError, DecisionRecord, DeriveName, Disposition, ErrorCode, Finding, FindingCode,
-        Ident, IntentCall, IntentKind, MutationSpec, NonEmpty, OuterCheckReason, ReviewReason,
-        ReviewRecord, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
+        Ident, IntentCall, IntentKind, MutationSpec, NonEmpty, Nonconformance, OuterCheckReason,
+        Provenance, ReviewReason, ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings, SpecRef,
+        TextRange,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -384,6 +385,7 @@ mod tests {
         texts: BTreeMap<RelPath, String>,
         facts: BTreeMap<RelPath, FileFacts>,
         baseline: Vec<Finding>,
+        provenance: Option<Provenance>,
         results: RefCell<VecDeque<Result<ScopedFindings, CheckError>>>,
         checks: Cell<usize>,
     }
@@ -398,6 +400,9 @@ mod tests {
         }
         fn baseline(&self, _: &()) -> Vec<Finding> {
             self.baseline.clone()
+        }
+        fn provenance(&self, _: &()) -> Provenance {
+            self.provenance.clone().unwrap_or_else(prov)
         }
         fn check(&self, _: &mut (), _: &[Edit], _: Scope) -> Result<ScopedFindings, CheckError> {
             self.checks.set(self.checks.get() + 1);
@@ -421,6 +426,16 @@ mod tests {
 
     const BASE: &str = "let a = 1;";
 
+    fn prov() -> Provenance {
+        Provenance::new(
+            "fake",
+            "0",
+            BTreeMap::new(),
+            BTreeMap::from([(rel("src/lib.rs"), crate::domain::Fingerprint::of(b"x"))]),
+        )
+        .unwrap()
+    }
+
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
     }
@@ -443,7 +458,7 @@ mod tests {
             intent,
             specs,
             vec![ReadRange::capture(rel(path), text, tr(0, end)).unwrap()],
-            vec![SpecRef::new("t").unwrap()],
+            vec![SpecRef::parse("spec#t").unwrap()],
             DecisionRecord::new("agent", "why").unwrap(),
         )
     }
@@ -546,6 +561,33 @@ mod tests {
     }
 
     #[test]
+    fn no_op_rename_is_refused_and_never_checked() {
+        let fake = Fake::with_text("src/lib.rs", BASE);
+        let same = make(
+            1,
+            IntentCall::RenameLocal {
+                from: Ident::parse("a").unwrap(),
+                to: Ident::parse("a").unwrap(),
+            },
+            vec![MutationSpec::replace(rel("src/lib.rs"), tr(4, 5), "a").unwrap()],
+            "src/lib.rs",
+            BASE,
+        )
+        .unwrap();
+        let i = failed(run(&fake, vec![same], &every_rule()));
+        assert_eq!(fake.checks.get(), 0);
+        assert!(
+            matches!(
+                &i.blocking()[0],
+                Blocking::Nonconforming { blueprint, why: Nonconformance::NoOp { spec: 0 } }
+                    if *blueprint == bid(1)
+            ),
+            "{:?}",
+            i.blocking()
+        );
+    }
+
+    #[test]
     fn stale_blueprint_is_failed_and_never_checked() {
         let fake = Fake::with_text("src/lib.rs", "let a = 2;");
         let i = failed(run(
@@ -602,21 +644,24 @@ mod tests {
                 reason: ReviewReason::NoRule
             }
         );
-        assert_eq!(evidence.verdicts.len(), 3);
-        assert_eq!(evidence.fingerprints_checked, 3);
-        assert_eq!(evidence.baseline_size, 0);
-        assert_eq!(evidence.scope, Scope::Workspace);
-        assert_eq!(evidence.budget, DEFAULT_BUDGET);
+        assert_eq!(evidence.verdicts().len(), 3);
+        assert_eq!(evidence.fingerprints_checked(), 3);
+        assert_eq!(evidence.baseline_size(), 0);
+        assert_eq!(evidence.scope(), Scope::Workspace);
+        assert_eq!(evidence.budget(), DEFAULT_BUDGET);
         let last_of = |n| {
             decision_log
                 .entries()
                 .iter()
-                .rfind(|e| e.blueprint == bid(n))
+                .rfind(|e| e.blueprint() == bid(n))
                 .unwrap()
                 .clone()
         };
-        assert_eq!((last_of(1).stage, last_of(1).ok), (Stage::Candidate, true));
-        assert_eq!((last_of(2).stage, last_of(2).ok), (Stage::Check, false));
+        assert_eq!(
+            (last_of(1).stage(), last_of(1).ok()),
+            (Stage::Candidate, true)
+        );
+        assert_eq!((last_of(2).stage(), last_of(2).ok()), (Stage::Check, false));
 
         // The near-miss rule, seen through a run with no candidate.
         let fake = Fake::with_text("src/lib.rs", BASE);
@@ -685,6 +730,104 @@ mod tests {
         }
     }
 
+    /// A move of `foo` from `src/a.rs` to `src/b.rs`, which conforms to its intent.
+    fn move_foo(n: u8) -> Blueprint {
+        let a = "pub fn foo() {}\n";
+        Blueprint::new(
+            bid(n),
+            IntentCall::MoveItem {
+                item: Ident::parse("foo").unwrap(),
+                to: rel("src/b.rs"),
+            },
+            vec![
+                MutationSpec::replace(rel("src/a.rs"), tr(0, 15), "pub use crate::b::foo;")
+                    .unwrap(),
+                MutationSpec::insert(rel("src/b.rs"), 0, a).unwrap(),
+            ],
+            vec![
+                ReadRange::capture(rel("src/a.rs"), a, tr(0, 16)).unwrap(),
+                ReadRange::capture(rel("src/b.rs"), "", tr(0, 0)).unwrap(),
+            ],
+            vec![SpecRef::parse("spec#t").unwrap()],
+            DecisionRecord::new("agent", "why").unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rule_of_another_intent_never_covers() {
+        let move_rule = Rule::register(
+            RuleId::parse("01890a5d-ac96-774b-bcce-b302099a80a0").unwrap(),
+            IntentKind::MoveItem,
+            ReviewRecord {
+                reviewer: "me".to_owned(),
+                reviewed_at_ms: 1,
+                note: String::new(),
+            },
+            Scope::Affected,
+        )
+        .unwrap();
+        let rule_id = move_rule.id();
+        let rules = RuleCatalog::new(vec![move_rule]).unwrap();
+        let mut fake = Fake::with_text("src/lib.rs", BASE);
+        fake.texts.insert(rel("src/x.rs"), "f(1 + 2);".to_owned());
+        fake.texts
+            .insert(rel("src/a.rs"), "pub fn foo() {}\n".to_owned());
+        fake.texts.insert(rel("src/b.rs"), String::new());
+        let r = run(
+            &fake,
+            vec![rename(1, "src/lib.rs"), extract(2, "src/x.rs"), move_foo(3)],
+            &rules,
+        )
+        .unwrap();
+        let Resolution::Decided { blueprints, .. } = r else {
+            panic!("expected Decided");
+        };
+        let cs = blueprints.as_slice();
+        assert_eq!(cs.len(), 3);
+        assert_eq!(
+            cs[0].disposition(),
+            Disposition::NeedsReview {
+                reason: ReviewReason::NoRule
+            }
+        );
+        assert_eq!(
+            cs[1].disposition(),
+            Disposition::NeedsReview {
+                reason: ReviewReason::Behaviour
+            }
+        );
+        assert_eq!(
+            cs[2].disposition(),
+            Disposition::AfterOuterCheck { rule: rule_id }
+        );
+        assert_eq!(cs[2].marks(), &BTreeSet::from([RiskMark::Visibility]));
+        assert_eq!(cs[2].path().len(), 1);
+    }
+
+    #[test]
+    fn evidence_carries_the_provenance() {
+        let mut fake = Fake::with_text("src/lib.rs", BASE);
+        let given = Provenance::new(
+            "other",
+            "9.9",
+            BTreeMap::from([("k".to_owned(), "v".to_owned())]),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        fake.provenance = Some(given.clone());
+        let r = run(
+            &fake,
+            vec![rename(1, "src/lib.rs")],
+            &RuleCatalog::default(),
+        )
+        .unwrap();
+        let Resolution::Decided { evidence, .. } = r else {
+            panic!("expected Decided");
+        };
+        assert_eq!(evidence.provenance(), &given);
+    }
+
     #[test]
     fn missing_file_is_blocking() {
         let fake = Fake::default();
@@ -739,8 +882,8 @@ mod tests {
             decision_log
                 .entries()
                 .iter()
-                .filter(|e| e.blueprint == bid(n))
-                .map(|e| (e.stage, e.ok))
+                .filter(|e| e.blueprint() == bid(n))
+                .map(|e| (e.stage(), e.ok()))
                 .collect()
         };
         assert_eq!(

@@ -28,9 +28,18 @@ and this project adheres to
 - `SEARCH_LEDGER.md`: the first search-recall runs on ryo-rs (a verification repository used as a
   large sample): recall, generation, outer check and perf triggers, verdict insufficient;
   `CHECK_LEDGER.md` "Open work" holds what they found.
+- The `apply` and `search` JSON list, per candidate, the Blueprints of its path (intent, proposer,
+  rationale, spec refs), and under `evidence` the provenance of the decision: analyzer name and
+  version, its settings and a workspace fingerprint built from the per-file fingerprints.
 
 ### Changed
 
+- A candidate's risk marks and Rule are derived by the domain from its Blueprints and the roles of
+  the files they edit; `Candidate`, `Evidence` and decision-log entries can no longer be built
+  outside the core crate, and the `Verifier` port gains `provenance`.
+- A mutation that writes back the bytes it replaces (rename `a` to `a`) is refused as
+  nonconforming before any check.
+- A spec reference is `<doc>#<item>`; other text is refused.
 - Details of private execution environments are removed from the documentation; commands use the
   placeholders `<BASE>` and `<OUT>`.
 - `PUBLIC_DEVELOPMENT.md`, `CONTRIBUTING.md` and `AGENTS.md` agree with the development flow:

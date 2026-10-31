@@ -11,8 +11,13 @@ use ryo_v2_core::app::ports::{
 };
 use ryo_v2_core::domain::baseline::{restrict, same_findings};
 use ryo_v2_core::domain::text::revert_intact;
-use ryo_v2_core::domain::{Edit, Finding, Fingerprint, RelPath, Scope, ScopedFindings};
+use ryo_v2_core::domain::{Edit, Finding, Fingerprint, Provenance, RelPath, Scope, ScopedFindings};
+use std::collections::BTreeMap;
 use std::path::Path;
+
+/// The rust-analyzer release the adapter is built on; equals the `=` pin of the `ra_ap_*` crates
+/// in the workspace manifest.
+pub(crate) const ANALYZER_VERSION: &str = "0.0.358";
 
 /// Fingerprints of the database text of `paths` that are workspace files.
 pub(crate) fn fingerprints(session: &RaSession, paths: &[RelPath]) -> Vec<(RelPath, Fingerprint)> {
@@ -83,6 +88,41 @@ impl Verifier for RaAnalyzer {
 
     fn baseline(&self, s: &RaSession) -> Vec<Finding> {
         s.baseline.clone()
+    }
+
+    /// The analyzer, its configuration and the fingerprint of each workspace file's database
+    /// text.
+    ///
+    /// # Contract
+    /// - C1: the analyzer is `rust-analyzer` at the release the `ra_ap_*` crates are pinned to;
+    ///   the config lists `proc_macro`, `cfg_test`, `unresolved_paths` and `check_timeout_ms`
+    ///   (`none` when no limit is set); the files are the indexed workspace files whose text can
+    ///   be read.
+    ///   tested: check::tests::analyzer_version_is_the_manifest_pin
+    fn provenance(&self, s: &RaSession) -> Provenance {
+        let files: BTreeMap<RelPath, Fingerprint> = s
+            .files
+            .iter()
+            .filter_map(|(id, path)| {
+                let text = fork::db_text(&s.host, *id).ok()?;
+                Some((path.clone(), Fingerprint::of(text.as_bytes())))
+            })
+            .collect();
+        let config = BTreeMap::from([
+            ("proc_macro".to_owned(), self.config.proc_macro.to_string()),
+            ("cfg_test".to_owned(), self.config.cfg_test.to_string()),
+            (
+                "unresolved_paths".to_owned(),
+                self.config.unresolved_paths.to_string(),
+            ),
+            (
+                "check_timeout_ms".to_owned(),
+                self.check_timeout_ms
+                    .map_or_else(|| "none".to_owned(), |ms| ms.to_string()),
+            ),
+        ]);
+        Provenance::new("rust-analyzer", ANALYZER_VERSION, config, files)
+            .unwrap_or_else(|_| Provenance::unrecorded())
     }
 
     /// Applies `edits` to the in-memory state, diagnoses `scope`, and reverts.
@@ -224,4 +264,16 @@ fn run_fork(
         Ok(found)
     });
     (outcome, timed_out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyzer_version_is_the_manifest_pin() {
+        let manifest = include_str!("../../../Cargo.toml");
+        let pin = format!("ra_ap_ide = \"={ANALYZER_VERSION}\"");
+        assert!(manifest.contains(&pin), "{pin}");
+    }
 }

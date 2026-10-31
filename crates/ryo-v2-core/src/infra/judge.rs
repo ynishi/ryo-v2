@@ -116,7 +116,7 @@ mod tests {
             },
             vec![MutationSpec::replace(rel(), tr(4, 5), to).unwrap()],
             vec![ReadRange::capture(rel(), TEXT, tr(0, 10)).unwrap()],
-            vec![SpecRef::new("t").unwrap()],
+            vec![SpecRef::parse("spec#t").unwrap()],
             DecisionRecord::new("agent", "why").unwrap(),
         )
         .unwrap()
