@@ -22,8 +22,9 @@ use std::path::{Path, PathBuf};
 
 use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit};
 use ryo_v2_core::app::search::{
-    Fate, SearchError, SearchInput, SearchReport, TRIGGER_AFTER_CHECKS, TRIGGER_CHECK_MEDIAN_MS,
-    TRIGGER_DECISION_MEDIAN_MS, TRIGGER_HARNESS_MS, TRIGGER_RSS_KB, TraceEntry, search_decision,
+    Fate, SearchError, SearchInput, SearchReport, TRIGGER_AFTER_CHECKS,
+    TRIGGER_CHECK_GROWTH_PERMILLE, TRIGGER_CHECK_MEDIAN_MS, TRIGGER_DECISION_MEDIAN_MS,
+    TRIGGER_HARNESS_MS, TRIGGER_RSS_KB, TraceEntry, search_decision,
 };
 use ryo_v2_core::domain::{
     ChangeProbe, DEFAULT_WEIGHTS, DomainError, Edit, Ident, PruneStage, RelPath, Resolution,
@@ -761,6 +762,32 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
     Some(v[v.len() / 2])
 }
 
+/// Trigger 3, growth: how many checks at each end of a run are compared (the median of the
+/// first this many against the median of the last this many).
+pub const GROWTH_WINDOW: usize = 100;
+
+/// The median of the last [`GROWTH_WINDOW`] checks in thousandths of the median of the first
+/// [`GROWTH_WINDOW`]; `None` when fewer than `TRIGGER_AFTER_CHECKS` checks ran.
+///
+/// The checks of several workspaces (one session each) are flattened into one list, so on small
+/// bases the first and last windows can come from different sessions; the trigger is meant for
+/// the one-workspace large run.
+///
+/// # Contract
+/// - C1: `None` below `TRIGGER_AFTER_CHECKS` checks; else `last * 1000 / max(first, 1)` with
+///   `first` and `last` the medians of the first and the last `GROWTH_WINDOW` entries of
+///   `checks`, in the order given.
+///   tested: search_recall::tests::check_growth_compares_the_ends_of_the_run
+pub fn check_growth_permille(checks: &[u64]) -> Option<u64> {
+    if checks.len() < TRIGGER_AFTER_CHECKS as usize {
+        return None;
+    }
+    let w = GROWTH_WINDOW.min(checks.len());
+    let first = median(checks[..w].to_vec())?;
+    let last = median(checks[checks.len() - w..].to_vec())?;
+    Some(last * 1000 / first.max(1))
+}
+
 /// What a run reports besides its decisions: the beam it ran with and the trigger numbers of decision D4 in SEARCH_LEDGER.md.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunInfo {
@@ -784,6 +811,14 @@ impl RunInfo {
 }
 
 /// The trigger status (decision D4 in SEARCH_LEDGER.md) lines for `rows` and a run.
+///
+/// # Contract
+/// - C1: trigger 3 fires when the RSS is above `TRIGGER_RSS_KB` or the check growth is above
+///   `TRIGGER_CHECK_GROWTH_PERMILLE`, each read only after `TRIGGER_AFTER_CHECKS` checks; the
+///   line reads FIRED if either half fired, else "not measured" if either half was not
+///   measured, else "not fired".
+///   tested: search_recall::tests::trigger_3_reads_the_growth_limit
+///   tested: search_recall::tests::triggers_follow_the_decided_numbers
 pub fn trigger_lines(rows: &[DecisionRow], t: RunInfo) -> Vec<String> {
     let measured: Vec<&DecisionRow> = rows.iter().filter(|r| r.skipped.is_none()).collect();
     let decision = median(measured.iter().map(|r| r.wall_ms).collect());
@@ -792,6 +827,7 @@ pub fn trigger_lines(rows: &[DecisionRow], t: RunInfo) -> Vec<String> {
         .flat_map(|r| r.check_ms.iter().copied())
         .collect();
     let n_checks = checks.len();
+    let growth = check_growth_permille(&checks);
     let check = median(checks);
     let status = |fired: Option<bool>| match fired {
         Some(true) => "FIRED",
@@ -803,6 +839,12 @@ pub fn trigger_lines(rows: &[DecisionRow], t: RunInfo) -> Vec<String> {
         t.rss_kb.map(|r| r > TRIGGER_RSS_KB)
     } else {
         None
+    };
+    let growth_fired = growth.map(|g| g > TRIGGER_CHECK_GROWTH_PERMILLE);
+    let trigger_3 = match (rss_fired, growth_fired) {
+        (Some(true), _) | (_, Some(true)) => "FIRED",
+        (None, _) | (_, None) => "not measured",
+        _ => "not fired",
     };
     vec![
         format!(
@@ -816,9 +858,11 @@ pub fn trigger_lines(rows: &[DecisionRow], t: RunInfo) -> Vec<String> {
             status(check.map(|c| c > TRIGGER_CHECK_MEDIAN_MS))
         ),
         format!(
-            "trigger 3, RSS > {TRIGGER_RSS_KB} kB after {TRIGGER_AFTER_CHECKS} checks: {} kB after {n_checks} checks ({})",
+            "trigger 3, RSS > {TRIGGER_RSS_KB} kB or check time > {TRIGGER_CHECK_GROWTH_PERMILLE} permille of the first {GROWTH_WINDOW} after {TRIGGER_AFTER_CHECKS} checks: RSS {} kB ({}), check time {} permille ({}) after {n_checks} checks ({trigger_3})",
             t.rss_kb.map_or_else(|| "-".to_string(), |v| v.to_string()),
-            status(rss_fired)
+            status(rss_fired),
+            growth.map_or_else(|| "-".to_string(), |v| v.to_string()),
+            status(growth_fired)
         ),
         format!(
             "trigger 4, one run > {TRIGGER_HARNESS_MS} ms: {} ms ({})",
@@ -1288,5 +1332,62 @@ mod tests {
         );
         assert!(lines[2].contains("not measured"), "{lines:?}");
         assert!(lines[3].contains("not fired"), "{lines:?}");
+    }
+
+    #[test]
+    fn trigger_3_reads_the_growth_limit() {
+        let n = TRIGGER_AFTER_CHECKS as usize;
+        let at_limit = 1_000 * TRIGGER_CHECK_GROWTH_PERMILLE / 1_000;
+        let line = |last: u64, len: usize| {
+            let mut r = row("a", true, true);
+            let mut checks = vec![1_000; len];
+            for c in &mut checks[len - GROWTH_WINDOW..] {
+                *c = last;
+            }
+            r.check_ms = checks;
+            let lines = trigger_lines(
+                &[r],
+                RunInfo {
+                    beam: 5,
+                    harness_ms: 5,
+                    rss_kb: Some(1),
+                },
+            );
+            let growth = lines[2]
+                .rsplit_once("check time ")
+                .map_or(String::new(), |(_, rest)| rest.to_string());
+            (growth, lines)
+        };
+        let (growth, lines) = line(at_limit, n);
+        assert!(growth.contains("not fired"), "{lines:?}");
+        let (growth, lines) = line(at_limit + 1, n);
+        assert!(growth.contains("FIRED"), "{lines:?}");
+        let (growth, lines) = line(at_limit + 1, n - 1);
+        assert!(growth.contains("not measured"), "{lines:?}");
+    }
+
+    #[test]
+    fn check_growth_compares_the_ends_of_the_run() {
+        assert_eq!(check_growth_permille(&vec![10; 999]), None);
+        assert_eq!(check_growth_permille(&vec![10; 1_000]), Some(1_000));
+        let mut zero_first = vec![0; 1_000];
+        for c in &mut zero_first[900..] {
+            *c = 5;
+        }
+        assert_eq!(check_growth_permille(&zero_first), Some(5_000));
+        let mut slow_middle = vec![10; 1_000];
+        for c in &mut slow_middle[100..900] {
+            *c = 99_999;
+        }
+        assert_eq!(check_growth_permille(&slow_middle), Some(1_000));
+        let mut one_off = vec![10; 1_000];
+        one_off[99] = 7;
+        one_off[900] = 3;
+        assert_eq!(check_growth_permille(&one_off), Some(1_000));
+        let mut grown = vec![10; 1_000];
+        for c in &mut grown[900..] {
+            *c = 20;
+        }
+        assert_eq!(check_growth_permille(&grown), Some(2_000));
     }
 }
