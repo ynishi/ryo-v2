@@ -375,10 +375,17 @@ fn expect(args: Vec<String>) -> Result<()> {
         copy_tree(&pair.base, &build)?;
         copy_tree(&pair.overlay, &build)?;
         match cargo_check(&build, &target_dir) {
-            Ok(diags) => {
-                std::fs::write(&pair.expected, render_expected(&diags))
+            Ok(out) if !out.codeless.is_empty() => {
+                let first = out.codeless.first().map_or("", |c| c.message.as_str());
+                let why = format!("expect failed: error without a code: {first}");
+                println!("{}: {why}", entry.id);
+                entry.skip = Some(why);
+                let _ = std::fs::remove_file(&pair.expected);
+            }
+            Ok(out) => {
+                std::fs::write(&pair.expected, render_expected(&out.errors))
                     .with_context(|| format!("write {}", pair.expected.display()))?;
-                println!("{}: {} error(s)", entry.id, diags.len());
+                println!("{}: {} error(s)", entry.id, out.errors.len());
             }
             Err(CargoCheckError::NoCode { stderr_tail }) => {
                 let first = stderr_tail.lines().next().unwrap_or("no message");
