@@ -240,6 +240,14 @@ pub enum SearchError {
     /// The first depth had nothing to try.
     #[error("no candidate: no root and the expander produced nothing")]
     NoCandidates,
+    /// A root names a Blueprint it builds on; roots are staged on the start state.
+    #[error("root {blueprint} builds on {parent}; a search root cannot build on another blueprint")]
+    ChainedRoot {
+        /// The root.
+        blueprint: BlueprintId,
+        /// The Blueprint it builds on.
+        parent: BlueprintId,
+    },
 }
 
 /// A child before the stages.
@@ -361,6 +369,9 @@ fn sat32(n: usize) -> u32 {
 ///   they were proposed; its edits are present only on request. `depths` holds one entry per
 ///   depth that ran.
 ///   tested: app::search::tests::trace_has_one_entry_per_child_and_edits_only_on_request
+/// - C11: a root with `builds_on` is `SearchError::ChainedRoot` for the first such root,
+///   returned before anything runs: no check and no expansion.
+///   tested: app::search::tests::root_with_builds_on_is_refused
 pub fn search_decision<V, E, A, J>(
     v: &V,
     e: &E,
@@ -376,6 +387,13 @@ where
     A: Assessor,
     J: Judge,
 {
+    if let Some((blueprint, parent)) = input
+        .roots
+        .iter()
+        .find_map(|bp| bp.builds_on().map(|p| (bp.id(), p)))
+    {
+        return Err(SearchError::ChainedRoot { blueprint, parent });
+    }
     let t0 = clock.now_ms();
     let elapsed = || clock.now_ms().saturating_sub(t0);
     let b = input.budget;
@@ -876,6 +894,7 @@ mod tests {
             bases: vec![BaseFp::capture(rel(LIB), text)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap()
     }
@@ -1414,6 +1433,7 @@ mod tests {
             bases: vec![BaseFp::capture(rel(LIB), at_b)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap();
         fx.e.set(state(vec![w(at_b)]), vec![child]);
@@ -1621,6 +1641,7 @@ mod tests {
             bases: vec![BaseFp::capture(rel("build.rs"), BASE)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap();
         fx.e.set(root_state(), vec![parent]);
@@ -1709,6 +1730,48 @@ mod tests {
         assert!(r.trace.iter().filter(|t| t.root).count() == 2);
         // Roots are not shown to the judge.
         assert_eq!(*fx.j.sizes.borrow(), vec![3]);
+    }
+
+    #[test]
+    fn root_with_builds_on_is_refused() {
+        let plain = rename(1, "a", "b", BASE);
+        let other = rename(2, "a", "c", BASE);
+        let chained = Blueprint::new(BlueprintParts {
+            id: other.id(),
+            intent: other.intent().clone(),
+            specs: other.specs().to_vec(),
+            reads: other.reads().to_vec(),
+            bases: other.bases().to_vec(),
+            spec_refs: other.spec_refs().to_vec(),
+            record: other.record().clone(),
+            builds_on: Some(plain.id()),
+        })
+        .unwrap();
+        let later = rename(4, "a", "e", BASE);
+        let later = Blueprint::new(BlueprintParts {
+            id: later.id(),
+            intent: later.intent().clone(),
+            specs: later.specs().to_vec(),
+            reads: later.reads().to_vec(),
+            bases: later.bases().to_vec(),
+            spec_refs: later.spec_refs().to_vec(),
+            record: later.record().clone(),
+            builds_on: Some(plain.id()),
+        })
+        .unwrap();
+        let mut fx = Fx::new(BASE);
+        // The first chained root is named, not the last.
+        fx.roots = vec![plain.clone(), chained, later];
+        fx.e.set(root_state(), vec![rename(3, "a", "d", BASE)]);
+        let err = fx.run().unwrap_err();
+        assert!(
+            matches!(&err, SearchError::ChainedRoot { blueprint, parent }
+                if *blueprint == bid(2) && *parent == plain.id()),
+            "{err}"
+        );
+        assert!(fx.v.events.borrow().is_empty(), "no check, no audit");
+        assert!(fx.v.checked_texts().is_empty());
+        assert!(fx.e.calls.borrow().is_empty(), "no expansion");
     }
 
     #[test]

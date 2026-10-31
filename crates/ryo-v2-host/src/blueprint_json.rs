@@ -31,6 +31,8 @@ struct BlueprintJson {
     #[serde(default)]
     spec_refs: Vec<String>,
     record: RecordJson,
+    #[serde(default)]
+    builds_on: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -234,6 +236,9 @@ fn base(index: usize, j: BaseJson) -> Result<BaseFp> {
 /// - C4: `bases` is required, and a blueprint whose spec is in a file without a base, or with
 ///   two bases of one path, is an error naming the blueprint index (and the spec).
 ///   tested: blueprint_json::tests::missing_base_is_a_parse_error
+/// - C5: `builds_on` is optional; a parent not listed before the blueprint is an error naming
+///   both ids.
+///   tested: blueprint_json::tests::builds_on_must_name_an_earlier_blueprint
 pub(crate) fn parse_blueprints(json: &str) -> Result<ParsedBlueprints> {
     let input: Input = serde_json::from_str(json).context("blueprint JSON")?;
     build(input.blueprints)
@@ -289,6 +294,10 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
             "record",
             DecisionRecord::new(&bp.record.proposer, &bp.record.rationale),
         )?;
+        let builds_on = bp
+            .builds_on
+            .map(|s| field(index, "builds_on", BlueprintId::parse(&s)))
+            .transpose()?;
         let blueprint = field(
             index,
             "blueprint",
@@ -300,6 +309,7 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
                 bases,
                 spec_refs,
                 record,
+                builds_on,
             }),
         )?;
         items.push(blueprint);
@@ -341,6 +351,40 @@ mod tests {
     }
 
     const RENAME: &str = "{\"kind\":\"rename-local\",\"from\":\"a\",\"to\":\"b\"}";
+
+    #[test]
+    fn builds_on_must_name_an_earlier_blueprint() {
+        let (a, b) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let fp = Fingerprint::of(b"a = 1");
+        let one = |id: uuid::Uuid, builds_on: Option<&str>| {
+            let builds_on = builds_on.map_or(String::new(), |p| format!("\"builds_on\":\"{p}\","));
+            format!(
+                "{{\"id\":\"{id}\",{builds_on}\"intent\":{RENAME},\"specs\":[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"start\":0,\"end\":1,\"text\":\"b\"}}],\"reads\":[{{\"path\":\"src/lib.rs\",\"start\":0,\"end\":5,\"fingerprint\":\"{fp}\"}}],\"bases\":[{}],\"record\":{{\"proposer\":\"p\",\"rationale\":\"r\"}}}}",
+                base_json()
+            )
+        };
+        let doc = |items: &[String]| format!("{{\"blueprints\":[{}]}}", items.join(","));
+        // The parent is listed earlier.
+        let parsed = parse_blueprints(&doc(&[one(a, None), one(b, Some(&a.to_string()))]))
+            .expect("parent first");
+        let parent = parsed.set.iter().next().expect("first").id();
+        assert_eq!(
+            parsed.set.iter().nth(1).expect("second").builds_on(),
+            Some(parent)
+        );
+        assert_eq!(parsed.set.iter().next().expect("first").builds_on(), None);
+        // The parent is listed later: both ids are named.
+        let err = parse_blueprints(&doc(&[one(b, Some(&a.to_string())), one(a, None)]))
+            .expect_err("parent later");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&a.to_string()) && text.contains(&b.to_string()),
+            "{text}"
+        );
+        // A malformed id names the field.
+        let err = parse_blueprints(&doc(&[one(a, Some("not-a-uuid"))])).expect_err("malformed");
+        assert!(format!("{err:#}").contains("builds_on"), "{err:#}");
+    }
 
     #[test]
     fn unknown_intent_kind_rejected() {

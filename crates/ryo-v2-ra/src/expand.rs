@@ -533,6 +533,7 @@ impl<'a> Env<'a> {
             bases,
             spec_refs: Vec::new(),
             record,
+            builds_on: None,
         })
         .ok()
     }

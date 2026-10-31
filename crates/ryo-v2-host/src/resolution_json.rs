@@ -219,6 +219,9 @@ fn blocking_json(b: &Blocking) -> Value {
         Blocking::BudgetExhausted { limit_ms, .. } => json!({
             "kind": "budget_exhausted", "blueprint": blueprint, "limit_ms": limit_ms,
         }),
+        Blocking::ParentFailed { parent, .. } => json!({
+            "kind": "parent_failed", "blueprint": blueprint, "parent": parent.to_string(),
+        }),
     }
 }
 
@@ -236,11 +239,13 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   tested: resolution_json::tests::decided_lists_the_reads_of_files_only_read
 /// - C2: a `Failed` resolution lists each blocker with its `kind` and the blueprint; a stale
 ///   blocking lists its `drift`, each entry a `file` (path, expected `fingerprint`, `freshness`,
-///   `actual`), a `read` (path, range, `fingerprint`, freshness) or a `missing` path.
+///   `actual`), a `read` (path, range, `fingerprint`, freshness) or a `missing` path; a
+///   `parent_failed` blocking lists the `parent` it builds on.
 ///   tested: resolution_json::tests::failed_lists_stale_reads
 ///   tested: tests/apply.rs apply_after_disk_change_is_failed_stale
 ///   tested: tests/apply.rs apply_after_insert_above_is_failed_stale
 ///   tested: resolution_json::tests::budget_exhausted_blocking_is_listed
+///   tested: resolution_json::tests::failed_lists_parent_failed
 /// - C3: a `Decided` resolution lists, per candidate, the Blueprints of its path with intent,
 ///   proposer, rationale and spec refs, and the evidence lists the provenance: analyzer,
 ///   version, config and workspace fingerprint.
@@ -409,6 +414,7 @@ mod tests {
                 .map(|r| SpecRef::parse(r).expect("a spec ref"))
                 .collect(),
             record: DecisionRecord::new("agent", "because").expect("a record"),
+            builds_on: None,
         })
         .expect("a blueprint")
     }
@@ -550,6 +556,7 @@ mod tests {
             bases: vec![BaseFp::capture(lib, text)],
             spec_refs: vec![],
             record: DecisionRecord::new("agent", "because").expect("a record"),
+            builds_on: None,
         })
         .expect("a blueprint");
         let fake = Fake::with(&[("src/lib.rs", text), ("src/o.rs", "abcdef")]);
@@ -669,6 +676,24 @@ mod tests {
         assert_eq!(oor["kind"], "read");
         assert_eq!(oor["freshness"], "out_of_range");
         assert_eq!(oor["len"], 2);
+    }
+
+    #[test]
+    fn failed_lists_parent_failed() {
+        let (b, p) = (
+            id(),
+            BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a80ff").unwrap(),
+        );
+        let blocked = Blocking::ParentFailed {
+            blueprint: b,
+            parent: p,
+        };
+        let inf = Infeasible::new(vec![blocked], vec![], false).expect("blocking");
+        let v = resolution_to_json(&Resolution::Failed(inf));
+        let first = &v["blocking"][0];
+        assert_eq!(first["kind"], "parent_failed");
+        assert_eq!(first["blueprint"], b.to_string());
+        assert_eq!(first["parent"], p.to_string());
     }
 
     #[test]

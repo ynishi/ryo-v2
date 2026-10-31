@@ -139,6 +139,14 @@ pub enum BlueprintError {
     /// Two Blueprints of a set share an id.
     #[error("blueprint id {0} appears twice")]
     DuplicateId(BlueprintId),
+    /// `builds_on` names a Blueprint that is not listed before this one in the set.
+    #[error("blueprint {blueprint} builds on {parent}, which is not listed before it")]
+    UnknownParent {
+        /// The Blueprint that names the parent.
+        blueprint: BlueprintId,
+        /// The parent it names.
+        parent: BlueprintId,
+    },
 }
 
 /// The parts of a Blueprint before they are checked against each other.
@@ -158,6 +166,8 @@ pub struct BlueprintParts {
     pub spec_refs: Vec<SpecRef>,
     /// Who proposed it and why.
     pub record: DecisionRecord,
+    /// The Blueprint of the set whose result this one's bases, reads and specs are against.
+    pub builds_on: Option<BlueprintId>,
 }
 
 /// One proposed change.
@@ -170,6 +180,7 @@ pub struct Blueprint {
     bases: Vec<BaseFp>,
     spec_refs: Vec<SpecRef>,
     record: DecisionRecord,
+    builds_on: Option<BlueprintId>,
 }
 
 impl Blueprint {
@@ -199,6 +210,7 @@ impl Blueprint {
             mut bases,
             spec_refs,
             record,
+            builds_on,
         } = parts;
         let specs = NonEmpty::new(specs).ok_or(BlueprintError::NoSpecs)?;
         let mut seen: BTreeSet<(&RelPath, TextRange)> = BTreeSet::new();
@@ -243,6 +255,7 @@ impl Blueprint {
             bases,
             spec_refs,
             record,
+            builds_on,
         })
     }
 
@@ -281,6 +294,12 @@ impl Blueprint {
         &self.record
     }
 
+    /// The Blueprint whose result this one is against, if any. `Blueprint::new` does not check
+    /// it; `BlueprintSet::new` does.
+    pub fn builds_on(&self) -> Option<BlueprintId> {
+        self.builds_on
+    }
+
     /// What the Blueprint rests on in the text it was made against.
     ///
     /// # Contract
@@ -300,7 +319,8 @@ impl Blueprint {
     }
 }
 
-/// The Blueprints proposed for one task: at least one, ids unique, in the order proposed.
+/// The Blueprints submitted together: at least one, ids unique, in the order proposed; those
+/// not on one chain are alternatives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlueprintSet(NonEmpty<Blueprint>);
 
@@ -310,12 +330,28 @@ impl BlueprintSet {
     /// # Contract
     /// - C1: no Blueprint gives `EmptySet`; two with one id give `DuplicateId`.
     ///   tested: domain::blueprint::tests::duplicate_ids_rejected
+    /// - C2: a Blueprint whose `builds_on` is not the id of a Blueprint listed earlier (listed
+    ///   later, absent or itself) gives `UnknownParent` for the first such Blueprint in list
+    ///   order, after the `DuplicateId` check of the whole list; so a set is acyclic.
+    ///   tested: domain::blueprint::tests::set_refuses_forward_or_unknown_parent
     pub fn new(items: Vec<Blueprint>) -> Result<Self, BlueprintError> {
         let mut seen = BTreeSet::new();
         for b in &items {
             if !seen.insert(b.id()) {
                 return Err(BlueprintError::DuplicateId(b.id()));
             }
+        }
+        let mut earlier = BTreeSet::new();
+        for b in &items {
+            if let Some(parent) = b.builds_on()
+                && !earlier.contains(&parent)
+            {
+                return Err(BlueprintError::UnknownParent {
+                    blueprint: b.id(),
+                    parent,
+                });
+            }
+            earlier.insert(b.id());
         }
         NonEmpty::new(items)
             .map(Self)
@@ -389,6 +425,7 @@ mod tests {
             bases,
             spec_refs: vec![SpecRef::parse("spec#1").unwrap()],
             record: DecisionRecord::new("agent", "because").unwrap(),
+            builds_on: None,
         })
     }
     fn rep(path: &str, a: u32, b: u32) -> MutationSpec {
@@ -561,5 +598,58 @@ mod tests {
         assert!(!set.is_empty());
         let ids: Vec<_> = set.iter().map(Blueprint::id).collect();
         assert_eq!(ids, vec![bid(2), bid(1)]);
+    }
+
+    #[test]
+    fn set_refuses_forward_or_unknown_parent() {
+        let on = |n, parent: Option<u8>| {
+            let b = make(bid(n), vec![rep("a.rs", 0, 3)], vec![read("a.rs", 0, 10)]).unwrap();
+            let mut parts = BlueprintParts {
+                id: b.id(),
+                intent: b.intent().clone(),
+                specs: b.specs().to_vec(),
+                reads: b.reads().to_vec(),
+                bases: b.bases().to_vec(),
+                spec_refs: b.spec_refs().to_vec(),
+                record: b.record().clone(),
+                builds_on: None,
+            };
+            parts.builds_on = parent.map(bid);
+            Blueprint::new(parts).unwrap()
+        };
+        let unknown = |blueprint: u8, parent: u8| {
+            Err(BlueprintError::UnknownParent {
+                blueprint: bid(blueprint),
+                parent: bid(parent),
+            })
+        };
+        // The parent is listed later, is absent, or is the Blueprint itself.
+        assert_eq!(
+            BlueprintSet::new(vec![on(2, Some(1)), on(1, None)]),
+            unknown(2, 1)
+        );
+        assert_eq!(BlueprintSet::new(vec![on(2, Some(9))]), unknown(2, 9));
+        assert_eq!(BlueprintSet::new(vec![on(2, Some(2))]), unknown(2, 2));
+        // The first offender in list order is reported.
+        assert_eq!(
+            BlueprintSet::new(vec![
+                on(1, None),
+                on(3, Some(4)),
+                on(2, Some(7)),
+                on(4, None)
+            ]),
+            unknown(3, 4)
+        );
+        // A duplicate id is reported before a bad parent.
+        assert_eq!(
+            BlueprintSet::new(vec![on(2, Some(9)), on(1, None), on(1, None)]),
+            Err(BlueprintError::DuplicateId(bid(1)))
+        );
+        // A parent listed earlier is accepted, alone or in a chain.
+        let set = BlueprintSet::new(vec![on(1, None), on(2, Some(1))]).unwrap();
+        assert_eq!(set.iter().nth(1).unwrap().builds_on(), Some(bid(1)));
+        assert_eq!(set.iter().next().unwrap().builds_on(), None);
+        let chain = BlueprintSet::new(vec![on(1, None), on(2, Some(1)), on(3, Some(2))]).unwrap();
+        assert_eq!(chain.len(), 3);
     }
 }

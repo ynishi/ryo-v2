@@ -181,6 +181,67 @@ fn apply_rename_local_is_decided() {
 }
 
 #[test]
+fn builds_on_chain_is_decided() {
+    use ryo_v2_core::domain::Fingerprint;
+
+    let ws = Ws::new("apply_chain", &[]);
+    let a_id = uuid::Uuid::now_v7().to_string();
+    let b_id = uuid::Uuid::now_v7().to_string();
+    let mut a = rename_acc(&ws)["blueprints"][0].clone();
+    a["id"] = json!(a_id);
+
+    // B is against A's result: offsets, read and base are those of that text.
+    let a_text = LIB.replace("acc", "sum");
+    let fp = |bytes: &str| Fingerprint::of(bytes.as_bytes()).to_string();
+    let total = at(
+        &a_text,
+        "pub fn total",
+        0,
+        0,
+        a_text.find("\n\npub fn twice").unwrap(),
+    );
+    let sites: Vec<Value> = (0..3)
+        .map(|n| replace("src/lib.rs", at(&a_text, "sum", n, 0, 3), "total_sum"))
+        .collect();
+    let b = json!({
+        "id": b_id,
+        "builds_on": a_id,
+        "intent": {"kind": "rename-local", "from": "sum", "to": "total_sum"},
+        "specs": sites,
+        "reads": [{
+            "path": "src/lib.rs", "start": total.0, "end": total.1,
+            "fingerprint": fp(&a_text[total.0..total.1]),
+        }],
+        "bases": [{"path": "src/lib.rs", "fingerprint": fp(&a_text)}],
+        "record": {"proposer": "test", "rationale": "test"},
+    });
+    let (code, out, err) = apply(&ws, &json!({"blueprints": [a, b]}), None);
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(out["resolution"], "decided");
+    let candidates = out["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "{out}");
+    let child = &candidates[1];
+    assert_eq!(child["blueprint"], json!(b_id), "{out}");
+    let path = child["path"].as_array().unwrap();
+    assert_eq!(path.len(), 2, "{out}");
+    assert_eq!(path[0]["blueprint"], json!(a_id), "{out}");
+    assert_eq!(path[1]["blueprint"], json!(b_id), "{out}");
+    let new_text = child["edits"][0]["new_text"].as_str().unwrap();
+    assert!(
+        new_text.contains("total_sum") && !new_text.contains("acc") && !new_text.contains(" sum"),
+        "{new_text}"
+    );
+    // The basis is the loaded text's, not A's result.
+    assert_eq!(
+        child["basis"]["files"][0]["fingerprint"],
+        base(&ws, "src/lib.rs")["fingerprint"],
+        "{out}"
+    );
+    assert_eq!(child["basis"]["files"][0]["fingerprint"], json!(fp(LIB)));
+}
+
+#[test]
 fn decided_candidate_lists_its_basis() {
     let ws = Ws::new("apply_basis", &[]);
     let bp = rename_acc(&ws);

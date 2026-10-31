@@ -120,6 +120,7 @@ mod tests {
             bases: vec![BaseFp::capture(rel(), TEXT)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap()
     }

@@ -6,11 +6,12 @@
 
 use crate::app::ports::{CheckError, Verifier};
 use crate::domain::resolution::DEFAULT_BUDGET;
-use crate::domain::stage::{On, Refused, stage};
+use crate::domain::stage::{On, Refused, Staged, stage};
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, BlueprintSet, Candidate, DecisionLog, Evidence, Infeasible,
     LogEntry, NearMiss, NonEmpty, Resolution, RuleCatalog, Scope, Stage, Verdict,
 };
+use std::collections::BTreeMap;
 
 /// Why `apply_blueprints` could not finish.
 #[derive(Debug, thiserror::Error)]
@@ -27,7 +28,7 @@ pub enum ApplyError {
 }
 
 enum Outcome {
-    Candidate(Box<Candidate>),
+    Candidate(Box<Candidate>, Box<Staged>),
     Blocked {
         blocking: Blocking,
         near_miss: Option<NearMiss>,
@@ -99,6 +100,16 @@ impl Acc {
 ///   tested: app::apply::tests::no_op_rename_is_refused_and_never_checked
 /// - C11: a `Decided` resolution's evidence carries the verifier's provenance unchanged.
 ///   tested: app::apply::tests::evidence_carries_the_provenance
+/// - C12: a Blueprint with `builds_on` is staged on its parent's staged path (`On::Parent`):
+///   its reads, bases and specs are against the parent candidate's result, the check is given
+///   the composed edits of the chain, its candidate's path is the chain (root first) and its
+///   basis is the loaded text's (`Basis::of_chain`).
+///   tested: app::apply::tests::child_builds_on_parent_result
+///   tested: ryo-v2-host tests/apply.rs builds_on_chain_is_decided
+/// - C13: a Blueprint whose parent is not a candidate is blocked as `ParentFailed`, logs one
+///   `Freshness` entry with `ok` false, and neither the stages nor the check run for it; a
+///   chain below it fails the same way.
+///   tested: app::apply::tests::child_of_failed_parent_is_never_checked
 pub fn apply_blueprints<V: Verifier>(
     v: &V,
     s: &mut V::Session,
@@ -112,9 +123,43 @@ pub fn apply_blueprints<V: Verifier>(
     let mut candidates = Vec::new();
     let mut blocking = Vec::new();
     let mut near_miss = Vec::new();
+    let mut staged_of: BTreeMap<BlueprintId, Staged> = BTreeMap::new();
     for bp in set.iter() {
-        match decide(v, s, bp, &baseline, rules, scope, &mut acc)? {
-            Outcome::Candidate(c) => candidates.push(*c),
+        let parent = match bp.builds_on() {
+            None => None,
+            Some(p) => match staged_of.get(&p) {
+                Some(staged) => Some(staged),
+                None => {
+                    acc.note(
+                        bp.id(),
+                        Stage::Freshness,
+                        false,
+                        format!("builds on {p}, which did not pass"),
+                    );
+                    blocking.push(Blocking::ParentFailed {
+                        blueprint: bp.id(),
+                        parent: p,
+                    });
+                    continue;
+                }
+            },
+        };
+        match decide(
+            v,
+            s,
+            bp,
+            parent,
+            &Decision {
+                baseline: &baseline,
+                rules,
+                scope,
+            },
+            &mut acc,
+        )? {
+            Outcome::Candidate(c, staged) => {
+                staged_of.insert(bp.id(), *staged);
+                candidates.push(*c);
+            }
             Outcome::Blocked {
                 blocking: b,
                 near_miss: n,
@@ -145,21 +190,33 @@ pub fn apply_blueprints<V: Verifier>(
     Ok(Resolution::Failed(infeasible))
 }
 
+/// What every Blueprint of a set is decided against.
+#[derive(Clone, Copy)]
+struct Decision<'a> {
+    baseline: &'a [crate::domain::Finding],
+    rules: &'a RuleCatalog,
+    scope: Scope,
+}
+
 fn decide<V: Verifier>(
     v: &V,
     s: &mut V::Session,
     bp: &Blueprint,
-    baseline: &[crate::domain::Finding],
-    rules: &RuleCatalog,
-    scope: Scope,
+    parent: Option<&Staged>,
+    ctx: &Decision<'_>,
     acc: &mut Acc,
 ) -> Result<Outcome, ApplyError> {
+    let Decision {
+        baseline,
+        rules,
+        scope,
+    } = *ctx;
     let id = bp.id();
     let staged = {
         let session: &V::Session = s;
         stage(
             bp,
-            On::Start(&[]),
+            parent.map_or(On::Start(&[]), On::Parent),
             &|p| v.text(session, p),
             &|p| v.facts(session, p),
             &mut acc.log,
@@ -194,10 +251,11 @@ fn decide<V: Verifier>(
     );
 
     // 7. candidate
+    let kept = staged.clone();
     match Candidate::new(staged, verdict, rules, scope) {
         Ok(c) => {
             acc.note(id, Stage::Candidate, true, c.disposition().to_string());
-            Ok(Outcome::Candidate(Box::new(c)))
+            Ok(Outcome::Candidate(Box::new(c), Box::new(kept)))
         }
         Err(verdict) => {
             let near_miss = NearMiss::of(id, errors);
@@ -217,6 +275,7 @@ mod tests {
     use super::*;
     use crate::app::ports::FileFacts;
     use crate::domain::resolution::NEAR_MISS_MAX;
+    use crate::domain::search::compose;
     use crate::domain::{
         BaseFp, BlueprintError, BlueprintParts, DecisionRecord, DeriveName, Disposition, Drift,
         Edit, ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident, IntentCall, IntentKind,
@@ -235,6 +294,7 @@ mod tests {
         provenance: Option<Provenance>,
         results: RefCell<VecDeque<Result<ScopedFindings, CheckError>>>,
         checks: Cell<usize>,
+        seen: RefCell<Vec<Vec<Edit>>>,
     }
 
     impl Verifier for Fake {
@@ -251,8 +311,14 @@ mod tests {
         fn provenance(&self, _: &()) -> Provenance {
             self.provenance.clone().unwrap_or_else(prov)
         }
-        fn check(&self, _: &mut (), _: &[Edit], _: Scope) -> Result<ScopedFindings, CheckError> {
+        fn check(
+            &self,
+            _: &mut (),
+            edits: &[Edit],
+            _: Scope,
+        ) -> Result<ScopedFindings, CheckError> {
             self.checks.set(self.checks.get() + 1);
+            self.seen.borrow_mut().push(edits.to_vec());
             self.results
                 .borrow_mut()
                 .pop_front()
@@ -308,6 +374,7 @@ mod tests {
             bases: vec![BaseFp::capture(rel(path), text)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
     }
     /// Renames `a` to `b` in `BASE` at `path`.
@@ -338,6 +405,20 @@ mod tests {
             path,
             text,
         )
+        .unwrap()
+    }
+    /// `bp` with `builds_on` set to `parent`.
+    fn chained(bp: &Blueprint, parent: BlueprintId) -> Blueprint {
+        Blueprint::new(BlueprintParts {
+            id: bp.id(),
+            intent: bp.intent().clone(),
+            specs: bp.specs().to_vec(),
+            reads: bp.reads().to_vec(),
+            bases: bp.bases().to_vec(),
+            spec_refs: bp.spec_refs().to_vec(),
+            record: bp.record().clone(),
+            builds_on: Some(parent),
+        })
         .unwrap()
     }
     fn set(bps: Vec<Blueprint>) -> BlueprintSet {
@@ -409,6 +490,173 @@ mod tests {
     }
 
     #[test]
+    fn child_builds_on_parent_result() {
+        let path = "src/lib.rs";
+        let a_text = "let t = 1 + 2;\nf(t);";
+        let final_text = "let u = 1 + 2;\nf(u);";
+        let a = extract(1, path);
+        // B's offsets and fingerprints are those of A's result, not of the loaded text.
+        let b = make(
+            2,
+            IntentCall::RenameLocal {
+                from: Ident::parse("t").unwrap(),
+                to: Ident::parse("u").unwrap(),
+            },
+            vec![
+                MutationSpec::replace(rel(path), tr(4, 5), "u").unwrap(),
+                MutationSpec::replace(rel(path), tr(17, 18), "u").unwrap(),
+            ],
+            path,
+            a_text,
+        )
+        .unwrap();
+        let loaded = "f(1 + 2);";
+        let fake = Fake::with_text(path, loaded);
+        let r = run(
+            &fake,
+            vec![a.clone(), chained(&b, a.id())],
+            &RuleCatalog::default(),
+        )
+        .unwrap();
+        let Resolution::Decided { blueprints, .. } = r else {
+            panic!("expected Decided");
+        };
+        assert_eq!(blueprints.len(), 2);
+        let (ca, cb) = (&blueprints.as_slice()[0], &blueprints.as_slice()[1]);
+        let a_edits = vec![Edit::write(rel(path), a_text)];
+        assert_eq!(ca.edits(), a_edits.as_slice());
+        let expected = vec![Edit::write(rel(path), final_text)];
+        assert_eq!(cb.edits(), expected.as_slice());
+        let own = vec![Edit::write(rel(path), final_text)];
+        let base = |p: &RelPath| fake.texts.get(p).cloned();
+        assert_eq!(cb.edits(), compose(&a_edits, &own, &base).as_slice());
+        assert_eq!(fake.seen.borrow().last(), Some(&expected));
+        let ids: Vec<_> = cb.path().iter().map(Blueprint::id).collect();
+        assert_eq!(ids, vec![bid(1), bid(2)]);
+        assert_eq!(
+            cb.basis().files(),
+            [BaseFp::capture(rel(path), loaded)].as_slice()
+        );
+        assert_eq!(fake.checks.get(), 2);
+
+        // Without `builds_on` the same Blueprint is stale against the loaded text.
+        let fake = Fake::with_text(path, loaded);
+        let r = run(&fake, vec![a.clone(), b], &RuleCatalog::default()).unwrap();
+        let Resolution::Decided { blueprints, .. } = r else {
+            panic!("expected Decided");
+        };
+        assert_eq!(blueprints.len(), 1);
+        assert_eq!(fake.checks.get(), 1);
+        let fake = Fake::with_text(path, loaded);
+        let alone = failed(run(
+            &fake,
+            vec![
+                make(
+                    2,
+                    IntentCall::RenameLocal {
+                        from: Ident::parse("t").unwrap(),
+                        to: Ident::parse("u").unwrap(),
+                    },
+                    vec![MutationSpec::replace(rel(path), tr(4, 5), "u").unwrap()],
+                    path,
+                    a_text,
+                )
+                .unwrap(),
+            ],
+            &RuleCatalog::default(),
+        ));
+        assert!(matches!(alone.blocking()[0], Blocking::Stale { .. }));
+        assert_eq!(fake.checks.get(), 0);
+
+        // A child on another file is staged on the parent it names, not on the candidate
+        // before it, and its check is given the edits of the whole chain, not its own alone.
+        let mut fake = Fake::with_text(path, loaded);
+        fake.texts.insert(rel("src/x.rs"), BASE.to_owned());
+        fake.texts.insert(rel("src/other.rs"), BASE.to_owned());
+        let x = rename(3, "src/x.rs");
+        let c = chained(&rename(4, "src/other.rs"), a.id());
+        let r = run(&fake, vec![a.clone(), x, c], &RuleCatalog::default()).unwrap();
+        let Resolution::Decided { blueprints, .. } = r else {
+            panic!("expected Decided");
+        };
+        assert_eq!(blueprints.len(), 3);
+        let cc = &blueprints.as_slice()[2];
+        let ids: Vec<_> = cc.path().iter().map(Blueprint::id).collect();
+        assert_eq!(ids, vec![bid(1), bid(4)]);
+        let chain = vec![
+            Edit::write(rel("src/lib.rs"), a_text),
+            Edit::write(rel("src/other.rs"), "let b = 1;"),
+        ];
+        assert_eq!(cc.edits(), chain.as_slice());
+        assert_eq!(fake.seen.borrow().last(), Some(&chain));
+        assert_eq!(
+            cc.basis().files(),
+            [
+                BaseFp::capture(rel("src/lib.rs"), loaded),
+                BaseFp::capture(rel("src/other.rs"), BASE)
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn child_of_failed_parent_is_never_checked() {
+        let fake = Fake::with_text("src/lib.rs", BASE);
+        fake.queue(Ok(errors(1)));
+        let a = rename(1, "src/lib.rs");
+        let b = chained(&rename(2, "src/lib.rs"), a.id());
+        let c = chained(&rename(3, "src/lib.rs"), b.id());
+        // D has no parent and passes, so the set is decided and its log is kept.
+        let d = rename(4, "src/lib.rs");
+        let r = run(&fake, vec![a.clone(), b, c, d], &RuleCatalog::default()).unwrap();
+        let Resolution::Decided {
+            blueprints,
+            decision_log,
+            ..
+        } = r
+        else {
+            panic!("expected Decided");
+        };
+        // Only A (failed) and D were checked.
+        assert_eq!(fake.checks.get(), 2);
+        assert_eq!(blueprints.len(), 1);
+        assert_eq!(blueprints.first().blueprint(), bid(4));
+        for n in [2, 3] {
+            let entries: Vec<_> = decision_log
+                .entries()
+                .iter()
+                .filter(|e| e.blueprint() == bid(n))
+                .collect();
+            assert_eq!(entries.len(), 1, "{n}");
+            assert_eq!(
+                (entries[0].stage(), entries[0].ok()),
+                (Stage::Freshness, false)
+            );
+        }
+        // Without a passing sibling the blockings name the failed parents.
+        let fake = Fake::with_text("src/lib.rs", BASE);
+        fake.queue(Ok(errors(1)));
+        let b = chained(&rename(2, "src/lib.rs"), a.id());
+        let c = chained(&rename(3, "src/lib.rs"), b.id());
+        let i = failed(run(&fake, vec![a, b, c], &RuleCatalog::default()));
+        assert_eq!(fake.checks.get(), 1);
+        assert!(matches!(i.blocking()[0], Blocking::NewErrors { .. }));
+        assert_eq!(
+            i.blocking()[1..],
+            [
+                Blocking::ParentFailed {
+                    blueprint: bid(2),
+                    parent: bid(1)
+                },
+                Blocking::ParentFailed {
+                    blueprint: bid(3),
+                    parent: bid(2)
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn no_op_rename_is_refused_and_never_checked() {
         let fake = Fake::with_text("src/lib.rs", BASE);
         let same = make(
@@ -477,6 +725,7 @@ mod tests {
             bases: vec![BaseFp::capture(path.clone(), base)],
             spec_refs: vec![],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap();
         // The bytes of the read are unchanged, but the file is not the base any more.
@@ -516,6 +765,7 @@ mod tests {
             bases: vec![BaseFp::capture(path, BASE)],
             spec_refs: vec![],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap();
         let mut fake = Fake::with_text("src/lib.rs", BASE);
@@ -589,6 +839,7 @@ mod tests {
                 ],
                 spec_refs: vec![],
                 record: DecisionRecord::new("agent", "why").unwrap(),
+                builds_on: None,
             })
             .unwrap()
         };
@@ -723,6 +974,7 @@ mod tests {
             bases: vec![BaseFp::capture(a, BASE), BaseFp::capture(c, BASE)],
             spec_refs: vec![],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap();
         let mut fake = Fake::with_text("src/a.rs", BASE);
@@ -875,6 +1127,7 @@ mod tests {
             ],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
             record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
         })
         .unwrap()
     }
