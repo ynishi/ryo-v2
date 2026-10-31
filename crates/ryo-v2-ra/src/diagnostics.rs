@@ -127,6 +127,17 @@ type Detect = fn(&RootDatabase, FileId, &[TextRange], &dyn Fn(TextSize) -> u32) 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GapDetector {
     /// Unresolved type names and path prefixes (E0405, E0425, E0433), `unresolved.rs`.
+    ///
+    /// # Contract
+    /// - C1: on a file where rust-analyzer reports a macro call it could not expand, this
+    ///   detector reports nothing.
+    ///   tested: tests/unresolved.rs build_script_include_types_are_not_reported_without_out_dir
+    ///   tested: tests/unresolved.rs function_like_proc_macro_types_are_not_reported_without_the_server
+    ///   tested: diagnostics::tests::unexpanded_macro_codes
+    /// - C2: the skip is per file: other files keep their findings, and a file whose macro calls
+    ///   all expand is not skipped.
+    ///   tested: tests/unresolved.rs unresolved_names_outside_an_unexpanded_macro_file_are_still_reported
+    ///   tested: tests/unresolved.rs a_file_whose_macros_expand_keeps_its_findings
     UnresolvedPath,
     /// A name an item and a `use` both define (E0255), `duplicate.rs`.
     DuplicateName,
@@ -141,6 +152,14 @@ impl GapDetector {
         GapDetector::DuplicateName,
         GapDetector::FieldBounds,
     ];
+
+    /// Whether this detector is skipped on a file where rust-analyzer reports a macro call it
+    /// could not expand. Only the unresolved-path detector is: a name the missing expansion would
+    /// define cannot be told from a missing one, so it would report a false error. The other two
+    /// only lose findings, never gain false ones, from an item that is missing.
+    pub fn skips_files_with_unexpanded_macros(self) -> bool {
+        matches!(self, GapDetector::UnresolvedPath)
+    }
 
     /// "unresolved-path", "duplicate-name", "field-bounds".
     pub fn name(self) -> &'static str {
@@ -176,6 +195,18 @@ pub(crate) struct Detector<'a> {
     pub(crate) panics: &'a Mutex<BTreeSet<DetectorPanic>>,
 }
 
+/// Whether `code` is one rust-analyzer 0.0.358 gives a macro call it could not expand: an
+/// expansion error (missing proc-macro expander, unset `OUT_DIR`, failed `include!`, a
+/// macro-by-example error), a disabled proc macro, or an unresolved macro call. Attribute macros
+/// are left out: the unresolved-path detector already skips their input item by item.
+fn is_unexpanded_macro(code: &DiagnosticCode) -> bool {
+    matches!(
+        code,
+        DiagnosticCode::Ra("macro-error" | "proc-macro-disabled", _)
+            | DiagnosticCode::RustcHardError("unresolved-macro-call")
+    )
+}
+
 /// Error diagnostics of the files, sorted. With `db`, the errors ra does not diagnose are added
 /// by the [`DETECTORS`] ([`crate::unresolved`], [`crate::duplicate`], [`crate::field_bounds`]). With `deadline`, stops with `Cancelled`
 /// before the first file it finds the deadline reached.
@@ -200,7 +231,9 @@ fn collect_errors(
             let mut found = Vec::new();
             let mut ra_keys: Vec<(FindingCode, u32)> = Vec::new();
             let mut inactive: Vec<TextRange> = Vec::new();
+            let mut unexpanded_macro = false;
             for d in diags {
+                unexpanded_macro |= is_unexpanded_macro(&d.code);
                 if matches!(d.code, DiagnosticCode::RaLint("inactive_code", _))
                     && d.range.file_id == *file_id
                 {
@@ -221,6 +254,9 @@ fn collect_errors(
             if let Some(db) = db {
                 let line_of = |at: TextSize| index.line_col(at).line + 1;
                 for (which, run) in DETECTORS {
+                    if unexpanded_macro && which.skips_files_with_unexpanded_macros() {
+                        continue;
+                    }
                     // Each detector is contained on its own: a panic in one costs this file
                     // that detector's findings, not the others' and not the collect.
                     let hits = catch_unwind(AssertUnwindSafe(|| {
@@ -339,6 +375,25 @@ mod tests {
             classify(&DiagnosticCode::Ra("bad-rtn", Severity::Error)),
             FindingCode::Analyzer("bad-rtn".to_owned())
         );
+    }
+
+    #[test]
+    fn unexpanded_macro_codes() {
+        for yes in [
+            DiagnosticCode::Ra("macro-error", Severity::Error),
+            DiagnosticCode::Ra("macro-error", Severity::WeakWarning),
+            DiagnosticCode::Ra("proc-macro-disabled", Severity::WeakWarning),
+            DiagnosticCode::RustcHardError("unresolved-macro-call"),
+        ] {
+            assert!(is_unexpanded_macro(&yes), "{yes:?}");
+        }
+        for no in [
+            DiagnosticCode::RaLint("inactive_code", Severity::WeakWarning),
+            DiagnosticCode::RustcHardError("E0599"),
+            DiagnosticCode::Ra("attribute-expansion-disabled", Severity::WeakWarning),
+        ] {
+            assert!(!is_unexpanded_macro(&no), "{no:?}");
+        }
     }
 
     #[test]

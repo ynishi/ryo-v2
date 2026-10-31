@@ -50,7 +50,7 @@ const FLOOR_MACRO_ATTR: usize = 2;
 const FLOOR_MACRO_RULES: usize = 0;
 const FLOOR_MACRO_TOKENS: usize = 2;
 const FLOOR_PROC_MACRO_EDIT: usize = 0;
-const FLOOR_VALID: usize = 8;
+const FLOOR_VALID: usize = 9;
 const PRIMARY_OF_FLOOR: usize = 32; // raised, never lowered (same rule as the floors)
 
 fn floor(g: Group) -> usize {
