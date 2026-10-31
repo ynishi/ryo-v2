@@ -10,10 +10,13 @@
 //! A candidate is skipped whenever the answer cannot be trusted: inside attributes, macro
 //! calls and macro definitions, in cfg-disabled code, in the input of an attribute macro, for
 //! a name some `use` of the file introduces (rustc reports only the failed import), and in a
-//! file with a glob import ra cannot resolve. Skipping loses recall, never precision.
+//! file with a glob import ra cannot resolve. The caller does not run this module at all on a
+//! file where ra reports a macro call it could not expand, since the expansion could define any
+//! name ([`crate::GapDetector::UnresolvedPath`]). Skipping loses recall, never precision.
 //!
 //! Residual false positives: a name a child module gets through `use super::*` from a parent
-//! whose import failed, and items produced by `include!` when out dirs are not loaded. Both
+//! whose import failed, and a name a module gets through a glob import from a module whose file
+//! has a macro call ra could not expand (the skip is per file). Both
 //! exist in the baseline too, so the baseline difference cancels them unless an edit adds a
 //! new use.
 

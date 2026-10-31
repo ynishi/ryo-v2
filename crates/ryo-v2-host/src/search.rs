@@ -68,7 +68,7 @@ fn search_with<J: Judge>(
             proc_macro: args.proc_macro,
             threads: None,
             assert_revert: false,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
             cfg_test: true,
         },

@@ -5,7 +5,8 @@
 //!
 //! Env: `RYO_V2_HISTORY_DIR=<out>` (unset: the test prints that and returns),
 //! `RYO_V2_HISTORY_LIMIT=<n>` (the first n pairs), `RYO_V2_HISTORY_REPORT=<file>` (per-pair JSON),
-//! and the oracle's `RYO_V2_ORACLE_PROC_MACRO=off`, `RYO_V2_ORACLE_UNRESOLVED=off`,
+//! and the oracle's `RYO_V2_ORACLE_PROC_MACRO=off`, `RYO_V2_ORACLE_GAP_DETECTORS=off` (every gap detector; renamed from
+//! `RYO_V2_ORACLE_UNRESOLVED`, which now stops the run),
 //! `RYO_V2_ORACLE_CFG_TEST=off`.
 
 use std::collections::BTreeMap;
@@ -62,7 +63,7 @@ fn run_pair(pair: &HistoryPair, proc_macro: bool) -> Result<(Outcome, Option<u64
             proc_macro,
             threads: None,
             assert_revert: true,
-            unresolved_paths: switch_on("RYO_V2_ORACLE_UNRESOLVED"),
+            gap_detectors: switch_on("RYO_V2_ORACLE_GAP_DETECTORS"),
             assert_revert_every: None,
             cfg_test: switch_on("RYO_V2_ORACLE_CFG_TEST"),
         },
@@ -87,6 +88,10 @@ fn run_pair(pair: &HistoryPair, proc_macro: bool) -> Result<(Outcome, Option<u64
 
 #[test]
 fn history_precision() {
+    assert!(
+        std::env::var_os("RYO_V2_ORACLE_UNRESOLVED").is_none(),
+        "RYO_V2_ORACLE_UNRESOLVED was renamed to RYO_V2_ORACLE_GAP_DETECTORS (=off switches every gap detector off)"
+    );
     let Some(dir) = std::env::var_os("RYO_V2_HISTORY_DIR") else {
         println!("history: RYO_V2_HISTORY_DIR not set; skipped");
         return;
@@ -98,8 +103,8 @@ fn history_precision() {
         pairs.truncate(n);
     }
     println!(
-        "unresolved-paths: {}, cfg-test: {}, proc-macro: {}",
-        if switch_on("RYO_V2_ORACLE_UNRESOLVED") {
+        "gap-detectors: {}, cfg-test: {}, proc-macro: {}",
+        if switch_on("RYO_V2_ORACLE_GAP_DETECTORS") {
             "on"
         } else {
             "off"

@@ -95,10 +95,11 @@ impl Verifier for RaAnalyzer {
     ///
     /// # Contract
     /// - C1: the analyzer is `rust-analyzer` at the release the `ra_ap_*` crates are pinned to;
-    ///   the config lists `proc_macro`, `cfg_test`, `unresolved_paths` and `check_timeout_ms`
+    ///   the config lists `proc_macro`, `cfg_test`, `gap_detectors` and `check_timeout_ms`
     ///   (`none` when no limit is set); the files are the indexed workspace files whose text can
-    ///   be read.
+    ///   be read; the `gap_detectors` entry is the switch of every gap detector.
     ///   tested: check::tests::analyzer_version_is_the_manifest_pin
+    ///   tested: tests/verifier.rs provenance_records_the_gap_detector_switch
     fn provenance(&self, s: &RaSession) -> Provenance {
         let files: BTreeMap<RelPath, Fingerprint> = s
             .files
@@ -112,8 +113,8 @@ impl Verifier for RaAnalyzer {
             ("proc_macro".to_owned(), self.config.proc_macro.to_string()),
             ("cfg_test".to_owned(), self.config.cfg_test.to_string()),
             (
-                "unresolved_paths".to_owned(),
-                self.config.unresolved_paths.to_string(),
+                "gap_detectors".to_owned(),
+                self.config.gap_detectors.to_string(),
             ),
             (
                 "check_timeout_ms".to_owned(),
@@ -212,7 +213,7 @@ impl RevertAudit for RaAnalyzer {
             &s.host,
             &scope,
             s.threads,
-            s.unresolved_paths,
+            s.gap_detectors,
             // An audit is never cut off.
             None,
             Detector {

@@ -50,7 +50,7 @@ pub(crate) fn run_apply(args: &ApplyArgs) -> Result<ExitCode> {
             proc_macro: args.proc_macro,
             threads: None,
             assert_revert: false,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: None,
             cfg_test: true,
         },

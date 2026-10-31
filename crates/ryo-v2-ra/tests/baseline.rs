@@ -38,7 +38,7 @@ impl Probe {
                 proc_macro: false,
                 threads: Some(1),
                 assert_revert: true,
-                unresolved_paths: true,
+                gap_detectors: true,
                 assert_revert_every: None,
                 cfg_test: false,
             },

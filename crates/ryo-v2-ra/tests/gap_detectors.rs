@@ -5,7 +5,7 @@ use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::{Diagnostic, Edit, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
+use ryo_v2_ra::{GapDetector, RaAnalyzer, RaConfig, RaSession};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,13 +31,13 @@ impl Probe {
         Self { dir }
     }
 
-    fn load(&self, unresolved_paths: bool) -> (RaAnalyzer, RaSession) {
+    fn load(&self, gap_detectors: bool) -> (RaAnalyzer, RaSession) {
         let a = RaAnalyzer::new(
             RaConfig {
                 proc_macro: false,
                 threads: Some(1),
                 assert_revert: true,
-                unresolved_paths,
+                gap_detectors,
                 assert_revert_every: None,
                 cfg_test: false,
             },
@@ -50,8 +50,8 @@ impl Probe {
     }
 
     /// New errors of writing `text` to src/lib.rs.
-    fn errors_of(&self, unresolved_paths: bool, text: &str) -> Vec<Diagnostic> {
-        let (a, mut s) = self.load(unresolved_paths);
+    fn errors_of(&self, gap_detectors: bool, text: &str) -> Vec<Diagnostic> {
+        let (a, mut s) = self.load(gap_detectors);
         let edit = Edit::write(RelPath::parse("src/lib.rs").unwrap(), text.to_owned());
         verify(&a, &mut s, &[edit], Scope::Affected)
             .expect("verify")
@@ -412,6 +412,108 @@ pub struct Unknown {
     assert_eq!(
         codes_of(&got, "E0369"),
         at("E0369", line_of(text, "pub raw_both: Raw")),
+        "got {got:?}"
+    );
+}
+
+#[test]
+fn each_detector_panic_is_contained_on_its_own() {
+    use ryo_v2_core::app::ports::Verifier;
+    use ryo_v2_core::domain::FindingCode;
+    let lib = "pub struct S;\n\
+pub fn g(s: S) {\n    s.missing();\n}\n\
+pub fn f(_x: Missing) {}\n\
+pub fn h() {}\n\
+pub mod m {\n    pub fn h() {}\n}\n\
+use m::h;\n\
+#[derive(Clone, Copy)]\n\
+pub struct Note {\n    pub text: String,\n}\n";
+    let p = Probe::new("each-contained");
+    std::fs::write(p.dir.join("src/lib.rs"), lib).unwrap();
+    let lib_rel = RelPath::parse("src/lib.rs").unwrap();
+    let analyzer = || {
+        RaAnalyzer::new(
+            RaConfig {
+                proc_macro: false,
+                threads: Some(1),
+                assert_revert: true,
+                gap_detectors: true,
+                assert_revert_every: None,
+                cfg_test: false,
+            },
+            Arc::new(MonotonicClock::new()),
+            Arc::new(RecordingObserver::default()),
+        )
+    };
+    let code_of = |d: GapDetector| match d {
+        GapDetector::UnresolvedPath => "E0425",
+        GapDetector::DuplicateName => "E0255",
+        GapDetector::FieldBounds => "E0204",
+    };
+    let has = |base: &[ryo_v2_core::domain::Finding], code: &str| {
+        base.iter()
+            .any(|f| matches!(&f.code, FindingCode::Rustc(c) if c.as_str() == code))
+    };
+
+    let plain = analyzer();
+    let s0 = plain.load(&p.dir).expect("load without fault");
+    let base0 = Verifier::baseline(&plain, &s0);
+    for code in ["E0425", "E0255", "E0204", "E0599"] {
+        assert!(has(&base0, code), "{code} missing, got {base0:?}");
+    }
+    assert!(s0.detector_panics().is_empty());
+
+    for d in GapDetector::ALL {
+        let a = analyzer().with_detector_fault(Some((d, lib_rel.clone())));
+        let mut s = a.load(&p.dir).expect("load survives a detector panic");
+        let base = Verifier::baseline(&a, &s);
+        for other in GapDetector::ALL {
+            assert_eq!(
+                has(&base, code_of(other)),
+                other != d,
+                "{d} fault, {other} code, got {base:?}"
+            );
+        }
+        assert!(
+            has(&base, "E0599"),
+            "ra finding kept under {d}, got {base:?}"
+        );
+        let panics = s.detector_panics();
+        assert_eq!(panics.len(), 1, "{d}: got {panics:?}");
+        assert_eq!(panics[0].detector, d);
+        assert_eq!(panics[0].path, lib_rel);
+        assert!(
+            panics[0].message.contains("fault injected"),
+            "got {panics:?}"
+        );
+        let edit = Edit::write(lib_rel.clone(), format!("{lib}// edited\n"));
+        a.check(&mut s, &[edit], Scope::Affected)
+            .expect("check is not poisoned");
+    }
+}
+
+/// A file with a macro call rust-analyzer could not expand (here an `include!` of `OUT_DIR`, which
+/// the probe never sets) is skipped by the unresolved-path detector only: the duplicate-name and
+/// field-bounds detectors still report on it.
+#[test]
+fn unexpanded_macro_file_keeps_the_other_detectors() {
+    let p = Probe::new("unexpanded-others");
+    std::fs::write(
+        p.dir.join("build.rs"),
+        "fn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(std::path::Path::new(&out).join(\"generated.rs\"), \"pub struct Generated;\\n\").unwrap();\n}\n",
+    )
+    .unwrap();
+    let text = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\npub fn make(_g: Generated) {}\n\npub fn f() {}\npub mod m {\n    pub fn f() {}\n}\nuse m::f;\n\n#[derive(Clone, Copy)]\npub struct Note {\n    pub text: String,\n}\n";
+    let got = p.errors_of(true, text);
+    assert!(codes_of(&got, "E0425").is_empty(), "got {got:?}");
+    assert_eq!(
+        codes_of(&got, "E0255"),
+        at("E0255", line_of(text, "use m::f;")),
+        "got {got:?}"
+    );
+    assert_eq!(
+        codes_of(&got, "E0204"),
+        at("E0204", line_of(text, "pub struct Note")),
         "got {got:?}"
     );
 }

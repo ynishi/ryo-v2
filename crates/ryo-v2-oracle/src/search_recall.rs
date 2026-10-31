@@ -1110,7 +1110,7 @@ impl ContainedPanics {
     }
 
     /// `contained panics: {d} detector, {e} expander` followed by one line per panic:
-    /// `detector panic {ws} {path}: {message}` / `expander panic {ws} {kind|-} {path|-}: {message}`
+    /// `detector panic {ws} {detector} {path}: {message}` / `expander panic {ws} {kind|-} {path|-}: {message}`
     /// (message: first line only). Always at least the first line.
     pub fn lines(&self) -> Vec<String> {
         let first = |m: &str| m.lines().next().unwrap_or("").to_owned();
@@ -1121,7 +1121,8 @@ impl ContainedPanics {
         )];
         for (ws, d) in &self.detector {
             out.push(format!(
-                "detector panic {ws} {}: {}",
+                "detector panic {ws} {} {}: {}",
+                d.detector,
                 d.path,
                 first(&d.message)
             ));
@@ -1186,6 +1187,7 @@ mod tests {
         BlueprintId, Fingerprint, Infeasible, IntentKind, Prior, ProposalId, Reward, SearchTree,
         StateFp,
     };
+    use ryo_v2_ra::GapDetector;
 
     #[test]
     fn contained_panics_lines_count_and_list() {
@@ -1193,6 +1195,7 @@ mod tests {
         assert!(p.is_empty());
         assert_eq!(p.lines(), vec!["contained panics: 0 detector, 0 expander"]);
         let d = [DetectorPanic {
+            detector: GapDetector::DuplicateName,
             path: RelPath::parse("src/a.rs").unwrap(),
             message: "boom\nmore".to_owned(),
         }];
@@ -1208,7 +1211,7 @@ mod tests {
         let lines = p.lines();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "contained panics: 1 detector, 1 expander");
-        assert_eq!(lines[1], "detector panic ws1 src/a.rs: boom");
+        assert_eq!(lines[1], "detector panic ws1 duplicate-name src/a.rs: boom");
         assert_eq!(
             lines[2],
             format!(

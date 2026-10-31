@@ -66,7 +66,7 @@ fn one_planted_case_runs_end_to_end() {
             proc_macro: false,
             threads: None,
             assert_revert: false,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
             cfg_test: true,
         },

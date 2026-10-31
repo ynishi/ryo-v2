@@ -5,7 +5,7 @@ use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::{Diagnostic, Edit, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
+use ryo_v2_ra::{GapDetector, RaAnalyzer, RaConfig, RaSession};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,13 +32,28 @@ impl Probe {
         Self { dir }
     }
 
-    fn load(&self, unresolved_paths: bool) -> (RaAnalyzer, RaSession) {
+    /// Writes `text` to `rel` under the package before it is loaded.
+    fn write(&self, rel: &str, text: &str) {
+        let path = self.dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// A `build.rs` whose output (never run here) defines `Generated`.
+    fn with_build_script(&self) {
+        self.write(
+            "build.rs",
+            "fn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(\n        std::path::Path::new(&out).join(\"generated.rs\"),\n        \"pub struct Generated;\\nimpl Generated { pub fn new() -> Self { Generated } }\\n\",\n    )\n    .unwrap();\n}\n",
+        );
+    }
+
+    fn load(&self, gap_detectors: bool) -> (RaAnalyzer, RaSession) {
         let a = RaAnalyzer::new(
             RaConfig {
                 proc_macro: false,
                 threads: Some(1),
                 assert_revert: true,
-                unresolved_paths,
+                gap_detectors,
                 assert_revert_every: None,
                 cfg_test: false,
             },
@@ -51,8 +66,8 @@ impl Probe {
     }
 
     /// New errors of writing `text` to src/lib.rs.
-    fn errors_of(&self, unresolved_paths: bool, text: &str) -> Vec<Diagnostic> {
-        let (a, mut s) = self.load(unresolved_paths);
+    fn errors_of(&self, gap_detectors: bool, text: &str) -> Vec<Diagnostic> {
+        let (a, mut s) = self.load(gap_detectors);
         let edit = Edit::write(RelPath::parse("src/lib.rs").unwrap(), text.to_owned());
         verify(&a, &mut s, &[edit], Scope::Affected)
             .expect("verify")
@@ -207,10 +222,10 @@ fn baseline_keys(a: &RaAnalyzer, s: &RaSession) -> Vec<String> {
     keys
 }
 
-fn load_corpus(path: &Path, unresolved_paths: bool) -> (RaAnalyzer, RaSession) {
+fn load_corpus(path: &Path, gap_detectors: bool) -> (RaAnalyzer, RaSession) {
     let a = RaAnalyzer::new(
         RaConfig {
-            unresolved_paths,
+            gap_detectors,
             ..RaConfig::default()
         },
         Arc::new(MonotonicClock::new()),
@@ -223,7 +238,12 @@ fn load_corpus(path: &Path, unresolved_paths: bool) -> (RaAnalyzer, RaSession) {
 #[test]
 fn corpus_bases_add_no_baseline_findings() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/base");
-    for name in ["breakage-lab", "extract-trait-multicrate", "macro-lab"] {
+    for name in [
+        "breakage-lab",
+        "build-lab",
+        "extract-trait-multicrate",
+        "macro-lab",
+    ] {
         let path = corpus.join(name);
         let (a_on, s_on) = load_corpus(&path, true);
         let on = baseline_keys(&a_on, &s_on);
@@ -284,7 +304,7 @@ fn detector_panic_is_contained_per_file() {
                 proc_macro: false,
                 threads: Some(1),
                 assert_revert: true,
-                unresolved_paths: true,
+                gap_detectors: true,
                 assert_revert_every: None,
                 cfg_test: false,
             },
@@ -301,7 +321,7 @@ fn detector_panic_is_contained_per_file() {
     assert!(base0.iter().any(|f| is_detector(&f)), "got {base0:?}");
     assert!(s0.detector_panics().is_empty());
 
-    let a = analyzer().with_detector_fault(Some(lib_rel.clone()));
+    let a = analyzer().with_detector_fault(Some((GapDetector::UnresolvedPath, lib_rel.clone())));
     let mut s = a.load(&p.dir).expect("load survives a detector panic");
     let base = Verifier::baseline(&a, &s);
     assert!(
@@ -311,6 +331,7 @@ fn detector_panic_is_contained_per_file() {
     assert!(!base.iter().any(|f| is_detector(&f)), "got {base:?}");
     let panics = s.detector_panics();
     assert_eq!(panics.len(), 1, "got {panics:?}");
+    assert_eq!(panics[0].detector, GapDetector::UnresolvedPath);
     assert_eq!(panics[0].path, lib_rel);
     assert!(
         panics[0].message.contains("fault injected"),
@@ -321,4 +342,67 @@ fn detector_panic_is_contained_per_file() {
     a.check(&mut s, &[edit], Scope::Affected)
         .expect("check is not poisoned");
     assert_eq!(s.detector_panics().len(), 1, "deduplicated");
+}
+
+const INCLUDE_GENERATED: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\npub fn make() -> Generated {\n    Generated::new()\n}\n";
+
+#[test]
+fn build_script_include_types_are_not_reported_without_out_dir() {
+    let p = Probe::new("build_include");
+    p.with_build_script();
+    let got = p.errors_of(true, INCLUDE_GENERATED);
+    assert!(detector_codes(&got).is_empty(), "got {got:?}");
+}
+
+#[test]
+fn function_like_proc_macro_types_are_not_reported_without_the_server() {
+    let p = Probe::new("proc_macro_type");
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\npm = { path = \"pm\" }\n\n[workspace]\nmembers = [\"pm\"]\n",
+    );
+    p.write(
+        "pm/Cargo.toml",
+        "[package]\nname = \"pm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n",
+    );
+    p.write(
+        "pm/src/lib.rs",
+        "extern crate proc_macro;\nuse proc_macro::TokenStream;\n#[proc_macro]\npub fn make_type(_: TokenStream) -> TokenStream {\n    \"pub struct Made;\".parse().unwrap()\n}\n",
+    );
+    let got = p.errors_of(true, "pm::make_type!();\n\npub fn f(_x: Made) {}\n");
+    assert!(detector_codes(&got).is_empty(), "got {got:?}");
+}
+
+#[test]
+fn unresolved_names_outside_an_unexpanded_macro_file_are_still_reported() {
+    let p = Probe::new("per_file");
+    p.with_build_script();
+    p.write("src/other.rs", "pub fn g(_x: Missing) {}\n");
+    let text = format!("{INCLUDE_GENERATED}\npub mod other;\n");
+    let got = p.errors_of(true, &text);
+    let in_file = |file: &str| -> Vec<(String, u32)> {
+        let mut v: Vec<(String, u32)> = got
+            .iter()
+            .filter(|d| {
+                d.path.as_str() == file && matches!(d.code.as_str(), "E0405" | "E0425" | "E0433")
+            })
+            .map(|d| (d.code.as_str().to_owned(), d.line))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        in_file("src/other.rs"),
+        pairs(&[("E0425", 1)]),
+        "got {got:?}"
+    );
+    assert!(in_file("src/lib.rs").is_empty(), "got {got:?}");
+}
+
+#[test]
+fn a_file_whose_macros_expand_keeps_its_findings() {
+    let p = Probe::new("expanding_macro");
+    let text = "macro_rules! noop {\n    () => {};\n}\nnoop!();\n\npub fn f(_x: Missing) {}\n";
+    let got = p.errors_of(true, text);
+    assert_eq!(detector_codes(&got), pairs(&[("E0425", 6)]), "got {got:?}");
 }

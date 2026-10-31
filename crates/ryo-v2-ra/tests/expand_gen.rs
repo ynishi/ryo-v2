@@ -72,7 +72,7 @@ fn load(f: &Fixture) -> (RaAnalyzer, RaSession) {
             proc_macro: false,
             threads: Some(1),
             assert_revert: false,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
         },

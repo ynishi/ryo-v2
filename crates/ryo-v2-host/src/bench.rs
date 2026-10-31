@@ -75,7 +75,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
             proc_macro: args.proc_macro,
             threads: None,
             assert_revert: args.assert_revert,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
         },

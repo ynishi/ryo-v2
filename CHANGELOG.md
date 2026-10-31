@@ -37,6 +37,12 @@ and this project adheres to
 
 ### Changed
 
+- `RaConfig.unresolved_paths` is renamed `RaConfig.gap_detectors`: it switches all three gap
+  detectors (unresolved-path, duplicate-name, field-bounds), and the Evidence provenance records
+  it under `gap_detectors`. The oracle switch `RYO_V2_ORACLE_UNRESOLVED=off` is now
+  `RYO_V2_ORACLE_GAP_DETECTORS=off`; the old name stops the run. `DetectorPanic` names its
+  detector (`GapDetector`), and the test fault hook `with_detector_fault` takes a detector and a
+  file. The contained-panics lines of the harnesses print the detector.
 - `search-recall run` reports the time of its outer `cargo check` apart (`outer_check_ms`,
   `search_ms` in the JSON report), and its trigger 4 line follows decision D4 as restated in
   `SEARCH_LEDGER.md`: the run without its outer check is compared with the limit, and a run with a
@@ -102,6 +108,9 @@ and this project adheres to
 - Extract-variable no longer proposes a name the block already reads outside the extracted
   expression: rust-analyzer may name the value after a local in scope, and the new `let` would
   shadow it for the later reads.
+- The unresolved-path detector no longer reports types defined by a macro rust-analyzer could not
+  expand (a proc macro without the server, an `include!` of `OUT_DIR` without build scripts): it
+  skips a file with such a macro call. New corpus base `build-lab`.
 - The expander no longer panics on the value of a struct-literal field that has an attribute
   (`#[cfg(..)] k: v`): extract-variable refuses it, since rust-analyzer would build the variable's
   name from the whole field text. A panic inside the expander now costs one call of one edit kind,

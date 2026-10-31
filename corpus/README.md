@@ -3,7 +3,7 @@
 Where the fixtures in this directory come from.
 
 - Written in this repository: the other bases under `corpus/base`
-  (`breakage-lab`, `cfg-test-lab`, `macro-lab`) and the remaining fixtures here
+  (`breakage-lab`, `build-lab`, `cfg-test-lab`, `macro-lab`) and the remaining fixtures here
   (`broken-*`, `valid-*`, `created-broken-disk`, `search`).
 - Derived from ryo-rs: `corpus/body-01`, `corpus/body-02`, `corpus/body-03` and
   `corpus/base/extract-trait-multicrate` derive from ryo-rs, a verification
