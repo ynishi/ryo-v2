@@ -277,30 +277,46 @@ CLI takes `judge: {kind: "replay", file}` and `search_recall` counts both.
 copy of the workspace for each `Decided` candidate (at most 3 per decision) and counts those that
 report an error the unedited workspace does not:
 
-| corpus | decided candidates | failed | rate |
-|---|---|---|---|
-| small bases | 114 | 14 | 0.12 |
-| ryo-rs | 30 | 2 | 0.07 |
+| corpus | verifier | decided candidates | failed | rate |
+|---|---|---|---|---|
+| small bases | before the duplicate-name and field-bounds detectors | 114 | 14 | 0.12 |
+| small bases | with them (2026-11-01; 47.8 s wall on 16 cores and 30 GiB, other runs possibly on the machine) | 112 | 0 | 0.00 |
+| ryo-rs | before them | 30 | 2 | 0.07 |
+| ryo-rs | with them | pending | | |
 
-All 14 failures are E0255 (a name defined by an item and by a `use` in the same module), in 11
-decisions: the 9 single `misplace-item` decisions and 2 pairs that contain one. They are the 2nd
-or 3rd candidate of the decision, never the best: 0 of the 39 best candidates failed. The
-failing candidate moves the item back into the file that already re-exports it and leaves the
-`use`. rust-analyzer's diagnostics pass it (the search's check misses E0255) and only the outer
-`cargo check` stops it, which is review finding 2 (the outer check) shown with a number. A
-decision that plants no `misplace-item` had no failing candidate. (The pairs `inline-function`
-plus `misplace-item` and `inline-variable` plus `misplace-item` had none either: their `Decided`
-candidates did not include the bad move.)
+Before the detectors all 14 failures were E0255 (a name defined by an item and by a `use` in the
+same module), in 11 decisions: the 9 single `misplace-item` decisions and 2 pairs that contain
+one. They were the 2nd or 3rd candidate of the decision, never the best: 0 of the 39 best
+candidates failed. The failing candidate was move-item's forward shape: it moved the item into
+the file that still re-exported it (`pub use crate::plan::NAME;` at the top of
+`app/src/lib.rs`, the item appended at its end) and left the `use`. rust-analyzer's diagnostics
+passed it and only the outer `cargo check` stopped it. A decision that plants no
+`misplace-item` had no failing candidate. (The pairs `inline-function` plus `misplace-item` and
+`inline-variable` plus `misplace-item` had none either: their `Decided` candidates did not
+include the bad move.)
+
+With the detectors (CHECK_LEDGER Gaps G-B-9, G-B-10, G-B-11) the verifier rejects those moves itself,
+and 0 of 112 decided candidates fail. The recall table above (section "Counts") is the same row
+for row; every decision keeps its generated, hit, fate and final rank. What moves is the
+depth-2 search below a `misplace-item` parent, because the rejected moves are no longer parents:
+`pair-inline-function-misplace-item-0` proposes 64 children at depth 2 instead of 57 and keeps
+its best at beam rank 8 instead of 7 (final rank 3 both times), `pair-inline-variable-misplace-item-0`
+52 instead of 45, `pair-obscure-name-misplace-item-0` 60 instead of 55, and
+`pair-misplace-item-misplace-item-0` 16 instead of 18 with 9 kept instead of 10. The decided
+candidates are 112 instead of 114: a decision is cut to 3 passing candidates, so where the
+rejected move had been one of 3, another passing candidate takes its place if there is one (the
+harness prints no per-decision count; the 2 fewer are decisions with no such replacement, an
+inference). The run had 564 checks (565 before), median warm check 9 ms.
 
 On ryo-rs (a verification repository used as a large sample; run 3 of section "ryo-rs (large
-run)") 2 of 30 decided candidates failed, in 10 decisions (`inline-variable-0` had no candidate),
-both in `misplace-item` decisions: candidate 0 of `misplace-item-0` reports E0255 at
-`crates/ryo-agent/src/decide.rs:147`, candidate 1 of `misplace-item-2` reports E0204 (a `Copy`
-impl on a type with a field that is not `Copy`) at `crates/ryo-agent/src/decide.rs:150` (paths
-inside ryo-rs). The harness counts 1 of the 10 first candidates of a decision as failed: candidate
-0 of `misplace-item-0`, a decision whose planted best was not generated. rust-analyzer's
-diagnostics passed both candidates and only the outer `cargo check` rejected them: two more errors
-the search's check misses (CHECK_LEDGER Open work M-10).
+run)", before the detectors) 2 of 30 decided candidates failed, in 10 decisions
+(`inline-variable-0` had no candidate), both in `misplace-item` decisions: candidate 0 of
+`misplace-item-0` reports E0255 at `crates/ryo-agent/src/decide.rs:147`, candidate 1 of
+`misplace-item-2` reports E0204 (a `Copy` impl on a type with a field that is not `Copy`) at
+`crates/ryo-agent/src/decide.rs:150` (paths inside ryo-rs). The harness counts 1 of the 10
+first candidates of a decision as failed: candidate 0 of `misplace-item-0`, a decision whose
+planted best was not generated. Both codes are now detected (CHECK_LEDGER Gaps G-B-9 and G-B-10);
+the run with the detectors is pending.
 
 ## ryo-rs (large run)
 

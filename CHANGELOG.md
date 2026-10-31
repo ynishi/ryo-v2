@@ -75,3 +75,11 @@ and this project adheres to
   (`#[cfg(..)] k: v`): extract-variable refuses it, since rust-analyzer would build the variable's
   name from the whole field text. A panic inside the expander now costs one call of one edit kind,
   not every child of the state being expanded.
+- The verifier (`ryo-v2-ra`) rejects two kinds of edit that rust-analyzer passes and `cargo check`
+  refuses: a module in which an item and a `use` define the same name (E0255; the move-item
+  candidates that put an item into the module still importing it), and a derived impl or a written
+  `impl Copy` whose trait a field of the type lacks (E0204, E0277, E0369; add-derive proposes such
+  derives). The small-base search-recall run with `--outer-check` goes from 14 of 114 decided
+  candidates failing `cargo check` to 0 of 112. The oracle has the groups `duplicate-name`,
+  `copy-impl` and `derive-field` with 13 cases on breakage-lab; `RaConfig.unresolved_paths`
+  switches the new detectors with the old one.

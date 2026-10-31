@@ -1,7 +1,8 @@
 //! Error diagnostics out of rust-analyzer, as domain [`Finding`]s.
 
 use crate::session::DetectorPanic;
-use crate::unresolved;
+use crate::unresolved::{self, Hit};
+use crate::{duplicate, field_bounds};
 use ra_ap_base_db::salsa::Cancelled;
 use ra_ap_hir::PrefixKind;
 use ra_ap_ide::{
@@ -117,17 +118,34 @@ impl Deadline {
     }
 }
 
-/// What a collect needs to run, and to report on, the unresolved-path detector.
+/// One detector of an error rust-analyzer 0.0.358 does not report: the rustc code, message and
+/// line of each error it finds in a file, given the cfg-disabled ranges and the line of an offset.
+type Detect = fn(&RootDatabase, FileId, &[TextRange], &dyn Fn(TextSize) -> u32) -> Vec<Hit>;
+
+/// Name of the unresolved-path detector, the one the test fault hook targets.
+const UNRESOLVED: &str = "unresolved-path";
+
+/// The detectors a collect runs when it has a database, in this order: unresolved type names and
+/// path prefixes (E0405, E0425, E0433), names an item and a `use` both define (E0255), and the
+/// trait a field owes to a derived impl or a written `Copy` impl (E0204, E0277, E0369).
+const DETECTORS: [(&str, Detect); 3] = [
+    (UNRESOLVED, unresolved::find),
+    ("duplicate-name", duplicate::find),
+    ("field-bounds", field_bounds::find),
+];
+
+/// What a collect needs to run, and to report on, the detectors of [`DETECTORS`].
 #[derive(Clone, Copy)]
 pub(crate) struct Detector<'a> {
-    /// File on which the detector is made to panic (test hook).
+    /// File on which the unresolved-path detector is made to panic (test hook).
     pub(crate) fault: Option<&'a RelPath>,
-    /// Where a contained detector panic is recorded.
+    /// Where a contained detector panic is recorded (a detector other than the unresolved-path
+    /// one prefixes its name to the message).
     pub(crate) panics: &'a Mutex<BTreeSet<DetectorPanic>>,
 }
 
-/// Error diagnostics of the files, sorted. With `db`, the unresolved names ra does not
-/// diagnose are added (see [`crate::unresolved`]). With `deadline`, stops with `Cancelled`
+/// Error diagnostics of the files, sorted. With `db`, the errors ra does not diagnose are added
+/// by the [`DETECTORS`] ([`crate::unresolved`], [`crate::duplicate`], [`crate::field_bounds`]). With `deadline`, stops with `Cancelled`
 /// before the first file it finds the deadline reached.
 fn collect_errors(
     analysis: &Analysis,
@@ -170,39 +188,46 @@ fn collect_errors(
             }
             if let Some(db) = db {
                 let line_of = |at: TextSize| index.line_col(at).line + 1;
-                // Only the detector is contained: a panic in it costs this file its detector
-                // findings, not the collect.
-                let found_paths = catch_unwind(AssertUnwindSafe(|| {
-                    if detector.fault == Some(rel) {
-                        panic!("unresolved-path detector fault injected on {rel}");
-                    }
-                    unresolved::find(db, *file_id, &inactive, &line_of)
-                }))
-                .unwrap_or_else(|payload| {
-                    // salsa 0.28 raises its cancellation with `resume_unwind`; it is not a
-                    // detector fault, so it goes on to the outer catch as before.
-                    if payload.downcast_ref::<Cancelled>().is_some() {
-                        std::panic::resume_unwind(payload);
-                    }
-                    detector
-                        .panics
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(DetectorPanic {
-                            path: rel.clone(),
-                            message: panic_message(payload),
-                        });
-                    Vec::new()
-                });
-                for (code, message, line) in found_paths {
-                    // The same code on the same line: ra already says it.
-                    if !ra_keys.contains(&(code.clone(), line)) {
-                        found.push(Finding {
-                            code,
-                            message,
-                            path: rel.clone(),
-                            line,
-                        });
+                for (name, run) in DETECTORS {
+                    // Each detector is contained on its own: a panic in one costs this file
+                    // that detector's findings, not the others' and not the collect.
+                    let hits = catch_unwind(AssertUnwindSafe(|| {
+                        if name == UNRESOLVED && detector.fault == Some(rel) {
+                            panic!("unresolved-path detector fault injected on {rel}");
+                        }
+                        run(db, *file_id, &inactive, &line_of)
+                    }))
+                    .unwrap_or_else(|payload| {
+                        // salsa 0.28 raises its cancellation with `resume_unwind`; it is not a
+                        // detector fault, so it goes on to the outer catch as before.
+                        if payload.downcast_ref::<Cancelled>().is_some() {
+                            std::panic::resume_unwind(payload);
+                        }
+                        let message = panic_message(payload);
+                        detector
+                            .panics
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(DetectorPanic {
+                                path: rel.clone(),
+                                message: if name == UNRESOLVED {
+                                    message
+                                } else {
+                                    format!("{name} detector: {message}")
+                                },
+                            });
+                        Vec::new()
+                    });
+                    for (code, message, line) in hits {
+                        // The same code on the same line: ra already says it.
+                        if !ra_keys.contains(&(code.clone(), line)) {
+                            found.push(Finding {
+                                code,
+                                message,
+                                path: rel.clone(),
+                                line,
+                            });
+                        }
                     }
                 }
             }
@@ -216,7 +241,7 @@ fn collect_errors(
 }
 
 /// Parallel [`collect_errors`]: chunks the files and diagnoses each chunk on its own snapshot.
-/// `unresolved` switches the detector of [`crate::unresolved`] on; each chunk then also takes
+/// `unresolved` switches the [`DETECTORS`] on; each chunk then also takes
 /// its own database clone, dropped before this function returns.
 pub(crate) fn collect_errors_par(
     host: &AnalysisHost,

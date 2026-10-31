@@ -1,0 +1,417 @@
+//! The detectors of duplicate names (E0255) and of `Copy` impls on non-`Copy` fields (E0204), on throwaway workspaces.
+
+use ryo_v2_core::app::ports::Analyzer;
+use ryo_v2_core::app::verify::verify;
+use ryo_v2_core::domain::{Diagnostic, Edit, RelPath, Scope};
+use ryo_v2_core::infra::clock::MonotonicClock;
+use ryo_v2_core::infra::observer::RecordingObserver;
+use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+const BASE: &str = "pub struct S;\n";
+
+/// A temp workspace (one crate) that removes itself on drop.
+struct Probe {
+    dir: PathBuf,
+}
+
+impl Probe {
+    fn new(test: &str) -> Self {
+        // Not CARGO_TARGET_TMPDIR: `session::load` skips every path with a `target` component.
+        let dir = std::env::temp_dir().join(format!("ryo-v2-gap-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), BASE).unwrap();
+        Self { dir }
+    }
+
+    fn load(&self, unresolved_paths: bool) -> (RaAnalyzer, RaSession) {
+        let a = RaAnalyzer::new(
+            RaConfig {
+                proc_macro: false,
+                threads: Some(1),
+                assert_revert: true,
+                unresolved_paths,
+                assert_revert_every: None,
+                cfg_test: false,
+            },
+            Arc::new(MonotonicClock::new()),
+            Arc::new(RecordingObserver::default()),
+        );
+        let s = a.load(&self.dir).expect("load probe");
+        assert!(a.baseline(&s).is_empty(), "got {:?}", a.baseline(&s));
+        (a, s)
+    }
+
+    /// New errors of writing `text` to src/lib.rs.
+    fn errors_of(&self, unresolved_paths: bool, text: &str) -> Vec<Diagnostic> {
+        let (a, mut s) = self.load(unresolved_paths);
+        let edit = Edit::write(RelPath::parse("src/lib.rs").unwrap(), text.to_owned());
+        verify(&a, &mut s, &[edit], Scope::Affected)
+            .expect("verify")
+            .new_errors
+            .errors
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `(code, line)` of the diagnostics whose code is `code`, sorted.
+fn codes_of(errors: &[Diagnostic], code: &str) -> Vec<(String, u32)> {
+    let mut got: Vec<(String, u32)> = errors
+        .iter()
+        .filter(|d| d.code.as_str() == code)
+        .map(|d| (d.code.as_str().to_owned(), d.line))
+        .collect();
+    got.sort();
+    got
+}
+
+/// The 1-based line of the first line of `text` that contains `needle`.
+fn line_of(text: &str, needle: &str) -> u32 {
+    let at = text
+        .lines()
+        .position(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no line with {needle:?}"));
+    u32::try_from(at + 1).unwrap()
+}
+
+fn at(code: &str, line: u32) -> Vec<(String, u32)> {
+    vec![(code.to_owned(), line)]
+}
+
+/// An item and a `use` that define one name in one namespace are reported at the later of the two:
+/// the item head when the `use` comes first, the `use` leaf when the item comes first, and in an
+/// inline module as in the root; the switch turns the detector off.
+#[test]
+fn duplicate_name_reports_item_and_use() {
+    let p = Probe::new("dup-positive");
+
+    // Type namespace, through a cyclic re-export; the `use` comes first.
+    let a = "pub struct S;\npub mod sizes {\n    pub use crate::Size;\n}\nuse sizes::Size;\npub struct Size {\n    pub side: u32,\n}\n";
+    let got = p.errors_of(true, a);
+    assert_eq!(
+        codes_of(&got, "E0255"),
+        at("E0255", line_of(a, "pub struct Size")),
+        "got {got:?}"
+    );
+    let off = p.errors_of(false, a);
+    assert!(codes_of(&off, "E0255").is_empty(), "got {off:?}");
+
+    // Value namespace; the item comes first.
+    let b = "pub struct S;\npub fn f() {}\npub mod m {\n    pub fn f() {}\n}\nuse m::f;\n";
+    let got = p.errors_of(true, b);
+    assert_eq!(
+        codes_of(&got, "E0255"),
+        at("E0255", line_of(b, "use m::f;")),
+        "got {got:?}"
+    );
+    let off = p.errors_of(false, b);
+    assert!(codes_of(&off, "E0255").is_empty(), "got {off:?}");
+
+    // Inside an inline module; the `use` comes first.
+    let c =
+        "pub struct S;\npub struct X;\npub mod inner {\n    use super::X;\n    pub struct X;\n}\n";
+    let got = p.errors_of(true, c);
+    assert_eq!(
+        codes_of(&got, "E0255"),
+        at("E0255", line_of(c, "    pub struct X;")),
+        "got {got:?}"
+    );
+    let off = p.errors_of(false, c);
+    assert!(codes_of(&off, "E0255").is_empty(), "got {off:?}");
+}
+
+/// What rustc accepts is not reported: other namespaces, globs, `as _`, renames, the same name in
+/// two modules, a `use` in a function body and a cfg-disabled item.
+#[test]
+fn duplicate_name_skips_what_rustc_accepts() {
+    let text = r#"pub struct S;
+
+pub mod m {
+    pub fn scale() -> u32 {
+        1
+    }
+}
+use m::scale;
+pub mod scale {}
+
+pub mod m2 {
+    pub struct Same;
+}
+use m2::*;
+pub struct Same;
+
+pub mod m3 {
+    pub fn g() {}
+}
+use m3::g as _;
+pub fn g() {}
+
+pub mod m4 {
+    pub fn h() {}
+}
+use m4::h as h2;
+pub fn h() {}
+
+pub struct Y;
+pub mod other {
+    pub struct Y;
+}
+
+pub mod m6 {
+    pub struct W;
+}
+pub struct W;
+pub fn body() {
+    use m6::W;
+    let _ = W;
+}
+
+pub mod m5 {
+    pub fn z() {}
+}
+#[cfg(any())]
+pub fn z() {}
+use m5::z;
+"#;
+    let p = Probe::new("dup-negative");
+    let got = p.errors_of(true, text);
+    assert!(codes_of(&got, "E0255").is_empty(), "got {got:?}");
+}
+
+/// `Copy` on a type with a field that is not `Copy` is reported at the type head for a derive
+/// (not at the attribute), at the `Copy` of a manual impl, and for an enum variant field.
+#[test]
+fn copy_impl_reports_non_copy_fields() {
+    let text = r#"pub struct S;
+
+#[derive(Clone, Copy)]
+pub struct Note {
+    pub text: String,
+}
+
+#[derive(Clone)]
+pub struct Tags {
+    pub list: Vec<u32>,
+}
+impl Copy for Tags {}
+
+#[derive(Clone, Copy)]
+pub enum Token {
+    Number(u32),
+    Word(String),
+}
+"#;
+    let p = Probe::new("copy-positive");
+    let got = p.errors_of(true, text);
+    let mut want = vec![
+        ("E0204".to_owned(), line_of(text, "pub struct Note")),
+        ("E0204".to_owned(), line_of(text, "impl Copy for Tags")),
+        ("E0204".to_owned(), line_of(text, "pub enum Token")),
+    ];
+    want.sort();
+    assert_eq!(codes_of(&got, "E0204"), want, "got {got:?}");
+    let off = p.errors_of(false, text);
+    assert!(codes_of(&off, "E0204").is_empty(), "got {off:?}");
+}
+
+/// Types whose fields are all `Copy`, generic types, lifetime-only types, fieldless enums, a
+/// `Clone` derive alone and a field of unknown type are not reported.
+#[test]
+fn copy_impl_skips_copy_and_generic_types() {
+    let text = r#"pub struct S;
+
+#[derive(Clone, Copy)]
+pub struct Inner {
+    pub a: u8,
+}
+
+#[derive(Clone, Copy)]
+pub struct AllCopy {
+    pub n: u32,
+    pub s: &'static str,
+    pub arr: [u32; 2],
+    pub inner: Inner,
+}
+
+#[derive(Clone, Copy)]
+pub struct Pair2(pub (u8, char));
+
+#[derive(Clone, Copy)]
+pub struct Pair<T> {
+    pub a: T,
+}
+
+#[derive(Clone, Copy)]
+pub struct R<'a> {
+    pub s: &'a str,
+}
+
+#[derive(Clone, Copy)]
+pub enum Plain {
+    A,
+    B,
+}
+
+#[derive(Clone)]
+pub struct Owned {
+    pub text: String,
+}
+
+#[derive(Clone, Copy)]
+pub struct Unknown {
+    pub m: Missing,
+}
+"#;
+    let p = Probe::new("copy-negative");
+    let got = p.errors_of(true, text);
+    assert!(codes_of(&got, "E0204").is_empty(), "got {got:?}");
+}
+
+/// A derive of Debug, Clone, Default or Eq over a field without the trait is reported as E0277 at
+/// the field line, and a derive of PartialEq as E0369 at the field line.
+#[test]
+fn derive_field_reports_missing_field_traits() {
+    let text = r#"pub struct Raw;
+
+#[derive(PartialEq)]
+pub struct PRaw;
+
+#[derive(Debug)]
+pub struct A {
+    pub id: u32,
+    pub raw_a: Raw,
+}
+
+#[derive(Clone)]
+pub struct B {
+    pub id: u32,
+    pub raw_b: Raw,
+}
+
+#[derive(Default)]
+pub struct C {
+    pub id: u32,
+    pub raw_c: Raw,
+}
+
+#[derive(PartialEq)]
+pub struct D {
+    pub id: u32,
+    pub raw_d: Raw,
+}
+
+#[derive(PartialEq, Eq)]
+pub struct E {
+    pub raw_e: PRaw,
+}
+"#;
+    let p = Probe::new("field-positive");
+    let got = p.errors_of(true, text);
+    let mut want77 = vec![
+        ("E0277".to_owned(), line_of(text, "pub raw_a: Raw")),
+        ("E0277".to_owned(), line_of(text, "pub raw_b: Raw")),
+        ("E0277".to_owned(), line_of(text, "pub raw_c: Raw")),
+        ("E0277".to_owned(), line_of(text, "pub raw_e: PRaw")),
+    ];
+    want77.sort();
+    assert_eq!(codes_of(&got, "E0277"), want77, "got {got:?}");
+    assert_eq!(
+        codes_of(&got, "E0369"),
+        at("E0369", line_of(text, "pub raw_d: Raw")),
+        "got {got:?}"
+    );
+    let off = p.errors_of(false, text);
+    assert!(
+        codes_of(&off, "E0277").is_empty() && codes_of(&off, "E0369").is_empty(),
+        "got {off:?}"
+    );
+}
+
+/// Nothing is reported for a hand-written impl, a generic type, fields that have the traits, Clone
+/// next to Copy (over a field without `Clone` only the E0204 is reported), a `#[default]` enum
+/// variant with another variant that holds a field without the trait, a cfg-disabled type and a
+/// field of unknown type; for `PartialEq, Eq` over a bare field only the E0369 is reported.
+#[test]
+fn derive_field_skips_what_needs_nothing() {
+    let text = r#"pub struct Raw;
+
+pub struct Opaque {
+    pub raw_o: Raw,
+}
+impl std::fmt::Debug for Opaque {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Opaque")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct G<T> {
+    pub t: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Plain {
+    pub n: u32,
+    pub s: String,
+    pub v: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Num {
+    pub n: u32,
+}
+
+#[derive(Default)]
+pub enum Pick {
+    #[default]
+    A,
+    B(Raw),
+}
+
+#[derive(PartialEq, Eq)]
+pub struct Both {
+    pub raw_both: Raw,
+}
+
+#[derive(Clone, Copy)]
+pub struct CopyRaw {
+    pub raw_copy: Raw,
+}
+
+#[cfg(any())]
+#[derive(Debug, Clone, Copy)]
+pub struct Gone {
+    pub raw_gone: Raw,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unknown {
+    pub m: Missing,
+}
+"#;
+    let p = Probe::new("field-negative");
+    let got = p.errors_of(true, text);
+    assert!(codes_of(&got, "E0277").is_empty(), "got {got:?}");
+    assert_eq!(
+        codes_of(&got, "E0204"),
+        at("E0204", line_of(text, "pub struct CopyRaw")),
+        "got {got:?}"
+    );
+    assert_eq!(
+        codes_of(&got, "E0369"),
+        at("E0369", line_of(text, "pub raw_both: Raw")),
+        "got {got:?}"
+    );
+}

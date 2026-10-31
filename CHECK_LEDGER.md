@@ -36,7 +36,7 @@ the change that does the work, when its direction is carried out.
 | M-2 | candidates | A decided candidate carries whole-file texts (`Candidate::edits`, `edits[].new_text` of the output) and no specs, read ranges or fingerprint of the text it was checked against. ryo-v2 writes nothing itself, and the session is a snapshot of the load, so whoever writes a candidate later cannot tell whether a file changed after the load, and writing it overwrites such a change, inside its ranges or outside them. | Candidates carry specs and read ranges; freshness is re-checked against the files at apply time and the change is spliced in. | open |
 | M-3 | Blueprints | Blueprints have no dependencies or conflicts. Each Blueprint of a set is checked alone against the loaded text, so two passing Blueprints on the same file are returned as two whole-file texts, and writing both keeps only the later one. Two passing Blueprints are never checked together, so on different files as well, each passing alone says nothing about both applied. A Blueprint cannot state that its specs are against another Blueprint's result; only the search composes a child onto its parent. | `deps` / `conflicts` on Blueprint, checked in BlueprintSet (acyclic, no overlapping ranges in one file). | open |
 | M-4 | freshness | A read-range fingerprint covers only the bytes of the range (`ReadRange::check` C1). An offset names a position only while the bytes before it are unchanged, so a change above that keeps the range's bytes (an identical line inserted above, for one) leaves the read Fresh while the old offset points at another statement. The base text that the specs' offsets refer to has no fingerprint of its own. | A whole-file fingerprint for edited files; anchors around read-only ranges. | open |
-| M-6 | verifier gaps | The verifier's known gaps are reflected only by the Borrow mark. `OUTER_CHECK_MAX` is defined but unused, so the outer `cargo check` of the final candidates is not wired. | Derive the risk marks from the weak groups of this ledger; select the outer-check candidates by `OUTER_CHECK_MAX`. | open |
+| M-6 | verifier gaps | A G-B row of the Gaps below reaches the disposition of a candidate only through a detector that turns it into a failed check, or through a risk mark of the intent that can produce it: `Borrow` (extract-variable, extract-function) and `Visibility` (move-item) make the candidate `AfterOuterCheck`, never `AutoApplicable`. `OUTER_CHECK_MAX` is used: the search makes the first 3 of its final ranking the candidates of a decision (`app/search.rs`). Two things are missing. (1) Nothing runs that outer check: `AfterOuterCheck` tells the caller to run `cargo check`, and the only runner is the search-recall harness (`--outer-check`). (2) Which G-B rows each edit kind can produce is not written down, so a kind without a mark can carry one past the verifier; the known case is add-derive (no mark) on a type with type or const parameters, which the field-bounds detector skips (an `impl Copy` or derive on such a type is not checked against its fields); today the M-1 valve keeps every add-derive candidate `NeedsReview`. | A table of edit kind against the G-B rows it can produce, kept by a test; for each pair not covered by a detector, a mark on the kind or a detector; a runner of the outer check for `AfterOuterCheck` candidates outside the analyzer. | open |
 | M-7 | risk marks | Files included from `build.rs` by `mod`, the crates a proc-macro crate depends on and `include!` targets carry no mark. A Blueprint that only reads `Cargo.toml` fails as MissingFile. | Mark these files and crates; let a Blueprint read `Cargo.toml` without a MissingFile failure. | open |
 | M-8 | errors | One Blueprint's CheckError stops the whole set. | Split per-Blueprint errors from session-fatal ones. | open |
 | M-11 | domain visibility (stages) | The marks and the Rule of a candidate are derived in the domain and `Candidate::new` is `pub(crate)`, but the stages before the check (file role, freshness, conformance, splice) still run in `app::apply::prepare`: `Candidate::new` trusts its callers inside the crate to have run them. `NearMiss` keeps `pub` fields. | Make the stages a domain function whose result is the only input `Candidate::new` accepts (with the candidate specs of M-2); make the `NearMiss` fields private. | open |
@@ -47,16 +47,18 @@ the change that does the work, when its direction is carried out.
 | S-2 | search metric | The extensibility term of the score is 0 for every candidate: the syntax assessor counts change-probe sites (matches without a catch-all arm, record literals and patterns without `..`, trait impls), and none of the expander's edit kinds (rename, extract, inline, move between files) adds or removes such a site. Probes are written for every planted case, but they cannot change the ranking (SEARCH_LEDGER "Probes"). | An expander edit kind that changes a site count, or a different extensibility metric (with M5's spec model); until then the term is reported as inert. | open |
 | S-6 | expander (extract-variable) | The value of a field of a struct literal (`S { k: v }`) is never extracted: rust-analyzer's edit turns the field into the shorthand `k` and rewrites the whole statement in one diff, so the expander reads no name from it and drops the candidate. A value behind an attribute (`#[cfg(..)] k: v`) is refused before the call, because rust-analyzer builds the name from the whole field text and its syntax factory panics on it (`expand.rs` `is_nameable_field_value`, guarded by `tests/expand_panics.rs`). | Name the variable after the field (`k`) and write the shorthand as rust-analyzer does, with a case of a plain field in `tests/expand_panics.rs`. | open |
 | S-4 | expander (generation) | On ryo-rs (a verification repository used as a large sample, SEARCH_LEDGER "ryo-rs (large run)") the best of five of the 11 planted decisions is never generated: `inline-variable-0` (no candidate at all), `inline-variable-2`, `misplace-item-0`, `misplace-item-1` and the pair `obscure-name` plus `inline-variable`. Generation is 0.55 (0.79 on the small bases). In the exhaustive run the pair keeps every depth-1 child and still does not generate its best, so the miss is the expander's. The cause is not investigated; whether the inline-variable ones are the `let`-initializer gap (SEARCH_LEDGER "Generation") is not checked. | Find, for each of the five, the edit the expander would have to propose and why it does not; a case on the small bases for each cause found. | open |
-| M-10 | verifier gaps | The outer `cargo check` of the ryo-rs run (a verification repository used as a large sample, SEARCH_LEDGER "Outer check") rejects 2 of 30 decided candidates that rust-analyzer's diagnostics passed: E0255 for candidate 0 of `misplace-item-0` (at `crates/ryo-agent/src/decide.rs:147` of ryo-rs) and E0204 for candidate 1 of `misplace-item-2` (at `crates/ryo-agent/src/decide.rs:150`). E0255 is the code of the 14 failures of the small bases; E0204 is not among them. The outer check of the final candidates is not wired outside the harness (M-6), so such a candidate can be decided. | Add both to the oracle corpus as cases and give each a Gaps row; wire the outer check (M-6). | open |
 | S-5 | perf triggers (decision D4) | Trigger 4 (one recall run over 600,000 ms) was printed as fired only by the ryo-rs run with `--outer-check` (983,033 ms; SEARCH_LEDGER "Perf triggers"). The decisions of that run take about as long as those of the run without it (360,538 ms, not fired); the extra time is the outer `cargo check` of each decided candidate, outside the search. D4 states trigger 4 for one recall run in CI, which none of these runs was, so by its text no perf task is opened; it does not say whether outer-check time counts, and the harness prints the trigger as fired for any run over the limit. | Restate trigger 4 in a new D4 row with this measurement (whether outer-check time counts, and which run is the one judged); then make the harness's trigger 4 line follow it, with a test that pins the fired line (only the not-fired line is tested today). | open |
+| R-6 | detector switch and containment | One switch, `RaConfig.unresolved_paths`, turns on the unresolved-path, duplicate-name and field-bounds detectors together, so its name and the setting the Evidence provenance records under it say less than they switch. The fault hook of the detector tests can target only the unresolved-path detector, so the per-detector panic containment of the two others has no test. | Rename the switch to say it covers every gap detector, with the provenance key, in one change; let the fault hook name a detector and test the containment of each. | open |
+| R-7 | field-bounds detector | The detector skips a type with type or const parameters, so an add-derive on a generic type whose field lacks the trait passes the verifier. Every add-derive candidate is held for review today (M-1), so none is applied. | Check the fields under the bounds the derived impl puts on the parameters, with a generic case in the oracle corpus; at the latest before M-1 lets a Rule cover add-derive. | open |
 
 ## Counts
 
 Corpus: 4 workspaces, `base/extract-trait-multicrate` (8 hand cases + 18
-breakage cases), `base/breakage-lab` (38 breakage cases), `base/macro-lab`
+breakage cases), `base/breakage-lab` (38 breakage cases + 13 hand cases: E0255, E0204 and the
+field obligations of derived impls, all in the leaf crate `app`), `base/macro-lab`
 (11 hand cases: a local proc-macro crate, a derive, two attribute macros and a
 `macro_rules!`) and `base/cfg-test-lab` (5 hand cases: errors inside a
-`#[cfg(test)]` module and an integration test), 80 cases in all (`just oracle`;
+`#[cfg(test)]` module and an integration test), 93 cases in all (`just oracle`;
 expected from `just oracle-refresh`; breakage cases from `just breakage-gen`,
 groups from `just breakage-regroup`). Groups with no case (arity) are omitted.
 oracle-refresh over all bases on 2026-10-31 (`just oracle-refresh-all`, every case, after the
@@ -64,7 +66,8 @@ refusal of errors without a code): no codeless error, expected files unchanged.
 
 Expected diagnostics are `cargo check --workspace --all-targets --keep-going`
 (since the V2 change below; before, `--workspace` alone, lib and bins). The
-tables from "after: V2" down are the current ones; the older tables ("after:
+table "after: the duplicate-name and field-bounds detectors" is the current one, with the V2
+tables below it for the settings off; the older tables ("after:
 HEAD 1d5a2a6" and below) are the history of the 75-case corpus and stay as they
 were.
 
@@ -85,6 +88,48 @@ unresolved-path detector (`ryo-v2-ra/src/unresolved.rs`) then raised
 unresolved-import 4 to 7 and unresolved-name 0 to 5, the measured `hit`; the
 floors are checked only with proc-macro on and the detector on
 (`RYO_V2_ORACLE_UNRESOLVED=off` skips them).
+
+### after: the duplicate-name and field-bounds detectors, cfg-test on, proc-macro on
+
+Command: `just oracle` (2026-11-01, 93 cases). Floors hold; no case is MISGROUPED or skipped. The
+three new rows are the 10 error cases of the 13 hand cases on breakage-lab (section Gaps,
+G-B-9, G-B-10, G-B-11); valid has 8 cases with `dup-name-valid-0`, `copy-impl-valid-0` and
+`derive-field-valid-0`, all exact, so neither detector reports anything on them (a function and a
+module of one name; `Copy` and the other derives over fields that have the traits, a generic
+derive, a hand-written `Debug` impl over a field without `Debug`). derive-field is a cause group
+(its codes are those of trait-bound and type-mismatch), so the H7 primary groups do not change.
+Every other row, the other-codes table and H7 (32/32) equal the table "after: V2" below. Before
+the detectors (the same corpus with only the unresolved-path detector registered) each of the 10
+error cases misses its one diagnostic and reports nothing extra: duplicate-name hit 0 of 2,
+copy-impl 0 of 3, derive-field 0 of 5, and the run fails below the floors.
+
+| group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| unresolved-import | 7 | 0 | 7 | 7 | 0 | 5 | 2 | 7 | 1.00 | 0.91 |
+| unresolved-name | 5 | 0 | 5 | 5 | 0 | 2 | 1 | 5 | 1.00 | 1.00 |
+| unresolved-type | 2 | 0 | 2 | 0 | 2 | 0 | 1 | 0 | 0.00 | - |
+| no-method | 10 | 0 | 10 | 10 | 0 | 9 | 1 | 10 | 1.00 | 0.93 |
+| type-mismatch | 7 | 0 | 7 | 7 | 0 | 3 | 4 | 7 | 1.00 | 0.71 |
+| trait-bound | 3 | 0 | 3 | 3 | 0 | 3 | 0 | 3 | 1.00 | 1.00 |
+| field | 7 | 0 | 7 | 1 | 6 | 0 | 7 | 1 | 0.14 | 0.14 |
+| borrow | 10 | 0 | 10 | 0 | 10 | 0 | 0 | 0 | 0.00 | - |
+| privacy | 5 | 0 | 5 | 4 | 1 | 4 | 0 | 4 | 0.80 | 1.00 |
+| const-eval | 2 | 0 | 2 | 0 | 2 | 0 | 0 | 0 | 0.00 | - |
+| duplicate-name | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| copy-impl | 3 | 0 | 3 | 3 | 0 | 3 | 0 | 3 | 1.00 | 1.00 |
+| cfg | 2 | 0 | 2 | 1 | 1 | 1 | 0 | 1 | 0.50 | 1.00 |
+| cfg-test | 5 | 0 | 5 | 5 | 0 | 4 | 1 | 5 | 1.00 | 0.83 |
+| macro-derive | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| derive-field | 5 | 0 | 5 | 5 | 0 | 5 | 0 | 5 | 1.00 | 1.00 |
+| macro-attr | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-rules | 2 | 0 | 2 | 0 | 2 | 0 | 2 | 0 | 0.00 | 0.20 |
+| macro-tokens | 3 | 0 | 3 | 2 | 1 | 2 | 1 | 2 | 0.67 | 0.75 |
+| proc-macro-edit | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0.00 | - |
+| valid | 8 | 0 | 0 | 0 | 0 | 8 | 0 | 8 | - | - |
+
+The tables below do not hold the 13 cases. With `RYO_V2_ORACLE_UNRESOLVED=off` all three
+detectors are off (one switch); with `RYO_V2_ORACLE_PROC_MACRO=off` or `RYO_V2_ORACLE_CFG_TEST=off`
+the new rows were not measured.
 
 ### after: V2 (oracle truth = the CI gate), cfg-test on, proc-macro on
 
@@ -550,8 +595,19 @@ recall definition (they count cases and diagnostics, not pass or hit).
 |---|---|---|---|---|---|---|
 | G-B-3 | unresolved-import, unresolved-name | 4 cases, 9 diagnostics (E0433) | breakage-lab shapes/src/lib.rs:40,41,50 (remove-import-2, `fmt::` path), app/src/lib.rs:38 (typo-type-1, `Binn::new`); extract-trait-multicrate user/src/lib.rs:29 (typo-type-2, `Case022::area`), user/src/lib.rs:28,31,32,35 (remove-import-1) | Diagnostic: ra reports nothing when the first segment of a path (`fmt::Display`, `Binn::new`) does not resolve | detector in ryo-v2-ra (unresolved.rs), RaConfig.unresolved_paths | fixed |
 | G-B-4 | unresolved-name, unresolved-type | 6 cases, 12 diagnostics (E0425) | breakage-lab store/src/lib.rs:26 (remove-import-1), store/src/lib.rs:35 (typo-type-2, `b: Binn`), app/src/lib.rs:16 (remove-import-0); extract-trait-multicrate user/src/lib.rs:18,21,27,30,41,47 (remove-import-1), viewer/src/lib.rs:11,14 (remove-import-2), lib/src/lib.rs:129 (typo-type-1, `impl Case055`) | Diagnostic: ra reports nothing for an unresolved type name in a signature or `impl` head. rustc 1.98.1 gives this E0425 ("cannot find type"), not E0412, so the cases are grouped as unresolved-name | detector in ryo-v2-ra (unresolved.rs), RaConfig.unresolved_paths | fixed |
+| G-B-9 | duplicate-name | 2 cases (E0255 2); before the detector 14 of 114 decided candidates of the small-base search-recall run failed the outer check with it (SEARCH_LEDGER "Outer check") | breakage-lab app/src/lib.rs:60 (dup-name-0: a module re-exports a root item that the root also imports, the shape the failing move-item candidates left), :53 (dup-name-1: `scale` imported from `lab_shapes` and defined in the crate); ryo-rs (a verification repository used as a sample): candidate 0 of `misplace-item-0` | Diagnostic: ra's name resolution lets an item shadow a `use` that binds the same name in the same namespace of one module and reports nothing; rustc refuses both (E0255) and reports the second of the two in the file. The producer is move-item's forward shape, which puts an item into a module that still imports its name | detector in ryo-v2-ra (`duplicate.rs`), switched by `RaConfig.unresolved_paths`; floor duplicate-name 2. A detector and not a risk mark: move-item already carries `Visibility`, so such a candidate was never auto-applicable; the detector makes the verifier reject it | fixed |
+| G-B-10 | copy-impl | 3 cases (E0204 3) | breakage-lab app/src/lib.rs:54 (copy-impl-0: `#[derive(Clone, Copy)]` on a struct with a `String`, reported at `pub struct`, not at the attribute), :58 (copy-impl-1: `impl Copy for Tags {}`), :54 (copy-impl-2: an enum variant holding a `String`); ryo-rs (a verification repository used as a sample): candidate 1 of `misplace-item-2` | Diagnostic: ra checks no `Copy` impl, derived or written, against the fields of the type. The producer is add-derive, which proposes `Copy` wherever `Clone` is derived and carries no risk mark | detector in ryo-v2-ra (`field_bounds.rs`), same switch; floor copy-impl 3 | fixed |
+| G-B-11 | derive-field | 5 cases (E0277 4, E0369 1) | breakage-lab app/src/lib.rs:58 (derive-debug-0, derive-clone-0, derive-default-0: E0277; derive-partialeq-0: E0369), :59 (derive-eq-0: E0277), each at the field whose type lacks the derived trait | Diagnostic: ra holds builtin derived impls without bodies and checks none of the obligations they put on the fields (E0204 of G-B-10 is the `Copy` one). The producer is the same add-derive, which proposes `Debug`, `Clone`, `PartialEq`, `Eq` and `Default`; no search run has hit it yet | detector in ryo-v2-ra (`field_bounds.rs`), same switch; floor derive-field 5 (a cause group: its codes are those of trait-bound and type-mismatch). Types with type or const parameters are skipped (M-6) | fixed |
 
 The detector skips a name some `use` of the file introduces (rustc reports only
 the failed import), cfg-disabled code, macro input, and files with a glob import
 ra cannot resolve. It is switched off with `RaConfig.unresolved_paths = false`
 (oracle: `RYO_V2_ORACLE_UNRESOLVED=off`).
+
+The duplicate-name detector skips glob imports, `as _`, `extern crate`, the macro namespace, a
+`use` whose path resolves in no namespace (rustc reports the import), cfg-disabled code,
+attribute-macro input and items inside function bodies. The field-bounds detector reads only
+impls ra holds without a source (builtin derives) and written `impl Copy`, and skips types with
+type or const parameters, fields of unknown type, `Clone` next to a derived `Copy`, `Eq` on a
+field that already lacks `PartialEq`, `Default` on an enum, and the derives `Hash`, `PartialOrd`
+and `Ord` (not measured). Both run with the unresolved-path detector under one switch.
