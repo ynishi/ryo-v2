@@ -8,8 +8,9 @@ construction and independent of every metric (`crates/ryo-v2-oracle/src/planted.
 holds numbers of runs that were done, nothing projected; a row marked pending has not been run.
 
 Run: `just search-recall` (the small bases, about 15 s). Cases are written by
-`just search-recall-gen <ws> <seeds>` and committed; they ship with `probes = []` (the maintainer fills
-the probes by hand until M5, which changes the extensibility metric, not the cases).
+`just search-recall-gen <ws> <seeds>` and committed; the generator writes `probes = []` and the
+maintainer fills the probes by hand (until M5, which changes the extensibility metric, not the
+cases). The committed small-base cases carry probes since 2026-10-31 (section "Probes").
 
 ## Definitions
 
@@ -77,7 +78,8 @@ planted edits) written to hold sites of every kind.
 | `base/breakage-lab` | 1 | one obscure-name site (`store/src/lib.rs`); no other kind has a site |
 | `base/cfg-test-lab`, `base/macro-lab`, `base/extract-trait-multicrate` | 0 | no site of any kind |
 
-Run at beam 20 (`search-recall run corpus/search`, 14.6 s):
+Run at beam 20 (`search-recall run corpus/search`, 14.6 s), without probes (every case had
+`probes = []`; the run with probes is in section "Probes" and gives the same numbers):
 
 | set | decisions | skipped | generated | hit | recall@20 | hit/all | generation | top-3 |
 |---|---|---|---|---|---|---|---|---|
@@ -101,6 +103,61 @@ at 95 % (exact binomial, one-sided); at depth 1, 0 misses in 24 puts it at most 
    depth 1 cannot be below 1.00. The pruning is exercised at depth 2, where 18 to 76 children are
    proposed and the beam is full in 9 of the 10 pairs, and by the narrow-beam runs below.
 2. `search-lab` is small and written for this harness: its sites are natural to the generator.
+
+## Probes
+
+Since 2026-10-31 every committed case of the small bases names one to three expected spec changes,
+the next change a maintainer of that code would plausibly make (case file field `probes`, kinds
+`add-variant`, `add-field`, `add-method`). They are chosen from the types the planted code builds
+or reads: a new shape (`add-variant` on `Shape`) where the code goes over shapes, a new field on
+`Bounds`, `Rect`, `Line`, `Report`, `Slot` or `Store` where the code builds or reads one, and a
+new field on `Bin` for the one breakage-lab case. Neither workspace defines a trait of its own (the
+only `impl` of a trait is `Default for Store`), so no `add-method` probe is plausible and none is
+used. The test `one_planted_case_runs_end_to_end` (`crates/ryo-v2-oracle/tests/search_recall.rs`)
+checks that the probes of a case file reach the case and that every committed case has probes.
+
+| case kind (decisions) | probes | add-variant | add-field | per case |
+|---|---|---|---|---|
+| obscure-name, depth 1 (8, one in breakage-lab) | 10 | 5 | 5 | 1 to 2 |
+| inline-variable, depth 1 (9) | 12 | 4 | 8 | 1 to 2 |
+| inline-function, depth 1 (3) | 4 | 1 | 3 | 1 to 2 |
+| misplace-item, depth 1 (9) | 11 | 2 | 9 | 1 to 2 |
+| pairs, depth 2 (10) | 24 | 6 | 18 | 2 to 3 |
+| all (39) | 61 | 18 | 43 | |
+
+Run with probes, beam 20 (`search-recall run corpus/search`, 19.7 s, repo HEAD 747c3d8 plus the
+probes), next to the run without probes above:
+
+| set | without probes: generated / hit / recall@20 / top-3 | with probes: generated / hit / recall@20 / top-3 |
+|---|---|---|
+| all | 31 / 30 / 0.97 / 0.72 | 31 / 30 / 0.97 / 0.72 |
+| ws breakage-lab | 1 / 1 / 1.00 / 1.00 | 1 / 1 / 1.00 / 1.00 |
+| ws search-lab | 30 / 29 / 0.97 / 0.71 | 30 / 29 / 0.97 / 0.71 |
+| kind inline-function | 5 / 4 / 0.80 / 0.33 | 5 / 4 / 0.80 / 0.33 |
+| kind inline-variable | 5 / 5 / 1.00 / 0.36 | 5 / 5 / 1.00 / 0.36 |
+| kind misplace-item | 13 / 13 / 1.00 / 0.86 | 13 / 13 / 1.00 / 0.86 |
+| kind obscure-name | 15 / 14 / 0.93 / 0.93 | 15 / 14 / 0.93 / 0.93 |
+| depth 1 | 24 / 24 / 1.00 / 0.79 | 24 / 24 / 1.00 / 0.79 |
+| depth 2 | 7 / 6 / 0.86 / 0.50 | 7 / 6 / 0.86 / 0.50 |
+
+The beam rank, fate, final rank, proposed and kept of each of the 39 decisions are the same as in
+the table "Decisions (beam 20)" below; the one miss is the same decision, dropped `dominated`.
+The rankings are the same where the order matters most as well: `--exhaustive` gives 31 of 31
+over 879 checks with the same final ranks as section "Exhaustive" (the depth-2 obscure-name plus
+inline-function best at beam rank 25, final rank 9), and `--beam 1` gives 23 of 31 (0.74, 8
+`dominated`), inline-function 0/5, inline-variable 3/5, misplace-item 12/13, obscure-name 12/15,
+the row of beam 1 under "Narrow beams".
+
+Why nothing moved (from the definition, not a separate measurement; the report prints no
+per-candidate extensibility): `SyntaxAssessor` counts, in the files a step touches, the matches
+without a catch-all arm that name the probed enum, the record literals and patterns of the probed
+struct without `..`, and the impls of the probed trait, and the extensibility change is the parent's
+count minus the child's. The M4 expander proposes renames, extract and inline of a variable or a
+function, and moves of an item between files; none of them adds or removes such a match, literal,
+pattern or impl, it only renames or moves it, so the change is 0 for every candidate whatever the
+probes are. The extensibility term is now fed, but it can only separate candidates once the
+expander proposes an edit that changes a site count (a catch-all arm, a `..` rest, a literal folded
+into a constructor, a match turned into a method), or once M5 replaces the metric.
 
 ## Decisions (beam 20)
 
@@ -251,7 +308,12 @@ default test suite; it needs a large machine, with `<BASE>` an exported ryo-rs
 tree and `<OUT>` a directory without a `target` path component:
 
 1. Plants: `cargo run -q -p ryo-v2-oracle --bin search-recall -- gen ryo-rs --base <BASE> --out
-   <OUT>/ryo-rs --seeds 3 --pairs 2` (at least 10 decisions).
+   <OUT>/ryo-rs --seeds 3 --pairs 2` (at least 10 decisions). Done 2026-10-31 on ryo-rs (a
+   verification repository used as a large sample) at its commit 67b0ebfb, in 61 s: 11 decisions,
+   9 at depth 1 (3 obscure-name, 3 inline-variable, 3 misplace-item) and 2 pairs (obscure-name plus
+   obscure-name, obscure-name plus inline-variable). Sites found: obscure-name 172, misplace-item
+   97, inline-variable 10, inline-function 0 (its 3 seeds are skipped). The cases are not
+   committed (they name `<BASE>`) and have `probes = []`.
 2. The run (longer than 10 minutes): `cargo run -q -p ryo-v2-oracle --bin
    search-recall -- run <OUT>/ryo-rs --report <OUT>/ryo-rs.json --markdown <OUT>/ryo-rs.md`.
 3. The same with `--exhaustive --limit 10`, and with `--outer-check`, then paste the tables here.
@@ -268,9 +330,11 @@ tree and `<OUT>` a directory without a `target` path component:
   (counted as not generated). An inline-function plant therefore needs the helper in the shape the
   expander writes: `let x = e; x`, parameters in the order the caller defines them, by value for
   what is moved and `&name` for what is borrowed.
-- **Syntactic extensibility.** The static metric counts edit sites by name, not by type; with no
-  probes the extensibility term is 0 everywhere, so the ranking here is driven by the `clean`
-  metric and the edit size. The probes are filled by hand later.
+- **Syntactic extensibility.** The static metric counts edit sites by name, not by type. The
+  small-base cases carry hand-written probes (section "Probes"), but every edit the M4 expander
+  proposes keeps the number of probe sites, so the extensibility term is still 0 for every
+  candidate and the ranking is driven by the `clean` metric and the edit size. The ryo-rs cases
+  are generated with `probes = []`.
 - **Add-derive is not planted.** Its best has no definition independent of the metrics.
 - **Score weights are untuned** (`DEFAULT_WEIGHTS`): the restore of an inline-function plant is
   never the top reward (above). They are to be set from this table, not before.
