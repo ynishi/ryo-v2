@@ -269,3 +269,56 @@ fn cfg_disabled_statements_are_skipped() {
     let got = p.errors_of(true, text);
     assert!(detector_codes(&got).is_empty(), "got {got:?}");
 }
+
+#[test]
+fn detector_panic_is_contained_per_file() {
+    use ryo_v2_core::app::ports::Verifier;
+    use ryo_v2_core::domain::{Finding, FindingCode};
+    let lib = "pub struct S;\npub fn g(s: S) {\n    s.missing();\n}\npub fn f(_x: Missing) {}\n";
+    let p = Probe::new("contained");
+    std::fs::write(p.dir.join("src/lib.rs"), lib).unwrap();
+    let lib_rel = RelPath::parse("src/lib.rs").unwrap();
+    let analyzer = || {
+        RaAnalyzer::new(
+            RaConfig {
+                proc_macro: false,
+                threads: Some(1),
+                assert_revert: true,
+                unresolved_paths: true,
+                assert_revert_every: None,
+                cfg_test: false,
+            },
+            Arc::new(MonotonicClock::new()),
+            Arc::new(RecordingObserver::default()),
+        )
+    };
+    let is_detector = |f: &&Finding| matches!(&f.code, FindingCode::Rustc(c) if matches!(c.as_str(), "E0405" | "E0425" | "E0433"));
+
+    // The snippet does trigger the detector when it does not panic.
+    let plain = analyzer();
+    let s0 = plain.load(&p.dir).expect("load without fault");
+    let base0 = Verifier::baseline(&plain, &s0);
+    assert!(base0.iter().any(|f| is_detector(&f)), "got {base0:?}");
+    assert!(s0.detector_panics().is_empty());
+
+    let a = analyzer().with_detector_fault(Some(lib_rel.clone()));
+    let mut s = a.load(&p.dir).expect("load survives a detector panic");
+    let base = Verifier::baseline(&a, &s);
+    assert!(
+        base.iter().any(|f| f.path == lib_rel && !is_detector(&f)),
+        "ra finding kept, got {base:?}"
+    );
+    assert!(!base.iter().any(|f| is_detector(&f)), "got {base:?}");
+    let panics = s.detector_panics();
+    assert_eq!(panics.len(), 1, "got {panics:?}");
+    assert_eq!(panics[0].path, lib_rel);
+    assert!(
+        panics[0].message.contains("fault injected"),
+        "got {panics:?}"
+    );
+
+    let edit = Edit::write(lib_rel, format!("{lib}// edited\n"));
+    a.check(&mut s, &[edit], Scope::Affected)
+        .expect("check is not poisoned");
+    assert_eq!(s.detector_panics().len(), 1, "deduplicated");
+}

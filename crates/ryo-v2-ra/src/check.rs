@@ -2,7 +2,7 @@
 //! session as it found it.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{Deadline, collect_errors_par};
+use crate::diagnostics::{Deadline, Detector, collect_errors_par};
 use crate::fork;
 use crate::rev_deps::scoped_files;
 use crate::session::RaSession;
@@ -172,6 +172,10 @@ impl RevertAudit for RaAnalyzer {
             s.unresolved_paths,
             // An audit is never cut off.
             None,
+            Detector {
+                fault: self.detector_fault.as_ref(),
+                panics: &s.detector_panics,
+            },
         )
         .map_err(|e| map_error(e, &edited))?;
         let paths: Vec<RelPath> = scope.iter().map(|(_, r)| r.clone()).collect();
