@@ -19,6 +19,7 @@ fn mark_str(m: RiskMark) -> &'static str {
         RiskMark::BuildScript => "build_script",
         RiskMark::ProcMacroCrate => "proc_macro_crate",
         RiskMark::Behaviour => "behaviour",
+        RiskMark::Visibility => "visibility",
     }
 }
 
@@ -27,6 +28,7 @@ fn reason_str(r: OuterCheckReason) -> &'static str {
         OuterCheckReason::Borrow => "borrow",
         OuterCheckReason::BuildScript => "build_script",
         OuterCheckReason::ProcMacroCrate => "proc_macro_crate",
+        OuterCheckReason::Visibility => "visibility",
     }
 }
 
@@ -46,6 +48,7 @@ fn stage_str(s: Stage) -> &'static str {
         Stage::Conformance => "conformance",
         Stage::Splice => "splice",
         Stage::Marks => "marks",
+        Stage::Prune => "prune",
         Stage::Check => "check",
         Stage::Candidate => "candidate",
     }
@@ -165,6 +168,9 @@ fn blocking_json(b: &Blocking) -> Value {
                 "errors": errors, "unmapped": unmapped,
             })
         }
+        Blocking::BudgetExhausted { limit_ms, .. } => json!({
+            "kind": "budget_exhausted", "blueprint": blueprint, "limit_ms": limit_ms,
+        }),
     }
 }
 
@@ -179,6 +185,7 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   read carries its freshness.
 ///   tested: resolution_json::tests::failed_lists_stale_reads
 ///   tested: tests/apply.rs apply_after_disk_change_is_failed_stale
+///   tested: resolution_json::tests::budget_exhausted_blocking_is_listed
 pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
     match r {
         Resolution::Decided {
@@ -326,6 +333,24 @@ mod tests {
         );
         assert_eq!(v["blocking"][1]["reads"][0]["freshness"], "out_of_range");
         assert_eq!(v["blocking"][1]["reads"][0]["len"], 2);
+    }
+
+    #[test]
+    fn budget_exhausted_blocking_is_listed() {
+        let b = id();
+        let cut = Blocking::BudgetExhausted {
+            blueprint: b,
+            limit_ms: 6_000,
+        };
+        let inf = Infeasible::new(vec![cut], vec![], false).expect("blocking");
+        let v = resolution_to_json(&Resolution::Failed(inf));
+        let first = &v["blocking"][0];
+        assert_eq!(first["kind"], "budget_exhausted");
+        assert_eq!(first["blueprint"], b.to_string());
+        assert_eq!(first["limit_ms"], 6_000);
+        assert_eq!(stage_str(Stage::Prune), "prune");
+        assert_eq!(mark_str(RiskMark::Visibility), "visibility");
+        assert_eq!(reason_str(OuterCheckReason::Visibility), "visibility");
     }
 
     #[test]

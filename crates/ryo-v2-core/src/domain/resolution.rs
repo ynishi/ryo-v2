@@ -19,6 +19,8 @@ pub enum OuterCheckReason {
     BuildScript,
     /// A proc-macro crate changed.
     ProcMacroCrate,
+    /// An item moved: privacy and cfg-gated paths across crates are not judged by the analyzer.
+    Visibility,
 }
 
 impl std::fmt::Display for OuterCheckReason {
@@ -27,6 +29,7 @@ impl std::fmt::Display for OuterCheckReason {
             OuterCheckReason::Borrow => "borrow",
             OuterCheckReason::BuildScript => "build-script",
             OuterCheckReason::ProcMacroCrate => "proc-macro-crate",
+            OuterCheckReason::Visibility => "visibility",
         })
     }
 }
@@ -108,9 +111,11 @@ impl std::fmt::Display for Disposition {
 /// The checks outside the analyzer that `marks` call for, or `None` if there are none.
 ///
 /// # Contract
-/// - C1: the reasons are those of `Borrow`, `BuildScript` and `ProcMacroCrate` among `marks`;
-///   `None` when there is none of them (`Behaviour` alone asks for a review, not a build).
+/// - C1: the reasons are those of `Borrow`, `BuildScript`, `ProcMacroCrate` and `Visibility`
+///   among `marks`; `None` when there is none of them (`Behaviour` alone asks for a review, not
+///   a build).
 ///   tested: domain::resolution::tests::outer_check_is_never_auto_applicable
+///   tested: domain::resolution::tests::visibility_owes_outer_check_not_review
 pub fn outer_check(marks: &BTreeSet<RiskMark>) -> Option<OuterCheck> {
     let reasons: BTreeSet<OuterCheckReason> = marks
         .iter()
@@ -118,6 +123,7 @@ pub fn outer_check(marks: &BTreeSet<RiskMark>) -> Option<OuterCheck> {
             RiskMark::Borrow => Some(OuterCheckReason::Borrow),
             RiskMark::BuildScript => Some(OuterCheckReason::BuildScript),
             RiskMark::ProcMacroCrate => Some(OuterCheckReason::ProcMacroCrate),
+            RiskMark::Visibility => Some(OuterCheckReason::Visibility),
             RiskMark::Behaviour => None,
         })
         .collect();
@@ -278,10 +284,21 @@ pub enum Blocking {
         /// The errors.
         verdict: Verdict,
     },
+    /// The check was cut off at the per-candidate limit.
+    BudgetExhausted {
+        /// The Blueprint.
+        blueprint: BlueprintId,
+        /// The limit, in milliseconds.
+        limit_ms: u64,
+    },
 }
 
 impl Blocking {
     /// The Blueprint that was blocked.
+    ///
+    /// # Contract
+    /// - C1: every variant, `BudgetExhausted` included, names the Blueprint it was made for.
+    ///   tested: domain::resolution::tests::budget_exhausted_names_its_blueprint
     pub fn blueprint(&self) -> BlueprintId {
         match self {
             Blocking::Unverifiable { blueprint, .. }
@@ -289,7 +306,8 @@ impl Blocking {
             | Blocking::MissingFile { blueprint, .. }
             | Blocking::Nonconforming { blueprint, .. }
             | Blocking::Splice { blueprint, .. }
-            | Blocking::NewErrors { blueprint, .. } => *blueprint,
+            | Blocking::NewErrors { blueprint, .. }
+            | Blocking::BudgetExhausted { blueprint, .. } => *blueprint,
         }
     }
 }
@@ -320,6 +338,10 @@ impl std::fmt::Display for Blocking {
                 verdict.new_errors.errors.len(),
                 verdict.new_errors.unmapped.len()
             ),
+            Blocking::BudgetExhausted {
+                blueprint,
+                limit_ms,
+            } => write!(f, "{blueprint}: check cut off after {limit_ms} ms"),
         }
     }
 }
@@ -433,6 +455,8 @@ pub enum Stage {
     Splice,
     /// Risk marks.
     Marks,
+    /// The search drops candidates before they are checked.
+    Prune,
     /// The analyzer check.
     Check,
     /// The candidate.
@@ -447,6 +471,7 @@ impl std::fmt::Display for Stage {
             Stage::Conformance => "conformance",
             Stage::Splice => "splice",
             Stage::Marks => "marks",
+            Stage::Prune => "prune",
             Stage::Check => "check",
             Stage::Candidate => "candidate",
         })
@@ -538,11 +563,12 @@ mod tests {
     use super::*;
     use crate::domain::{Diagnostic, Diagnostics, ErrorCode, IntentKind, ReviewRecord};
 
-    const ALL_MARKS: [RiskMark; 4] = [
+    const ALL_MARKS: [RiskMark; 5] = [
         RiskMark::Borrow,
         RiskMark::BuildScript,
         RiskMark::ProcMacroCrate,
         RiskMark::Behaviour,
+        RiskMark::Visibility,
     ];
 
     fn marks(mask: u8) -> BTreeSet<RiskMark> {
@@ -586,7 +612,7 @@ mod tests {
     #[test]
     fn outer_check_is_never_auto_applicable() {
         let rule = rule();
-        for mask in 0..16u8 {
+        for mask in 0..32u8 {
             let m = marks(mask);
             for r in [None, Some(&rule)] {
                 for scope in [Scope::Affected, Scope::Workspace] {
@@ -614,6 +640,44 @@ mod tests {
             both.reasons(),
             &BTreeSet::from([OuterCheckReason::Borrow, OuterCheckReason::BuildScript])
         );
+    }
+
+    #[test]
+    fn visibility_owes_outer_check_not_review() {
+        let rule = rule();
+        let vis = BTreeSet::from([RiskMark::Visibility]);
+        assert_eq!(
+            outer_check(&vis).unwrap().reasons(),
+            &BTreeSet::from([OuterCheckReason::Visibility])
+        );
+        assert_eq!(OuterCheckReason::Visibility.to_string(), "visibility");
+        assert_eq!(
+            disposition(&vis, Some(&rule), Scope::Workspace),
+            Disposition::AfterOuterCheck { rule: rule.id() }
+        );
+        assert_eq!(
+            disposition(&vis, None, Scope::Workspace),
+            Disposition::NeedsReview {
+                reason: ReviewReason::NoRule
+            }
+        );
+        assert_eq!(Stage::Prune.to_string(), "prune");
+        assert!(Stage::Marks < Stage::Prune && Stage::Prune < Stage::Check);
+    }
+
+    #[test]
+    fn budget_exhausted_names_its_blueprint() {
+        let b = Blocking::BudgetExhausted {
+            blueprint: bid(),
+            limit_ms: 6_000,
+        };
+        assert_eq!(b.blueprint(), bid());
+        assert_eq!(
+            b.to_string(),
+            format!("{}: check cut off after 6000 ms", bid())
+        );
+        let i = Infeasible::new(vec![b.clone()], vec![], false).unwrap();
+        assert_eq!(i.blocking(), std::slice::from_ref(&b));
     }
 
     #[test]

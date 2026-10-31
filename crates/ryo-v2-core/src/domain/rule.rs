@@ -44,6 +44,7 @@ impl Rule {
     /// - C1: refuses an intent whose catalog risks contain `Behaviour`, so such an intent is
     ///   never auto-applicable.
     ///   tested: domain::rule::tests::behaviour_intent_cannot_be_registered
+    ///   tested: domain::rule::tests::extract_function_cannot_be_registered
     pub fn register(
         id: RuleId,
         intent: IntentKind,
@@ -141,6 +142,21 @@ mod tests {
         assert_eq!(r.intent(), IntentKind::RenameLocal);
         assert_eq!(r.min_scope(), Scope::Workspace);
         assert_eq!(r.review().reviewer, "me");
+    }
+
+    #[test]
+    fn extract_function_cannot_be_registered() {
+        assert_eq!(
+            Rule::register(
+                rid(1),
+                IntentKind::ExtractFunction,
+                review(),
+                Scope::Workspace
+            ),
+            Err(RuleError::BehaviourChanging(IntentKind::ExtractFunction))
+        );
+        let r = Rule::register(rid(2), IntentKind::MoveItem, review(), Scope::Workspace).unwrap();
+        assert_eq!(r.intent(), IntentKind::MoveItem);
     }
 
     #[test]

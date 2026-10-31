@@ -103,9 +103,26 @@ pub enum IntentKind {
     ExtractVariable,
     /// Add names to a `#[derive(..)]`.
     AddDerive,
+    /// Move statements into a new function and call it.
+    ExtractFunction,
+    /// Move an item to another file and leave a re-export where it was.
+    MoveItem,
 }
 
 /// What can go wrong with an intent that the verifier alone does not show.
+///
+/// Why each intent carries the marks it does. Extract-function moves statements into a new body,
+/// so parameters become borrows or moves (the analyzer runs no borrow check), and temporaries
+/// and guards are dropped at the new function's end instead of the old scope's: drop order is
+/// behaviour, the same reason extract-variable carries `Behaviour`. It can therefore never be a
+/// Rule. Move-item changes where an item lives and who can see it: the analyzer misses
+/// cross-crate privacy (E0603) and cfg-gated paths in another crate, so it owes an outer
+/// `cargo check` (`Visibility`). It does not reorder evaluation or drops and does not change
+/// borrows, so it carries no `Borrow` and no `Behaviour`, and stays registrable as a Rule.
+///
+/// Known limit of move-item: a glob import (`use a::*`) that reached the item through its old
+/// file is not followed, so a name can stop resolving there; the outer check shows it, the
+/// conformance check does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RiskMark {
     /// The edit can break borrow checking, which the analyzer does not run.
@@ -116,6 +133,9 @@ pub enum RiskMark {
     ProcMacroCrate,
     /// The edit can change what the program does.
     Behaviour,
+    /// The edit changes where an item lives and who can see it: only a real build shows a
+    /// privacy or cfg error across crates.
+    Visibility,
 }
 
 impl std::fmt::Display for RiskMark {
@@ -125,6 +145,7 @@ impl std::fmt::Display for RiskMark {
             RiskMark::BuildScript => "build-script",
             RiskMark::ProcMacroCrate => "proc-macro-crate",
             RiskMark::Behaviour => "behaviour",
+            RiskMark::Visibility => "visibility",
         })
     }
 }
@@ -140,10 +161,12 @@ pub struct IntentSpec {
 
 impl IntentKind {
     /// Every intent.
-    pub const ALL: [IntentKind; 3] = [
+    pub const ALL: [IntentKind; 5] = [
         IntentKind::RenameLocal,
         IntentKind::ExtractVariable,
         IntentKind::AddDerive,
+        IntentKind::ExtractFunction,
+        IntentKind::MoveItem,
     ];
 
     /// The catalog entry.
@@ -152,20 +175,30 @@ impl IntentKind {
     /// - C1: `RenameLocal` and `AddDerive` carry no risk; `ExtractVariable` carries `Borrow`
     ///   and `Behaviour`, so it can never be registered as a Rule.
     ///   tested: domain::intent::tests::extract_variable_carries_borrow_and_behaviour
+    /// - C2: `ExtractFunction` carries `Borrow` and `Behaviour` (parameters become borrows and
+    ///   drop order changes), so it can never be registered as a Rule; `MoveItem` carries
+    ///   `Visibility` alone, so it owes an outer check and may be registered.
+    ///   tested: domain::intent::tests::new_intents_carry_their_risks
     pub fn spec(self) -> IntentSpec {
         let risks = match self {
             IntentKind::RenameLocal | IntentKind::AddDerive => BTreeSet::new(),
-            IntentKind::ExtractVariable => BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour]),
+            IntentKind::ExtractVariable | IntentKind::ExtractFunction => {
+                BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
+            }
+            IntentKind::MoveItem => BTreeSet::from([RiskMark::Visibility]),
         };
         IntentSpec { kind: self, risks }
     }
 
-    /// The stable name: `rename-local`, `extract-variable` or `add-derive`.
+    /// The stable name: `rename-local`, `extract-variable`, `add-derive`, `extract-function` or
+    /// `move-item`.
     pub fn id(self) -> &'static str {
         match self {
             IntentKind::RenameLocal => "rename-local",
             IntentKind::ExtractVariable => "extract-variable",
             IntentKind::AddDerive => "add-derive",
+            IntentKind::ExtractFunction => "extract-function",
+            IntentKind::MoveItem => "move-item",
         }
     }
 
@@ -204,6 +237,18 @@ pub enum IntentCall {
     AddDerive {
         /// The names to add, in the order they appear in the edits.
         derives: NonEmpty<DeriveName>,
+    },
+    /// Move statements into a new function `name` and call it.
+    ExtractFunction {
+        /// The new function.
+        name: Ident,
+    },
+    /// Move the item `item` to the file `to`.
+    MoveItem {
+        /// The item moved.
+        item: Ident,
+        /// The file it moves to.
+        to: RelPath,
     },
 }
 
@@ -254,6 +299,159 @@ pub enum Nonconformance {
     /// The derives written differ from the intent's list.
     #[error("the derives written differ from the intent's list")]
     DeriveListMismatch,
+    /// No single insert declares the new function.
+    #[error("no single insert declares the new function")]
+    NoFnInsert,
+    /// No replace puts a call of the new function in place of the statements.
+    #[error("no replace puts a call of the new function in place of the statements")]
+    NoCallReplace,
+    /// A name used by the replaced statements is in neither the new function nor the call.
+    #[error("the name {ident} is lost: neither the new function nor the call has it")]
+    LostIdent {
+        /// The name.
+        ident: String,
+    },
+    /// The specs of a move do not touch exactly the source file and the destination file.
+    #[error("the specs do not touch exactly the file moved from and the file moved to")]
+    MoveFiles,
+    /// The base text under spec number `spec` does not declare the item moved.
+    #[error("spec {spec} does not declare the item moved")]
+    NotAnItem {
+        /// Index of the spec.
+        spec: usize,
+    },
+    /// The new text of spec number `spec` is not a re-export of the item moved.
+    #[error("spec {spec} does not re-export the item moved")]
+    NoReexport {
+        /// Index of the spec.
+        spec: usize,
+    },
+    /// The destination does not receive the text of the item.
+    #[error("the destination does not receive the item's text")]
+    NotMoved,
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The identifier tokens of `text` with their byte offsets: maximal runs of `[A-Za-z0-9_]` that
+/// do not start with a digit.
+fn ident_tokens(text: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        match (start, is_ident_char(c)) {
+            (None, true) => start = Some(i),
+            (Some(s), false) => {
+                let run = &text[s..i];
+                if !run.starts_with(|d: char| d.is_ascii_digit()) {
+                    out.push((s, run));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `text` has `fn`, whitespace, `name`, optional whitespace and `(` or `<`.
+fn declares_fn(text: &str, name: &str) -> bool {
+    ident_tokens(text).into_iter().any(|(at, tok)| {
+        if tok != "fn" {
+            return false;
+        }
+        let rest = &text[at + 2..];
+        let after_ws = rest.trim_start();
+        after_ws.len() < rest.len()
+            && after_ws.strip_prefix(name).is_some_and(|r| {
+                let r = r.trim_start();
+                r.starts_with('(') || r.starts_with('<')
+            })
+    })
+}
+
+/// Whether `text` has `name(` not preceded by an identifier char.
+fn calls_fn(text: &str, name: &str) -> bool {
+    let pat = format!("{name}(");
+    text.match_indices(&pat)
+        .any(|(i, _)| !text[..i].chars().next_back().is_some_and(is_ident_char))
+}
+
+/// The first identifier token of `base_text` that is not a keyword and is in no token of
+/// `texts`.
+fn first_lost_ident(base_text: &str, texts: [&str; 2]) -> Option<String> {
+    let known: BTreeSet<&str> = texts
+        .iter()
+        .flat_map(|t| ident_tokens(t))
+        .map(|(_, tok)| tok)
+        .collect();
+    ident_tokens(base_text)
+        .into_iter()
+        .map(|(_, tok)| tok)
+        .find(|tok| !is_keyword(tok) && !known.contains(tok))
+        .map(str::to_owned)
+}
+
+const ITEM_KEYWORDS: [&str; 8] = [
+    "fn", "struct", "enum", "trait", "type", "const", "static", "union",
+];
+
+/// Whether `text` declares `item`: `<kw> <item>` with the name followed by a non-identifier char.
+fn declares_item(text: &str, item: &str) -> bool {
+    ident_tokens(text).into_iter().any(|(at, tok)| {
+        if !ITEM_KEYWORDS.contains(&tok) {
+            return false;
+        }
+        let rest = &text[at + tok.len()..];
+        let after_ws = rest.trim_start();
+        after_ws.len() < rest.len()
+            && after_ws
+                .strip_prefix(item)
+                .is_some_and(|r| !r.starts_with(is_ident_char))
+    })
+}
+
+/// Strips a leading `pub`, `pub(crate)` or `pub(super)` that is followed by whitespace.
+fn strip_vis(t: &str) -> &str {
+    for v in ["pub(crate)", "pub(super)", "pub"] {
+        if let Some(r) = t.strip_prefix(v) {
+            let rest = r.trim_start();
+            if rest.len() < r.len() {
+                return rest;
+            }
+        }
+    }
+    t
+}
+
+/// Whether the trimmed `text` is `[<vis> ]use <path>::<item>;`.
+fn is_use_of(text: &str, item: &str) -> bool {
+    let Some(rest) = strip_vis(text.trim()).strip_prefix("use") else {
+        return false;
+    };
+    let path = rest.trim_start();
+    if path.len() == rest.len() {
+        return false;
+    }
+    let Some(path) = path.trim_end().strip_suffix(';') else {
+        return false;
+    };
+    let segs: Vec<&str> = path.trim().split("::").collect();
+    segs.len() >= 2 && segs.iter().all(|s| is_ident_shape(s)) && segs.last() == Some(&item)
+}
+
+/// `text` with visibility tokens removed and whitespace collapsed to single spaces.
+fn without_vis(text: &str) -> String {
+    let stripped = text
+        .replace("pub(crate)", "")
+        .replace("pub(super)", "")
+        .replace("pub", "");
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn base_slice<'a>(base: &'a str, spec: &super::MutationSpec) -> Option<&'a str> {
@@ -298,14 +496,16 @@ impl IntentCall {
             IntentCall::RenameLocal { .. } => IntentKind::RenameLocal,
             IntentCall::ExtractVariable { .. } => IntentKind::ExtractVariable,
             IntentCall::AddDerive { .. } => IntentKind::AddDerive,
+            IntentCall::ExtractFunction { .. } => IntentKind::ExtractFunction,
+            IntentCall::MoveItem { .. } => IntentKind::MoveItem,
         }
     }
 
     /// Checks that `specs` carry out this call against the `base` texts.
     ///
     /// # Contract
-    /// - C1: all specs are on one path and `base` has a text for it, else `ManyFiles` or
-    ///   `MissingBase`.
+    /// - C1: for every intent except `MoveItem`, all specs are on one path and `base` has a
+    ///   text for it, else `ManyFiles` or `MissingBase`.
     ///   tested: domain::intent::tests::conforms_needs_one_file_and_its_base
     /// - C2: `RenameLocal`: every spec is a `Replace` of the text `from` by the text `to`.
     ///   tested: domain::intent::tests::rename_local_rejects_replace_of_other_text
@@ -315,11 +515,33 @@ impl IntentCall {
     /// - C4: `AddDerive`: every spec is an `Insert` of `#[derive(L)]` or `, L`, and the
     ///   concatenated lists equal `derives` in order.
     ///   tested: domain::intent::tests::add_derive_checks_list
+    /// - C5: `ExtractFunction`: no `Delete` (`WrongKind`); exactly one `Insert` whose text has
+    ///   `fn`, whitespace, the name, optional whitespace and `(` or `<` (`NoFnInsert`); exactly
+    ///   one `Replace` whose new text contains `name(` not preceded by an identifier char
+    ///   (`NoCallReplace`); every identifier token of that `Replace`'s base text that is not a
+    ///   keyword occurs among the tokens of the `Insert` text or of the `Replace` text, the
+    ///   first missing one giving `LostIdent`.
+    ///   tested: domain::intent::tests::extract_function_needs_fn_insert_and_call
+    ///   tested: domain::intent::tests::extract_function_rejects_lost_identifiers
+    /// - C6: `MoveItem`: the specs touch exactly two paths, one of them `to`, both with a base
+    ///   text (`MoveFiles`, `MissingBase`). The other path, the source, has exactly one spec, a
+    ///   `Replace` or a `Delete` (`WrongKind`, else `NotMoved`), whose base text declares the
+    ///   item as `<kw> <item>` with `kw` one of `fn struct enum trait type const static union`
+    ///   (`NotAnItem`); a `Replace` there writes `[<vis> ]use <path>::<item>;` with `vis` one of
+    ///   `pub`, `pub(crate)` or `pub(super)` (`NoReexport`). The destination `to` has exactly one
+    ///   spec, an `Insert`, or a `Replace` of such a `use` line (`WrongKind`, `NotMoved`,
+    ///   `BaseTextMismatch`), and its new text, with whitespace collapsed and every visibility
+    ///   token removed, contains the source's base text treated the same way (`NotMoved`).
+    ///   tested: domain::intent::tests::move_item_needs_two_files_and_the_item
+    ///   tested: domain::intent::tests::move_item_accepts_reexport_and_collapse
     pub fn conforms(
         &self,
         specs: &[super::MutationSpec],
         base: &BTreeMap<RelPath, String>,
     ) -> Result<(), Nonconformance> {
+        if let IntentCall::MoveItem { item, to } = self {
+            return conforms_move(item, to, specs, base);
+        }
         let Some(first) = specs.first() else {
             return Err(Nonconformance::ManyFiles);
         };
@@ -393,7 +615,108 @@ impl IntentCall {
                     Err(Nonconformance::DeriveListMismatch)
                 }
             }
+            IntentCall::ExtractFunction { name } => {
+                if let Some((i, s)) = specs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, s)| s.kind() == SpecKind::Delete)
+                {
+                    return Err(Nonconformance::WrongKind {
+                        spec: i,
+                        kind: s.kind(),
+                    });
+                }
+                let mut inserts = specs.iter().filter(|s| s.kind() == SpecKind::Insert);
+                let ins = match (inserts.next(), inserts.next()) {
+                    (Some(ins), None) if declares_fn(ins.text(), name.as_str()) => ins,
+                    _ => return Err(Nonconformance::NoFnInsert),
+                };
+                let mut replaces = specs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.kind() == SpecKind::Replace);
+                let (ri, rep) = match (replaces.next(), replaces.next()) {
+                    (Some((i, r)), None) if calls_fn(r.text(), name.as_str()) => (i, r),
+                    _ => return Err(Nonconformance::NoCallReplace),
+                };
+                let Some(replaced) = base_slice(text, rep) else {
+                    return Err(Nonconformance::BaseTextMismatch { spec: ri });
+                };
+                match first_lost_ident(replaced, [ins.text(), rep.text()]) {
+                    Some(ident) => Err(Nonconformance::LostIdent { ident }),
+                    None => Ok(()),
+                }
+            }
+            IntentCall::MoveItem { item, to } => conforms_move(item, to, specs, base),
         }
+    }
+}
+
+/// The checks of `MoveItem`, which spans two files.
+fn conforms_move(
+    item: &Ident,
+    to: &RelPath,
+    specs: &[super::MutationSpec],
+    base: &BTreeMap<RelPath, String>,
+) -> Result<(), Nonconformance> {
+    let paths: BTreeSet<&RelPath> = specs.iter().map(|s| s.path()).collect();
+    if paths.len() != 2 || !paths.contains(to) {
+        return Err(Nonconformance::MoveFiles);
+    }
+    for p in &paths {
+        if !base.contains_key(*p) {
+            return Err(Nonconformance::MissingBase { path: (*p).clone() });
+        }
+    }
+    let src = paths
+        .iter()
+        .find(|p| **p != to)
+        .copied()
+        .ok_or(Nonconformance::MoveFiles)?;
+    let on = |p: &RelPath| -> Vec<(usize, &super::MutationSpec)> {
+        specs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.path() == p)
+            .collect()
+    };
+    let item = item.as_str();
+    let [(si, s)] = on(src)[..] else {
+        return Err(Nonconformance::NotMoved);
+    };
+    if s.kind() == SpecKind::Insert {
+        return Err(Nonconformance::WrongKind {
+            spec: si,
+            kind: s.kind(),
+        });
+    }
+    let Some(declared) = base_slice(&base[src], s).filter(|d| declares_item(d, item)) else {
+        return Err(Nonconformance::NotAnItem { spec: si });
+    };
+    if s.kind() == SpecKind::Replace && !is_use_of(s.text(), item) {
+        return Err(Nonconformance::NoReexport { spec: si });
+    }
+    let [(di, d)] = on(to)[..] else {
+        return Err(Nonconformance::NotMoved);
+    };
+    match d.kind() {
+        SpecKind::Delete => {
+            return Err(Nonconformance::WrongKind {
+                spec: di,
+                kind: d.kind(),
+            });
+        }
+        SpecKind::Replace => {
+            if !base_slice(&base[to], d).is_some_and(|b| is_use_of(b, item)) {
+                return Err(Nonconformance::BaseTextMismatch { spec: di });
+            }
+        }
+        SpecKind::Insert => {}
+    }
+    if without_vis(d.text()).contains(&without_vis(declared)) {
+        Ok(())
+    } else {
+        Err(Nonconformance::NotMoved)
     }
 }
 
@@ -406,6 +729,8 @@ impl std::fmt::Display for IntentCall {
                 let names: Vec<&str> = derives.iter().map(DeriveName::as_str).collect();
                 write!(f, "add-derive {}", names.join(", "))
             }
+            IntentCall::ExtractFunction { name } => write!(f, "extract-function {name}"),
+            IntentCall::MoveItem { item, to } => write!(f, "move-item {item} -> {to}"),
         }
     }
 }
@@ -467,6 +792,35 @@ mod tests {
         }
         assert_eq!(IntentKind::parse("rename"), None);
         assert_eq!(IntentKind::AddDerive.to_string(), "add-derive");
+        assert_eq!(IntentKind::ALL.len(), 5);
+        assert_eq!(
+            IntentKind::parse("extract-function"),
+            Some(IntentKind::ExtractFunction)
+        );
+        assert_eq!(IntentKind::parse("move-item"), Some(IntentKind::MoveItem));
+        assert_eq!(IntentKind::MoveItem.to_string(), "move-item");
+        assert_eq!(RiskMark::Visibility.to_string(), "visibility");
+    }
+
+    #[test]
+    fn new_intents_carry_their_risks() {
+        assert_eq!(
+            IntentKind::ExtractFunction.spec().risks,
+            BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
+        );
+        assert_eq!(
+            IntentKind::MoveItem.spec().risks,
+            BTreeSet::from([RiskMark::Visibility])
+        );
+        let ef = IntentCall::ExtractFunction { name: id("h") };
+        let mv = IntentCall::MoveItem {
+            item: id("foo"),
+            to: RelPath::parse("b.rs").unwrap(),
+        };
+        assert_eq!(ef.kind(), IntentKind::ExtractFunction);
+        assert_eq!(mv.kind(), IntentKind::MoveItem);
+        assert_eq!(ef.to_string(), "extract-function h");
+        assert_eq!(mv.to_string(), "move-item foo -> b.rs");
     }
 
     #[test]
@@ -622,6 +976,301 @@ mod tests {
                 spec: 0,
                 kind: SpecKind::Replace
             })
+        );
+    }
+
+    #[test]
+    fn extract_function_needs_fn_insert_and_call() {
+        let call = IntentCall::ExtractFunction { name: id("h") };
+        let text = "fn f(x: i32) { g(x + 1); }";
+        let decl = "fn h(x: i32) { g(x + 1); }\n";
+        assert_eq!(
+            call.conforms(&[ins(0, decl), rep(15, 24, "h(x);")], &base(text)),
+            Ok(())
+        );
+        // a space before the parameters, generics, and a method-style call are all fine
+        assert_eq!(
+            call.conforms(
+                &[ins(0, "pub fn  h <T>() { g(x); }"), rep(15, 24, "s.h(x);")],
+                &base(text)
+            ),
+            Ok(())
+        );
+        let del = MutationSpec::delete(rel(), TextRange::new(0, 2).unwrap()).unwrap();
+        assert_eq!(
+            call.conforms(&[ins(0, decl), rep(15, 24, "h(x);"), del], &base(text)),
+            Err(Nonconformance::WrongKind {
+                spec: 2,
+                kind: SpecKind::Delete
+            })
+        );
+        for bad in [
+            "const h: i32 = 1;",
+            "fn hh(x: i32) { g(x); }",
+            "xfn h() { g(x); }",
+        ] {
+            assert_eq!(
+                call.conforms(&[ins(0, bad), rep(15, 24, "h(x);")], &base(text)),
+                Err(Nonconformance::NoFnInsert),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            call.conforms(
+                &[ins(0, decl), ins(1, decl), rep(15, 24, "h(x);")],
+                &base(text)
+            ),
+            Err(Nonconformance::NoFnInsert)
+        );
+        assert_eq!(
+            call.conforms(&[rep(15, 24, "h(x);")], &base(text)),
+            Err(Nonconformance::NoFnInsert)
+        );
+        for bad in ["hh(x);", "xh(x);", "h;"] {
+            assert_eq!(
+                call.conforms(&[ins(0, decl), rep(15, 24, bad)], &base(text)),
+                Err(Nonconformance::NoCallReplace),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            call.conforms(&[ins(0, decl)], &base(text)),
+            Err(Nonconformance::NoCallReplace)
+        );
+        assert_eq!(
+            call.conforms(
+                &[ins(0, decl), rep(15, 16, "h(x);"), rep(17, 24, "h(x);")],
+                &base(text)
+            ),
+            Err(Nonconformance::NoCallReplace)
+        );
+        // a replace outside the base text is a mismatch, not a panic
+        assert_eq!(
+            call.conforms(&[ins(0, decl), rep(60, 70, "h(x);")], &base(text)),
+            Err(Nonconformance::BaseTextMismatch { spec: 1 })
+        );
+    }
+
+    #[test]
+    fn extract_function_rejects_lost_identifiers() {
+        let call = IntentCall::ExtractFunction { name: id("h") };
+        let text = "fn f(x: i32) { g(x + 1); }";
+        // `g` is neither in the new function nor in the call
+        assert_eq!(
+            call.conforms(
+                &[ins(0, "fn h(x: i32) { x + 1; }\n"), rep(15, 24, "h(x);")],
+                &base(text)
+            ),
+            Err(Nonconformance::LostIdent {
+                ident: "g".to_owned()
+            })
+        );
+        // the first missing one is reported, in the order of the base text
+        assert_eq!(
+            call.conforms(&[ins(0, "fn h() {}\n"), rep(15, 24, "h();")], &base(text)),
+            Err(Nonconformance::LostIdent {
+                ident: "g".to_owned()
+            })
+        );
+        // a name found only in the call is kept, and keywords and numbers are not names
+        let text = "fn f(x: i32) { return; }";
+        assert_eq!(
+            call.conforms(&[ins(0, "fn h() {}\n"), rep(15, 22, "h();")], &base(text)),
+            Ok(())
+        );
+        let text = "fn f(x: i32) { g(x, 7u8); }";
+        assert_eq!(
+            call.conforms(
+                &[
+                    ins(0, "fn h(x: i32) { g(x, 7u8); }\n"),
+                    rep(15, 25, "h(x);")
+                ],
+                &base(text)
+            ),
+            Ok(())
+        );
+    }
+
+    fn rp(s: &str) -> RelPath {
+        RelPath::parse(s).unwrap()
+    }
+    fn rep_at(p: &str, a: u32, b: u32, t: &str) -> MutationSpec {
+        MutationSpec::replace(rp(p), TextRange::new(a, b).unwrap(), t).unwrap()
+    }
+    fn ins_at(p: &str, at: u32, t: &str) -> MutationSpec {
+        MutationSpec::insert(rp(p), at, t).unwrap()
+    }
+    fn del_at(p: &str, a: u32, b: u32) -> MutationSpec {
+        MutationSpec::delete(rp(p), TextRange::new(a, b).unwrap()).unwrap()
+    }
+    fn two(a: &str, b: &str) -> BTreeMap<RelPath, String> {
+        BTreeMap::from([(rp("a.rs"), a.to_owned()), (rp("b.rs"), b.to_owned())])
+    }
+    fn mv(item: &str, to: &str) -> IntentCall {
+        IntentCall::MoveItem {
+            item: id(item),
+            to: rp(to),
+        }
+    }
+
+    #[test]
+    fn move_item_needs_two_files_and_the_item() {
+        let b = two("pub fn foo() {}\nfn bar() {}\n", "");
+        let call = mv("foo", "b.rs");
+        let reexport = "pub use crate::b::foo;";
+        let item = "pub fn foo() {}\n";
+        let ok = [rep_at("a.rs", 0, 15, reexport), ins_at("b.rs", 0, item)];
+        assert_eq!(call.conforms(&ok, &b), Ok(()));
+        // one file, a third file, or `to` missing from the specs
+        assert_eq!(call.conforms(&ok[..1], &b), Err(Nonconformance::MoveFiles));
+        assert_eq!(call.conforms(&[], &b), Err(Nonconformance::MoveFiles));
+        let c = ins_at("c.rs", 0, "x");
+        assert_eq!(
+            call.conforms(&[ok[0].clone(), ok[1].clone(), c.clone()], &b),
+            Err(Nonconformance::MoveFiles)
+        );
+        assert_eq!(
+            call.conforms(&[ok[0].clone(), c], &b),
+            Err(Nonconformance::MoveFiles)
+        );
+        // both files need a base text
+        let only_a = BTreeMap::from([(rp("a.rs"), "pub fn foo() {}\n".to_owned())]);
+        assert_eq!(
+            call.conforms(&ok, &only_a),
+            Err(Nonconformance::MissingBase { path: rp("b.rs") })
+        );
+        // the source must declare exactly the item
+        assert_eq!(
+            call.conforms(&[rep_at("a.rs", 16, 27, reexport), ok[1].clone()], &b),
+            Err(Nonconformance::NotAnItem { spec: 0 })
+        );
+        assert_eq!(
+            mv("fo", "b.rs").conforms(&ok, &b),
+            Err(Nonconformance::NotAnItem { spec: 0 })
+        );
+        // an index counts in `specs`, whichever file comes first
+        assert_eq!(
+            call.conforms(&[ok[1].clone(), rep_at("a.rs", 16, 27, reexport)], &b),
+            Err(Nonconformance::NotAnItem { spec: 1 })
+        );
+        // a replace of the source must leave a re-export of the item
+        for bad in [
+            "pub use crate::b::bar;",
+            "pub use foo;",
+            "pub use crate::b::foo",
+            "pub(in x) use crate::b::foo;",
+            "pub fn foo() {}",
+        ] {
+            assert_eq!(
+                call.conforms(&[rep_at("a.rs", 0, 15, bad), ok[1].clone()], &b),
+                Err(Nonconformance::NoReexport { spec: 0 }),
+                "{bad}"
+            );
+        }
+        for good in [
+            "use crate::b::foo;",
+            "pub(crate) use crate::b::foo;",
+            " pub(super) use super::b::foo;\n",
+        ] {
+            assert_eq!(
+                call.conforms(&[rep_at("a.rs", 0, 15, good), ok[1].clone()], &b),
+                Ok(()),
+                "{good}"
+            );
+        }
+        // the source has one spec, a replace or a delete
+        assert_eq!(
+            call.conforms(&[ins_at("a.rs", 0, "x"), ok[1].clone()], &b),
+            Err(Nonconformance::WrongKind {
+                spec: 0,
+                kind: SpecKind::Insert
+            })
+        );
+        assert_eq!(
+            call.conforms(
+                &[ok[0].clone(), rep_at("a.rs", 16, 27, "z"), ok[1].clone()],
+                &b
+            ),
+            Err(Nonconformance::NotMoved)
+        );
+        // the destination must receive the text of the item
+        assert_eq!(
+            call.conforms(&[ok[0].clone(), ins_at("b.rs", 0, "pub fn other() {}")], &b),
+            Err(Nonconformance::NotMoved)
+        );
+        assert_eq!(
+            call.conforms(&[ok[0].clone(), ok[1].clone(), ins_at("b.rs", 0, "y")], &b),
+            Err(Nonconformance::NotMoved)
+        );
+        let b2 = two("pub fn foo() {}\nfn bar() {}\n", "fn z() {}\n");
+        assert_eq!(
+            call.conforms(&[ok[0].clone(), del_at("b.rs", 0, 5)], &b2),
+            Err(Nonconformance::WrongKind {
+                spec: 1,
+                kind: SpecKind::Delete
+            })
+        );
+        assert_eq!(
+            call.conforms(&[ok[0].clone(), rep_at("b.rs", 0, 9, item)], &b2),
+            Err(Nonconformance::BaseTextMismatch { spec: 1 })
+        );
+    }
+
+    #[test]
+    fn move_item_accepts_reexport_and_collapse() {
+        // forward: the destination may write the item with another visibility and spacing
+        let b = two("pub fn foo() {}\nfn bar() {}\n", "");
+        let call = mv("foo", "b.rs");
+        let reexport = rep_at("a.rs", 0, 15, "pub use crate::b::foo;");
+        for dest in [
+            "pub fn foo() {}\n",
+            "pub(crate) fn  foo()\n{}",
+            "// moved\nfn foo() {}",
+        ] {
+            assert_eq!(
+                call.conforms(&[reexport.clone(), ins_at("b.rs", 0, dest)], &b),
+                Ok(()),
+                "{dest}"
+            );
+        }
+        // other item kinds
+        let b = two("struct S;\n", "");
+        assert_eq!(
+            mv("S", "b.rs").conforms(
+                &[
+                    rep_at("a.rs", 0, 9, "use crate::b::S;"),
+                    ins_at("b.rs", 0, "pub struct S;")
+                ],
+                &b
+            ),
+            Ok(())
+        );
+        // collapse: the item comes back to the file that re-exports it
+        let b = two(
+            "pub use crate::b::foo;\nfn bar() {}\n",
+            "pub fn foo() {}\nfn baz() {}\n",
+        );
+        let back = mv("foo", "a.rs");
+        assert_eq!(
+            back.conforms(
+                &[
+                    del_at("b.rs", 0, 16),
+                    rep_at("a.rs", 0, 22, "pub fn foo() {}")
+                ],
+                &b
+            ),
+            Ok(())
+        );
+        // a collapse that writes something else is not a move
+        assert_eq!(
+            back.conforms(
+                &[
+                    del_at("b.rs", 0, 16),
+                    rep_at("a.rs", 0, 22, "pub fn foo() { 1 }")
+                ],
+                &b
+            ),
+            Err(Nonconformance::NotMoved)
         );
     }
 }
