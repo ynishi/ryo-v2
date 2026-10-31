@@ -8,10 +8,11 @@ use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at
 use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{FileId, Vfs};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
-use ryo_v2_core::domain::{Finding, IntentKind, RelPath};
+use ryo_v2_core::domain::{Finding, Fingerprint, IntentKind, RelPath};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 
 /// A file on which a gap detector panicked: in the collect that hit it the file kept its
@@ -38,6 +39,54 @@ pub struct ExpanderPanic {
     pub message: String,
 }
 
+/// What the dependencies of a workspace were at load, besides its `.rs` files; the provenance
+/// reports it.
+///
+/// Read from disk once, at load; a later change on disk does not move it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoadInputs {
+    /// Fingerprint of the root `Cargo.toml`, of each member's `Cargo.toml` and of the root
+    /// `Cargo.lock` (when it exists), by path relative to the root. A file that could not be
+    /// read is left out.
+    pub(crate) manifests: Vec<(RelPath, Fingerprint)>,
+    /// First line of `rustc --version` run in the root (so a `rust-toolchain` file is honoured);
+    /// `unknown` when it could not be run. It stands for the sysroot of that toolchain; the
+    /// sysroot path itself is an execution-environment value and is not recorded.
+    pub(crate) toolchain: String,
+}
+
+/// Captures the manifests, the lock file and the toolchain version of the workspace at `root`.
+fn capture_load_inputs(root: &Path, rev_deps: &RevDeps) -> LoadInputs {
+    let mut dirs: BTreeSet<PathBuf> = rev_deps.keys().cloned().collect();
+    dirs.insert(PathBuf::new());
+    let mut candidates: Vec<PathBuf> = dirs.iter().map(|d| d.join("Cargo.toml")).collect();
+    candidates.push(PathBuf::from("Cargo.lock"));
+    let manifests = candidates
+        .iter()
+        .filter_map(|rel| {
+            let rel_path = rel_of(root, &root.join(rel))?;
+            let bytes = std::fs::read(root.join(rel)).ok()?;
+            Some((rel_path, Fingerprint::of(&bytes)))
+        })
+        .collect();
+    let toolchain = Command::new("rustc")
+        .arg("--version")
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let text = String::from_utf8(o.stdout).ok()?;
+            let line = text.lines().next()?.trim().to_owned();
+            (!line.is_empty()).then_some(line)
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    LoadInputs {
+        manifests,
+        toolchain,
+    }
+}
+
 /// A loaded workspace: the rust-analyzer database, its VFS and the baseline diagnostics.
 pub struct RaSession {
     pub(crate) host: AnalysisHost,
@@ -59,6 +108,8 @@ pub struct RaSession {
     pub(crate) live_fork: bool,
     /// Build-script sources and proc-macro member dirs, from `cargo metadata`.
     pub(crate) path_facts: PathFacts,
+    /// Manifests, lock file and toolchain as of load.
+    pub(crate) load_inputs: LoadInputs,
     /// Number of `Verifier::check` calls so far.
     pub(crate) check_count: u32,
     /// Cut-off of the diagnostics of the `check` that is running; `None` outside the diagnostics
@@ -184,6 +235,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
     let load_ms = a.clock.now_ms().saturating_sub(t0);
 
     let (rev_deps, path_facts) = build_rev_deps(&root).unwrap_or_default();
+    let load_inputs = capture_load_inputs(&root, &rev_deps);
     let threads = a
         .config
         .threads
@@ -224,6 +276,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         gap_detectors: a.config.gap_detectors,
         live_fork: false,
         path_facts,
+        load_inputs,
         check_count: 0,
         deadline: None,
         edited_since_audit: BTreeSet::new(),

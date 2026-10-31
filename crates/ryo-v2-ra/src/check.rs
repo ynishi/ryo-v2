@@ -91,15 +91,21 @@ impl Verifier for RaAnalyzer {
     }
 
     /// The analyzer, its configuration and the fingerprint of each workspace file's database
-    /// text.
+    /// text, of the manifests and of the lock file.
     ///
     /// # Contract
     /// - C1: the analyzer is `rust-analyzer` at the release the `ra_ap_*` crates are pinned to;
-    ///   the config lists `proc_macro`, `cfg_test`, `gap_detectors` and `check_timeout_ms`
-    ///   (`none` when no limit is set); the files are the indexed workspace files whose text can
-    ///   be read; the `gap_detectors` entry is the switch of every gap detector.
+    ///   the config lists `proc_macro`, `cfg_test`, `gap_detectors`, `check_timeout_ms`
+    ///   (`none` when no limit is set) and `toolchain` (the first line of `rustc --version` in
+    ///   the root, `unknown` if it could not be run; it stands for that toolchain's sysroot, whose
+    ///   path is not recorded); the files are the indexed workspace files whose text can be read,
+    ///   plus the root `Cargo.toml`, each member's `Cargo.toml` and the root `Cargo.lock` as read
+    ///   at load (one that could not be read is left out), so a manifest or lock change moves
+    ///   the workspace fingerprint; the `gap_detectors` entry is the switch of every gap detector.
     ///   tested: check::tests::analyzer_version_is_the_manifest_pin
     ///   tested: tests/verifier.rs provenance_records_the_gap_detector_switch
+    ///   tested: tests/verifier.rs provenance_fingerprints_manifests_lock_and_toolchain
+    ///   tested: tests/verifier.rs provenance_fingerprints_each_member_manifest
     fn provenance(&self, s: &RaSession) -> Provenance {
         let files: BTreeMap<RelPath, Fingerprint> = s
             .files
@@ -108,6 +114,10 @@ impl Verifier for RaAnalyzer {
                 let text = fork::db_text(&s.host, *id).ok()?;
                 Some((path.clone(), Fingerprint::of(text.as_bytes())))
             })
+            .collect();
+        let files = files
+            .into_iter()
+            .chain(s.load_inputs.manifests.iter().cloned())
             .collect();
         let config = BTreeMap::from([
             ("proc_macro".to_owned(), self.config.proc_macro.to_string()),
@@ -121,6 +131,7 @@ impl Verifier for RaAnalyzer {
                 self.check_timeout_ms
                     .map_or_else(|| "none".to_owned(), |ms| ms.to_string()),
             ),
+            ("toolchain".to_owned(), s.load_inputs.toolchain.clone()),
         ]);
         Provenance::new("rust-analyzer", ANALYZER_VERSION, config, files)
             .unwrap_or_else(|_| Provenance::unrecorded())

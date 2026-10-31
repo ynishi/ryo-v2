@@ -226,8 +226,9 @@ pub enum Token {
     assert!(codes_of(&off, "E0204").is_empty(), "got {off:?}");
 }
 
-/// Types whose fields are all `Copy`, generic types, lifetime-only types, fieldless enums, a
-/// `Clone` derive alone and a field of unknown type are not reported.
+/// Types whose fields are all `Copy`, a generic type whose field is `Copy` under the derive's
+/// `T: Copy`, lifetime-only types, fieldless enums, a `Clone` derive alone and a field of unknown
+/// type are not reported.
 #[test]
 fn copy_impl_skips_copy_and_generic_types() {
     let text = r#"pub struct S;
@@ -516,4 +517,313 @@ fn unexpanded_macro_file_keeps_the_other_detectors() {
         at("E0204", line_of(text, "pub struct Note")),
         "got {got:?}"
     );
+}
+
+/// A derive on a generic type is checked under the bounds the derived impl puts on the type's
+/// parameters (D1): a field that lacks the trait whatever `T` is gets the same finding as on a
+/// plain type, at the same position (E0277, E0369 for `PartialEq`, E0204 for `Copy`), for a struct
+/// field, an enum variant field and a declared bound (D2).
+#[test]
+fn derive_field_generic_reports_missing_field_traits() {
+    let text = r#"pub struct Raw;
+
+#[derive(PartialEq)]
+pub struct PRaw;
+
+#[derive(Debug)]
+pub struct GA<T> {
+    pub t: T,
+    pub raw_a: Raw,
+}
+
+#[derive(Clone)]
+pub struct GB<T> {
+    pub t: Vec<T>,
+    pub raw_b: Raw,
+}
+
+#[derive(Default)]
+pub struct GC<T> {
+    pub t: Option<T>,
+    pub raw_c: Raw,
+}
+
+#[derive(PartialEq)]
+pub struct GD<T> {
+    pub t: T,
+    pub raw_d: Raw,
+}
+
+#[derive(PartialEq, Eq)]
+pub struct GE<T> {
+    pub t: T,
+    pub raw_e: PRaw,
+}
+
+#[derive(Clone)]
+pub enum GF<T> {
+    Ok(T),
+    Bad(Raw),
+}
+
+#[derive(Clone)]
+pub struct GG<T: Clone> {
+    pub t: T,
+    pub raw_g: Raw,
+}
+
+#[derive(Clone)]
+pub struct GH<T>
+where
+    T: Clone,
+{
+    pub t: T,
+    pub raw_h: Raw,
+}
+
+#[derive(Clone, Copy)]
+pub struct GI<T> {
+    pub t: T,
+    pub raw_i: Raw,
+}
+
+#[derive(Clone, Copy)]
+pub struct GJ<const N: usize> {
+    pub cells: [Raw; N],
+}
+"#;
+    let p = Probe::new("field-generic-positive");
+    let got = p.errors_of(true, text);
+    let mut want77: Vec<(String, u32)> = [
+        "pub raw_a: Raw",
+        "pub raw_b: Raw",
+        "pub raw_c: Raw",
+        "pub raw_e: PRaw",
+        "Bad(Raw)",
+        "pub raw_g: Raw",
+        "pub raw_h: Raw",
+        "pub raw_i: Raw",
+        "pub cells: [Raw; N]",
+    ]
+    .iter()
+    .map(|n| ("E0277".to_owned(), line_of(text, n)))
+    .collect();
+    want77.sort();
+    assert_eq!(codes_of(&got, "E0277"), want77, "got {got:?}");
+    assert_eq!(
+        codes_of(&got, "E0369"),
+        at("E0369", line_of(text, "pub raw_d: Raw")),
+        "got {got:?}"
+    );
+    assert_eq!(
+        codes_of(&got, "E0204"),
+        vec![
+            ("E0204".to_owned(), line_of(text, "pub struct GI")),
+            ("E0204".to_owned(), line_of(text, "pub struct GJ")),
+        ],
+        "got {got:?}"
+    );
+    let off = p.errors_of(false, text);
+    assert!(
+        ["E0277", "E0369", "E0204"]
+            .iter()
+            .all(|c| codes_of(&off, c).is_empty()),
+        "got {off:?}"
+    );
+}
+
+/// Fields that need only what the derived impl assumes of the parameters, or what the type
+/// declares of them, give no finding on a generic type (D1, D2).
+#[test]
+fn derive_field_generic_accepts_what_the_derive_bounds_cover() {
+    let text = r#"use std::marker::PhantomData;
+
+pub trait Tr {}
+
+pub struct Needs<T>(pub T);
+
+impl<T: Tr + Clone> Clone for Needs<T> {
+    fn clone(&self) -> Self {
+        Needs(self.0.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cover<T> {
+    pub a: T,
+    pub v: Vec<T>,
+    pub o: Option<T>,
+    pub p: PhantomData<T>,
+    pub b: Box<T>,
+    pub n: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct CoverCopy<T> {
+    pub a: T,
+    pub o: Option<T>,
+    pub p: PhantomData<T>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoverEnum<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+#[derive(Clone)]
+pub struct Declared<T: Tr> {
+    pub n: Needs<T>,
+}
+
+#[derive(Clone)]
+pub struct DeclaredWhere<T>
+where
+    T: Tr,
+{
+    pub n: Needs<T>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Items<I: Iterator> {
+    pub first: Option<I::Item>,
+}
+"#;
+    let p = Probe::new("field-generic-negative");
+    let got = p.errors_of(true, text);
+    for c in ["E0277", "E0369", "E0204"] {
+        assert!(codes_of(&got, c).is_empty(), "{c}: got {got:?}");
+    }
+}
+
+/// Shapes the generic check cannot judge stay unreported (D3): a field that mentions a const
+/// parameter of a type that also has type parameters, and a field of unknown type.
+#[test]
+fn derive_field_generic_skips_what_it_cannot_judge() {
+    let text = r#"pub struct Raw;
+
+#[derive(Clone)]
+pub struct Mixed<T, const N: usize> {
+    pub t: T,
+    pub arr: [Raw; N],
+}
+
+#[derive(Clone)]
+pub struct Unknown<T> {
+    pub t: T,
+    pub m: Missing,
+}
+
+#[derive(Clone)]
+pub struct CloneOnly;
+
+#[derive(Clone)]
+pub struct CArr<const N: usize> {
+    pub a: [CloneOnly; N],
+}
+impl<const N: usize> Copy for CArr<N> {}
+"#;
+    let p = Probe::new("field-generic-skip");
+    let got = p.errors_of(true, text);
+    assert!(codes_of(&got, "E0277").is_empty(), "got {got:?}");
+    // A written `Copy` impl with a const parameter is not judged.
+    assert!(codes_of(&got, "E0204").is_empty(), "got {got:?}");
+}
+
+/// A written `Copy` impl of a generic type is checked in the impl's own env (D5): a field that
+/// lacks `Copy` whatever `T` is, is reported at the `Copy` of the impl; fields covered by the
+/// impl's bounds, and a concrete instance of the type, are not.
+#[test]
+fn copy_impl_written_generic_uses_the_impl_env() {
+    let text = r#"pub struct Raw;
+
+#[derive(Clone)]
+pub struct Bad<T> {
+    pub t: T,
+    pub raw: Raw,
+}
+impl<T: Copy> Copy for Bad<T> {}
+
+#[derive(Clone)]
+pub struct Good<T> {
+    pub t: T,
+    pub o: Option<T>,
+}
+impl<T: Copy> Copy for Good<T> {}
+
+#[derive(Clone)]
+pub struct Conc<T> {
+    pub t: T,
+}
+impl Copy for Conc<u8> {}
+impl Clone for Conc<u16> {
+    fn clone(&self) -> Self {
+        Conc { t: self.t }
+    }
+}
+"#;
+    let p = Probe::new("copy-written-generic");
+    let got = p.errors_of(true, text);
+    assert_eq!(
+        codes_of(&got, "E0204"),
+        at("E0204", line_of(text, "impl<T: Copy> Copy for Bad<T>")),
+        "got {got:?}"
+    );
+}
+
+/// A type with a lifetime and a type parameter is judged in the derived impl's env as well: the
+/// lifetime argument does not make a field unknown, a borrowed `T` passes under `T: Trait`, and
+/// a field that lacks the trait is reported.
+#[test]
+fn derive_field_generic_with_a_lifetime() {
+    let text = r#"pub struct Raw;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fine<'a, T> {
+    pub r: &'a T,
+    pub v: Vec<T>,
+}
+
+#[derive(Debug)]
+pub struct Lacks<'a, T> {
+    pub r: &'a T,
+    pub raw: Raw,
+}
+"#;
+    let p = Probe::new("field-generic-lifetime");
+    let got = p.errors_of(true, text);
+    assert_eq!(
+        codes_of(&got, "E0277"),
+        at("E0277", line_of(text, "pub raw: Raw")),
+        "got {got:?}"
+    );
+    assert!(codes_of(&got, "E0369").is_empty(), "got {got:?}");
+}
+
+/// `Eq` on a field of a generic type is skipped only when the field also fails `PartialEq` in the
+/// derived `PartialEq` impl's env: `Wrap<T>` is `PartialEq` under `T: PartialEq` and never `Eq`,
+/// so the derived `Eq` (under `T: Eq`) is reported at the field and the derived `PartialEq` is not.
+#[test]
+fn derive_field_generic_eq_beside_partialeq() {
+    let text = r#"pub struct Wrap<T>(pub T);
+
+impl<T: PartialEq> PartialEq for Wrap<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct HasWrap<T> {
+    pub w: Wrap<T>,
+}
+"#;
+    let p = Probe::new("field-generic-eq");
+    let got = p.errors_of(true, text);
+    assert_eq!(
+        codes_of(&got, "E0277"),
+        at("E0277", line_of(text, "pub w: Wrap<T>")),
+        "got {got:?}"
+    );
+    assert!(codes_of(&got, "E0369").is_empty(), "got {got:?}");
 }

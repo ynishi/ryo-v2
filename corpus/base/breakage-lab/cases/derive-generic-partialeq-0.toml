@@ -1,0 +1,4 @@
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/overlays/derive-generic-partialeq-0"
+group = "derive-field"
+origin = "hand"
