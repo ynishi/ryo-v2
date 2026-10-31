@@ -9,7 +9,7 @@
 //!
 //! A candidate is skipped whenever the answer cannot be trusted: inside attributes, macro
 //! calls and macro definitions, in cfg-disabled code, in the input of an attribute macro, for
-//! a name some `use` of the file introduces (rustc reports only the failed import), and in a
+//! a name some `use` of the scope introduces (rustc reports only the failed import), and in a
 //! file with a glob import ra cannot resolve. The caller does not run this module at all on a
 //! file where ra reports a macro call it could not expand, since the expansion could define any
 //! name ([`crate::GapDetector::UnresolvedPath`]). Skipping loses recall, never precision.
@@ -23,11 +23,10 @@
 use ra_ap_hir::{InFile, Semantics};
 use ra_ap_ide::{TextRange, TextSize};
 use ra_ap_ide_db::RootDatabase;
-use ra_ap_syntax::SyntaxKind;
-use ra_ap_syntax::ast::{self, AstNode, HasName, PathSegmentKind};
+use ra_ap_syntax::ast::{self, AstNode, HasModuleItem, HasName, PathSegmentKind};
+use ra_ap_syntax::{SyntaxKind, SyntaxNode};
 use ra_ap_vfs::FileId;
 use ryo_v2_core::domain::{ErrorCode, FindingCode};
-use std::collections::HashSet;
 
 /// One unresolved name: the rustc code, the message and the 1-based line.
 pub(crate) type Hit = (FindingCode, String, u32);
@@ -155,7 +154,7 @@ fn skipped_syntactically(
     c: &Candidate,
     name: &str,
     inactive: &[TextRange],
-    imported: &HashSet<String>,
+    imported: &[Import],
 ) -> bool {
     let opaque = c.path.syntax().ancestors().any(|a| {
         matches!(
@@ -171,7 +170,63 @@ fn skipped_syntactically(
         )
     });
     let start = c.name.syntax().text_range().start();
-    opaque || inactive.iter().any(|r| r.contains(start)) || imported.contains(name)
+    opaque || inactive.iter().any(|r| r.contains(start)) || imported_in_scope(c, name, imported)
+}
+
+/// Whether a `use` that introduces `name` covers the candidate: the candidate is inside the
+/// scope the `use` is declared in.
+///
+/// # Contract
+/// - C1: a `use` exempts a name only inside its scope (the item list or block it is declared
+///   in, the file for a top-level one); blocks and items nested in that scope are inside it.
+///   tested: tests/unresolved.rs a_use_in_a_block_exempts_only_that_block
+///   tested: tests/unresolved.rs failed_import_is_not_reported_again
+/// - C2: a `use` does not reach into a child module, except into one with a top-level
+///   `use super::*`, which lets the parent's names flow in.
+///   tested: tests/unresolved.rs a_use_in_a_child_module_does_not_exempt_the_parent
+///   tested: tests/unresolved.rs a_parent_use_still_reaches_a_child_with_use_super_glob
+fn imported_in_scope(c: &Candidate, name: &str, imported: &[Import]) -> bool {
+    imported
+        .iter()
+        .filter(|i| i.name == name)
+        .any(|i| covers(&i.scope, c.path.syntax()))
+}
+
+/// Whether `scope` holds `node` without an `ast::Module` boundary in between that keeps the
+/// parent's names out (a module with a top-level `use super::*` does not).
+fn covers(scope: &SyntaxNode, node: &SyntaxNode) -> bool {
+    for a in node.ancestors() {
+        if a == *scope {
+            return true;
+        }
+        if let Some(module) = ast::Module::cast(a)
+            && !has_super_glob(&module)
+        {
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether a top-level item of the module is `use super::*`.
+fn has_super_glob(module: &ast::Module) -> bool {
+    module.item_list().is_some_and(|list| {
+        list.items()
+            .filter_map(|item| match item {
+                ast::Item::Use(u) => u.use_tree(),
+                _ => None,
+            })
+            .any(|t| {
+                t.star_token().is_some()
+                    && t.path().is_some_and(|p| {
+                        p.qualifier().is_none()
+                            && matches!(
+                                p.segment().and_then(|s| s.kind()),
+                                Some(PathSegmentKind::SuperKw)
+                            )
+                    })
+            })
+    })
 }
 
 /// Whether an enclosing item is the input of an attribute macro (its expansion is unknown).
@@ -218,17 +273,39 @@ fn is_module_keyword(path: &ast::Path) -> bool {
         )
 }
 
-/// The names the `use` items of the file introduce. rustc binds a failed import to a dummy
-/// and reports only the import, so the name is not reported again where it is used.
-fn imported_names(file: &ast::SourceFile) -> HashSet<String> {
-    let mut names = HashSet::new();
+/// A name a `use` introduces, and the syntax node of the scope the `use` is declared in.
+struct Import {
+    name: String,
+    scope: SyntaxNode,
+}
+
+/// The names the `use` items of the file introduce, each with its scope. rustc binds a failed
+/// import to a dummy and reports only the import, so the name is not reported again where it is
+/// used.
+fn imported_names(file: &ast::SourceFile) -> Vec<Import> {
+    let mut names = Vec::new();
     for tree in file.syntax().descendants().filter_map(ast::UseTree::cast) {
         if tree.use_tree_list().is_some() || tree.star_token().is_some() {
             continue;
         }
+        // The container of the `use` item: the file, an item list or a block's statement list.
+        let Some(scope) = tree
+            .syntax()
+            .ancestors()
+            .find_map(ast::Use::cast)
+            .and_then(|u| u.syntax().parent())
+        else {
+            continue;
+        };
+        let mut add = |name: String| {
+            names.push(Import {
+                name,
+                scope: scope.clone(),
+            })
+        };
         if let Some(rename) = tree.rename() {
             if let Some(name) = rename.name() {
-                names.insert(name.text().to_string());
+                add(name.text().to_string());
             }
             continue;
         }
@@ -238,13 +315,13 @@ fn imported_names(file: &ast::SourceFile) -> HashSet<String> {
         };
         match segment.kind() {
             Some(PathSegmentKind::Name(n)) => {
-                names.insert(n.text().to_string());
+                add(n.text().to_string());
             }
             Some(PathSegmentKind::SelfKw) => {
                 if let Some(base) = self_import_base(&tree, &path)
                     && let Some(PathSegmentKind::Name(n)) = base.segment().and_then(|s| s.kind())
                 {
-                    names.insert(n.text().to_string());
+                    add(n.text().to_string());
                 }
             }
             _ => {}

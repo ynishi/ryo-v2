@@ -164,20 +164,25 @@ pub(crate) fn diagnostics(
     if !fork.applied {
         return Ok(ScopedFindings::default());
     }
-    let base_scope = match scope {
-        Scope::Affected => &fork.full_scope,
-        Scope::Workspace => &session.files,
+    let live = |files: &[(FileId, RelPath)]| -> Vec<(FileId, RelPath)> {
+        let mut out: Vec<(FileId, RelPath)> = files
+            .iter()
+            .filter(|(id, _)| !fork.deleted.iter().any(|(did, _, _)| did == id))
+            .cloned()
+            .collect();
+        out.extend(fork.created.iter().cloned());
+        out
     };
-    let mut diag_scope: Vec<(FileId, RelPath)> = base_scope
-        .iter()
-        .filter(|(id, _)| !fork.deleted.iter().any(|(did, _, _)| did == id))
-        .cloned()
-        .collect();
-    diag_scope.extend(fork.created.iter().cloned());
+    let workspace = live(&session.files);
+    let diag_scope = match scope {
+        Scope::Affected => live(&fork.full_scope),
+        Scope::Workspace => workspace.clone(),
+    };
 
     let findings = collect_errors_par(
         &session.host,
         &diag_scope,
+        &workspace,
         session.threads,
         session.gap_detectors,
         session.deadline.as_ref(),
@@ -245,6 +250,7 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
         let after = collect_errors_par(
             &session.host,
             &assert_scope,
+            &session.files,
             session.threads,
             session.gap_detectors,
             // Revert is outside the cut-off.

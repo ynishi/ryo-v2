@@ -214,6 +214,7 @@ impl RevertAudit for RaAnalyzer {
         let found = collect_errors_par(
             &s.host,
             &scope,
+            &s.files,
             s.threads,
             s.gap_detectors,
             // An audit is never cut off.

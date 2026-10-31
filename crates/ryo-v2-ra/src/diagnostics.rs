@@ -15,7 +15,8 @@ use ra_ap_ide_db::{RootDatabase, SnippetCap};
 use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{AnalyzerError, Clock};
 use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath};
-use std::collections::BTreeSet;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -215,15 +216,37 @@ fn is_unexpanded_macro(code: &DiagnosticCode) -> bool {
 /// Error diagnostics of the files, sorted. With `db`, the errors ra does not diagnose are added
 /// by the [`DETECTORS`] ([`crate::unresolved`], [`crate::duplicate`], [`crate::field_bounds`]). With `deadline`, stops with `Cancelled`
 /// before the first file it finds the deadline reached.
+///
+/// `known` lists every file a diagnostic range may be attributed to (the files of the session,
+/// plus the files a fork created, minus the ones it deleted).
+///
+/// # Contract
+/// - C1: an error ra reports with a range in another known file than the scanned one (for
+///   example code a file pulls in with `include!`) is a finding of that file, at the line of that
+///   file. The included file is also scanned on its own and reports the same error there; the
+///   finding is then kept once.
+///   tested: tests/attribution.rs included_file_error_is_reported_against_the_included_file
+/// - C2: a gap-detector hit is dropped only when ra reports the same code on the same line of
+///   the same file.
+///   tested: tests/attribution.rs detector_hit_is_kept_when_ra_reports_the_same_code_and_line_in_another_file
+/// - C3 [free]: the path and line of an error whose range is in a file outside `known` (today
+///   the scanned file, at the line that range's offset has there, which may be meaningless).
+/// - C4: the file a finding is attributed to by C1 is in the crate of the scanned file: an
+///   `include!` of another crate's file is not loaded (a `macro-error`), so a scope of whole
+///   crates holds both, and the baseline difference and the revert asserts compare the
+///   attributed file against its own baseline.
+///   tested: tests/attribution.rs include_of_another_crates_file_is_not_loaded
 fn collect_errors(
     analysis: &Analysis,
     db: Option<&RootDatabase>,
     files: &[(FileId, RelPath)],
+    known: &[(FileId, RelPath)],
     deadline: Option<&Deadline>,
     detector: Detector<'_>,
-) -> Result<Vec<Finding>, AnalyzerError> {
+) -> Result<Collected, AnalyzerError> {
     let diag_config = diagnostics_config();
-    let mut errors = Vec::new();
+    let known: HashMap<FileId, &RelPath> = known.iter().map(|(id, rel)| (*id, rel)).collect();
+    let mut errors = Collected::default();
     for (file_id, rel) in files {
         if deadline.is_some_and(Deadline::expired) {
             return Err(AnalyzerError::Cancelled);
@@ -233,8 +256,9 @@ fn collect_errors(
                 .full_diagnostics(&diag_config, AssistResolveStrategy::None, *file_id)
                 .map_err(|_| ())?;
             let index = analysis.file_line_index(*file_id).map_err(|_| ())?;
-            let mut found = Vec::new();
-            let mut ra_keys: Vec<(FindingCode, u32)> = Vec::new();
+            let mut found = Collected::default();
+            let mut ra_keys: Vec<(FindingCode, RelPath, u32)> = Vec::new();
+            let mut other_indexes = HashMap::new();
             let mut inactive: Vec<TextRange> = Vec::new();
             let mut unexpanded_macro = false;
             for d in diags {
@@ -246,14 +270,33 @@ fn collect_errors(
                 }
                 if d.severity == Severity::Error {
                     let code = classify(&d.code);
-                    let line = index.line_col(d.range.range.start()).line + 1;
-                    ra_keys.push((code.clone(), line));
-                    found.push(Finding {
+                    let mut is_foreign = false;
+                    let (path, line) = match known.get(&d.range.file_id) {
+                        Some(other) if d.range.file_id != *file_id => {
+                            let other_index = match other_indexes.entry(d.range.file_id) {
+                                Entry::Occupied(e) => e.into_mut(),
+                                Entry::Vacant(e) => e.insert(
+                                    analysis.file_line_index(d.range.file_id).map_err(|_| ())?,
+                                ),
+                            };
+                            let line = other_index.line_col(d.range.range.start()).line + 1;
+                            is_foreign = true;
+                            ((*other).clone(), line)
+                        }
+                        _ => (rel.clone(), index.line_col(d.range.range.start()).line + 1),
+                    };
+                    ra_keys.push((code.clone(), path.clone(), line));
+                    let finding = Finding {
                         code,
                         message: d.message,
-                        path: rel.clone(),
+                        path,
                         line,
-                    });
+                    };
+                    if is_foreign {
+                        found.foreign.push(finding);
+                    } else {
+                        found.native.push(finding);
+                    }
                 }
             }
             if let Some(db) = db {
@@ -289,9 +332,9 @@ fn collect_errors(
                         Vec::new()
                     });
                     for (code, message, line) in hits {
-                        // The same code on the same line: ra already says it.
-                        if !ra_keys.contains(&(code.clone(), line)) {
-                            found.push(Finding {
+                        // The same code on the same line of the same file: ra already says it.
+                        if !ra_keys.contains(&(code.clone(), rel.clone(), line)) {
+                            found.native.push(Finding {
                                 code,
                                 message,
                                 path: rel.clone(),
@@ -306,16 +349,49 @@ fn collect_errors(
         .map_err(|p| AnalyzerError::Panicked(panic_message(p)))?;
         errors.extend(got.map_err(|()| AnalyzerError::Cancelled)?);
     }
-    errors.sort();
     Ok(errors)
+}
+
+/// The findings of a collect: those in the scanned file itself, and those ra reported with a
+/// range in another known file. A file pulled in by `include!` is also scanned on its own and
+/// gets the same finding there, so the second kind is kept only where the first lacks it.
+#[derive(Default)]
+struct Collected {
+    native: Vec<Finding>,
+    foreign: Vec<Finding>,
+}
+
+impl Collected {
+    fn extend(&mut self, other: Collected) {
+        self.native.extend(other.native);
+        self.foreign.extend(other.foreign);
+    }
+
+    /// Native findings and the foreign ones no native finding equals (once each), sorted.
+    fn into_findings(self) -> Vec<Finding> {
+        let seen: HashSet<Finding> = self.native.iter().cloned().collect();
+        let mut foreign: Vec<Finding> = self
+            .foreign
+            .into_iter()
+            .filter(|f| !seen.contains(f))
+            .collect();
+        foreign.sort();
+        foreign.dedup();
+        let mut all = self.native;
+        all.extend(foreign);
+        all.sort();
+        all
+    }
 }
 
 /// Parallel [`collect_errors`]: chunks the files and diagnoses each chunk on its own snapshot.
 /// `gap_detectors` switches the [`DETECTORS`] on; each chunk then also takes
-/// its own database clone, dropped before this function returns.
+/// its own database clone, dropped before this function returns. `known` is as in
+/// [`collect_errors`].
 pub(crate) fn collect_errors_par(
     host: &AnalysisHost,
     files: &[(FileId, RelPath)],
+    known: &[(FileId, RelPath)],
     threads: usize,
     gap_detectors: bool,
     deadline: Option<&Deadline>,
@@ -323,7 +399,15 @@ pub(crate) fn collect_errors_par(
 ) -> Result<Vec<Finding>, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
         let db = gap_detectors.then(|| host.raw_database().clone());
-        return collect_errors(&host.analysis(), db.as_ref(), files, deadline, detector);
+        return collect_errors(
+            &host.analysis(),
+            db.as_ref(),
+            files,
+            known,
+            deadline,
+            detector,
+        )
+        .map(Collected::into_findings);
     }
     let chunk_size = files.len().div_ceil(threads);
     let chunks: Vec<&[(FileId, RelPath)]> = files.chunks(chunk_size).collect();
@@ -335,13 +419,15 @@ pub(crate) fn collect_errors_par(
             )
         })
         .collect();
-    let mut errors = Vec::new();
+    let mut errors = Collected::default();
     std::thread::scope(|s| -> Result<(), AnalyzerError> {
         let handles: Vec<_> = chunks
             .into_iter()
             .zip(snapshots)
             .map(|(chunk, (analysis, db))| {
-                s.spawn(move || collect_errors(&analysis, db.as_ref(), chunk, deadline, detector))
+                s.spawn(move || {
+                    collect_errors(&analysis, db.as_ref(), chunk, known, deadline, detector)
+                })
             })
             .collect();
         for h in handles {
@@ -352,8 +438,7 @@ pub(crate) fn collect_errors_par(
         }
         Ok(())
     })?;
-    errors.sort();
-    Ok(errors)
+    Ok(errors.into_findings())
 }
 
 #[cfg(test)]
