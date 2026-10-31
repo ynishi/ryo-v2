@@ -104,6 +104,10 @@ and this project adheres to
 
 ### Fixed
 
+- The field-bounds detector reports a derived `Clone` beside a derived `Copy` on a type without
+  type or const parameters, as rustc does: E0277 at each field without `Clone`, next to the E0204
+  (a field that is `Clone` but not `Copy` gives only the E0204). Three cases on breakage-lab; the
+  derive-field floor rises to 13.
 - The field-bounds detector checks types with type or const parameters: a field of a generic type
   is judged under the bounds the derived impl puts on the parameters (and the bounds the type
   declares), a written `Copy` impl in its own env, so an add-derive on a generic type whose field
