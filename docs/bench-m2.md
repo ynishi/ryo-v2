@@ -33,7 +33,7 @@ Rows named ryo-rs use ryo-rs (a verification repository used as a large sample).
 | ryo-rs, cold load (target empty) | 504 | 28979 | 34768 | 5 | not captured |
 | ryo-rs, warm load (target built) | 504 | 3172 | 35911 | 5 | 5017192 |
 
-ryo-rs rows: measured on a 16 vCPU / 30 GB machine shared with other builds, dev profile, proc-macro on, assert_revert on, cargo capped at 6 jobs / 16G, 2026-10-31 (runs with repeat 1 and repeat 10). The raw logs are not kept in this repo. Cold load includes building ryo-rs's build scripts and proc-macros once; the baseline (diagnosing all 504 files) is about 35 s either way.
+ryo-rs rows: measured on 16 threads / 30 GB, busy with other builds, dev profile, proc-macro on, assert_revert on, cargo at `-j 6` with a 16 GB memory limit, 2026-10-31 (runs with repeat 1 and repeat 10). The raw logs are not kept in this repo. Cold load includes building ryo-rs's build scripts and proc-macros once; the baseline (diagnosing all 504 files) is about 35 s either way.
 
 ### Table 2: per run (n = 100 per row for the small workspace)
 
@@ -52,27 +52,26 @@ principle-15 line of the run: `principle-15: holds (worst warm median check_ms 7
 
 ## ryo-rs (large)
 
-This run is not part of the default test suite: 227k lines of `.rs` exceeds a small machine's compute budget, so it ran on a larger shared machine with `cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat N --scope both` (ryo-rs exported at 67b0ebfb with `git archive`, not cloned).
+This run is not part of the default test suite: 227k lines of `.rs` exceeds a small machine's compute budget, so it ran on a larger machine with `cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat N --scope both` (ryo-rs exported at 67b0ebfb with `git archive`, not cloned).
 
-Steps for the large run (from the ryo-v2 repo root, so `corpus/body-0N` resolves; `<CLONE>` is any path; the clone is not kept in this repo):
+Steps for the large run (from the ryo-v2 repo root, so `corpus/body-0N` resolves; `<RYO_RS>` is a checkout of ryo-rs, `<BASE>` an empty directory without a `target` path component; the export is not kept in this repo):
 
 ```
-git clone --quiet /path/to/ryo-rs <CLONE>
-git -C <CLONE> checkout --quiet 67b0ebfb
+git -C <RYO_RS> archive 67b0ebfb | tar -x -C <BASE>
 mkdir -p target/bench-m2
 # (b0) cold load (target empty) + estimate of cost; this run's [load] is the "cold load (target empty)" row
-cargo run -q -p ryo-v2-cli -- bench --large <CLONE> --repeat 1 --scope both > target/bench-m2/large-r1.log 2>&1
+cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat 1 --scope both > target/bench-m2/large-r1.log 2>&1
 # (b) T = sum of check_ms + revert_ms over all runs in large-r1.log; N = clamp(floor(300000 / T), 2, 10)
 #     this run's [load] is the "warm load (target built)" row
-cargo run -q -p ryo-v2-cli -- bench --large <CLONE> --repeat N --scope both > target/bench-m2/large.log 2>&1
+cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat N --scope both > target/bench-m2/large.log 2>&1
 # fallbacks if even N = 2 is too slow: add --no-assert-revert (keep b0 with assert on to confirm revert_ok true)
 # optional: load only plus repeat 2 without proc-macro
-cargo run -q -p ryo-v2-cli -- bench --large <CLONE> --repeat 2 --scope both --no-proc-macro > target/bench-m2/large-nopm.log 2>&1
+cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat 2 --scope both --no-proc-macro > target/bench-m2/large-nopm.log 2>&1
 ```
 
-Before (b), check `pgrep -fa "cargo|rustc"` so that nothing else is building. Afterwards confirm the source repo is unchanged (`git -C /path/to/ryo-rs status --short`).
+Before (b), check `pgrep -fa "cargo|rustc"` so that nothing else is building. Afterwards confirm the source repo is unchanged (`git -C <RYO_RS> status --short`).
 
-Results to fill (from the logs only): N chosen and reason, the two ryo-rs rows of Table 1, and Table 2 rows for corpus/body-01 (renames `pub fn parse` in `ryo-symbol`, which 10 crates depend on; Affected is expected to approach Workspace), corpus/body-02, corpus/body-03 (leaf crate `ryo-cli`; if Affected equals Workspace here, suspect `rev_deps.rs` / `cargo metadata` failure).
+The rows below are taken from the logs only: Table 2 rows for corpus/body-01 (renames `pub fn parse` in `ryo-symbol`, which 10 crates depend on; Affected is expected to approach Workspace), corpus/body-02, corpus/body-03 (leaf crate `ryo-cli`; if Affected equals Workspace here, suspect `rev_deps.rs` / `cargo metadata` failure).
 
 | workspace | variant | scope | scope files | n | first check ms | warm check ms min/med/max | warm revert ms min/med/max | rss kB first/last/max | slope kB/iter | leak suspect |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -111,5 +110,5 @@ ra's `AnalysisHost` is one mutable salsa DB per Session. `Fork` is not an indepe
 
 ## Anomalies
 
-- `corpus/body-03` (`crates/ryo-cli/src/commands/graph.rs`) was cut from an older ryo-rs. Besides the intended rename `resolve_symbol` to `resolve_symbol_renamed`, it reverts `connect_or_local` to `connect_or_spawn` (diffed against 67b0ebfb), so it can carry unintended new errors. Write the measured new_errors as they are; the corpus is not fixed.
+- `corpus/body-03` (`crates/ryo-cli/src/commands/graph.rs`) was cut from an older ryo-rs. Besides the intended rename `resolve_symbol` to `resolve_symbol_renamed`, it reverts `connect_or_local` to `connect_or_spawn` (diffed against 67b0ebfb), so it can carry unintended new errors. new_errors are reported as measured; the corpus is not fixed.
 - Small workspace: the check time is a few ms because the fixture has 4 files; it says little about ryo-rs scale. The 522 MB RSS after load for a 4-file workspace suggests a large fixed cost in ra (probably sysroot / std); this was not separately measured.

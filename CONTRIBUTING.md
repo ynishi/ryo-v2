@@ -18,6 +18,9 @@ to your own setup goes somewhere the tree does not track — for Claude Code, a
 
 ## Issue conventions
 
+"Issue" in this file includes what stands for one while no issue tracker is
+used — see [Development flow](#development-flow).
+
 ### Labels
 
 Four categories. Assign at least one when you open an issue.
@@ -29,10 +32,14 @@ Four categories. Assign at least one when you open an issue.
 | `refactor`    | behaviour unchanged                                  |
 | `chore`       | production code untouched — CI, tests, tooling, docs |
 
+A ledger row carries no label; the `<type>` of its branch (see
+[Branches](#branches)) is its category.
+
 ## Branches
 
 Never work on `main`. One branch per issue, cut from `origin/main` after a fetch
-and named `<type>/<slug>`, where `<type>` is `ci`, `fix`, `feat` or `docs`.
+and named `<type>/<slug>`, where `<type>` is `feat`, `fix`, `refactor`, `chore`,
+`ci` or `docs`.
 
 Whether that branch lives in a second worktree or in the checkout you already
 have is your setup's decision. If the second checkout sits inside this tree, it
@@ -107,7 +114,7 @@ cost. This is where the reasoning lives.>
 
 Verified: <the recipes actually run, and their outcome>
 
-Refs #<issue>
+Refs <issue: #<n>, or a ledger id such as S-2>
 ```
 
 - No AI attribution of any kind — no `Co-Authored-By`, no "Generated with", no
@@ -136,25 +143,37 @@ issue -> just worktree-new -> implement -> just check
       -> review locally
       -> commit
       -> git fetch origin -> just pre-push
-      -> write the PR body to a file -> hand over push/PR
+      -> write the PR body to a file -> hand over push/PR (or the branch to merge)
 ```
 
 Review the change locally before it goes up, by a person or by an AI agent —
-whichever you have. Six questions are worth asking of every diff: does it do
-what its issue asked, may everything in it be published
-([PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#agent-publication-check)), are
-the comments beside the code still true, and does each test a changed
-`# Contract` clause names actually check that clause (would it fail if the
-promise broke); (5) does the change alter behaviour a `[free]` clause names, or
-make callers rely on it — then it is no longer free: retag the clause and name
-a test; (6) does a glossary `includes:` list change — then every clause using
-that term now covers the new members: read them. Say in the PR body who or what
-reviewed it, or that nobody did.
+whichever you have. Questions worth asking of every diff:
+
+1. Does it do what its issue asked?
+2. May everything in it be published
+   ([PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#agent-publication-check))?
+3. Are the comments beside the code still true?
+4. Does each test a changed `# Contract` clause names actually check that
+   clause — would it fail if the promise broke?
+5. Does the change alter behaviour a `[free]` clause names, or make callers rely
+   on it? Then it is no longer free: retag the clause and name a test.
+6. Does a glossary `includes:` list change? Then every clause using that term
+   now covers the new members: read them.
+7. For each decision the change makes, which test or ceiling guards it, and
+   would it fail if the decision were broken?
+
+Say in the hand-over — the PR body, or the note the maintainer merges from (see
+[Development flow](#development-flow)) — who or what reviewed it, or that nobody
+did.
 
 Releases and publishes (crates, the repository's own settings) are performed by
 a human hand.
 
 ## Pull requests
+
+While the maintainer merges locally ([Development flow](#development-flow)),
+step 3 is replaced by naming the branch to merge; steps 1 and 2 stay, with the
+body as the note the merge is made from.
 
 An agent's part ends with everything that does not write to anything remote, and
 that includes the gate:
@@ -187,19 +206,21 @@ This is repository policy for every implementer, human or agent.
 
 - Each implementer works in its own worktree and branch. Until the code base is functionally
   complete, integration into `main` is a local merge done by the maintainer, conflicts included;
-  pull requests are not required in this phase.
-- Work to be done is written into a ledger (`CHECK_LEDGER.md` or `SEARCH_LEDGER.md`, section "Open
-  work") or into the task's contract, and handed over from there. No separate issue tracker is
-  used.
+  pull requests are not required in this phase, and the hand-over ends as
+  [Pull requests](#pull-requests) says.
+- In the same phase no issue tracker is used. Work to be done is written into the "Open work"
+  section of `CHECK_LEDGER.md` or into the task's contract, and handed over from there; what that
+  row stands for is defined in
+  [PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#role-of-each-public-artifact).
 - A decision that code or data must keep (a grouping, a denominator, a threshold) gets a test or a
-  ceiling in the same change that makes the decision; prose alone does not keep it.
-- A verification repository may be used as a sample (today ryo-rs). Wherever a file names it, the
-  file says that it is a verification repository used as a sample.
-- Files and commit messages never describe the execution environment. Commands use placeholders
-  such as `<BASE>` and `<OUT>`.
-- Review adds one question: for each decision the change makes, which test or ceiling guards it,
-  and would it fail if the decision were broken.
-- Weak tests are managed as a measured risk, not driven to zero. Once per milestone, (a) for each
-  main capability, a change that disables it must make some test fail; (b) a sample of n contract
-  clauses each gets a mutant that breaks the promise, and the share k/n of named tests that still
-  pass is recorded with its confidence bound in `CHECK_LEDGER.md` (section "Test strength (risk)").
+  ceiling in the same change that makes the decision; prose alone does not keep it. Review asks
+  after it (question 7 of the
+  [recommended pattern](#working-with-coding-agents--the-recommended-pattern)).
+- A verification repository may be used as a sample. Wherever a file names it, the file says that
+  it is a verification repository used as a sample.
+- Files and commit messages never describe the execution environment: no host, account, provider,
+  path or user name. Commands use placeholders such as `<BASE>` and `<OUT>`. What a reader needs
+  to read a measurement — core count, memory, and whether the machine was busy — is part of the
+  measurement and stays beside it.
+- Weak tests are managed as a measured risk, not driven to zero; the procedure, run once per
+  milestone, and its results are in `CHECK_LEDGER.md` (section "Test strength (risk)").

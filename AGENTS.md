@@ -16,13 +16,15 @@
 - `just check` is green. [CONTRIBUTING.md](CONTRIBUTING.md#verification) says
   what it covers.
 - Review a change locally before it goes up — by a person or an AI agent — and
-  say in the PR body who or what reviewed it.
+  say in the hand-over (PR body, or the note the maintainer merges from) who or
+  what reviewed it.
   [CONTRIBUTING.md](CONTRIBUTING.md#working-with-coding-agents--the-recommended-pattern)
   lists the questions a review answers.
 - Development flow ([CONTRIBUTING.md](CONTRIBUTING.md#development-flow)): one worktree and
   branch per implementer; until the code base is functionally complete the maintainer merges into
   `main` locally.
-- Open work lives in the ledgers ("Open work") or in the task's contract, not in an issue tracker.
+- In that phase there is no issue tracker: open work lives in the "Open work" section of
+  [CHECK_LEDGER.md](CHECK_LEDGER.md) or in the task's contract.
 - A decision code or data must keep gets a test or a ceiling in the same change.
-- Files and commit messages never describe the execution environment; use placeholders such as
-  `<BASE>` and `<OUT>`.
+- Files and commit messages never describe the execution environment (host, account, path); use
+  placeholders such as `<BASE>` and `<OUT>`. Core count and memory beside a measurement stay.
