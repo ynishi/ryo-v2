@@ -7,4 +7,6 @@ origin = "planted:inline-variable:0"
 targets = [
     { path = "app/src/lib.rs", start = 601, end = 765 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Report" },
+]

@@ -9,5 +9,8 @@ targets = [
     { path = "app/src/lib.rs", start = 601, end = 765 },
     { path = "geo/src/store.rs", start = 901, end = 1129 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Report" },
+    { kind = "add-field", type = "Store" },
+]
 original_fn = "free_room"

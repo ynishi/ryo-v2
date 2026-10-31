@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ryo_v2_core::app::ports::Analyzer;
 use ryo_v2_core::app::search::{ASSERT_REVERT_EVERY, DEFAULT_SEARCH_BUDGET};
+use ryo_v2_core::domain::{ChangeProbe, Ident};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::judge::MetricJudge;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -25,7 +26,40 @@ fn one_planted_case_runs_end_to_end() {
         .find(|c| c.id == "obscure-name-0")
         .expect("obscure-name-0 is a case of search-lab");
     assert_eq!(case.depth, 1);
-    assert!(case.probes.is_empty(), "probes are filled by hand later");
+    assert_eq!(
+        case.probes,
+        vec![
+            ChangeProbe::AddVariant {
+                ty: Ident::parse("Shape").unwrap()
+            },
+            ChangeProbe::AddField {
+                ty: Ident::parse("Report").unwrap()
+            },
+        ],
+        "the probes of the case file reach the case"
+    );
+    let breakage = PlantedCase::load_all(&m.corpus.join("search/base/breakage-lab"), &m.corpus)
+        .expect("load breakage-lab cases");
+    for c in cases.iter().chain(&breakage) {
+        assert!(
+            !c.probes.is_empty(),
+            "every committed case carries probes: {} has none",
+            c.id
+        );
+        let src = workspace_sources(&c.workspace);
+        for p in &c.probes {
+            let (item, ty) = match p {
+                ChangeProbe::AddVariant { ty } => ("enum", ty),
+                ChangeProbe::AddField { ty } => ("struct", ty),
+                ChangeProbe::AddMethod { ty } => ("trait", ty),
+            };
+            assert!(
+                src.contains(&format!("pub {item} {} ", ty.as_str())),
+                "probe {p:?} of {} names no `{item}` of its workspace",
+                c.id
+            );
+        }
+    }
 
     let analyzer = RaAnalyzer::new(
         RaConfig {
@@ -71,4 +105,21 @@ fn one_planted_case_runs_end_to_end() {
         "and it survives a beam of 5 (fate {:?}): {row:?}",
         row.fate
     );
+}
+
+/// The text of every `.rs` file under `dir`, outside `target` and the planted overlays.
+fn workspace_sources(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    for entry in std::fs::read_dir(dir).expect("read workspace dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if path.is_dir() {
+            if !matches!(name, "target" | "planted" | ".git") {
+                out.push_str(&workspace_sources(&path));
+            }
+        } else if name.ends_with(".rs") {
+            out.push_str(&std::fs::read_to_string(&path).expect("read source"));
+        }
+    }
+    out
 }

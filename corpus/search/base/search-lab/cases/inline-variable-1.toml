@@ -7,4 +7,7 @@ origin = "planted:inline-variable:1"
 targets = [
     { path = "geo/src/shapes.rs", start = 1991, end = 2139 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Bounds" },
+    { kind = "add-variant", type = "Shape" },
+]

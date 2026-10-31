@@ -10,4 +10,8 @@ targets = [
     { path = "app/src/lib.rs", start = 1016, end = 1068 },
     { path = "app/src/plan.rs", start = 66, end = 87 },
 ]
-probes = []
+probes = [
+    { kind = "add-variant", type = "Shape" },
+    { kind = "add-field", type = "Report" },
+    { kind = "add-field", type = "Slot" },
+]

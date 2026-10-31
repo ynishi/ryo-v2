@@ -8,4 +8,6 @@ targets = [
     { path = "geo/src/shapes.rs", start = 89, end = 119 },
     { path = "geo/src/store.rs", start = 1470, end = 1574 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Bounds" },
+]

@@ -8,4 +8,7 @@ targets = [
     { path = "app/src/lib.rs", start = 98, end = 125 },
     { path = "app/src/plan.rs", start = 827, end = 864 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Rect" },
+    { kind = "add-field", type = "Slot" },
+]

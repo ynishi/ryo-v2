@@ -7,4 +7,6 @@ origin = "planted:inline-variable:3"
 targets = [
     { path = "app/src/plan.rs", start = 399, end = 514 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Slot" },
+]

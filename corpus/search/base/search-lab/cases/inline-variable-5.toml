@@ -7,4 +7,7 @@ origin = "planted:inline-variable:5"
 targets = [
     { path = "geo/src/report.rs", start = 1843, end = 1982 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Report" },
+    { kind = "add-field", type = "Line" },
+]

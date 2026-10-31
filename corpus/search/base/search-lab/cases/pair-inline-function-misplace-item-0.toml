@@ -10,5 +10,8 @@ targets = [
     { path = "app/src/lib.rs", start = 943, end = 995 },
     { path = "app/src/plan.rs", start = 66, end = 87 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Report" },
+    { kind = "add-field", type = "Slot" },
+]
 original_fn = "finish"

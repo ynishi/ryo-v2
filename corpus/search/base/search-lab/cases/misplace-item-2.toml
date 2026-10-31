@@ -8,4 +8,7 @@ targets = [
     { path = "geo/src/report.rs", start = 2131, end = 2224 },
     { path = "geo/src/shapes.rs", start = 194, end = 223 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Rect" },
+    { kind = "add-variant", type = "Shape" },
+]

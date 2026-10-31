@@ -7,4 +7,6 @@ origin = "planted:obscure-name:0"
 targets = [
     { path = "store/src/lib.rs", start = 1603, end = 1760 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Bin" },
+]
