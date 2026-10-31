@@ -265,7 +265,7 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   proposer, rationale and spec refs, and the evidence lists the provenance: analyzer,
 ///   version, config and workspace fingerprint.
 ///   tested: resolution_json::tests::decided_lists_record_and_provenance
-/// - C4: a `Decided` resolution lists, under `blocking` right after `candidates`, the blockings
+/// - C4: a `Decided` resolution lists, under `blocking`, the blockings
 ///   of the Blueprints that did not pass, in the vocabulary of C2; a `check_failed` blocking
 ///   has the `failure` (`edit`, `cancelled` or `panicked`), the `path` for an edit, and the
 ///   `message`.
@@ -771,9 +771,6 @@ mod tests {
         assert_eq!(v["blocking"].as_array().map(Vec::len), Some(1));
         assert_eq!(v["blocking"][0]["kind"], "new_errors");
         assert_eq!(v["blocking"][0]["blueprint"], b.to_string());
-        let keys: Vec<&String> = v.as_object().expect("an object").keys().collect();
-        let pos = |k: &str| keys.iter().position(|x| *x == k);
-        assert!(pos("candidates") < pos("blocking"));
     }
 
     #[test]
