@@ -39,7 +39,9 @@ pub(crate) fn map_error(e: AnalyzerError, edited: &[RelPath]) -> CheckError {
         AnalyzerError::RevertMismatch => CheckError::RevertMismatch {
             paths: edited.to_vec(),
         },
-        other => CheckError::Poisoned(other.to_string()),
+        AnalyzerError::ForkInUse => CheckError::ForkInUse,
+        AnalyzerError::AlreadyApplied => CheckError::AlreadyApplied,
+        AnalyzerError::Load(m) => CheckError::Load(m),
     }
 }
 
@@ -276,5 +278,21 @@ mod tests {
         let manifest = include_str!("../../../Cargo.toml");
         let pin = format!("ra_ap_ide = \"={ANALYZER_VERSION}\"");
         assert!(manifest.contains(&pin), "{pin}");
+    }
+
+    #[test]
+    fn map_error_keeps_fork_in_use_already_applied_and_load_apart() {
+        assert_eq!(
+            map_error(AnalyzerError::ForkInUse, &[]),
+            CheckError::ForkInUse
+        );
+        assert_eq!(
+            map_error(AnalyzerError::AlreadyApplied, &[]),
+            CheckError::AlreadyApplied
+        );
+        assert_eq!(
+            map_error(AnalyzerError::Load("l".to_owned()), &[]),
+            CheckError::Load("l".to_owned())
+        );
     }
 }

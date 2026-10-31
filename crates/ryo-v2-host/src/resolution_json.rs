@@ -1,9 +1,9 @@
 //! The `Resolution` as the JSON the `apply` command prints, and its exit code.
 
 use ryo_v2_core::domain::{
-    BaseFp, Basis, Blocking, Candidate, Diagnostics, Disposition, Drift, FileRole, Freshness,
-    LogEntry, OuterCheckReason, ReadRange, Resolution, ReviewReason, RiskMark, Scope, Stage,
-    Verdict,
+    BaseFp, Basis, Blocking, Candidate, CheckFailure, Diagnostics, Disposition, Drift, FileRole,
+    Freshness, LogEntry, OuterCheckReason, ReadRange, Resolution, ReviewReason, RiskMark, Scope,
+    Stage, Verdict,
 };
 use serde_json::{Value, json};
 
@@ -219,6 +219,21 @@ fn blocking_json(b: &Blocking) -> Value {
         Blocking::BudgetExhausted { limit_ms, .. } => json!({
             "kind": "budget_exhausted", "blueprint": blueprint, "limit_ms": limit_ms,
         }),
+        Blocking::CheckFailed { failure, .. } => {
+            let (kind, path) = match failure {
+                CheckFailure::Edit { path, .. } => ("edit", Some(path.to_string())),
+                CheckFailure::Cancelled => ("cancelled", None),
+                CheckFailure::Panicked(_) => ("panicked", None),
+            };
+            let mut v = json!({
+                "kind": "check_failed", "blueprint": blueprint,
+                "failure": kind, "message": failure.to_string(),
+            });
+            if let (Some(path), Some(o)) = (path, v.as_object_mut()) {
+                o.insert("path".to_owned(), json!(path));
+            }
+            v
+        }
         Blocking::ParentFailed { parent, .. } => json!({
             "kind": "parent_failed", "blueprint": blueprint, "parent": parent.to_string(),
         }),
@@ -250,10 +265,17 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   proposer, rationale and spec refs, and the evidence lists the provenance: analyzer,
 ///   version, config and workspace fingerprint.
 ///   tested: resolution_json::tests::decided_lists_record_and_provenance
+/// - C4: a `Decided` resolution lists, under `blocking` right after `candidates`, the blockings
+///   of the Blueprints that did not pass, in the vocabulary of C2; a `check_failed` blocking
+///   has the `failure` (`edit`, `cancelled` or `panicked`), the `path` for an edit, and the
+///   `message`.
+///   tested: resolution_json::tests::decided_lists_the_blockings
+///   tested: resolution_json::tests::check_failed_blocking_is_listed
 pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
     match r {
         Resolution::Decided {
             blueprints,
+            blocking,
             decision_log,
             evidence,
         } => {
@@ -269,6 +291,7 @@ pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
             json!({
                 "resolution": "decided",
                 "candidates": blueprints.iter().map(candidate_json).collect::<Vec<_>>(),
+                "blocking": blocking.iter().map(blocking_json).collect::<Vec<_>>(),
                 "decision_log": decision_log.entries().iter().map(log_json).collect::<Vec<_>>(),
                 "evidence": {
                     "scope": scope_str(evidence.scope()),
@@ -322,9 +345,9 @@ mod tests {
     use ryo_v2_core::app::ports::{CheckError, FileFacts, Verifier};
     use ryo_v2_core::domain::{
         BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, DecisionRecord, Edit,
-        Finding, Fingerprint, Ident, Infeasible, IntentCall, IntentKind, MutationSpec, Provenance,
-        ReadRange, RelPath, ReviewRecord, Rule, RuleCatalog, RuleId, ScopedFindings, SpecRef,
-        TextRange,
+        ErrorCode, Finding, FindingCode, Fingerprint, Ident, Infeasible, IntentCall, IntentKind,
+        MutationSpec, Provenance, ReadRange, RelPath, ReviewRecord, Rule, RuleCatalog, RuleId,
+        ScopedFindings, SpecRef, TextRange,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -721,5 +744,67 @@ mod tests {
         assert_eq!(exit_code(&r), 0);
         let inf = Infeasible::new(vec![], vec![], true).expect("budget exhausted");
         assert_eq!(exit_code(&Resolution::Failed(inf)), 2);
+    }
+
+    #[test]
+    fn decided_lists_the_blockings() {
+        let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
+        let mut r = decided(&fake, vec![rename("src/lib.rs")], &RuleCatalog::default());
+        let b = id();
+        let checked = ScopedFindings {
+            files: vec![rel("src/lib.rs")],
+            findings: vec![Finding {
+                code: FindingCode::Rustc(ErrorCode::parse("E0599").expect("a code")),
+                message: "m".to_owned(),
+                path: rel("src/lib.rs"),
+                line: 1,
+            }],
+        };
+        let Resolution::Decided { blocking, .. } = &mut r else {
+            panic!("expected Decided");
+        };
+        blocking.push(Blocking::NewErrors {
+            blueprint: b,
+            verdict: Verdict::from_baseline(&[], &checked),
+        });
+        let v = resolution_to_json(&r);
+        assert_eq!(v["blocking"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["blocking"][0]["kind"], "new_errors");
+        assert_eq!(v["blocking"][0]["blueprint"], b.to_string());
+        let keys: Vec<&String> = v.as_object().expect("an object").keys().collect();
+        let pos = |k: &str| keys.iter().position(|x| *x == k);
+        assert!(pos("candidates") < pos("blocking"));
+    }
+
+    #[test]
+    fn check_failed_blocking_is_listed() {
+        let b = id();
+        let edit = Blocking::CheckFailed {
+            blueprint: b,
+            failure: CheckFailure::Edit {
+                path: rel("src/lib.rs"),
+                reason: "no".to_owned(),
+            },
+        };
+        let v = blocking_json(&edit);
+        assert_eq!(v["kind"], "check_failed");
+        assert_eq!(v["blueprint"], b.to_string());
+        assert_eq!(v["failure"], "edit");
+        assert_eq!(v["path"], "src/lib.rs");
+        assert_eq!(v["message"], "edit rejected: src/lib.rs: no");
+        let cancelled = blocking_json(&Blocking::CheckFailed {
+            blueprint: b,
+            failure: CheckFailure::Cancelled,
+        });
+        assert_eq!(cancelled["failure"], "cancelled");
+        assert_eq!(cancelled["message"], "check cancelled");
+        assert!(cancelled.get("path").is_none());
+        let panicked = blocking_json(&Blocking::CheckFailed {
+            blueprint: b,
+            failure: CheckFailure::Panicked("boom".to_owned()),
+        });
+        assert_eq!(panicked["failure"], "panicked");
+        assert_eq!(panicked["message"], "analyzer panicked: boom");
+        assert!(panicked.get("path").is_none());
     }
 }

@@ -100,7 +100,8 @@ pub struct SearchInput<'a> {
 /// What became of one child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fate {
-    /// A stage before the check refused it.
+    /// A stage refused it before a verdict: one before the check, or the check itself when it
+    /// did not finish and the session survived (`Stage::Check`).
     Blocked(Stage),
     /// It was dropped without a check.
     Pruned(PruneStage),
@@ -222,7 +223,8 @@ pub struct SearchReport {
 /// Why a search could not finish.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
-    /// A check failed as a process, not as a verdict, and the search cannot go on.
+    /// A check failed as a process, not as a verdict, with a failure that reaches the session
+    /// (`CheckReach::Session`), and the search cannot go on.
     #[error("check of blueprint {blueprint} failed: {source}")]
     Check {
         /// The Blueprint being checked.
@@ -336,12 +338,17 @@ fn sat32(n: usize) -> u32 {
 ///   6 s limit at most 59 full checks begin after any expansion time. A child whose state is
 ///   already in the tree is `Fate::Pruned` for being a duplicate and is not checked. A check
 ///   cut off by `CheckError::TimedOut` is `Blocking::BudgetExhausted` and `Fate::TimedOut` and
-///   the search goes on; a check that fails any other way is `SearchError::Check`; a check
-///   that adds errors is `Fate::Failed` and `Blocking::NewErrors`, and a near miss when
-///   the errors are few.
+///   the search goes on; a check that fails another way with a failure of reach `Blueprint`
+///   is `Blocking::CheckFailed`, a `Stage::Check` log entry with `ok` false and
+///   `Fate::Blocked(Stage::Check)`, and the search goes on; one of reach `Session` is
+///   `SearchError::Check`; a check that adds errors is `Fate::Failed` and
+///   `Blocking::NewErrors`, and a near miss when the errors are few. A `Decided` resolution
+///   lists every blocking of the search.
 ///   tested: app::search::tests::budget_exhausted_returns_verified_so_far
 ///   tested: app::search::tests::hard_budget_with_nothing_verified_is_failed_exhausted
 ///   tested: app::search::tests::check_timeout_is_budget_exhausted_blocking
+///   tested: app::search::tests::per_blueprint_check_error_blocks_only_that_child
+///   tested: app::search::tests::session_check_error_stops_the_search
 ///   tested: app::search::tests::same_state_children_are_checked_once
 /// - C6: after a depth, when the time spent has reached `soft_ms`, `soft_stopped` is set and
 ///   no further depth starts.
@@ -743,11 +750,21 @@ where
                     run.trace[t].fate = Fate::TimedOut;
                     stats.timed_out = stats.timed_out.saturating_add(1);
                 }
-                Err(source) => {
-                    return Err(SearchError::Check {
-                        blueprint: bp_id,
-                        source,
-                    });
+                Err(e) => {
+                    let note = format!("check failed: {e}");
+                    match e.into_blocking(bp_id) {
+                        Ok(blocking) => {
+                            run.acc.note(bp_id, Stage::Check, false, note);
+                            run.blocking.push(blocking);
+                            run.trace[t].fate = Fate::Blocked(Stage::Check);
+                        }
+                        Err(source) => {
+                            return Err(SearchError::Check {
+                                blueprint: bp_id,
+                                source,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -810,6 +827,7 @@ where
     let resolution = match NonEmpty::new(candidates) {
         Some(blueprints) => Resolution::Decided {
             blueprints,
+            blocking: run.blocking,
             decision_log: run.acc.log,
             evidence: Evidence::new(
                 input.scope,
@@ -844,10 +862,10 @@ mod tests {
     use super::*;
     use crate::app::ports::{FileFacts, Verifier};
     use crate::domain::{
-        BaseFp, BlueprintParts, CleanDelta, Criterion, DEFAULT_BUDGET, DEFAULT_WEIGHTS,
-        DecisionRecord, DeriveName, Disposition, ErrorCode, Finding, FindingCode, Ident,
-        IntentCall, Judgement, MutationSpec, Provenance, ReadRange, ReviewReason, ReviewRecord,
-        RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
+        BaseFp, BlueprintParts, CheckFailure, CleanDelta, Criterion, DEFAULT_BUDGET,
+        DEFAULT_WEIGHTS, DecisionRecord, DeriveName, Disposition, ErrorCode, Finding, FindingCode,
+        Ident, IntentCall, Judgement, MutationSpec, Provenance, ReadRange, ReviewReason,
+        ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -1375,6 +1393,60 @@ mod tests {
             }]
         );
         assert!(!i.budget_exhausted());
+    }
+
+    #[test]
+    fn per_blueprint_check_error_blocks_only_that_child() {
+        let mut fx = Fx::new(BASE);
+        fx.v.rule = Box::new(|edits| {
+            if first_text(edits) == "let c = 1;" {
+                Err(CheckError::Panicked("boom".to_owned()))
+            } else {
+                Ok(ScopedFindings::default())
+            }
+        });
+        fx.rename_children(1, &["b", "c"]);
+        let r = fx.run().unwrap();
+        assert_eq!(decided(&r).len(), 1);
+        assert_eq!(fate_of(&r, 1), Fate::Passed);
+        assert_eq!(fate_of(&r, 2), Fate::Blocked(Stage::Check));
+        let Resolution::Decided {
+            blocking,
+            decision_log,
+            ..
+        } = &r.resolution
+        else {
+            panic!("expected Decided");
+        };
+        assert_eq!(
+            blocking,
+            &vec![Blocking::CheckFailed {
+                blueprint: bid(2),
+                failure: CheckFailure::Panicked("boom".to_owned())
+            }]
+        );
+        let entry = decision_log
+            .entries()
+            .iter()
+            .find(|e| e.blueprint() == bid(2) && e.stage() == Stage::Check)
+            .unwrap();
+        assert!(!entry.ok());
+        assert!(!r.budget_exhausted);
+    }
+
+    #[test]
+    fn session_check_error_stops_the_search() {
+        let mut fx = Fx::new(BASE);
+        fx.v.rule = Box::new(|_| Err(CheckError::Poisoned("x".to_owned())));
+        fx.rename_children(1, &["b", "c"]);
+        assert!(matches!(
+            fx.run(),
+            Err(SearchError::Check {
+                source: CheckError::Poisoned(_),
+                ..
+            })
+        ));
+        assert_eq!(fx.v.checks.borrow().len(), 1);
     }
 
     #[test]

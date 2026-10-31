@@ -16,7 +16,8 @@ use std::collections::BTreeMap;
 /// Why `apply_blueprints` could not finish.
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
-    /// The analyzer check failed as a process, not as a verdict.
+    /// The analyzer check failed as a process, not as a verdict, and the failure reaches the
+    /// session (`CheckReach::Session`); a failure that reaches only one Blueprint blocks it.
     #[error("check of blueprint {blueprint} failed: {source}")]
     Check {
         /// The Blueprint being checked.
@@ -76,12 +77,18 @@ impl Acc {
 ///   `MissingFile`, also when other entries drifted, and the check is not called.
 ///   tested: app::apply::tests::missing_file_is_blocking
 ///   tested: app::apply::tests::read_of_file_without_base_is_checked
-/// - C4: an `Err` of the check returns `ApplyError::Check` at once.
-///   tested: app::apply::tests::check_error_is_apply_error
+/// - C4: a check failure of reach `Session` returns `ApplyError::Check` at once; one of reach
+///   `Blueprint` blocks that Blueprint (`Blocking::CheckFailed`, or `BudgetExhausted` for
+///   `TimedOut`), logs a `Check` entry with `ok` false, and the other Blueprints are still
+///   decided.
+///   tested: app::apply::tests::session_check_error_is_apply_error
+///   tested: app::apply::tests::per_blueprint_check_error_blocks_only_that_blueprint
 /// - C5: the result is `Decided` when at least one Blueprint passed, with the candidates in
 ///   input order; a failed Blueprint with one to `NEAR_MISS_MAX` new errors is also listed
-///   as a near miss. With no candidate the result is `Failed`.
+///   as a near miss, and a `Decided` resolution lists the blockings of the Blueprints that did
+///   not pass, in input order. With no candidate the result is `Failed`.
 ///   tested: app::apply::tests::one_passing_of_two_is_decided_with_near_miss
+///   tested: app::apply::tests::decided_lists_blockings_of_the_others
 /// - C6: each stage logs one entry per Blueprint, `ok` false at the stage that blocked it and
 ///   no entry after that.
 ///   tested: app::apply::tests::decision_log_stops_at_blocking_stage
@@ -172,6 +179,7 @@ pub fn apply_blueprints<V: Verifier>(
     if let Some(blueprints) = NonEmpty::new(candidates) {
         return Ok(Resolution::Decided {
             blueprints,
+            blocking,
             decision_log: acc.log,
             evidence: Evidence::new(
                 scope,
@@ -234,12 +242,25 @@ fn decide<V: Verifier>(
     };
 
     // 6. check
-    let found = v
-        .check(s, staged.edits(), scope)
-        .map_err(|source| ApplyError::Check {
-            blueprint: id,
-            source,
-        })?;
+    let found = match v.check(s, staged.edits(), scope) {
+        Ok(found) => found,
+        Err(e) => {
+            let note = format!("check failed: {e}");
+            return match e.into_blocking(id) {
+                Ok(blocking) => {
+                    acc.note(id, Stage::Check, false, note);
+                    Ok(Outcome::Blocked {
+                        blocking,
+                        near_miss: None,
+                    })
+                }
+                Err(source) => Err(ApplyError::Check {
+                    blueprint: id,
+                    source,
+                }),
+            };
+        }
+    };
     let verdict = Verdict::from_baseline(baseline, &found);
     acc.verdicts.push((id, verdict.clone()));
     let errors = verdict.new_errors.errors.len() + verdict.new_errors.unmapped.len();
@@ -277,10 +298,11 @@ mod tests {
     use crate::domain::resolution::NEAR_MISS_MAX;
     use crate::domain::search::compose;
     use crate::domain::{
-        BaseFp, BlueprintError, BlueprintParts, DecisionRecord, DeriveName, Disposition, Drift,
-        Edit, ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident, IntentCall, IntentKind,
-        MutationSpec, NonEmpty, Nonconformance, OuterCheckReason, Provenance, ReadRange, RelPath,
-        ReviewReason, ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
+        BaseFp, BlueprintError, BlueprintParts, CheckFailure, DecisionRecord, DeriveName,
+        Disposition, Drift, Edit, ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident,
+        IntentCall, IntentKind, MutationSpec, NonEmpty, Nonconformance, OuterCheckReason,
+        Provenance, ReadRange, RelPath, ReviewReason, ReviewRecord, RiskMark, Rule, RuleId,
+        ScopedFindings, SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -1009,6 +1031,7 @@ mod tests {
             blueprints,
             decision_log,
             evidence,
+            ..
         } = r
         else {
             panic!("expected Decided");
@@ -1225,21 +1248,120 @@ mod tests {
     }
 
     #[test]
-    fn check_error_is_apply_error() {
-        let fake = Fake::with_text("src/lib.rs", BASE);
-        fake.queue(Err(CheckError::Cancelled));
-        let e = run(
-            &fake,
-            vec![rename(1, "src/lib.rs")],
-            &RuleCatalog::default(),
-        )
-        .unwrap_err();
-        match e {
-            ApplyError::Check { blueprint, source } => {
-                assert_eq!(blueprint, bid(1));
-                assert_eq!(source, CheckError::Cancelled);
+    fn session_check_error_is_apply_error() {
+        let session_errors = [
+            CheckError::Poisoned("x".to_owned()),
+            CheckError::ForkInUse,
+            CheckError::RevertMismatch {
+                paths: vec![rel("src/lib.rs")],
+            },
+        ];
+        for err in session_errors {
+            let fake = Fake::with_text("src/lib.rs", BASE);
+            fake.queue(Err(err.clone()));
+            let e = run(
+                &fake,
+                vec![rename(1, "src/lib.rs"), rename(2, "src/lib.rs")],
+                &RuleCatalog::default(),
+            )
+            .unwrap_err();
+            match e {
+                ApplyError::Check { blueprint, source } => {
+                    assert_eq!(blueprint, bid(1));
+                    assert_eq!(source, err);
+                }
             }
+            // The second Blueprint was not checked.
+            assert_eq!(fake.checks.get(), 1);
         }
+    }
+
+    #[test]
+    fn per_blueprint_check_error_blocks_only_that_blueprint() {
+        let failures = [
+            (
+                CheckError::Panicked("boom".to_owned()),
+                CheckFailure::Panicked("boom".to_owned()),
+            ),
+            (
+                CheckError::Edit {
+                    path: rel("src/lib.rs"),
+                    reason: "no".to_owned(),
+                },
+                CheckFailure::Edit {
+                    path: rel("src/lib.rs"),
+                    reason: "no".to_owned(),
+                },
+            ),
+        ];
+        for (err, failure) in failures {
+            let fake = Fake::with_text("src/lib.rs", BASE);
+            fake.queue(Err(err));
+            fake.queue(Ok(ScopedFindings::default()));
+            let r = run(
+                &fake,
+                vec![rename(1, "src/lib.rs"), rename(2, "src/lib.rs")],
+                &RuleCatalog::default(),
+            )
+            .unwrap();
+            assert_eq!(fake.checks.get(), 2);
+            let Resolution::Decided {
+                blueprints,
+                blocking,
+                decision_log,
+                ..
+            } = r
+            else {
+                panic!("expected Decided");
+            };
+            assert_eq!(blueprints.len(), 1);
+            assert_eq!(blueprints.first().blueprint(), bid(2));
+            assert_eq!(
+                blocking,
+                vec![Blocking::CheckFailed {
+                    blueprint: bid(1),
+                    failure
+                }]
+            );
+            let check = decision_log
+                .entries()
+                .iter()
+                .find(|e| e.blueprint() == bid(1) && e.stage() == Stage::Check)
+                .unwrap();
+            assert!(!check.ok());
+        }
+    }
+
+    #[test]
+    fn decided_lists_blockings_of_the_others() {
+        let fake = Fake::with_text("src/lib.rs", BASE);
+        fake.queue(Ok(ScopedFindings::default()));
+        fake.queue(Ok(errors(1)));
+        let a = rename(1, "src/lib.rs");
+        let b = rename(2, "src/lib.rs");
+        let c = chained(&rename(3, "src/lib.rs"), b.id());
+        let r = run(&fake, vec![a, b, c], &RuleCatalog::default()).unwrap();
+        let Resolution::Decided {
+            blueprints,
+            blocking,
+            ..
+        } = r
+        else {
+            panic!("expected Decided");
+        };
+        assert_eq!(blueprints.len(), 1);
+        assert_eq!(blocking.len(), 2);
+        assert!(matches!(
+            &blocking[0],
+            Blocking::NewErrors { blueprint, .. } if *blueprint == bid(2)
+        ));
+        assert_eq!(
+            blocking[1],
+            Blocking::ParentFailed {
+                blueprint: bid(3),
+                parent: bid(2)
+            }
+        );
     }
 
     #[test]
