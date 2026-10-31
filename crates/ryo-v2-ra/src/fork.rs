@@ -1,9 +1,7 @@
 //! Forks: apply edits in place on the session, diagnose, revert.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{
-    RawError, collect_errors_par, filter_baseline, sorted_keys, to_diagnostics,
-};
+use crate::diagnostics::{collect_errors_par, panic_message};
 use crate::rev_deps::scoped_files;
 use crate::session::RaSession;
 use ra_ap_base_db::salsa::Durability;
@@ -13,8 +11,10 @@ use ra_ap_ide::AnalysisHost;
 use ra_ap_vfs::file_set::FileSet;
 use ra_ap_vfs::{AbsPathBuf, FileExcluded, FileId, VfsPath};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
-use ryo_v2_core::domain::{Diagnostics, Edit, RelPath, Scope};
-use std::collections::{HashMap, HashSet};
+use ryo_v2_core::domain::baseline::{restrict, same_findings};
+use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
+use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use triomphe::Arc as TriArc;
 
@@ -22,7 +22,7 @@ use triomphe::Arc as TriArc;
 pub struct RaFork {
     applied: bool,
     apply_started_ms: u64,
-    /// (file, path, text on disk)
+    /// (file, path, text in the database before the edit)
     modified: Vec<(FileId, RelPath, String)>,
     created: Vec<(FileId, RelPath)>,
     deleted: Vec<(FileId, RelPath, String)>,
@@ -37,7 +37,32 @@ fn edit_err(path: &RelPath, reason: impl Into<String>) -> AnalyzerError {
     }
 }
 
+/// Runs a database write; a panic poisons the session (the database may be half-updated) and
+/// comes back as `Panicked`.
+fn guarded<T>(poisoned: &mut Option<String>, f: impl FnOnce() -> T) -> Result<T, AnalyzerError> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|p| {
+        let msg = panic_message(p);
+        *poisoned = Some(msg.clone());
+        AnalyzerError::Panicked(msg)
+    })
+}
+
+/// The text of `id` as the database holds it now. `Files::file_text` panics on an unknown id,
+/// so this is wrapped.
+fn db_text(host: &AnalysisHost, id: FileId) -> Result<String, AnalyzerError> {
+    catch_unwind(AssertUnwindSafe(|| {
+        let db = host.raw_database();
+        db.file_text(id).text(db).to_string()
+    }))
+    .map_err(|p| AnalyzerError::Panicked(panic_message(p)))
+}
+
 pub(crate) fn fork(session: &mut RaSession) -> Result<RaFork, AnalyzerError> {
+    if let Some(msg) = &session.poisoned {
+        return Err(AnalyzerError::Panicked(format!(
+            "session poisoned by an earlier panic: {msg}"
+        )));
+    }
     if session.live_fork {
         return Err(AnalyzerError::ForkInUse);
     }
@@ -66,20 +91,21 @@ pub(crate) fn apply(
 
     // Resolve every path first, so a rejected edit leaves the session untouched.
     // A path not in the workspace is Created; `new_text == None` is Deleted.
+    // Base texts come from the database, before any change is applied.
     let by_rel: HashMap<&RelPath, FileId> = session.files.iter().map(|(id, r)| (r, *id)).collect();
     let mut modified: Vec<(FileId, RelPath, String, String)> = Vec::new(); // id, path, base, new
     let mut created: Vec<(RelPath, String)> = Vec::new();
     let mut deleted: Vec<(FileId, RelPath, String)> = Vec::new();
-    let read_base = |rel: &RelPath| {
-        std::fs::read_to_string(session.root.join(rel.as_str()))
-            .map_err(|e| edit_err(rel, format!("read base text: {e}")))
-    };
     for edit in edits {
         match (by_rel.get(&edit.path), &edit.new_text) {
             (Some(&id), Some(new)) => {
-                modified.push((id, edit.path.clone(), read_base(&edit.path)?, new.clone()));
+                let base = db_text(&session.host, id)?;
+                modified.push((id, edit.path.clone(), base, new.clone()));
             }
-            (Some(&id), None) => deleted.push((id, edit.path.clone(), read_base(&edit.path)?)),
+            (Some(&id), None) => {
+                let base = db_text(&session.host, id)?;
+                deleted.push((id, edit.path.clone(), base));
+            }
             (None, Some(new)) => {
                 if session.root.join(edit.path.as_str()).exists() {
                     return Err(edit_err(
@@ -110,7 +136,7 @@ pub(crate) fn apply(
         let id = add_created_file(session, fork, rel, text)?;
         created_texts.push((id, text.clone()));
     }
-    remove_deleted_files(session, fork);
+    remove_deleted_files(session, fork)?;
 
     // Scope: edited crates + dependents. Deleted files cannot be diagnosed (off the root).
     let mut edited: Vec<&RelPath> = fork.modified.iter().map(|(_, r, _)| r).collect();
@@ -124,7 +150,7 @@ pub(crate) fn apply(
         .collect();
     new_texts.extend(created_texts.into_iter().map(|(id, t)| (id, Some(t))));
     new_texts.extend(fork.deleted.iter().map(|(id, _, _)| (*id, None)));
-    apply_texts(&mut session.host, &new_texts);
+    apply_texts(&mut session.host, &mut session.poisoned, &new_texts)?;
     fork.applied = true;
     Ok(())
 }
@@ -134,9 +160,9 @@ pub(crate) fn diagnostics(
     session: &RaSession,
     fork: &RaFork,
     scope: Scope,
-) -> Result<Diagnostics, AnalyzerError> {
+) -> Result<ScopedFindings, AnalyzerError> {
     if !fork.applied {
-        return Ok(Diagnostics::default());
+        return Ok(ScopedFindings::default());
     }
     let base_scope = match scope {
         Scope::Affected => &fork.full_scope,
@@ -148,20 +174,17 @@ pub(crate) fn diagnostics(
         .cloned()
         .collect();
     diag_scope.extend(fork.created.iter().cloned());
-    let scoped_baseline = filter_baseline(&session.baseline, &diag_scope);
-    let known: HashSet<_> = scoped_baseline.iter().map(RawError::key).collect();
 
-    let errors = collect_errors_par(&session.host, &diag_scope, session.threads)?;
-    let new_errors: Vec<RawError> = errors
-        .into_iter()
-        .filter(|e| !known.contains(&e.key()))
-        .collect();
+    let findings = collect_errors_par(&session.host, &diag_scope, session.threads)?;
+    let mut files: Vec<RelPath> = diag_scope.iter().map(|(_, r)| r.clone()).collect();
+    files.sort();
+    files.dedup();
     a.observer.observe(Event::Checked {
         scope_files: diag_scope.len(),
         total_files: session.files.len(),
         check_ms: a.clock.now_ms().saturating_sub(fork.apply_started_ms),
     });
-    Ok(to_diagnostics(&new_errors))
+    Ok(ScopedFindings { files, findings })
 }
 
 pub(crate) fn discard(
@@ -194,10 +217,10 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
             .map(|(id, _, base)| (*id, Some(base.clone()))),
     );
     if !base_texts.is_empty() {
-        apply_texts(&mut session.host, &base_texts);
+        apply_texts(&mut session.host, &mut session.poisoned, &base_texts)?;
     }
     if !fork.saved_roots.is_empty() {
-        restore_roots(session, fork);
+        restore_roots(session, fork)?;
     }
     let revert_ok = if session.assert_revert && fork.applied {
         // Created files are off the root after the revert; deleted ones are back.
@@ -207,9 +230,10 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
             .filter(|(id, _)| !fork.created.iter().any(|(cid, _)| cid == id))
             .cloned()
             .collect();
-        let want = sorted_keys(&filter_baseline(&session.baseline, &assert_scope));
+        let paths: Vec<RelPath> = assert_scope.iter().map(|(_, r)| r.clone()).collect();
+        let want = restrict(&session.baseline, &paths);
         let after = collect_errors_par(&session.host, &assert_scope, session.threads)?;
-        Some(sorted_keys(&after) == want)
+        Some(same_findings(&after, &want))
     } else {
         None
     };
@@ -254,13 +278,19 @@ fn add_created_file(
     session
         .vfs
         .set_file_contents(vfs_path.clone(), Some(text.as_bytes().to_vec()));
-    let (file_id, excluded) = session
-        .vfs
-        .file_id(&vfs_path)
-        .ok_or_else(|| edit_err(rel, "vfs did not assign a FileId"))?;
-    if matches!(excluded, FileExcluded::Yes) {
-        return Err(edit_err(rel, "vfs excluded the created file"));
-    }
+    let file_id = match session.vfs.file_id(&vfs_path) {
+        Some((id, FileExcluded::No)) => id,
+        other => {
+            // Leave no vfs entry behind.
+            session.vfs.set_file_contents(vfs_path, None);
+            let reason = if other.is_some() {
+                "vfs excluded the created file"
+            } else {
+                "vfs did not assign a FileId"
+            };
+            return Err(edit_err(rel, reason));
+        }
+    };
 
     // Copy the source root with the new file added (without it `mod x;` does not resolve).
     let db = session.host.raw_database_mut();
@@ -276,19 +306,23 @@ fn add_created_file(
         }
     }
     file_set.insert(file_id, vfs_path);
-    db.set_source_root_with_durability(
-        root_id,
-        TriArc::new(SourceRoot::new_local(file_set)),
-        Durability::LOW,
-    );
-    db.set_file_source_root_with_durability(file_id, root_id, Durability::LOW);
+    guarded(&mut session.poisoned, || {
+        db.set_source_root_with_durability(
+            root_id,
+            TriArc::new(SourceRoot::new_local(file_set)),
+            Durability::LOW,
+        );
+    })?;
+    guarded(&mut session.poisoned, || {
+        db.set_file_source_root_with_durability(file_id, root_id, Durability::LOW);
+    })?;
     fork.created.push((file_id, rel.clone()));
     Ok(file_id)
 }
 
 /// Removes deleted files from their source roots. The vfs is not touched: the file still exists
 /// on disk, so restoring its text is enough to revert.
-fn remove_deleted_files(session: &mut RaSession, fork: &mut RaFork) {
+fn remove_deleted_files(session: &mut RaSession, fork: &mut RaFork) -> Result<(), AnalyzerError> {
     let db = session.host.raw_database_mut();
     for (file_id, _, _) in &fork.deleted {
         let root_id = db.file_source_root(*file_id).source_root_id(db);
@@ -305,32 +339,44 @@ fn remove_deleted_files(session: &mut RaSession, fork: &mut RaFork) {
                 file_set.insert(f, p.clone());
             }
         }
-        db.set_source_root_with_durability(
-            root_id,
-            TriArc::new(SourceRoot::new_local(file_set)),
-            Durability::LOW,
-        );
+        guarded(&mut session.poisoned, || {
+            db.set_source_root_with_durability(
+                root_id,
+                TriArc::new(SourceRoot::new_local(file_set)),
+                Durability::LOW,
+            );
+        })?;
     }
+    Ok(())
 }
 
 /// Reverts created files: restores the original source roots and drops them from the vfs.
 /// (A path created again gets the same FileId back from the vfs.)
-fn restore_roots(session: &mut RaSession, fork: &RaFork) {
+fn restore_roots(session: &mut RaSession, fork: &RaFork) -> Result<(), AnalyzerError> {
     let db = session.host.raw_database_mut();
     for (root_id, root) in &fork.saved_roots {
-        db.set_source_root_with_durability(*root_id, root.clone(), Durability::LOW);
+        guarded(&mut session.poisoned, || {
+            db.set_source_root_with_durability(*root_id, root.clone(), Durability::LOW);
+        })?;
     }
     for (_, rel) in &fork.created {
         let abs = AbsPathBuf::assert_utf8(session.root.join(rel.as_str()));
         session.vfs.set_file_contents(VfsPath::from(abs), None);
     }
+    Ok(())
 }
 
-/// Applies texts; `None` removes the file (Deleted / Created revert).
-fn apply_texts(host: &mut AnalysisHost, texts: &[(FileId, Option<String>)]) {
+/// Applies texts; `None` removes the file (Deleted / Created revert). A panic poisons the session.
+fn apply_texts(
+    host: &mut AnalysisHost,
+    poisoned: &mut Option<String>,
+    texts: &[(FileId, Option<String>)],
+) -> Result<(), AnalyzerError> {
     let mut change = ChangeWithProcMacros::default();
     for (file_id, text) in texts {
         change.change_file(*file_id, text.clone());
     }
-    host.apply_change(change);
+    guarded(poisoned, || {
+        host.apply_change(change);
+    })
 }

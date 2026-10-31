@@ -1,10 +1,11 @@
 //! The verify use case.
 
 use crate::app::ports::{Analyzer, AnalyzerError};
-use crate::domain::{Diagnostics, Edit, Scope, Verdict};
+use crate::domain::{Diagnostics, Edit, Scope, ScopedFindings, Verdict};
 
 /// fork → apply → diagnostics → discard。discard は apply / diagnostics が Err でも必ず呼ぶ。
 /// 返す Err の優先: apply の Err > diagnostics の Err > discard の Err。edits が空なら analyzer を呼ばず passed。
+/// 成功時の Verdict は、scope 内の全 Error と baseline の差 (`domain::baseline`) から作る。
 pub fn verify<A: Analyzer>(
     analyzer: &A,
     session: &mut A::Session,
@@ -22,21 +23,27 @@ pub fn verify<A: Analyzer>(
     };
     let discarded = analyzer.discard(session, fork);
     applied?;
-    let diags = checked.unwrap_or_else(|| Ok(Diagnostics::default()))?;
+    let checked = checked.unwrap_or_else(|| Ok(ScopedFindings::default()))?;
     discarded?;
-    Ok(Verdict::from_diagnostics(diags))
+    // The baseline is load-time state; taken after discard.
+    Ok(Verdict::from_baseline(
+        &analyzer.baseline(session),
+        &checked,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Diagnostic, ErrorCode, RelPath};
+    use crate::domain::{Diagnostic, ErrorCode, Finding, FindingCode, RelPath};
     use std::cell::Cell;
     use std::path::Path;
 
     struct Fake {
         fail_apply: bool,
-        errors: Vec<Diagnostic>,
+        baseline: Vec<Finding>,
+        files: Vec<RelPath>,
+        findings: Vec<Finding>,
         discards: Cell<u32>,
     }
 
@@ -46,8 +53,8 @@ mod tests {
         fn load(&self, _: &Path) -> Result<(), AnalyzerError> {
             Ok(())
         }
-        fn baseline(&self, _: &()) -> Diagnostics {
-            Diagnostics::default()
+        fn baseline(&self, _: &()) -> Vec<Finding> {
+            self.baseline.clone()
         }
         fn fork(&self, _: &mut ()) -> Result<(), AnalyzerError> {
             Ok(())
@@ -59,10 +66,10 @@ mod tests {
                 Ok(())
             }
         }
-        fn diagnostics(&self, _: &(), _: &(), _: Scope) -> Result<Diagnostics, AnalyzerError> {
-            Ok(Diagnostics {
-                errors: self.errors.clone(),
-                unmapped: vec![],
+        fn diagnostics(&self, _: &(), _: &(), _: Scope) -> Result<ScopedFindings, AnalyzerError> {
+            Ok(ScopedFindings {
+                files: self.files.clone(),
+                findings: self.findings.clone(),
             })
         }
         fn discard(&self, _: &mut (), _: ()) -> Result<(), AnalyzerError> {
@@ -75,13 +82,28 @@ mod tests {
         vec![Edit::write(RelPath::parse("a.rs").unwrap(), "x")]
     }
 
+    fn finding(code: &str, msg: &str, line: u32) -> Finding {
+        Finding {
+            code: FindingCode::Rustc(ErrorCode::parse(code).unwrap()),
+            message: msg.to_owned(),
+            path: RelPath::parse("a.rs").unwrap(),
+            line,
+        }
+    }
+
+    fn fake(fail_apply: bool, baseline: Vec<Finding>, findings: Vec<Finding>) -> Fake {
+        Fake {
+            fail_apply,
+            baseline,
+            files: vec![RelPath::parse("a.rs").unwrap()],
+            findings,
+            discards: Cell::new(0),
+        }
+    }
+
     #[test]
     fn verify_discards_fork_when_apply_fails() {
-        let a = Fake {
-            fail_apply: true,
-            errors: vec![],
-            discards: Cell::new(0),
-        };
+        let a = fake(true, vec![], vec![]);
         let r = verify(&a, &mut (), &edit(), Scope::Affected);
         assert!(matches!(r, Err(AnalyzerError::Cancelled)));
         assert_eq!(a.discards.get(), 1);
@@ -89,23 +111,42 @@ mod tests {
 
     #[test]
     fn verify_fails_on_new_error() {
-        let d = Diagnostic {
-            code: ErrorCode::parse("E0599").unwrap(),
-            path: RelPath::parse("a.rs").unwrap(),
-            line: 3,
-        };
-        let a = Fake {
-            fail_apply: false,
-            errors: vec![d.clone()],
-            discards: Cell::new(0),
-        };
+        let f = finding("E0599", "m", 3);
+        let a = fake(false, vec![], vec![f]);
         let v = verify(&a, &mut (), &edit(), Scope::Affected).unwrap();
-        assert!(!v.passed);
-        assert_eq!(v.new_errors.errors, vec![d]);
+        assert!(!v.passed());
+        assert_eq!(
+            v.new_errors.errors,
+            vec![Diagnostic {
+                code: ErrorCode::parse("E0599").unwrap(),
+                path: RelPath::parse("a.rs").unwrap(),
+                line: 3,
+            }]
+        );
         assert_eq!(a.discards.get(), 1);
         // no edits: analyzer untouched, passed
         let v = verify(&a, &mut (), &[], Scope::Affected).unwrap();
-        assert!(v.passed);
+        assert!(v.passed());
         assert_eq!(a.discards.get(), 1);
+    }
+
+    #[test]
+    fn verify_subtracts_a_baseline_with_errors() {
+        let a = fake(
+            false,
+            vec![finding("E0599", "m", 3)],
+            vec![finding("E0599", "m", 5), finding("E0308", "t", 7)],
+        );
+        let v = verify(&a, &mut (), &edit(), Scope::Affected).unwrap();
+        assert!(!v.passed());
+        assert_eq!(
+            v.new_errors.errors,
+            vec![Diagnostic {
+                code: ErrorCode::parse("E0308").unwrap(),
+                path: RelPath::parse("a.rs").unwrap(),
+                line: 7,
+            }]
+        );
+        assert!(v.new_errors.unmapped.is_empty());
     }
 }

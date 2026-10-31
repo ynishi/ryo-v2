@@ -147,7 +147,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     }
                 }
                 let (label, verdict) = match result {
-                    Ok(v) => (if v.passed { "PASS" } else { "FAIL" }, Some(v)),
+                    Ok(v) => (if v.passed() { "PASS" } else { "FAIL" }, Some(v)),
                     Err(AnalyzerError::RevertMismatch) => ("REVERT-MISMATCH", None),
                     Err(e) => return Err(e.into()),
                 };

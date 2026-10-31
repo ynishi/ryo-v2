@@ -3,7 +3,7 @@
 
 use ryo_v2_core::app::ports::{Analyzer, Event};
 use ryo_v2_core::app::verify::verify;
-use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
+use ryo_v2_core::domain::{Edit, FindingCode, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
@@ -66,7 +66,7 @@ fn broken01_detected_and_valid_passes() {
         &mut s,
         &[corpus_edit("broken-01", "lib/src/lib.rs")],
     );
-    assert!(!v.passed, "broken-01 must FAIL");
+    assert!(!v.passed(), "broken-01 must FAIL");
     assert!(
         v.new_errors
             .errors
@@ -86,7 +86,7 @@ fn broken01_detected_and_valid_passes() {
             corpus_edit("valid-02", "user/src/lib.rs"),
         ],
     );
-    assert!(v.passed, "valid-02 must PASS, got {:?}", v.new_errors);
+    assert!(v.passed(), "valid-02 must PASS, got {:?}", v.new_errors);
 
     // Created (新規 module file) — valid: 親に mod 宣言 + 新 file、PASS 期待
     let base_lib =
@@ -105,7 +105,11 @@ fn broken01_detected_and_valid_passes() {
             ),
         ],
     );
-    assert!(v.passed, "created-valid must PASS, got {:?}", v.new_errors);
+    assert!(
+        v.passed(),
+        "created-valid must PASS, got {:?}",
+        v.new_errors
+    );
 
     // Created — broken: 新 file が存在しないメソッドを呼ぶ → FAIL 期待
     let v = check(
@@ -120,7 +124,7 @@ fn broken01_detected_and_valid_passes() {
             ),
         ],
     );
-    assert!(!v.passed, "created-broken must FAIL");
+    assert!(!v.passed(), "created-broken must FAIL");
     assert!(
         v.new_errors
             .errors
@@ -137,7 +141,7 @@ fn broken01_detected_and_valid_passes() {
         &mut s,
         &[corpus_edit("broken-01", "lib/src/lib.rs")],
     );
-    assert!(!v.passed);
+    assert!(!v.passed());
 }
 
 /// Deleted 軸。base = corpus/created-broken-disk (probe module に E0599 が 1 件 baseline)。
@@ -148,7 +152,10 @@ fn deleted_file_detection() {
     let mut s = a.load(&base).expect("load fixture");
     let baseline = a.baseline(&s);
     assert_eq!(
-        baseline.errors.len(),
+        baseline
+            .iter()
+            .filter(|f| matches!(f.code, FindingCode::Rustc(_)))
+            .count(),
         1,
         "fixture baseline = probe module の E0599 1 件, got {baseline:?}"
     );
@@ -160,7 +167,7 @@ fn deleted_file_detection() {
         &mut s,
         &[Edit::delete(rel("lib/src/hircheck_probe_mod.rs"))],
     );
-    assert!(!v.passed, "dangling mod decl must FAIL");
+    assert!(!v.passed(), "dangling mod decl must FAIL");
     let at_lib_rs = v
         .new_errors
         .errors
@@ -188,7 +195,7 @@ fn deleted_file_detection() {
         ],
     );
     assert!(
-        v.passed,
+        v.passed(),
         "completed deletion must PASS, got {:?}",
         v.new_errors
     );
@@ -203,5 +210,5 @@ fn deleted_file_detection() {
             format!("{base_lib}\npub fn extra_probe() -> u32 {{ 1 }}\n"),
         )],
     );
-    assert!(v.passed, "got {:?}", v.new_errors);
+    assert!(v.passed(), "got {:?}", v.new_errors);
 }

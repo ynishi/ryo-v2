@@ -1,6 +1,6 @@
 //! Diagnostics as the oracle compares them.
 
-use super::{ErrorCode, RelPath};
+use super::{ErrorCode, Finding, FindingCode, RelPath};
 
 /// oracle が比べる単位: E-code + workspace 相対 path + 1 始まりの行。列と message は持たない。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,6 +34,28 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
+    /// Rustc codes go to `errors`, Analyzer codes to `unmapped` (message dropped); both sorted.
+    pub fn from_findings(findings: &[Finding]) -> Self {
+        let mut out = Self::default();
+        for f in findings {
+            match &f.code {
+                FindingCode::Rustc(code) => out.errors.push(Diagnostic {
+                    code: code.clone(),
+                    path: f.path.clone(),
+                    line: f.line,
+                }),
+                FindingCode::Analyzer(ra_code) => out.unmapped.push(UnmappedDiagnostic {
+                    ra_code: ra_code.clone(),
+                    path: f.path.clone(),
+                    line: f.line,
+                }),
+            }
+        }
+        out.errors.sort();
+        out.unmapped.sort();
+        out
+    }
+
     /// errors と unmapped が両方空。
     pub fn is_empty(&self) -> bool {
         self.errors.is_empty() && self.unmapped.is_empty()

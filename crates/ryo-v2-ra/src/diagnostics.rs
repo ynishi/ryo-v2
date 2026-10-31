@@ -1,48 +1,25 @@
-//! Error diagnostics out of rust-analyzer, normalised to rustc E-codes.
+//! Error diagnostics out of rust-analyzer, as domain [`Finding`]s.
 
+use ra_ap_hir::PrefixKind;
 use ra_ap_ide::{
-    Analysis, AnalysisHost, AssistResolveStrategy, DiagnosticCode, DiagnosticsConfig, Severity,
+    Analysis, AnalysisHost, AssistResolveStrategy, DiagnosticCode, DiagnosticsConfig,
+    ExprFillDefaultMode, Severity,
 };
+use ra_ap_ide_db::SnippetCap;
+use ra_ap_ide_db::imports::insert_use::{ImportGranularity, InsertUseConfig};
 use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::AnalyzerError;
-use ryo_v2_core::domain::{Diagnostic, Diagnostics, ErrorCode, RelPath, UnmappedDiagnostic};
-use std::collections::HashSet;
+use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// `Ok` = a rustc E-code; `Err` = the rust-analyzer specific code name.
-pub(crate) type Classified = Result<ErrorCode, String>;
-
-/// One Error diagnostic, before the baseline difference.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RawError {
-    pub(crate) code: Classified,
-    pub(crate) message: String,
-    pub(crate) rel: RelPath,
-    pub(crate) line: u32,
-}
-
-/// Baseline-difference key: line is deliberately not part of it, so an edit that shifts a
-/// pre-existing error to another line does not make it "new".
-pub(crate) type Key = (String, String, RelPath);
-
-impl RawError {
-    pub(crate) fn key(&self) -> Key {
-        let code = match &self.code {
-            Ok(c) => c.as_str().to_owned(),
-            Err(s) => s.clone(),
-        };
-        (code, self.message.clone(), self.rel.clone())
-    }
-}
-
 /// Maps a rust-analyzer code to an E-code where it is one.
-pub(crate) fn classify(code: &DiagnosticCode) -> Classified {
+pub(crate) fn classify(code: &DiagnosticCode) -> FindingCode {
     if let DiagnosticCode::RustcHardError(s) = code
         && let Ok(c) = ErrorCode::parse(s)
     {
-        return Ok(c);
+        return FindingCode::Rustc(c);
     }
-    Err(code.as_str().to_owned())
+    FindingCode::Analyzer(code.as_str().to_owned())
 }
 
 /// Text of a caught panic payload.
@@ -56,12 +33,55 @@ pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// The diagnostics configuration, spelled out field by field. The values equal 0.0.358's
+/// `DiagnosticsConfig::test_sample()` (which the measured oracle counts were taken with); a test
+/// pins that. Spelling them out keeps a test helper out of production code.
+pub(crate) fn diagnostics_config() -> DiagnosticsConfig {
+    DiagnosticsConfig {
+        // Diagnostics on.
+        enabled: true,
+        // No handler in 0.0.358 reads this; whether ra expands proc macros is decided at load
+        // by `ProcMacroServerChoice`.
+        proc_macros_enabled: false,
+        // Same: no handler reads it; attribute proc macros are decided by load-cargo.
+        proc_attr_macros_enabled: false,
+        // Keep experimental diagnostics: the measured oracle counts were taken with them.
+        disable_experimental: false,
+        // No diagnostic is switched off by name.
+        disabled: Default::default(),
+        // Only shapes fixes, which are not resolved (`AssistResolveStrategy::None`).
+        expr_fill_default: ExprFillDefaultMode::Todo,
+        // Style lints are warnings; they are filtered out by severity anyway.
+        style_lints: true,
+        // Only shapes fixes.
+        snippet_cap: SnippetCap::new(true),
+        // Only shapes fixes (import insertion style).
+        insert_use: InsertUseConfig {
+            granularity: ImportGranularity::Item,
+            enforce_granularity: false,
+            prefix_kind: PrefixKind::Plain,
+            group: false,
+            skip_glob_imports: false,
+        },
+        // Only shapes fixes.
+        prefer_no_std: false,
+        // Only shapes fixes.
+        prefer_prelude: true,
+        // Only shapes fixes.
+        prefer_absolute: false,
+        // Only shapes fixes (term search budget).
+        term_search_fuel: 400,
+        // Only shapes fixes (rename conflicts).
+        show_rename_conflicts: true,
+    }
+}
+
 /// Error diagnostics of the files, sorted.
 fn collect_errors(
     analysis: &Analysis,
     files: &[(FileId, RelPath)],
-) -> Result<Vec<RawError>, AnalyzerError> {
-    let diag_config = DiagnosticsConfig::test_sample();
+) -> Result<Vec<Finding>, AnalyzerError> {
+    let diag_config = diagnostics_config();
     let mut errors = Vec::new();
     for (file_id, rel) in files {
         let got = catch_unwind(AssertUnwindSafe(|| {
@@ -75,10 +95,10 @@ fn collect_errors(
         let (diags, index) = got.map_err(|()| AnalyzerError::Cancelled)?;
         for d in diags {
             if d.severity == Severity::Error {
-                errors.push(RawError {
+                errors.push(Finding {
                     code: classify(&d.code),
                     message: d.message,
-                    rel: rel.clone(),
+                    path: rel.clone(),
                     line: index.line_col(d.range.range.start()).line + 1,
                 });
             }
@@ -93,7 +113,7 @@ pub(crate) fn collect_errors_par(
     host: &AnalysisHost,
     files: &[(FileId, RelPath)],
     threads: usize,
-) -> Result<Vec<RawError>, AnalyzerError> {
+) -> Result<Vec<Finding>, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
         return collect_errors(&host.analysis(), files);
     }
@@ -119,45 +139,6 @@ pub(crate) fn collect_errors_par(
     Ok(errors)
 }
 
-/// The baseline entries that belong to files in `scope`.
-pub(crate) fn filter_baseline(baseline: &[RawError], scope: &[(FileId, RelPath)]) -> Vec<RawError> {
-    let rels: HashSet<&RelPath> = scope.iter().map(|(_, r)| r).collect();
-    baseline
-        .iter()
-        .filter(|e| rels.contains(&e.rel))
-        .cloned()
-        .collect()
-}
-
-/// Sorted keys, for comparing two error sets ignoring lines.
-pub(crate) fn sorted_keys(errors: &[RawError]) -> Vec<Key> {
-    let mut keys: Vec<Key> = errors.iter().map(RawError::key).collect();
-    keys.sort();
-    keys
-}
-
-/// Converts to the domain's sorted [`Diagnostics`].
-pub(crate) fn to_diagnostics<'a>(errors: impl IntoIterator<Item = &'a RawError>) -> Diagnostics {
-    let mut out = Diagnostics::default();
-    for e in errors {
-        match &e.code {
-            Ok(code) => out.errors.push(Diagnostic {
-                code: code.clone(),
-                path: e.rel.clone(),
-                line: e.line,
-            }),
-            Err(ra_code) => out.unmapped.push(UnmappedDiagnostic {
-                ra_code: ra_code.clone(),
-                path: e.rel.clone(),
-                line: e.line,
-            }),
-        }
-    }
-    out.errors.sort();
-    out.unmapped.sort();
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,19 +146,30 @@ mod tests {
     #[test]
     fn classify_maps_rustc_hard_error() {
         let got = classify(&DiagnosticCode::RustcHardError("E0599"));
-        assert_eq!(got, Ok(ErrorCode::parse("E0599").unwrap()));
+        assert_eq!(got, FindingCode::Rustc(ErrorCode::parse("E0599").unwrap()));
     }
 
     #[test]
     fn classify_keeps_ra_codes_unmapped() {
         assert_eq!(
             classify(&DiagnosticCode::RustcHardError("typed-hole")),
-            Err("typed-hole".to_owned())
+            FindingCode::Analyzer("typed-hole".to_owned())
         );
-        assert!(classify(&DiagnosticCode::SyntaxError).is_err());
+        assert!(matches!(
+            classify(&DiagnosticCode::SyntaxError),
+            FindingCode::Analyzer(_)
+        ));
         assert_eq!(
             classify(&DiagnosticCode::Ra("bad-rtn", Severity::Error)),
-            Err("bad-rtn".to_owned())
+            FindingCode::Analyzer("bad-rtn".to_owned())
+        );
+    }
+
+    #[test]
+    fn diagnostics_config_equals_test_sample() {
+        assert_eq!(
+            format!("{:?}", diagnostics_config()),
+            format!("{:?}", DiagnosticsConfig::test_sample())
         );
     }
 }

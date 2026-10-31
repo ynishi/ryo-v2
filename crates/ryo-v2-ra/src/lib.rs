@@ -12,7 +12,7 @@ mod rev_deps;
 mod session;
 
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Clock, Observer};
-use ryo_v2_core::domain::{Diagnostics, Edit, Scope};
+use ryo_v2_core::domain::{Edit, Finding, Scope, ScopedFindings};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -66,8 +66,8 @@ impl Analyzer for RaAnalyzer {
         session::load(self, root)
     }
 
-    fn baseline(&self, session: &RaSession) -> Diagnostics {
-        diagnostics::to_diagnostics(&session.baseline)
+    fn baseline(&self, session: &RaSession) -> Vec<Finding> {
+        session.baseline.clone()
     }
 
     fn fork(&self, session: &mut RaSession) -> Result<RaFork, AnalyzerError> {
@@ -88,7 +88,7 @@ impl Analyzer for RaAnalyzer {
         session: &RaSession,
         fork: &RaFork,
         scope: Scope,
-    ) -> Result<Diagnostics, AnalyzerError> {
+    ) -> Result<ScopedFindings, AnalyzerError> {
         fork::diagnostics(self, session, fork, scope)
     }
 

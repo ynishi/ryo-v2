@@ -1,6 +1,6 @@
 //! Ports the use cases need from the outside world.
 
-use crate::domain::{Diagnostics, Edit, RelPath, Scope};
+use crate::domain::{Edit, Finding, RelPath, Scope, ScopedFindings};
 use std::path::Path;
 
 /// Failure of an [`Analyzer`] operation.
@@ -92,8 +92,9 @@ pub trait Analyzer {
     type Fork;
     /// workspace を load して baseline (load 時点の Error) まで取る。
     fn load(&self, root: &Path) -> Result<Self::Session, AnalyzerError>;
-    /// load 時点の Error (全 local file)。
-    fn baseline(&self, session: &Self::Session) -> Diagnostics;
+    /// Every Error at load (all local files), message included. How it is compared is
+    /// `domain::baseline`, not the adapter's business.
+    fn baseline(&self, session: &Self::Session) -> Vec<Finding>;
     /// 空の Fork を作る。既に生きた Fork があれば Err(ForkInUse)。
     fn fork(&self, session: &mut Self::Session) -> Result<Self::Fork, AnalyzerError>;
     /// 編集を session の in-memory state に適用する。1 Fork に 1 回だけ (2 回目は Err(AlreadyApplied))。
@@ -103,13 +104,14 @@ pub trait Analyzer {
         fork: &mut Self::Fork,
         edits: &[Edit],
     ) -> Result<(), AnalyzerError>;
-    /// scope 内の Error のうち baseline に無い物。apply 前なら空。
+    /// Every Error in the files of `scope` after the edits, message included, and the list of
+    /// those files. No baseline difference here. Before apply: `ScopedFindings::default()`.
     fn diagnostics(
         &self,
         session: &Self::Session,
         fork: &Self::Fork,
         scope: Scope,
-    ) -> Result<Diagnostics, AnalyzerError>;
+    ) -> Result<ScopedFindings, AnalyzerError>;
     /// 適用を巻き戻して Fork を捨てる。assert_revert 有効時、巻き戻し後の診断が baseline と違えば Err(RevertMismatch)。
     fn discard(&self, session: &mut Self::Session, fork: Self::Fork) -> Result<(), AnalyzerError>;
 }

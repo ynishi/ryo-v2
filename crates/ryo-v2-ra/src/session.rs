@@ -1,14 +1,14 @@
 //! Loading a workspace into a session.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{RawError, collect_errors_par, panic_message};
+use crate::diagnostics::{collect_errors_par, panic_message};
 use crate::rev_deps::{RevDeps, build_rev_deps};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{FileId, Vfs};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
-use ryo_v2_core::domain::RelPath;
+use ryo_v2_core::domain::{Finding, RelPath};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
@@ -21,7 +21,11 @@ pub struct RaSession {
     pub(crate) files: Vec<(FileId, RelPath)>,
     pub(crate) root: PathBuf,
     pub(crate) rev_deps: RevDeps,
-    pub(crate) baseline: Vec<RawError>,
+    /// Every Error at load.
+    pub(crate) baseline: Vec<Finding>,
+    /// Set when a panic inside the database may have left it half-updated; the session is
+    /// then not reused (`fork` refuses). `None` at load.
+    pub(crate) poisoned: Option<String>,
     pub(crate) threads: usize,
     pub(crate) assert_revert: bool,
     pub(crate) live_fork: bool,
@@ -106,6 +110,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         root,
         rev_deps,
         baseline,
+        poisoned: None,
         threads,
         assert_revert: a.config.assert_revert,
         live_fork: false,
