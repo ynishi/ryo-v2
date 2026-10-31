@@ -16,8 +16,8 @@
 - `just check` is green. [CONTRIBUTING.md](CONTRIBUTING.md#verification) says
   what it covers.
 - Review a change locally before it goes up — by a person or an AI agent — and
-  say in the hand-over (PR body, or the note the maintainer merges from) who or
-  what reviewed it.
+  record who or what reviewed it: a GitHub review or the PR body, or, with a
+  local merge, the hand-over note and the merge commit's `Reviewed:` line.
   [CONTRIBUTING.md](CONTRIBUTING.md#working-with-coding-agents--the-recommended-pattern)
   lists the questions a review answers.
 - Development flow ([CONTRIBUTING.md](CONTRIBUTING.md#development-flow)): one worktree and

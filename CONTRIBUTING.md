@@ -162,9 +162,21 @@ whichever you have. Questions worth asking of every diff:
 7. For each decision the change makes, which test or ceiling guards it, and
    would it fail if the decision were broken?
 
-Say in the hand-over — the PR body, or the note the maintainer merges from (see
-[Development flow](#development-flow)) — who or what reviewed it, or that nobody
-did.
+Record who or what reviewed it, or that nobody did, where the change reaches
+`main`:
+
+- With a pull request, a GitHub review on it is the record, and the PR body
+  says who or what reviewed it when no such review was made.
+- With a local merge ([Development flow](#development-flow)), the hand-over
+  note says it, and the merge commit carries it in its body:
+
+  ```text
+  Reviewed: <who or what reviewed it, or "nobody">
+  Verified: <the recipes actually run, and their outcome>
+  ```
+
+A merge commit without these lines records a merge nobody can tell was
+reviewed.
 
 Releases and publishes (crates, the repository's own settings) are performed by
 a human hand.
