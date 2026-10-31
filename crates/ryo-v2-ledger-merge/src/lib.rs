@@ -189,7 +189,11 @@ fn merge_blocks(base: &[Block], ours: &[Block], theirs: &[Block], out: &mut Out)
             // A block both sides insert that the alignment does not pair (the two put it in a
             // different order around the shared ones) would be taken from each side and written
             // twice, so then the two insertions are one conflict.
-            Chunk::Conflict { base, ours, theirs } if base.is_empty() => {
+            Chunk::Conflict {
+                base: [],
+                ours,
+                theirs,
+            } => {
                 let common = shared(ours, theirs);
                 if common.is_empty() || unpaired_in_both(ours, theirs) {
                     out.conflict(&flat(ours), &flat(theirs));
