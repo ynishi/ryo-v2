@@ -37,6 +37,10 @@ and this project adheres to
 
 ### Changed
 
+- `search-recall run` reports the time of its outer `cargo check` apart (`outer_check_ms`,
+  `search_ms` in the JSON report), and its trigger 4 line follows decision D4 as restated in
+  `SEARCH_LEDGER.md`: the run without its outer check is compared with the limit, and a run with a
+  budget beyond the default (`--exhaustive`, a wider beam) is not measured.
 - The oracle prints the contained detector and expander panics and fails when there is any.
 - A candidate's risk marks and Rule are derived by the domain from its Blueprints and the roles of
   the files they edit; `Candidate`, `Evidence` and decision-log entries can no longer be built
