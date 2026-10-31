@@ -263,6 +263,8 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
         revert_ok,
     });
     if revert_ok == Some(false) {
+        session.poisoned =
+            Some("diagnostics after revert differ from the baseline (re-assert)".to_owned());
         return Err(AnalyzerError::RevertMismatch);
     }
     Ok(())

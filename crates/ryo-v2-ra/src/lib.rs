@@ -109,6 +109,12 @@ impl RaAnalyzer {
     }
 }
 
+/// The adapter's `Analyzer`.
+///
+/// # Contract
+/// - C1: a `discard` whose re-assert differs from the baseline is `RevertMismatch` and poisons
+///   the session; a later `fork` is refused.
+///   tested: tests/verifier.rs discard_reassert_mismatch_poisons_the_session
 impl Analyzer for RaAnalyzer {
     type Session = RaSession;
     type Fork = RaFork;

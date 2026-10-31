@@ -99,6 +99,9 @@ impl Verifier for RaAnalyzer {
     ///   the text fingerprints still compared, and the session stays usable. The limit is
     ///   looked at before each file, so one slow file can overrun it.
     ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
+    /// - C4: a diagnostic re-assert that differs from the baseline is `RevertMismatch` and
+    ///   poisons the session; the next call is `Poisoned`.
+    ///   tested: tests/verifier.rs reassert_mismatch_poisons_the_session
     fn check(
         &self,
         s: &mut RaSession,

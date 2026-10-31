@@ -1,6 +1,6 @@
 //! `Verifier` for `RaAnalyzer`, on throwaway workspaces (the corpus is never touched).
 
-use ryo_v2_core::app::ports::{Analyzer, CheckError, Event, Verifier};
+use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, Event, Verifier};
 use ryo_v2_core::domain::{Edit, ErrorCode, FindingCode, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -183,4 +183,73 @@ fn cfg_test_config_diagnoses_test_module() {
         "cfg(test) code is cfg-disabled by default"
     );
     assert!(has_e0425(true), "set_test enables cfg(test) code");
+}
+
+const UNRESOLVED_LIB: &str =
+    "pub struct S;\npub fn g(s: S) {\n    s.missing();\n}\npub fn f(_x: Missing) {}\n";
+
+/// An analyzer with the revert assert on; `fault` makes the detector panic on `src/lib.rs`, so a
+/// re-assert under it lacks the detector finding that the baseline has.
+fn assert_analyzer(fault: bool) -> RaAnalyzer {
+    let a = RaAnalyzer::new(
+        RaConfig {
+            proc_macro: false,
+            threads: Some(1),
+            assert_revert: true,
+            unresolved_paths: true,
+            assert_revert_every: None,
+            cfg_test: false,
+        },
+        Arc::new(MonotonicClock::new()),
+        Arc::new(RecordingObserver::default()),
+    );
+    a.with_detector_fault(fault.then(|| rel("src/lib.rs")))
+}
+
+#[test]
+fn reassert_mismatch_poisons_the_session() {
+    let f = Fixture::single("verifier_reassert_poison", UNRESOLVED_LIB);
+    let healthy = assert_analyzer(false);
+    let faulty = assert_analyzer(true);
+    let mut s = healthy.load(&f.dir).expect("load fixture");
+    let e0425 = FindingCode::Rustc(ErrorCode::parse("E0425").unwrap());
+    assert!(
+        Verifier::baseline(&healthy, &s)
+            .iter()
+            .any(|x| x.code == e0425),
+        "the baseline holds the detector finding"
+    );
+    let edit = Edit::write(
+        rel("src/lib.rs"),
+        format!("{UNRESOLVED_LIB}pub fn h() {{}}\n"),
+    );
+    let first = faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected);
+    assert!(
+        matches!(first, Err(CheckError::RevertMismatch { .. })),
+        "{first:?}"
+    );
+    let second = healthy.check(&mut s, &[edit], Scope::Affected);
+    assert!(matches!(second, Err(CheckError::Poisoned(_))), "{second:?}");
+}
+
+#[test]
+fn discard_reassert_mismatch_poisons_the_session() {
+    let f = Fixture::single("verifier_discard_poison", UNRESOLVED_LIB);
+    let healthy = assert_analyzer(false);
+    let faulty = assert_analyzer(true);
+    let mut s = healthy.load(&f.dir).expect("load fixture");
+    let mut fork = Analyzer::fork(&faulty, &mut s).expect("fork");
+    let edit = Edit::write(
+        rel("src/lib.rs"),
+        format!("{UNRESOLVED_LIB}pub fn h() {{}}\n"),
+    );
+    Analyzer::apply(&faulty, &mut s, &mut fork, &[edit]).expect("apply");
+    Analyzer::diagnostics(&faulty, &s, &fork, Scope::Affected).expect("diagnostics");
+    let discarded = Analyzer::discard(&faulty, &mut s, fork);
+    assert!(
+        matches!(discarded, Err(AnalyzerError::RevertMismatch)),
+        "{discarded:?}"
+    );
+    let next = Analyzer::fork(&healthy, &mut s);
+    assert!(next.is_err(), "a poisoned session must refuse a fork");
 }
