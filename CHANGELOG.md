@@ -44,3 +44,13 @@ and this project adheres to
 - The crate `ryo-v2-cli` is renamed `ryo-v2-host` (`cargo run -p ryo-v2-host`): it is the binary
   that hosts the engine, and the command line is one front of it. The `ryo-v2` binary, its
   subcommands and its output are unchanged.
+- Cargo manifests: `missing_docs` is set once in `[workspace.lints]`, inherited by every member;
+  the workspace states `rust-version = "1.98"` and drops the deprecated `authors`; each publishable
+  crate (`ryo-v2`, `ryo-v2-core`, `ryo-v2-ra`, `ryo-v2-host`) has its own `documentation` URL,
+  `keywords` and `categories`, and the core's `description` says what the core is.
+- Published packages of those crates contain `src/`, the manifest, `README.md` and both licence
+  files (`LICENSE-MIT`, `LICENSE-APACHE`), and no longer `tests/`, which need the corpus and the
+  workspace root to run. `crates/ryo-v2-core/tests/manifest.rs` keeps these manifest rules.
+- `just rust-clippy` denies warnings through Cargo's `build.warnings` (`CARGO_BUILD_WARNINGS=deny`)
+  instead of `-- -D warnings`, which invalidated the build cache; `just rust-test` runs with
+  `--locked`.
