@@ -77,13 +77,24 @@ fn read(ws: &Ws, path: &str, range: (usize, usize)) -> Value {
     serde_json::from_slice(&out.stdout).expect("fingerprint line")
 }
 
+/// A `bases` entry from the `fingerprint` subcommand without a range (the disk at call time).
+fn base(ws: &Ws, path: &str) -> Value {
+    let out = ryo(&["fingerprint", ws.dir.to_str().unwrap(), path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("fingerprint line")
+}
+
 fn replace(path: &str, range: (usize, usize), text: &str) -> Value {
     json!({"op": "replace", "path": path, "start": range.0, "end": range.1, "text": text})
 }
 
-fn blueprint(intent: Value, specs: Vec<Value>, reads: Vec<Value>) -> Value {
+fn blueprint(intent: Value, specs: Vec<Value>, reads: Vec<Value>, bases: Vec<Value>) -> Value {
     json!({"blueprints": [{
-        "intent": intent, "specs": specs, "reads": reads,
+        "intent": intent, "specs": specs, "reads": reads, "bases": bases,
         "record": {"proposer": "test", "rationale": "test"},
     }]})
 }
@@ -135,6 +146,7 @@ fn rename_acc(ws: &Ws) -> Value {
         json!({"kind": "rename-local", "from": "acc", "to": "sum"}),
         specs,
         vec![read(ws, "src/lib.rs", total)],
+        vec![base(ws, "src/lib.rs")],
     )
 }
 
@@ -183,6 +195,7 @@ fn apply_breaking_rename_is_failed_new_errors() {
         json!({"kind": "rename-local", "from": "twice", "to": "thrice"}),
         vec![replace("src/lib.rs", name, "thrice")],
         vec![read(&ws, "src/lib.rs", def)],
+        vec![base(&ws, "src/lib.rs")],
     );
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(2), "{err}\n{out}");
@@ -204,13 +217,52 @@ fn apply_breaking_rename_is_failed_new_errors() {
 fn apply_after_disk_change_is_failed_stale() {
     let ws = Ws::new("apply_stale", &[]);
     let bp = rename_acc(&ws);
-    // One byte inside the read range changes (same length).
+    // One byte inside the read range changes (same length): the base drifted, and the read of
+    // an edited file is covered by its base, so no read is listed.
     ws.write("src/lib.rs", &LIB.replacen("= 0;", "= 1;", 1));
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(2), "{err}\n{out}");
     assert_eq!(out["blocking"][0]["kind"], "stale", "{out}");
     assert_eq!(
-        out["blocking"][0]["reads"][0]["freshness"], "stale",
+        out["blocking"][0]["bases"][0]["path"], "src/lib.rs",
+        "{out}"
+    );
+    assert_eq!(
+        out["blocking"][0]["bases"][0]["freshness"], "stale",
+        "{out}"
+    );
+    assert!(
+        out["blocking"][0]["reads"].as_array().unwrap().is_empty(),
+        "{out}"
+    );
+}
+
+#[test]
+fn apply_after_insert_above_is_failed_stale() {
+    let ws = Ws::new("apply_insert_above", &[]);
+    // The read covers exactly the line `    let mut acc = 0;\n`; the spec renames its `acc`.
+    let line = "    let mut acc = 0;\n";
+    let line_at = at(LIB, line, 0, 0, line.len());
+    let bp = blueprint(
+        json!({"kind": "rename-local", "from": "acc", "to": "sum"}),
+        vec![replace("src/lib.rs", at(LIB, "acc", 0, 0, 3), "sum")],
+        vec![read(&ws, "src/lib.rs", line_at)],
+        vec![base(&ws, "src/lib.rs")],
+    );
+    // An identical copy of the line goes directly above it: the bytes at the read's old offsets
+    // are unchanged, but everything after them has moved.
+    let moved = format!("{}{line}{}", &LIB[..line_at.0], &LIB[line_at.0..]);
+    assert_eq!(&moved[line_at.0..line_at.1], line, "the bug is exercised");
+    ws.write("src/lib.rs", &moved);
+    let (code, out, err) = apply(&ws, &bp, None);
+    assert_eq!(code, Some(2), "{err}\n{out}");
+    assert_eq!(out["blocking"][0]["kind"], "stale", "{out}");
+    assert_eq!(
+        out["blocking"][0]["bases"][0]["path"], "src/lib.rs",
+        "{out}"
+    );
+    assert_eq!(
+        out["blocking"][0]["bases"][0]["freshness"], "stale",
         "{out}"
     );
 }
@@ -224,6 +276,7 @@ fn apply_cargo_toml_edit_is_unverifiable() {
         json!({"kind": "rename-local", "from": "probe", "to": "probe2"}),
         vec![replace("Cargo.toml", name, "probe2")],
         vec![read(&ws, "Cargo.toml", name)],
+        vec![base(&ws, "Cargo.toml")],
     );
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(2), "{err}\n{out}");
@@ -242,6 +295,7 @@ fn apply_build_rs_edit_needs_outer_check() {
             replace("build.rs", at(build, "= x;", 0, 2, 1), "y"),
         ],
         vec![read(&ws, "build.rs", (0, build.len()))],
+        vec![base(&ws, "build.rs")],
     );
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(0), "{err}\n{out}");
@@ -268,6 +322,7 @@ fn apply_extract_variable_needs_review_behaviour() {
             replace("src/lib.rs", at(LIB, "(3)", 0, 1, 1), "n"),
         ],
         vec![read(&ws, "src/lib.rs", uses)],
+        vec![base(&ws, "src/lib.rs")],
     );
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(0), "{err}\n{out}");
@@ -297,5 +352,18 @@ fn fingerprint_prints_shared_vector() {
     assert_eq!(
         line.trim(),
         r#"{"path":"src/lib.rs","start":0,"end":5,"fingerprint":"fnv1a64:c4f954ac18a041ff"}"#
+    );
+}
+
+#[test]
+fn fingerprint_without_range_is_whole_file() {
+    let ws = Ws::new("fingerprint_whole", &[]);
+    ws.write("src/lib.rs", "a = 1");
+    let out = ryo(&["fingerprint", ws.dir.to_str().unwrap(), "src/lib.rs"]);
+    assert!(out.status.success());
+    let line = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        line.trim(),
+        r#"{"path":"src/lib.rs","fingerprint":"fnv1a64:c4f954ac18a041ff"}"#
     );
 }

@@ -6,7 +6,7 @@ use crate::rules_json::parse_rules;
 use anyhow::{Context, Result};
 use ryo_v2_core::app::apply::apply_blueprints;
 use ryo_v2_core::app::ports::Analyzer;
-use ryo_v2_core::domain::{ReadRange, RelPath, RuleCatalog, Scope, TextRange};
+use ryo_v2_core::domain::{BaseFp, ReadRange, RelPath, RuleCatalog, Scope, TextRange};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig};
@@ -71,27 +71,51 @@ pub(crate) fn run_apply(args: &ApplyArgs) -> Result<ExitCode> {
 #[derive(Serialize)]
 struct FingerprintLine {
     path: String,
-    start: u32,
-    end: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<u32>,
     fingerprint: String,
 }
 
-/// Prints the `reads` entry for `range` of `<workspace>/<path>`, read from the disk.
+/// Prints the `reads` entry for `range` of `<workspace>/<path>`, read from the disk; without a
+/// range, the `bases` entry for the whole file.
+///
+/// # Contract
+/// - C1: with a range it prints `{path, start, end, fingerprint}` of those bytes; without one it
+///   prints `{path, fingerprint}` of the whole file, the value `Fingerprint::of` gives for the
+///   file's text.
+///   tested: tests/apply.rs fingerprint_prints_shared_vector
+///   tested: tests/apply.rs fingerprint_without_range_is_whole_file
 pub(crate) fn run_fingerprint(
     workspace: &std::path::Path,
     path: &str,
-    range: TextRange,
+    range: Option<TextRange>,
 ) -> Result<ExitCode> {
     let rel = RelPath::parse(path).map_err(|e| anyhow::anyhow!("path: {e}"))?;
     let file = workspace.join(rel.as_str());
     let text =
         std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-    let read = ReadRange::capture(rel, &text, range).map_err(|e| anyhow::anyhow!("range: {e}"))?;
-    let line = FingerprintLine {
-        path: read.path().to_string(),
-        start: read.range().start(),
-        end: read.range().end(),
-        fingerprint: read.fingerprint().to_string(),
+    let line = match range {
+        Some(range) => {
+            let read =
+                ReadRange::capture(rel, &text, range).map_err(|e| anyhow::anyhow!("range: {e}"))?;
+            FingerprintLine {
+                path: read.path().to_string(),
+                start: Some(read.range().start()),
+                end: Some(read.range().end()),
+                fingerprint: read.fingerprint().to_string(),
+            }
+        }
+        None => {
+            let base = BaseFp::capture(rel, &text);
+            FingerprintLine {
+                path: base.path().to_string(),
+                start: None,
+                end: None,
+                fingerprint: base.fingerprint().to_string(),
+            }
+        }
     };
     println!("{}", serde_json::to_string(&line)?);
     Ok(ExitCode::SUCCESS)

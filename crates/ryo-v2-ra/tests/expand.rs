@@ -194,6 +194,15 @@ fn every_expansion_conforms() {
         for r in b.reads() {
             assert_eq!(r.check(&texts[r.path()]), Freshness::Fresh);
         }
+        assert!(!b.bases().is_empty(), "{}", b.intent());
+        let edited: std::collections::BTreeSet<&RelPath> =
+            b.specs().iter().map(|sp| sp.path()).collect();
+        let based: Vec<&RelPath> = b.bases().iter().map(|x| x.path()).collect();
+        assert_eq!(based.len(), edited.len(), "{}", b.intent());
+        for bf in b.bases() {
+            assert!(edited.contains(bf.path()), "{}", b.intent());
+            assert_eq!(bf.check(&texts[bf.path()]), Freshness::Fresh);
+        }
         assert_eq!(b.record().proposer(), "ryo-v2-ra/expand");
     }
 }
@@ -278,6 +287,25 @@ fn expansion_reads_the_given_state() {
         });
         if in_extra {
             on_new_code += 1;
+        }
+        assert!(!b.bases().is_empty(), "{}", b.intent());
+        let edited: std::collections::BTreeSet<&RelPath> =
+            b.specs().iter().map(|sp| sp.path()).collect();
+        assert_eq!(b.bases().len(), edited.len(), "{}", b.intent());
+        for bf in b.bases() {
+            assert!(edited.contains(bf.path()), "{}", b.intent());
+            if bf.path() == &shapes_path() {
+                assert_eq!(bf.check(&state_text), Freshness::Fresh, "{}", b.intent());
+                // the loaded text is not the given state
+                assert_ne!(
+                    bf.check(&texts[&shapes_path()]),
+                    Freshness::Fresh,
+                    "{}",
+                    b.intent()
+                );
+            } else {
+                assert_eq!(bf.check(&texts[bf.path()]), Freshness::Fresh);
+            }
         }
         let base: BTreeMap<RelPath, String> = b
             .specs()

@@ -837,10 +837,10 @@ mod tests {
     use super::*;
     use crate::app::ports::{FileFacts, Verifier};
     use crate::domain::{
-        CleanDelta, Criterion, DEFAULT_BUDGET, DEFAULT_WEIGHTS, DecisionRecord, DeriveName,
-        Disposition, ErrorCode, Finding, FindingCode, Ident, IntentCall, Judgement, MutationSpec,
-        Provenance, ReadRange, ReviewReason, ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings,
-        SpecRef, TextRange,
+        BaseFp, BlueprintParts, CleanDelta, Criterion, DEFAULT_BUDGET, DEFAULT_WEIGHTS,
+        DecisionRecord, DeriveName, Disposition, ErrorCode, Finding, FindingCode, Ident,
+        IntentCall, Judgement, MutationSpec, Provenance, ReadRange, ReviewReason, ReviewRecord,
+        RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
     use std::sync::Arc;
@@ -878,14 +878,15 @@ mod tests {
     }
     fn make(n: u16, intent: IntentCall, specs: Vec<MutationSpec>, text: &str) -> Blueprint {
         let end = u32::try_from(text.len()).unwrap();
-        Blueprint::new(
-            bid(n),
+        Blueprint::new(BlueprintParts {
+            id: bid(n),
             intent,
             specs,
-            vec![ReadRange::capture(rel(LIB), text, tr(0, end)).unwrap()],
-            vec![SpecRef::parse("spec#t").unwrap()],
-            DecisionRecord::new("agent", "why").unwrap(),
-        )
+            reads: vec![ReadRange::capture(rel(LIB), text, tr(0, end)).unwrap()],
+            bases: vec![BaseFp::capture(rel(LIB), text)],
+            spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
+            record: DecisionRecord::new("agent", "why").unwrap(),
+        })
         .unwrap()
     }
     /// Renames the first `from` of `text` to `to`; the read is the whole `text`.
@@ -1557,17 +1558,18 @@ mod tests {
         fx.v.texts.insert(rel("build.rs"), BASE.to_owned());
         fx.v.build_scripts.insert(rel("build.rs"));
         // The parent renames in the build script, the child in an ordinary source file.
-        let parent = Blueprint::new(
-            bid(1),
-            IntentCall::RenameLocal {
+        let parent = Blueprint::new(BlueprintParts {
+            id: bid(1),
+            intent: IntentCall::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            vec![MutationSpec::replace(rel("build.rs"), tr(4, 5), "b").unwrap()],
-            vec![ReadRange::capture(rel("build.rs"), BASE, tr(0, 10)).unwrap()],
-            vec![SpecRef::parse("spec#t").unwrap()],
-            DecisionRecord::new("agent", "why").unwrap(),
-        )
+            specs: vec![MutationSpec::replace(rel("build.rs"), tr(4, 5), "b").unwrap()],
+            reads: vec![ReadRange::capture(rel("build.rs"), BASE, tr(0, 10)).unwrap()],
+            bases: vec![BaseFp::capture(rel("build.rs"), BASE)],
+            spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
+            record: DecisionRecord::new("agent", "why").unwrap(),
+        })
         .unwrap();
         fx.e.set(root_state(), vec![parent]);
         fx.e.set(

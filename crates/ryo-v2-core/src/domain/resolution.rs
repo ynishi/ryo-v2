@@ -9,9 +9,9 @@
 //! hands them over.
 
 use super::{
-    Blueprint, BlueprintId, DomainError, Edit, FileRole, Fingerprint, Freshness, IntentKind,
-    NonEmpty, Nonconformance, ReadRange, RelPath, RiskMark, Rule, RuleCatalog, RuleId, Scope,
-    SpliceError, Verdict,
+    BaseFp, Blueprint, BlueprintId, DomainError, Edit, FileRole, Fingerprint, Freshness,
+    IntentKind, NonEmpty, Nonconformance, ReadRange, RelPath, RiskMark, Rule, RuleCatalog, RuleId,
+    Scope, SpliceError, Verdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -323,11 +323,14 @@ pub enum Blocking {
         /// Its role.
         role: FileRole,
     },
-    /// Something the Blueprint read has changed. Lists every read that is not fresh.
+    /// Something the Blueprint rests on has changed: lists every base fingerprint and every
+    /// read (of a file without a base) that is not fresh.
     Stale {
         /// The Blueprint.
         blueprint: BlueprintId,
-        /// The reads and their state.
+        /// The base fingerprints that are not fresh, with their state.
+        bases: Vec<(BaseFp, Freshness)>,
+        /// The reads of files without a base that are not fresh, with their state.
         reads: Vec<(ReadRange, Freshness)>,
     },
     /// A file the Blueprint reads or edits is not in the workspace.
@@ -394,9 +397,16 @@ impl std::fmt::Display for Blocking {
                 path,
                 role,
             } => write!(f, "{blueprint}: {path} ({role}) cannot be verified"),
-            Blocking::Stale { blueprint, reads } => {
-                write!(f, "{blueprint}: {} read(s) are stale", reads.len())
-            }
+            Blocking::Stale {
+                blueprint,
+                bases,
+                reads,
+            } => write!(
+                f,
+                "{blueprint}: {} base(s) and {} read(s) are stale",
+                bases.len(),
+                reads.len()
+            ),
             Blocking::MissingFile { blueprint, path } => {
                 write!(f, "{blueprint}: {path} is not in the workspace")
             }
@@ -769,7 +779,9 @@ impl Evidence {
         self.scope
     }
 
-    /// How many reads were compared with the current text.
+    /// How many base fingerprints and reads of files without a base were compared with the
+    /// current text. It used to count reads only; the count changed meaning when the base
+    /// fingerprint was introduced.
     pub fn fingerprints_checked(&self) -> usize {
         self.fingerprints_checked
     }
@@ -818,8 +830,8 @@ mod tests {
     use super::*;
     use crate::domain::DeriveName;
     use crate::domain::{
-        DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident, IntentCall, MutationSpec,
-        ReviewRecord, TextRange,
+        BlueprintParts, DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident, IntentCall,
+        MutationSpec, ReviewRecord, TextRange,
     };
 
     const ALL_MARKS: [RiskMark; 5] = [
@@ -879,14 +891,15 @@ mod tests {
     fn blueprint(n: u8, kind: IntentKind) -> Blueprint {
         let path = RelPath::parse("a.rs").unwrap();
         let range = TextRange::new(0, 1).unwrap();
-        Blueprint::new(
-            BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap(),
-            call(kind),
-            vec![MutationSpec::replace(path.clone(), range, "y").unwrap()],
-            vec![ReadRange::capture(path, "x", range).unwrap()],
-            vec![],
-            DecisionRecord::new("agent", "why").unwrap(),
-        )
+        Blueprint::new(BlueprintParts {
+            id: BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap(),
+            intent: call(kind),
+            specs: vec![MutationSpec::replace(path.clone(), range, "y").unwrap()],
+            reads: vec![ReadRange::capture(path.clone(), "x", range).unwrap()],
+            bases: vec![BaseFp::capture(path, "x")],
+            spec_refs: vec![],
+            record: DecisionRecord::new("agent", "why").unwrap(),
+        })
         .unwrap()
     }
     fn path_of(kinds: &[IntentKind]) -> NonEmpty<Blueprint> {

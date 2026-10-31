@@ -1,11 +1,12 @@
 //! A Blueprint: one proposed change, with what it read and why.
 //!
 //! A Blueprint is never trusted as written. It cannot be built with a spec outside what it
-//! read, or with two specs on the same bytes; the intent check, freshness and the analyzer run
-//! later, in `app::apply`.
+//! read, with a spec in a file that has no [`BaseFp`], or with two specs on the same bytes; the
+//! intent check, freshness and the analyzer run later, in `app::apply`.
 
 use super::{
-    BlueprintId, DomainError, IntentCall, MutationSpec, NonEmpty, ReadRange, RelPath, TextRange,
+    BaseFp, BlueprintId, DomainError, IntentCall, MutationSpec, NonEmpty, ReadRange, RelPath,
+    TextRange,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -120,6 +121,15 @@ pub enum BlueprintError {
         /// Higher index.
         b: usize,
     },
+    /// Spec number `spec` is in a file without a base fingerprint.
+    #[error("spec {spec} is in a file without a base fingerprint")]
+    NoBase {
+        /// Index of the spec.
+        spec: usize,
+    },
+    /// Two base fingerprints name one path.
+    #[error("two base fingerprints name {0}")]
+    DuplicateBase(RelPath),
     /// Two reads have the same path and range.
     #[error("two reads have the same path and range")]
     DuplicateRead,
@@ -131,6 +141,25 @@ pub enum BlueprintError {
     DuplicateId(BlueprintId),
 }
 
+/// The parts of a Blueprint before they are checked against each other.
+#[derive(Debug, Clone)]
+pub struct BlueprintParts {
+    /// The id.
+    pub id: BlueprintId,
+    /// The intent and its arguments.
+    pub intent: IntentCall,
+    /// The mutations.
+    pub specs: Vec<MutationSpec>,
+    /// What was read.
+    pub reads: Vec<ReadRange>,
+    /// The fingerprint of the whole base text of each file.
+    pub bases: Vec<BaseFp>,
+    /// The specifications answered to.
+    pub spec_refs: Vec<SpecRef>,
+    /// Who proposed it and why.
+    pub record: DecisionRecord,
+}
+
 /// One proposed change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blueprint {
@@ -138,6 +167,7 @@ pub struct Blueprint {
     intent: IntentCall,
     specs: NonEmpty<MutationSpec>,
     reads: Vec<ReadRange>,
+    bases: Vec<BaseFp>,
     spec_refs: Vec<SpecRef>,
     record: DecisionRecord,
 }
@@ -147,26 +177,45 @@ impl Blueprint {
     ///
     /// # Contract
     /// - C1: no specs gives `NoSpecs`; then two reads of one path and range give
-    ///   `DuplicateRead`; then a spec not `contains`-ed by a read of its path gives
-    ///   `Uncovered` (an insert at `p` needs a read with `start <= p <= end`); then specs
-    ///   of one file that overlap give `Overlap` with the lowest indices.
+    ///   `DuplicateRead`; then two base fingerprints of one path give `DuplicateBase`; then a
+    ///   spec in a file without a base fingerprint gives `NoBase` with the lowest such index;
+    ///   then a spec not `contains`-ed by a read of its path gives `Uncovered` (an insert at
+    ///   `p` needs a read with `start <= p <= end`); then specs of one file that overlap give
+    ///   `Overlap` with the lowest indices.
     ///   tested: domain::blueprint::tests::uncovered_spec_rejected
+    ///   tested: domain::blueprint::tests::edited_file_needs_one_base
     /// - C2: overlapping specs of one file are refused; specs of different files never
     ///   overlap.
     ///   tested: domain::blueprint::tests::overlapping_specs_rejected
-    pub fn new(
-        id: BlueprintId,
-        intent: IntentCall,
-        specs: Vec<MutationSpec>,
-        reads: Vec<ReadRange>,
-        spec_refs: Vec<SpecRef>,
-        record: DecisionRecord,
-    ) -> Result<Self, BlueprintError> {
+    /// - C3: every file with a spec has exactly one base fingerprint; a base fingerprint of a
+    ///   file without a spec is allowed, and the bases are kept in path order.
+    ///   tested: domain::blueprint::tests::edited_file_needs_one_base
+    pub fn new(parts: BlueprintParts) -> Result<Self, BlueprintError> {
+        let BlueprintParts {
+            id,
+            intent,
+            specs,
+            reads,
+            mut bases,
+            spec_refs,
+            record,
+        } = parts;
         let specs = NonEmpty::new(specs).ok_or(BlueprintError::NoSpecs)?;
         let mut seen: BTreeSet<(&RelPath, TextRange)> = BTreeSet::new();
         for r in &reads {
             if !seen.insert((r.path(), r.range())) {
                 return Err(BlueprintError::DuplicateRead);
+            }
+        }
+        let mut base_paths: BTreeSet<&RelPath> = BTreeSet::new();
+        for b in &bases {
+            if !base_paths.insert(b.path()) {
+                return Err(BlueprintError::DuplicateBase(b.path().clone()));
+            }
+        }
+        for (i, s) in specs.iter().enumerate() {
+            if !base_paths.contains(s.path()) {
+                return Err(BlueprintError::NoBase { spec: i });
             }
         }
         for (i, s) in specs.iter().enumerate() {
@@ -185,11 +234,13 @@ impl Blueprint {
                 }
             }
         }
+        bases.sort_by(|x, y| x.path().cmp(y.path()));
         Ok(Self {
             id,
             intent,
             specs,
             reads,
+            bases,
             spec_refs,
             record,
         })
@@ -213,6 +264,11 @@ impl Blueprint {
     /// What was read.
     pub fn reads(&self) -> &[ReadRange] {
         &self.reads
+    }
+
+    /// The base fingerprints, in path order, one per path.
+    pub fn bases(&self) -> &[BaseFp] {
+        &self.bases
     }
 
     /// The specifications answered to.
@@ -297,19 +353,34 @@ mod tests {
             to: Ident::parse("b").unwrap(),
         }
     }
+    fn base(path: &str) -> BaseFp {
+        BaseFp::capture(rel(path), &"x".repeat(64))
+    }
+    /// Builds a Blueprint with one base per file that has a spec.
     fn make(
         id: BlueprintId,
         specs: Vec<MutationSpec>,
         reads: Vec<ReadRange>,
     ) -> Result<Blueprint, BlueprintError> {
-        Blueprint::new(
+        let paths: BTreeSet<&RelPath> = specs.iter().map(MutationSpec::path).collect();
+        let bases = paths.into_iter().map(|p| base(p.as_str())).collect();
+        make_with(id, specs, reads, bases)
+    }
+    fn make_with(
+        id: BlueprintId,
+        specs: Vec<MutationSpec>,
+        reads: Vec<ReadRange>,
+        bases: Vec<BaseFp>,
+    ) -> Result<Blueprint, BlueprintError> {
+        Blueprint::new(BlueprintParts {
             id,
-            call(),
+            intent: call(),
             specs,
             reads,
-            vec![SpecRef::parse("spec#1").unwrap()],
-            DecisionRecord::new("agent", "because").unwrap(),
-        )
+            bases,
+            spec_refs: vec![SpecRef::parse("spec#1").unwrap()],
+            record: DecisionRecord::new("agent", "because").unwrap(),
+        })
     }
     fn rep(path: &str, a: u32, b: u32) -> MutationSpec {
         MutationSpec::replace(rel(path), tr(a, b), "b").unwrap()
@@ -405,6 +476,67 @@ mod tests {
         assert_eq!(b.record().proposer(), "agent");
         assert_eq!(b.id(), bid(1));
         assert_eq!(b.intent(), &call());
+    }
+
+    #[test]
+    fn edited_file_needs_one_base() {
+        let specs = || vec![rep("a.rs", 0, 3), rep("b.rs", 0, 3)];
+        let reads = || vec![read("a.rs", 0, 10), read("b.rs", 0, 10)];
+        assert_eq!(
+            make_with(bid(1), specs(), reads(), vec![base("a.rs")]),
+            Err(BlueprintError::NoBase { spec: 1 })
+        );
+        assert_eq!(
+            make_with(bid(1), specs(), reads(), vec![base("b.rs")]),
+            Err(BlueprintError::NoBase { spec: 0 })
+        );
+        // both lack a base: the lowest spec index is reported
+        assert_eq!(
+            make_with(bid(1), specs(), reads(), vec![]),
+            Err(BlueprintError::NoBase { spec: 0 })
+        );
+        assert_eq!(
+            make_with(bid(1), specs(), reads(), vec![base("z.rs")]),
+            Err(BlueprintError::NoBase { spec: 0 })
+        );
+        assert_eq!(
+            make_with(
+                bid(1),
+                specs(),
+                reads(),
+                vec![base("a.rs"), base("b.rs"), base("a.rs")]
+            ),
+            Err(BlueprintError::DuplicateBase(rel("a.rs")))
+        );
+        // a base of a file that is only read is allowed; bases come back in path order
+        let ok = make_with(
+            bid(1),
+            specs(),
+            reads(),
+            vec![base("z.rs"), base("b.rs"), base("a.rs")],
+        )
+        .unwrap();
+        let paths: Vec<&str> = ok.bases().iter().map(|b| b.path().as_str()).collect();
+        assert_eq!(paths, vec!["a.rs", "b.rs", "z.rs"]);
+        // order of the checks
+        let dup_reads = || vec![read("a.rs", 0, 10), read("a.rs", 0, 10)];
+        assert_eq!(
+            make_with(
+                bid(1),
+                vec![rep("a.rs", 0, 3)],
+                dup_reads(),
+                vec![base("a.rs"), base("a.rs")]
+            ),
+            Err(BlueprintError::DuplicateRead)
+        );
+        assert_eq!(
+            make_with(bid(1), specs(), reads(), vec![base("a.rs"), base("a.rs")]),
+            Err(BlueprintError::DuplicateBase(rel("a.rs")))
+        );
+        assert_eq!(
+            make_with(bid(1), vec![rep("a.rs", 2, 3)], vec![], vec![]),
+            Err(BlueprintError::NoBase { spec: 0 })
+        );
     }
 
     #[test]

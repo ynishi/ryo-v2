@@ -335,7 +335,7 @@ impl Judgement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{BlueprintId, DecisionRecord, Ident, ReadRange};
+    use crate::domain::{BaseFp, BlueprintId, BlueprintParts, DecisionRecord, Ident, ReadRange};
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
@@ -348,17 +348,18 @@ mod tests {
     }
     fn bp(n: u8, to: &str) -> Blueprint {
         let read = ReadRange::capture(rel("a.rs"), "let a = a;", tr(0, 10)).unwrap();
-        Blueprint::new(
-            bid(n),
-            IntentCall::RenameLocal {
+        Blueprint::new(BlueprintParts {
+            id: bid(n),
+            intent: IntentCall::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse(to).unwrap(),
             },
-            vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), to).unwrap()],
-            vec![read],
-            vec![],
-            DecisionRecord::new("agent", "because").unwrap(),
-        )
+            specs: vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), to).unwrap()],
+            reads: vec![read],
+            bases: vec![BaseFp::capture(rel("a.rs"), "let a = a;")],
+            spec_refs: vec![],
+            record: DecisionRecord::new("agent", "because").unwrap(),
+        })
         .unwrap()
     }
     fn prop(n: u8, to: &str) -> Proposal {

@@ -2,7 +2,9 @@
 //!
 //! A Blueprint says where to edit as byte ranges against the text it read. A [`ReadRange`]
 //! remembers the fingerprint of those bytes, so a later change of the same bytes is noticed
-//! ([`Freshness::Stale`]) instead of being edited blindly.
+//! ([`Freshness::Stale`]) instead of being edited blindly. A [`BaseFp`] fingerprints the whole
+//! text of a file the Blueprint edits, so a change anywhere in it is noticed too, including one
+//! that moves the offsets of the specs while leaving the bytes of every read unchanged.
 
 use super::{DomainError, MutationSpec, RelPath};
 use std::collections::{BTreeMap, BTreeSet};
@@ -238,11 +240,14 @@ impl ReadRange {
         })
     }
 
-    /// Compares the remembered bytes with `current`, the current text of the same file.
+    /// Compares the remembered bytes with `current`, the current text of the same file. This is
+    /// the check for a file the Blueprint does not edit; a file it edits is checked by its
+    /// [`BaseFp`].
     ///
     /// # Contract
     /// - C1: `OutOfRange{len}` for an end past the length or off a char boundary, `Stale` when
-    ///   the bytes differ, `Fresh` otherwise; bytes outside the range never matter.
+    ///   the bytes differ, `Fresh` otherwise; bytes outside the range do not matter to this
+    ///   check (a file the Blueprint edits is covered by its `BaseFp`).
     ///   tested: domain::text::tests::read_range_is_stale_after_edit_inside
     pub fn check(&self, current: &str) -> Freshness {
         match slice_of(current, self.range) {
@@ -274,6 +279,62 @@ impl ReadRange {
     }
 
     /// The fingerprint of the bytes at capture time.
+    pub fn fingerprint(&self) -> Fingerprint {
+        self.fingerprint
+    }
+}
+
+/// The fingerprint of the whole base text of one file: the text a Blueprint's specs and read
+/// ranges in that file are offsets into.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BaseFp {
+    path: RelPath,
+    fingerprint: Fingerprint,
+}
+
+impl BaseFp {
+    /// A base fingerprint taken elsewhere (the parse boundary).
+    pub fn new(path: RelPath, fingerprint: Fingerprint) -> Self {
+        Self { path, fingerprint }
+    }
+
+    /// Fingerprints the whole of `text` as the base text of `path`.
+    ///
+    /// # Contract
+    /// - C1: the fingerprint is `Fingerprint::of` of the whole text, the same value as any
+    ///   whole-file `Fingerprint` of that text taken elsewhere.
+    ///   tested: domain::text::tests::base_fp_is_stale_after_change_anywhere
+    pub fn capture(path: RelPath, text: &str) -> Self {
+        Self {
+            path,
+            fingerprint: Fingerprint::of(text.as_bytes()),
+        }
+    }
+
+    /// Compares the whole base text with `current`, the current text of the same file.
+    ///
+    /// # Contract
+    /// - C1: `Fresh` if and only if the fingerprint of the whole of `current` equals the base's,
+    ///   otherwise `Stale{expected, actual}`; never `OutOfRange`.
+    ///   tested: domain::text::tests::base_fp_is_stale_after_change_anywhere
+    pub fn check(&self, current: &str) -> Freshness {
+        let actual = Fingerprint::of(current.as_bytes());
+        if actual == self.fingerprint {
+            Freshness::Fresh
+        } else {
+            Freshness::Stale {
+                expected: self.fingerprint,
+                actual,
+            }
+        }
+    }
+
+    /// The file.
+    pub fn path(&self) -> &RelPath {
+        &self.path
+    }
+
+    /// The fingerprint of the whole base text.
     pub fn fingerprint(&self) -> Fingerprint {
         self.fingerprint
     }
@@ -465,12 +526,46 @@ mod tests {
                 actual: Fingerprint::of(b"a = 2"),
             }
         );
+        // The read-only semantics: bytes outside the range do not matter. A file the blueprint
+        // edits is covered by its `BaseFp`.
         assert_eq!(r.check(&format!("{base} // more")), Freshness::Fresh);
         assert_eq!(r.check(&base[..15]), Freshness::OutOfRange { len: 15 });
+        // no relocation: the read's bytes are still in the text, once, at another offset
+        assert_eq!(
+            r.check(&format!("// x\n{base}")),
+            Freshness::Stale {
+                expected: Fingerprint::of(b"a = 1"),
+                actual: Fingerprint::of(b" let "),
+            }
+        );
         assert_eq!(
             r.check("é").to_string(),
             "out of range (text is 2 bytes)".to_owned()
         );
+    }
+
+    #[test]
+    fn base_fp_is_stale_after_change_anywhere() {
+        let base = "fn f() {\n    let a = 1;\n}\n";
+        let b = BaseFp::capture(rel("a.rs"), base);
+        assert_eq!(b.fingerprint(), Fingerprint::of(base.as_bytes()));
+        assert_eq!(b.path().as_str(), "a.rs");
+        assert_eq!(
+            b,
+            BaseFp::new(rel("a.rs"), Fingerprint::of(base.as_bytes()))
+        );
+        assert_eq!(b.check(base), Freshness::Fresh);
+        let stale = |t: &str| Freshness::Stale {
+            expected: Fingerprint::of(base.as_bytes()),
+            actual: Fingerprint::of(t.as_bytes()),
+        };
+        let appended = format!("{base} ");
+        assert_eq!(b.check(&appended), stale(&appended));
+        let far = base.replacen("fn f", "fn g", 1);
+        assert_eq!(b.check(&far), stale(&far));
+        let above = "fn f() {\n    let a = 1;\n    let a = 1;\n}\n";
+        assert_eq!(b.check(above), stale(above));
+        assert_eq!(b.check(""), stale(""));
     }
 
     #[test]
