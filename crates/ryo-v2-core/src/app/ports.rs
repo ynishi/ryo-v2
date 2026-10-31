@@ -1,8 +1,8 @@
 //! Ports the use cases need from the outside world.
 
 use crate::domain::{
-    Blueprint, ChangeProbe, Edit, Finding, JudgeRequest, Judgement, Provenance, RelPath, Scope,
-    ScopedFindings, StaticMetrics, Target,
+    Blocking, Blueprint, BlueprintId, ChangeProbe, CheckFailure, Edit, Finding, JudgeRequest,
+    Judgement, Provenance, RelPath, Scope, ScopedFindings, StaticMetrics, Target,
 };
 use std::path::Path;
 
@@ -71,6 +71,85 @@ pub enum CheckError {
         /// The limit that was hit, in milliseconds.
         limit_ms: u64,
     },
+    /// A fork was already live on the session when the check began.
+    #[error("a fork was already live on the session")]
+    ForkInUse,
+    /// The adapter applied edits twice to one fork.
+    #[error("edits were applied twice to one fork")]
+    AlreadyApplied,
+    /// The analyzer reported a load failure during a check.
+    #[error("load failed: {0}")]
+    Load(String),
+}
+
+/// How far a [`CheckError`] reaches.
+///
+/// The adapter reverts the edits and compares the text fingerprints of the edited files after
+/// every check, whatever its result, and a difference is `RevertMismatch`. So an `Edit`,
+/// `Cancelled` or `Panicked` that comes back says the session was restored and only this
+/// Blueprint's check did not finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckReach {
+    /// Only the Blueprint being checked: it is blocked, and the decision goes on.
+    Blueprint,
+    /// The session: the decision stops.
+    Session,
+}
+
+impl CheckError {
+    /// The reach of this failure.
+    ///
+    /// `RevertMismatch` and `Poisoned` are the poison of the session; `ForkInUse` and
+    /// `AlreadyApplied` mean the adapter's fork bookkeeping is broken; `Load` means the session
+    /// itself failed. None of these can be pinned on the Blueprint.
+    ///
+    /// # Contract
+    /// - C1: `Edit`, `Cancelled`, `Panicked` and `TimedOut` reach the Blueprint; `RevertMismatch`,
+    ///   `Poisoned`, `ForkInUse`, `AlreadyApplied` and `Load` reach the session. The match is
+    ///   exhaustive, so a new variant must be classified to compile.
+    ///   tested: app::ports::tests::check_error_reach_is_decided_per_variant
+    pub fn reach(&self) -> CheckReach {
+        match self {
+            CheckError::Edit { .. }
+            | CheckError::Cancelled
+            | CheckError::Panicked(_)
+            | CheckError::TimedOut { .. } => CheckReach::Blueprint,
+            CheckError::RevertMismatch { .. }
+            | CheckError::Poisoned(_)
+            | CheckError::ForkInUse
+            | CheckError::AlreadyApplied
+            | CheckError::Load(_) => CheckReach::Session,
+        }
+    }
+
+    /// The blocking of `blueprint` for a failure of reach `Blueprint`; the failure itself for
+    /// one of reach `Session`. `TimedOut` is `Blocking::BudgetExhausted`; `Edit`, `Cancelled`
+    /// and `Panicked` are `Blocking::CheckFailed`.
+    pub fn into_blocking(self, blueprint: BlueprintId) -> Result<Blocking, CheckError> {
+        match self {
+            CheckError::TimedOut { limit_ms } => Ok(Blocking::BudgetExhausted {
+                blueprint,
+                limit_ms,
+            }),
+            CheckError::Edit { path, reason } => Ok(Blocking::CheckFailed {
+                blueprint,
+                failure: CheckFailure::Edit { path, reason },
+            }),
+            CheckError::Cancelled => Ok(Blocking::CheckFailed {
+                blueprint,
+                failure: CheckFailure::Cancelled,
+            }),
+            CheckError::Panicked(m) => Ok(Blocking::CheckFailed {
+                blueprint,
+                failure: CheckFailure::Panicked(m),
+            }),
+            session @ (CheckError::RevertMismatch { .. }
+            | CheckError::Poisoned(_)
+            | CheckError::ForkInUse
+            | CheckError::AlreadyApplied
+            | CheckError::Load(_)) => Err(session),
+        }
+    }
 }
 
 fn join_paths(paths: &[RelPath]) -> String {
@@ -240,4 +319,79 @@ pub trait Analyzer {
     ) -> Result<ScopedFindings, AnalyzerError>;
     /// 適用を巻き戻して Fork を捨てる。assert_revert 有効時、巻き戻し後の診断が baseline と違えば Err(RevertMismatch)。
     fn discard(&self, session: &mut Self::Session, fork: Self::Fork) -> Result<(), AnalyzerError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rel(s: &str) -> RelPath {
+        RelPath::parse(s).unwrap()
+    }
+
+    #[test]
+    fn check_error_reach_is_decided_per_variant() {
+        let id = BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a80aa").unwrap();
+        let blueprint_reach = [
+            CheckError::Edit {
+                path: rel("src/a.rs"),
+                reason: "r".to_owned(),
+            },
+            CheckError::Cancelled,
+            CheckError::Panicked("p".to_owned()),
+            CheckError::TimedOut { limit_ms: 7 },
+        ];
+        for e in blueprint_reach {
+            assert_eq!(e.reach(), CheckReach::Blueprint, "{e:?}");
+            assert!(e.clone().into_blocking(id).is_ok(), "{e:?}");
+        }
+        let session_reach = [
+            CheckError::RevertMismatch {
+                paths: vec![rel("src/a.rs")],
+            },
+            CheckError::Poisoned("x".to_owned()),
+            CheckError::ForkInUse,
+            CheckError::AlreadyApplied,
+            CheckError::Load("l".to_owned()),
+        ];
+        for e in session_reach {
+            assert_eq!(e.reach(), CheckReach::Session, "{e:?}");
+            assert_eq!(e.clone().into_blocking(id), Err(e));
+        }
+        assert_eq!(
+            CheckError::TimedOut { limit_ms: 7 }.into_blocking(id),
+            Ok(Blocking::BudgetExhausted {
+                blueprint: id,
+                limit_ms: 7
+            })
+        );
+        assert_eq!(
+            CheckError::Edit {
+                path: rel("src/a.rs"),
+                reason: "r".to_owned()
+            }
+            .into_blocking(id),
+            Ok(Blocking::CheckFailed {
+                blueprint: id,
+                failure: CheckFailure::Edit {
+                    path: rel("src/a.rs"),
+                    reason: "r".to_owned()
+                }
+            })
+        );
+        assert_eq!(
+            CheckError::Cancelled.into_blocking(id),
+            Ok(Blocking::CheckFailed {
+                blueprint: id,
+                failure: CheckFailure::Cancelled
+            })
+        );
+        assert_eq!(
+            CheckError::Panicked("p".to_owned()).into_blocking(id),
+            Ok(Blocking::CheckFailed {
+                blueprint: id,
+                failure: CheckFailure::Panicked("p".to_owned())
+            })
+        );
+    }
 }

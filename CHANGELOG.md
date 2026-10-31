@@ -119,6 +119,19 @@ and this project adheres to
   `toolchain`.
 - The probe check of the search-recall end-to-end test loads every case under `corpus/search`,
   the gen-lab cases included.
+- A check failure of one Blueprint no longer stops the whole set or search: a failure that reaches
+  only that Blueprint (a rejected edit, a cancelled or panicking analysis, a cut-off check) blocks
+  it as `check_failed` (or `budget_exhausted`) and the others are still decided; a revert
+  mismatch, a poisoned session, a live fork, edits applied twice and a load failure still stop the
+  decision, each now with its own error instead of "session poisoned".
+- A `decided` resolution lists, under `blocking`, why each Blueprint that is not a candidate was
+  blocked.
+- An existing error whose message changed but whose code, file and line did not (a type renamed
+  in the message) is no longer a new error of the edit.
+- An error rust-analyzer reports inside a file a crate pulls in with `include!` is reported
+  against that file and line, and no longer hides a gap-detector error on the same line number of
+  the including file; a failed `use` exempts the name only inside its own scope, so a use of the
+  name elsewhere in the file is reported.
 - The expander proposes the restore of four planted shapes it dropped: an expression inside the
   initializer of a `let` (extract-variable read the new name from rust-analyzer's diff, which in
   front of another `let` holds the old statement's name), the value of a struct-literal field

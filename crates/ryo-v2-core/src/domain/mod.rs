@@ -50,9 +50,14 @@
 //!   includes: AutoApplicable, AfterOuterCheck, NeedsReview
 //! - Blocking: why a blueprint was not made a candidate.
 //!   includes: Unverifiable, Stale, MissingFile, Nonconforming, Splice, NewErrors, BudgetExhausted,
-//!   ParentFailed
+//!   CheckFailed, ParentFailed
 //! - CheckError: failure of a verifier check.
-//!   includes: Edit, Cancelled, Panicked, RevertMismatch, Poisoned, TimedOut
+//!   includes: Edit, Cancelled, Panicked, RevertMismatch, Poisoned, TimedOut, ForkInUse,
+//!   AlreadyApplied, Load
+//! - CheckReach: how far a check failure reaches: the one blueprint, or the session.
+//!   includes: Blueprint, Session
+//! - CheckFailure: why the check of a blueprint did not finish when the session survived it.
+//!   includes: Edit, Cancelled, Panicked
 //! - Verdict: the new errors relative to the baseline; passed if and only if there are none.
 //! - DecisionRecord: the proposer's identity and rationale, carried in the blueprint.
 //! - SpecRef: a reference `<doc>#<item>` to one item of a specification document.
@@ -141,9 +146,9 @@ pub use mutation::{MutationSpec, SpecKind};
 pub use non_empty::NonEmpty;
 pub use rel_path::RelPath;
 pub use resolution::{
-    Blocking, Candidate, DEFAULT_BUDGET, DecisionBudget, DecisionLog, Disposition, Evidence,
-    Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, OUTER_CHECK_MAX, OuterCheck, OuterCheckReason,
-    Provenance, Resolution, ReviewReason, SpecMismatch, Stage,
+    Blocking, Candidate, CheckFailure, DEFAULT_BUDGET, DecisionBudget, DecisionLog, Disposition,
+    Evidence, Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, OUTER_CHECK_MAX, OuterCheck,
+    OuterCheckReason, Provenance, Resolution, ReviewReason, SpecMismatch, Stage,
 };
 pub use rule::{ReviewRecord, Rule, RuleCatalog, RuleError};
 pub use scope::Scope;

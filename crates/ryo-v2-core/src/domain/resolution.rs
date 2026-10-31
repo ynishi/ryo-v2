@@ -329,6 +329,32 @@ impl Candidate {
     }
 }
 
+/// Why the check of a Blueprint did not finish, when the session survived it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckFailure {
+    /// An edit could not be applied.
+    Edit {
+        /// The offending file.
+        path: RelPath,
+        /// Why.
+        reason: String,
+    },
+    /// The check was cancelled.
+    Cancelled,
+    /// The analyzer panicked.
+    Panicked(String),
+}
+
+impl std::fmt::Display for CheckFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckFailure::Edit { path, reason } => write!(f, "edit rejected: {path}: {reason}"),
+            CheckFailure::Cancelled => write!(f, "check cancelled"),
+            CheckFailure::Panicked(m) => write!(f, "analyzer panicked: {m}"),
+        }
+    }
+}
+
 /// Why a Blueprint was not made a candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocking {
@@ -383,6 +409,13 @@ pub enum Blocking {
         /// The limit, in milliseconds.
         limit_ms: u64,
     },
+    /// The check of the Blueprint did not finish; the session survived it.
+    CheckFailed {
+        /// The Blueprint.
+        blueprint: BlueprintId,
+        /// What went wrong.
+        failure: CheckFailure,
+    },
     /// The Blueprint it builds on did not pass, so it was not checked.
     ParentFailed {
         /// The Blueprint.
@@ -396,8 +429,8 @@ impl Blocking {
     /// The Blueprint that was blocked.
     ///
     /// # Contract
-    /// - C1: every variant, `BudgetExhausted` and `ParentFailed` included, names the Blueprint it
-    ///   was made for.
+    /// - C1: every variant, `BudgetExhausted`, `CheckFailed` and `ParentFailed` included, names
+    ///   the Blueprint it was made for.
     ///   tested: domain::resolution::tests::budget_exhausted_names_its_blueprint
     pub fn blueprint(&self) -> BlueprintId {
         match self {
@@ -408,6 +441,7 @@ impl Blocking {
             | Blocking::Splice { blueprint, .. }
             | Blocking::NewErrors { blueprint, .. }
             | Blocking::BudgetExhausted { blueprint, .. }
+            | Blocking::CheckFailed { blueprint, .. }
             | Blocking::ParentFailed { blueprint, .. } => *blueprint,
         }
     }
@@ -454,6 +488,9 @@ impl std::fmt::Display for Blocking {
                 blueprint,
                 limit_ms,
             } => write!(f, "{blueprint}: check cut off after {limit_ms} ms"),
+            Blocking::CheckFailed { blueprint, failure } => {
+                write!(f, "{blueprint}: check did not finish: {failure}")
+            }
             Blocking::ParentFailed { blueprint, parent } => {
                 write!(f, "{blueprint}: builds on {parent}, which did not pass")
             }
@@ -873,6 +910,8 @@ pub enum Resolution {
     Decided {
         /// The candidates.
         blueprints: NonEmpty<Candidate>,
+        /// Why each Blueprint that is not a candidate was blocked, in the order they were decided.
+        blocking: Vec<Blocking>,
         /// How each Blueprint was decided.
         decision_log: DecisionLog,
         /// What it rested on.
@@ -1088,6 +1127,15 @@ mod tests {
         );
         let i = Infeasible::new(vec![b.clone()], vec![], false).unwrap();
         assert_eq!(i.blocking(), std::slice::from_ref(&b));
+        let cf = Blocking::CheckFailed {
+            blueprint: bid(),
+            failure: CheckFailure::Panicked("boom".to_owned()),
+        };
+        assert_eq!(cf.blueprint(), bid());
+        assert_eq!(
+            cf.to_string(),
+            format!("{}: check did not finish: analyzer panicked: boom", bid())
+        );
         // A child of a failed parent names the child, not the parent.
         let parent = BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a80ff").unwrap();
         let pf = Blocking::ParentFailed {

@@ -247,6 +247,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
     let baseline = collect_errors_par(
         &host,
         &files,
+        &files,
         threads,
         a.config.gap_detectors,
         None,

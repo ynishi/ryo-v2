@@ -406,3 +406,30 @@ fn a_file_whose_macros_expand_keeps_its_findings() {
     let got = p.errors_of(true, text);
     assert_eq!(detector_codes(&got), pairs(&[("E0425", 6)]), "got {got:?}");
 }
+
+#[test]
+fn a_use_in_a_child_module_does_not_exempt_the_parent() {
+    let p = Probe::new("child_use");
+    let text =
+        "mod inner { use missing_crate::Thing; pub fn a(_: Thing) {} }\npub fn b(_: Thing) {}\n";
+    let got = p.errors_of(true, text);
+    assert_eq!(detector_codes(&got), pairs(&[("E0425", 2)]), "got {got:?}");
+}
+
+#[test]
+fn a_use_in_a_block_exempts_only_that_block() {
+    let p = Probe::new("block_use");
+    let text =
+        "pub fn c() { use missing::Other; let _x: Option<Other> = None; }\npub fn d(_: Other) {}\n";
+    let got = p.errors_of(true, text);
+    assert_eq!(detector_codes(&got), pairs(&[("E0425", 2)]), "got {got:?}");
+}
+
+/// Unchanged by the per-use scopes: passes before and after.
+#[test]
+fn a_parent_use_still_reaches_a_child_with_use_super_glob() {
+    let p = Probe::new("super_glob");
+    let text = "use missing::Thing;\nmod child { use super::*; pub fn e(_: Thing) {} }\n";
+    let got = p.errors_of(true, text);
+    assert!(detector_codes(&got).is_empty(), "got {got:?}");
+}

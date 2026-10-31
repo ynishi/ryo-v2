@@ -150,7 +150,7 @@ struct Stats {
 }
 
 /// Only goes down. Equals the number of `untested:` clauses in the workspace.
-const UNTESTED_CEILING: usize = 1;
+const UNTESTED_CEILING: usize = 0;
 
 /// Only goes down. Equals the number of glossary gaps in the workspace.
 const GLOSSARY_GAP_CEILING: usize = 0;
