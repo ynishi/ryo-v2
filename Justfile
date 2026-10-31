@@ -13,11 +13,16 @@ check: rust-fmt-check rust-clippy rust-test deny
 rust-fmt-check:
     cargo fmt --all -- --check
 
+# Warnings fail the build through Cargo's `build.warnings` rather than
+# `-- -D warnings`, which changes the compiler flags and so invalidates the
+# build cache shared with `cargo build` and `cargo test`.
 rust-clippy:
-    cargo clippy --workspace --all-targets -- -D warnings
+    CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets
 
+# `--locked`: a Cargo.lock that does not match the manifests fails the gate
+# instead of being rewritten.
 rust-test:
-    cargo test --workspace
+    cargo test --workspace --locked
 
 deny:
     cargo deny check
