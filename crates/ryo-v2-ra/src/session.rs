@@ -8,7 +8,7 @@ use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at
 use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{FileId, Vfs};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
-use ryo_v2_core::domain::{Finding, RelPath};
+use ryo_v2_core::domain::{Finding, IntentKind, RelPath};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,17 @@ use std::sync::Mutex;
 pub struct DetectorPanic {
     /// The file.
     pub path: RelPath,
+    /// The panic message.
+    pub message: String,
+}
+
+/// A call of the expander that panicked: it contributed no Blueprint and the expansion went on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExpanderPanic {
+    /// The edit kind whose call panicked; `None` when the panic was outside every edit kind.
+    pub kind: Option<IntentKind>,
+    /// The file of the target.
+    pub path: Option<RelPath>,
     /// The panic message.
     pub message: String,
 }
@@ -54,6 +65,11 @@ pub struct RaSession {
     pub(crate) edited_since_audit: BTreeSet<RelPath>,
     /// Detector panics contained so far; collects run on several threads and take `&RaSession`.
     pub(crate) detector_panics: Mutex<BTreeSet<DetectorPanic>>,
+    /// Expander panics contained so far.
+    pub(crate) expander_panics: Mutex<BTreeSet<ExpanderPanic>>,
+    /// When set, every call of that edit kind in the expander panics; for the tests of the
+    /// containment.
+    pub(crate) expander_fault: Option<IntentKind>,
 }
 
 impl RaSession {
@@ -78,6 +94,30 @@ impl RaSession {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// Every distinct expander panic since load, sorted.
+    ///
+    /// # Contract
+    /// - C1: a panic of one edit kind's call leaves the expansion Ok with the other kinds'
+    ///   Blueprints, the session usable (not poisoned), and the panic listed here with its kind
+    ///   and path.
+    ///   tested: tests/expand_panics.rs an_expander_panic_is_contained_and_recorded
+    pub fn expander_panics(&self) -> Vec<ExpanderPanic> {
+        self.expander_panics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Makes every call of `kind` in the expander that reaches rust-analyzer (realizing a seed,
+    /// or the candidates of a target) panic; for the tests of the containment, like `poison`.
+    /// Nothing in the adapter calls it.
+    #[doc(hidden)]
+    pub fn inject_expander_fault(&mut self, kind: Option<IntentKind>) {
+        self.expander_fault = kind;
     }
 }
 
@@ -183,5 +223,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         deadline: None,
         edited_since_audit: BTreeSet::new(),
         detector_panics,
+        expander_panics: Mutex::new(BTreeSet::new()),
+        expander_fault: None,
     })
 }

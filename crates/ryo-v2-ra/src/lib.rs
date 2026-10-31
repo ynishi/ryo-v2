@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 pub use assess::SyntaxAssessor;
 pub use fork::RaFork;
-pub use session::{DetectorPanic, RaSession};
+pub use session::{DetectorPanic, ExpanderPanic, RaSession};
 
 /// Configuration of [`RaAnalyzer`].
 #[derive(Debug, Clone)]

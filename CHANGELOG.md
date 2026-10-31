@@ -31,9 +31,13 @@ and this project adheres to
 - The `apply` and `search` JSON list, per candidate, the Blueprints of its path (intent, proposer,
   rationale, spec refs), and under `evidence` the provenance of the decision: analyzer name and
   version, its settings and a workspace fingerprint built from the per-file fingerprints.
+- `RaSession::expander_panics()`: the panics the expander contained, with edit kind, file and
+  message. `search-recall run` prints `contained panics: <n> detector, <n> expander` and one line
+  per panic, also in `--markdown` and under `contained_panics` in `--report`.
 
 ### Changed
 
+- The oracle prints the contained detector and expander panics and fails when there is any.
 - A candidate's risk marks and Rule are derived by the domain from its Blueprints and the roles of
   the files they edit; `Candidate`, `Evidence` and decision-log entries can no longer be built
   outside the core crate, and the `Verifier` port gains `provenance`.
@@ -64,3 +68,10 @@ and this project adheres to
   instead of `-- -D warnings`, which invalidated the build cache; `just rust-clippy` and
   `just rust-test` run with `--locked`. `crates/ryo-v2-core/tests/manifest.rs` also checks these
   recipes.
+
+### Fixed
+
+- The expander no longer panics on the value of a struct-literal field that has an attribute
+  (`#[cfg(..)] k: v`): extract-variable refuses it, since rust-analyzer would build the variable's
+  name from the whole field text. A panic inside the expander now costs one call of one edit kind,
+  not every child of the state being expanded.

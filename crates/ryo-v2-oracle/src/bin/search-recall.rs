@@ -34,7 +34,7 @@ use ryo_v2_oracle::cargo_check::{CheckOutput, cargo_check};
 use ryo_v2_oracle::materials::Materials;
 use ryo_v2_oracle::planted::{PlantKind, generate, generate_pair, read_clean, sites, write_case};
 use ryo_v2_oracle::search_recall::{
-    DecisionRow, PlantedCase, RunInfo, markdown, report_json, run_case, terminal,
+    ContainedPanics, DecisionRow, PlantedCase, RunInfo, markdown, report_json, run_case, terminal,
 };
 use ryo_v2_ra::{RaAnalyzer, RaConfig, SyntaxAssessor};
 
@@ -327,6 +327,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!("search-recall-{}", std::process::id()));
     let mut rows: Vec<DecisionRow> = Vec::new();
     let mut outer_counts = Outer::default();
+    let mut panics = ContainedPanics::default();
     let mut done = 0usize;
     for (workspace, ws_cases) in &by_ws {
         let analyzer = RaAnalyzer::new(
@@ -416,12 +417,16 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                 }
                 Err(e) => {
                     // The session may be poisoned: start from a fresh one.
+                    panics.absorb(&case.ws, &s.detector_panics(), &s.expander_panics());
                     session = analyzer.load(workspace).ok();
                     let _ = observer.take();
                     DecisionRow::skipped(case, format!("search error: {e}"))
                 }
             };
             row.check_ms = checks;
+            if let Some(s) = session.as_ref() {
+                panics.absorb(&case.ws, &s.detector_panics(), &s.expander_panics());
+            }
             eprintln!(
                 "[{done}/{}] {}/{}: {}",
                 cases.len(),
@@ -447,9 +452,13 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
     if outer {
         text.push_str(&outer_counts.summary());
     }
+    let panic_text = format!("\n{}\n", panics.lines().join("\n"));
+    text.push_str(&panic_text);
     println!("{text}");
     if let Some(path) = report {
-        let json = serde_json::to_string_pretty(&report_json(&rows, triggers))?;
+        let mut json = report_json(&rows, triggers);
+        json["contained_panics"] = panics.to_json();
+        let json = serde_json::to_string_pretty(&json)?;
         std::fs::write(&path, json + "\n").with_context(|| format!("write {}", path.display()))?;
     }
     if let Some(path) = md {
@@ -457,6 +466,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         if outer {
             body.push_str(&outer_counts.summary());
         }
+        body.push_str(&panic_text);
         std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     }
     Ok(())
