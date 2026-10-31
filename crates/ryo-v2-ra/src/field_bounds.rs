@@ -241,7 +241,7 @@ fn fields_of(sema: &Semantics<'_, RootDatabase>, adt: &ast::Adt) -> Vec<(TextSiz
 
 /// The fields of a type ra resolved (for a written `Copy` impl).
 fn adt_fields(db: &RootDatabase, adt: Adt) -> Vec<Field> {
-    let fields = match adt {
+    match adt {
         Adt::Struct(s) => s.fields(db),
         Adt::Union(u) => u.fields(db),
         Adt::Enum(e) => e
@@ -249,8 +249,7 @@ fn adt_fields(db: &RootDatabase, adt: Adt) -> Vec<Field> {
             .into_iter()
             .flat_map(|v| v.fields(db))
             .collect(),
-    };
-    fields
+    }
 }
 
 /// The type of `f` as the derived impl `imp` sees it. A generic type's fields are instantiated
