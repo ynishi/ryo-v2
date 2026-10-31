@@ -33,7 +33,9 @@
 //!    `branch-check`), and `base-check` refuses a branch that `origin/main`, or the local `main`,
 //!    is no ancestor of (`merge-base --is-ancestor`), saying in one line that it skipped outside
 //!    a git checkout; `ledger-merge-install` sets `merge.ledger.driver` to the driver with git's
-//!    arguments `%O %A %B %L %P`, falling back to `git merge-file`.
+//!    arguments `%O %A %B %L %P`, falling back to `git merge-file`. The lines that carry these
+//!    decisions are pinned verbatim and in order ([`BASE_CHECK_LINES`], [`LEDGER_INSTALL_LINES`]),
+//!    so a negated or reversed check fails the rule, not only a missing word.
 //!
 //! Each rule is a function returning its problems; the `workspace_*` tests run them on the real
 //! manifests, the others show that each rule reports a broken manifest.
@@ -440,6 +442,61 @@ fn gate_recipe_problems(justfile: &str) -> Vec<String> {
     out
 }
 
+/// Rule 8, the lines it pins: per recipe, groups of consecutive lines (trimmed) that must appear
+/// in this order. The decisions are in the exact text: which ref wins, the direction of the
+/// ancestry check, which situations skip and pass, and the driver line with its fallback.
+const BASE_CHECK_LINES: [&[&str]; 5] = [
+    &[
+        r#"echo "base-check: skipped (not a git checkout)""#,
+        "exit 0",
+    ],
+    &[r#"echo "base-check: skipped (shallow clone)""#, "exit 0"],
+    &[
+        r#"if [ "$branch" = "main" ]; then"#,
+        r#"echo "base-check: on main""#,
+        "exit 0",
+    ],
+    &[
+        "if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then",
+        r#"base="origin/main""#,
+        "elif git rev-parse --verify --quiet refs/heads/main >/dev/null; then",
+        r#"base="main""#,
+        "else",
+        r#"echo "base-check: skipped (no main or origin/main)""#,
+        "exit 0",
+    ],
+    &[
+        r#"if ! git merge-base --is-ancestor "$base" HEAD; then"#,
+        r#"echo "base-check: $branch does not contain $base; merge $base into it and check again" >&2"#,
+        "exit 1",
+    ],
+];
+
+/// Rule 8, the driver lines of `ledger-merge-install`.
+const LEDGER_INSTALL_LINES: [&[&str]; 2] = [
+    &[r#"install -m 755 "$built" "$dest""#],
+    &[
+        r#"git config merge.ledger.driver "if [ -x '$dest' ]; then '$dest' %O %A %B %L %P; else git merge-file --marker-size=%L %A %O %B; fi""#,
+    ],
+];
+
+/// The groups of `groups` that are not found in `body`, in order, each after the previous one.
+fn missing_line_groups(name: &str, body: &[&str], groups: &[&[&str]]) -> Vec<String> {
+    let lines: Vec<&str> = body.iter().map(|l| l.trim()).collect();
+    let mut from = 0;
+    let mut out = Vec::new();
+    for group in groups {
+        let found = (from..lines.len()).find(|&i| lines[i..].starts_with(group));
+        match found {
+            Some(i) => from = i + group.len(),
+            None => out.push(format!(
+                "Justfile: {name} does not have, in order, the lines {group:?}"
+            )),
+        }
+    }
+    out
+}
+
 /// Rule 8.
 fn base_and_ledger_recipe_problems(justfile: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -450,29 +507,16 @@ fn base_and_ledger_recipe_problems(justfile: &str) -> Vec<String> {
             out.push(format!("Justfile: {runner} does not run base-check"));
         }
     }
-    let base = recipe(justfile, "base-check").join("\n");
-    for needle in [
-        "merge-base --is-ancestor",
-        "refs/remotes/origin/main",
-        "refs/heads/main",
-        "base-check: skipped (not a git checkout)",
-    ] {
-        if !base.contains(needle) {
-            out.push(format!("Justfile: base-check does not contain `{needle}`"));
-        }
-    }
-    let install = recipe(justfile, "ledger-merge-install").join("\n");
-    for needle in [
-        "merge.ledger.driver",
-        "%O %A %B %L %P",
-        "git merge-file --marker-size=%L %A %O %B",
-    ] {
-        if !install.contains(needle) {
-            out.push(format!(
-                "Justfile: ledger-merge-install does not contain `{needle}`"
-            ));
-        }
-    }
+    out.extend(missing_line_groups(
+        "base-check",
+        &recipe(justfile, "base-check"),
+        &BASE_CHECK_LINES,
+    ));
+    out.extend(missing_line_groups(
+        "ledger-merge-install",
+        &recipe(justfile, "ledger-merge-install"),
+        &LEDGER_INSTALL_LINES,
+    ));
     out
 }
 
@@ -559,23 +603,63 @@ fn workspace_base_check_and_ledger_driver_recipes_are_in_place() {
 }
 
 #[test]
-fn missing_base_check_or_ledger_driver_is_a_problem() {
-    let good = "check: base-check rust-test\n\nbranch-check: base-check\n    echo ok\n\nbase-check:\n    if git rev-parse --verify --quiet refs/remotes/origin/main; then base=origin/main\n    elif git rev-parse --verify --quiet refs/heads/main; then base=main; fi\n    echo \"base-check: skipped (not a git checkout)\"\n    git merge-base --is-ancestor \"$base\" HEAD\n\nledger-merge-install:\n    git config merge.ledger.driver \"x %O %A %B %L %P || git merge-file --marker-size=%L %A %O %B\"\n";
-    assert_none(base_and_ledger_recipe_problems(good));
-    let bad = good
-        .replace("check: base-check rust-test", "check: rust-test")
-        .replace("branch-check: base-check", "branch-check:")
-        .replace("--is-ancestor", "--octopus")
-        .replace(
+fn mutations_of_base_check_and_the_ledger_driver_are_problems() {
+    let justfile = fs::read_to_string(root().join("Justfile")).expect("Justfile");
+    assert_none(base_and_ledger_recipe_problems(&justfile));
+    let mutations: [(&str, &str, &str); 9] = [
+        ("check without base-check", "check: base-check ", "check: "),
+        (
+            "branch-check without it",
+            "branch-check: base-check",
+            "branch-check:",
+        ),
+        (
+            "ancestry negated",
+            "if ! git merge-base",
+            "if git merge-base",
+        ),
+        (
+            "ancestry reversed",
+            r#"--is-ancestor "$base" HEAD"#,
+            r#"--is-ancestor HEAD "$base""#,
+        ),
+        (
+            "main refused",
+            "echo \"base-check: on main\"\n        exit 0",
+            "echo \"base-check: on main\"\n        exit 1",
+        ),
+        (
+            "local main preferred",
+            "refs/remotes/origin/main >/dev/null; then\n        base=\"origin/main\"",
+            "refs/heads/main >/dev/null; then\n        base=\"main\"",
+        ),
+        (
+            "shallow skip removed",
+            "echo \"base-check: skipped (shallow clone)\"",
+            "true",
+        ),
+        (
+            "driver fallback inverted",
+            "if [ -x '$dest' ]",
+            "if [ ! -x '$dest' ]",
+        ),
+        (
+            "driver line commented out",
             "    git config merge.ledger.driver",
             "    # git config merge.ledger.driver",
+        ),
+    ];
+    for (what, from, to) in mutations {
+        assert!(
+            justfile.contains(from),
+            "{what}: the Justfile has no {from:?}"
         );
-    assert_eq!(
-        base_and_ledger_recipe_problems(&bad).len(),
-        6,
-        "{:?}",
-        base_and_ledger_recipe_problems(&bad)
-    );
+        let broken = justfile.replacen(from, to, 1);
+        assert!(
+            !base_and_ledger_recipe_problems(&broken).is_empty(),
+            "{what}: not reported"
+        );
+    }
 }
 
 #[test]

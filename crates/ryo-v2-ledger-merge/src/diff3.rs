@@ -28,8 +28,12 @@ pub(crate) enum Chunk<'a, T> {
     },
     /// Items to write as they are: the stretch only one side changed, or both changed alike.
     Take(&'a [T]),
-    /// A stretch both sides changed differently.
-    Conflict { ours: &'a [T], theirs: &'a [T] },
+    /// A stretch both sides changed differently, with what `base` had there.
+    Conflict {
+        base: &'a [T],
+        ours: &'a [T],
+        theirs: &'a [T],
+    },
 }
 
 /// Above this many cells (base items times side items, after the common prefix and suffix) the
@@ -38,7 +42,7 @@ pub(crate) enum Chunk<'a, T> {
 pub(crate) const MAX_CELLS: usize = 16_000_000;
 
 /// For each item of `a`, the index of the item of `b` it is aligned with.
-fn align<T: Item>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
+pub(crate) fn align<T: Item>(a: &[T], b: &[T]) -> Vec<Option<usize>> {
     let mut out = vec![None; a.len()];
     let pre = a
         .iter()
@@ -131,6 +135,7 @@ pub(crate) fn merge<'a, T: Item>(
             push_take(&mut out, os);
         } else {
             out.push(Chunk::Conflict {
+                base: bs,
                 ours: os,
                 theirs: ts,
             });
@@ -161,7 +166,7 @@ mod tests {
             match c {
                 Chunk::Stable { ours, .. } => out.push(ours.clone()),
                 Chunk::Take(xs) => out.extend(xs.iter().cloned()),
-                Chunk::Conflict { ours, theirs } => {
+                Chunk::Conflict { ours, theirs, .. } => {
                     out.push(format!("<{}|{}>", ours.join(" "), theirs.join(" ")))
                 }
             }
@@ -214,6 +219,7 @@ mod tests {
         assert_eq!(
             merged[1],
             Chunk::Conflict {
+                base: &base[1..2],
                 ours: &[],
                 theirs: &theirs[1..2]
             }

@@ -74,7 +74,7 @@ pub(crate) fn sections(lines: &[String]) -> Vec<(String, Vec<String>)> {
 }
 
 /// One piece of a section: a text line, or a whole table.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Block {
     /// A line outside tables.
     Line(String),

@@ -98,6 +98,11 @@ fn split(text: &str) -> Vec<String> {
 /// - C6: a table whose header line one side changed is a different table: if the other side
 ///   changed the table as well, the whole table is one conflict.
 ///   tested: tests::a_changed_header_makes_a_table_conflict_as_a_whole
+/// - C8: a section both sides added under the same heading, and any two insertions at one place
+///   in a section, are merged against what the two share (the lines both have; of a table both
+///   have, its header and the rows equal on both sides): the rows each side adds are kept, and
+///   lines that differ conflict.
+///   tested: tests::a_section_added_on_both_sides_with_different_bodies_merges_its_lines
 /// - C7 [free]: line ends: a `\r` stays part of its line, and a merged text (one that is not
 ///   one side unchanged) ends with a line end.
 pub fn merge(base: &str, ours: &str, theirs: &str, marker_size: usize) -> Merged {
@@ -146,18 +151,23 @@ pub fn merge(base: &str, ours: &str, theirs: &str, marker_size: usize) -> Merged
 
 /// A section both sides changed: line by line, tables as items.
 fn merge_section(base: &[String], ours: &[String], theirs: &[String], out: &mut Out) {
-    let (bb, bo, bt) = (
-        markdown::blocks(base),
-        markdown::blocks(ours),
-        markdown::blocks(theirs),
+    merge_blocks(
+        &markdown::blocks(base),
+        &markdown::blocks(ours),
+        &markdown::blocks(theirs),
+        out,
     );
-    let flat = |blocks: &[Block]| -> Vec<String> {
-        blocks
-            .iter()
-            .flat_map(|b| b.lines().iter().cloned())
-            .collect()
-    };
-    for chunk in diff3::merge(&bb, &bo, &bt) {
+}
+
+fn flat(blocks: &[Block]) -> Vec<String> {
+    blocks
+        .iter()
+        .flat_map(|b| b.lines().iter().cloned())
+        .collect()
+}
+
+fn merge_blocks(base: &[Block], ours: &[Block], theirs: &[Block], out: &mut Out) {
+    for chunk in diff3::merge(base, ours, theirs) {
         match chunk {
             Chunk::Stable {
                 base: Block::Table { lines: b, .. },
@@ -167,9 +177,48 @@ fn merge_section(base: &[String], ours: &[String], theirs: &[String], out: &mut 
             // A line: its key is its text, so all three are equal.
             Chunk::Stable { ours, .. } => out.push(ours.lines()),
             Chunk::Take(blocks) => out.push(&flat(blocks)),
-            Chunk::Conflict { ours, theirs } => out.conflict(&flat(ours), &flat(theirs)),
+            // Two insertions at one place: merged against what they share, so that a table both
+            // add keeps the rows of each. The common part is not empty, so the stretches left
+            // are smaller and the recursion ends.
+            Chunk::Conflict { base, ours, theirs } if base.is_empty() => {
+                let common = shared(ours, theirs);
+                if common.is_empty() {
+                    out.conflict(&flat(ours), &flat(theirs));
+                } else {
+                    merge_blocks(&common, ours, theirs, out);
+                }
+            }
+            Chunk::Conflict { ours, theirs, .. } => out.conflict(&flat(ours), &flat(theirs)),
         }
     }
+}
+
+/// What two insertions at one place share, as the base to merge them against: the blocks both
+/// have (aligned by key, in order); of a table both have, its header and the rows equal on both
+/// sides.
+fn shared(ours: &[Block], theirs: &[Block]) -> Vec<Block> {
+    diff3::align(ours, theirs)
+        .into_iter()
+        .zip(ours)
+        .filter_map(|(j, o)| Some((o, &theirs[j?])))
+        .map(|(o, t)| match (o, t) {
+            (Block::Table { key, lines: lo }, Block::Table { lines: lt, .. }) => {
+                let theirs_rows = markdown::rows(lt);
+                let mut lines = Vec::new();
+                for (k, row) in markdown::rows(lo) {
+                    let head = lines.is_empty();
+                    if head || theirs_rows.iter().any(|(tk, tr)| *tk == k && *tr == row) {
+                        lines.extend(row);
+                    }
+                }
+                Block::Table {
+                    key: key.clone(),
+                    lines,
+                }
+            }
+            _ => o.clone(),
+        })
+        .collect()
 }
 
 /// A table both sides changed: row by row.
@@ -429,6 +478,30 @@ Corpus: 5 workspaces.
     }
 
     #[test]
+    fn a_section_added_on_both_sides_with_different_bodies_merges_its_lines() {
+        // Both add "## Notes" at the end: the same heading, a shared table with one row each.
+        let notes = |row: &str, text: &str| {
+            format!("{BASE}\n## Notes\n\n{text}\n\n| id | note |\n|---|---|\n{row}")
+        };
+        let ours = notes("| N-1 | a |\n", "Shared text.");
+        let theirs = notes("| N-2 | b |\n", "Shared text.");
+        let m = run(BASE, &ours, &theirs);
+        assert_eq!(m.conflicts, 0, "{}", m.text);
+        assert_eq!(m.text, notes("| N-1 | a |\n| N-2 | b |\n", "Shared text."));
+        // Different text in the two new sections is a line conflict inside the section.
+        let theirs = notes("| N-2 | b |\n", "Other text.");
+        let m = run(BASE, &ours, &theirs);
+        assert_eq!(m.conflicts, 1, "{}", m.text);
+        assert!(
+            m.text.contains(
+                "## Notes\n\n<<<<<<< ours\nShared text.\n=======\nOther text.\n>>>>>>> theirs\n"
+            ),
+            "{}",
+            m.text
+        );
+    }
+
+    #[test]
     fn one_sided_merges_return_that_side() {
         let other = edit(BASE, &[(M6, "")]);
         let no_end = BASE.trim_end().to_owned();
@@ -488,6 +561,11 @@ Corpus: 5 workspaces.
         assert_eq!(
             conflict_markers("| a |\n||| b\n======\n<<<<<<<x\n## h\n=======\r\n>>>>>>>\n"),
             [6, 7]
+        );
+        // The base marker of a diff3-style conflict, and markers with a `\r`.
+        assert_eq!(
+            conflict_markers("||||||| base\n|||||||\n<<<<<<< ours\r\n| x | y |\n"),
+            [1, 2, 3]
         );
     }
 }

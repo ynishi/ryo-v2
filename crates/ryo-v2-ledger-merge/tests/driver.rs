@@ -68,6 +68,8 @@ fn bad_arguments_exit_2_and_leave_ours_unchanged() {
         .status()
         .expect("run ledger-merge");
     assert_eq!(status.code(), Some(2));
+    let (code, text) = drive("extra-args", &ours, BASE, &["7", "L.md", "surplus"]);
+    assert_eq!((code, text.as_str()), (Some(2), ours.as_str()));
     let dir = scratch("missing");
     let o = dir.join("ours");
     fs::write(&o, &ours).expect("write ours");
