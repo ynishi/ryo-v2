@@ -14,11 +14,11 @@ use crate::app::ports::{
 };
 use crate::domain::search::{compose, prune, rank_final, reward_score, score};
 use crate::domain::{
-    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, FileRole, Infeasible,
-    Inserted, IntentKind, JudgeRequest, NEAR_MISS_MAX, NearMiss, NewNode, NodeId, NonEmpty, Noul,
-    OUTER_CHECK_MAX, Prior, Proposal, ProposalId, ProviderTag, PruneStage, RelPath, Resolution,
-    Reward, RuleCatalog, Scope, Scored, SearchBudget, SearchTree, Stage, StateFp, StaticMetrics,
-    Target, Verdict, Weights,
+    Basis, Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, FileRole,
+    Infeasible, Inserted, IntentKind, JudgeRequest, NEAR_MISS_MAX, NearMiss, NewNode, NodeId,
+    NonEmpty, Noul, OUTER_CHECK_MAX, Prior, Proposal, ProposalId, ProviderTag, PruneStage, RelPath,
+    Resolution, Reward, RuleCatalog, Scope, Scored, SearchBudget, SearchTree, Stage, StateFp,
+    StaticMetrics, Target, Verdict, Weights,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
@@ -787,11 +787,18 @@ where
             continue;
         };
         let leaf = path.last().id();
+        // The basis is against the loaded text, never a parent's state.
+        let basis = {
+            let session: &V::Session = s;
+            let chain: Vec<&Blueprint> = path.iter().collect();
+            Basis::of_chain(&chain, n.edits(), &|p| v.text(session, p))
+        };
         if let Ok(c) = Candidate::new(
             path,
             n.roles(),
             n.edits().to_vec(),
             verdict.clone(),
+            basis,
             input.rules,
             input.scope,
         ) {
@@ -1124,6 +1131,7 @@ mod tests {
         budget: SearchBudget,
         scope: Scope,
         keep_edits: bool,
+        start: Vec<Edit>,
     }
     impl Fx {
         fn new(text: &str) -> Self {
@@ -1145,6 +1153,7 @@ mod tests {
                 },
                 scope: Scope::Workspace,
                 keep_edits: false,
+                start: vec![],
             }
         }
         fn run(&self) -> Result<SearchReport, SearchError> {
@@ -1156,7 +1165,7 @@ mod tests {
                 &self.clock,
                 &mut (),
                 &SearchInput {
-                    start: &[],
+                    start: &self.start,
                     roots: &self.roots,
                     targets: &[],
                     probes: &[],
@@ -1393,6 +1402,66 @@ mod tests {
         }
         assert_eq!((r.depths[0].kept, r.depths[0].audited), (0, 3));
         assert_eq!(decided(&r).len(), 3);
+    }
+
+    #[test]
+    fn search_candidate_basis_is_against_the_loaded_text() {
+        let mut fx = Fx::new(BASE);
+        fx.budget = SearchBudget {
+            max_depth: 2,
+            ..DEFAULT_SEARCH_BUDGET
+        };
+        let other = rel("src/o.rs");
+        fx.v.texts.insert(other.clone(), "abc".to_owned());
+        let at_b = "let b = 1;";
+        fx.rename_children(1, &["b"]);
+        let end = u32::try_from(at_b.len()).unwrap();
+        let child = Blueprint::new(BlueprintParts {
+            id: bid(10),
+            intent: IntentCall::RenameLocal {
+                from: Ident::parse("b").unwrap(),
+                to: Ident::parse("c").unwrap(),
+            },
+            specs: vec![MutationSpec::replace(rel(LIB), tr(4, 5), "c").unwrap()],
+            reads: vec![
+                ReadRange::capture(rel(LIB), at_b, tr(0, end)).unwrap(),
+                ReadRange::capture(other.clone(), "abc", tr(0, 3)).unwrap(),
+            ],
+            // against the parent's state, not the loaded text
+            bases: vec![BaseFp::capture(rel(LIB), at_b)],
+            spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
+            record: DecisionRecord::new("agent", "why").unwrap(),
+        })
+        .unwrap();
+        fx.e.set(state(vec![w(at_b)]), vec![child]);
+        let r = fx.run().unwrap();
+        let deep = decided(&r)
+            .iter()
+            .find(|c| c.path().len() == 2)
+            .expect("a depth-2 candidate");
+        assert_eq!(deep.basis().files(), &[BaseFp::capture(rel(LIB), BASE)][..]);
+        assert_eq!(
+            deep.basis().reads(),
+            &[ReadRange::capture(other, "abc", tr(0, 3)).unwrap()][..]
+        );
+    }
+
+    #[test]
+    fn start_state_file_is_in_the_basis() {
+        let mut fx = Fx::new(BASE);
+        let s_rs = rel("src/s.rs");
+        fx.v.texts.insert(s_rs.clone(), "start".to_owned());
+        fx.start = vec![Edit::write(s_rs.clone(), "started")];
+        fx.roots = vec![rename(1, "a", "b", BASE)];
+        let r = fx.run().unwrap();
+        let c = &decided(&r).as_slice()[0];
+        assert_eq!(
+            c.basis().files(),
+            &[
+                BaseFp::capture(rel(LIB), BASE),
+                BaseFp::capture(s_rs, "start")
+            ][..]
+        );
     }
 
     #[test]

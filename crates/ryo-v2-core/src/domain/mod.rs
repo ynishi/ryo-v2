@@ -26,7 +26,12 @@
 //! - Freshness: the result of checking a read range or a base fingerprint against the current
 //!   text.
 //!   includes: Fresh, Stale, OutOfRange
-//! - Edit: the whole new text of one file, built by splicing; what the verifier consumes.
+//! - Edit: the whole new text of one file, built by splicing; what the verifier consumes and a
+//!   writer writes once its candidate's basis has no drift.
+//! - Basis: what a candidate's verdict rests on in the loaded text: the base fingerprint of every
+//!   file its path edits and the read ranges of the files it only reads.
+//! - Drift: one way the files no longer match a basis.
+//!   includes: File, Read, Missing
 //! - IntentKind: a typed action of the one-layer action space.
 //!   includes: RenameLocal, ExtractVariable, AddDerive, ExtractFunction, MoveItem
 //! - IntentCall: one use of an intent in a blueprint: its kind and validated parameters.
@@ -92,6 +97,7 @@
 //! - ReplayJudge: a judge that replays recorded answers.
 
 pub mod baseline;
+pub mod basis;
 pub mod blueprint;
 pub mod diagnostic;
 pub mod edit;
@@ -111,6 +117,7 @@ pub mod scope;
 pub mod search;
 pub mod text;
 pub mod verdict;
+pub use basis::{Basis, Drift};
 pub use blueprint::{
     Blueprint, BlueprintError, BlueprintParts, BlueprintSet, DecisionRecord, SpecRef,
 };

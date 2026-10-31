@@ -1,8 +1,9 @@
 //! The `Resolution` as the JSON the `apply` command prints, and its exit code.
 
 use ryo_v2_core::domain::{
-    Blocking, Candidate, Diagnostics, Disposition, FileRole, Freshness, LogEntry, OuterCheckReason,
-    Resolution, ReviewReason, RiskMark, Scope, Stage, Verdict,
+    BaseFp, Basis, Blocking, Candidate, Diagnostics, Disposition, Drift, FileRole, Freshness,
+    LogEntry, OuterCheckReason, ReadRange, Resolution, ReviewReason, RiskMark, Scope, Stage,
+    Verdict,
 };
 use serde_json::{Value, json};
 
@@ -88,6 +89,44 @@ fn verdict_json(v: &Verdict) -> (Value, Value) {
     diagnostics_json(&v.new_errors)
 }
 
+fn file_json(b: &BaseFp) -> Value {
+    json!({"path": b.path().to_string(), "fingerprint": b.fingerprint().to_string()})
+}
+
+fn read_json(r: &ReadRange) -> Value {
+    json!({
+        "path": r.path().to_string(),
+        "start": r.range().start(),
+        "end": r.range().end(),
+        "fingerprint": r.fingerprint().to_string(),
+    })
+}
+
+fn basis_json(b: &Basis) -> Value {
+    json!({
+        "files": b.files().iter().map(file_json).collect::<Vec<_>>(),
+        "reads": b.reads().iter().map(read_json).collect::<Vec<_>>(),
+    })
+}
+
+fn drift_json(d: &Drift) -> Value {
+    match d {
+        Drift::File { base, now } => {
+            let mut o = file_json(base);
+            o["kind"] = json!("file");
+            add_freshness(&mut o, now);
+            o
+        }
+        Drift::Read { read, now } => {
+            let mut o = read_json(read);
+            o["kind"] = json!("read");
+            add_freshness(&mut o, now);
+            o
+        }
+        Drift::Missing(path) => json!({"kind": "missing", "path": path.to_string()}),
+    }
+}
+
 fn candidate_json(c: &Candidate) -> Value {
     let (disposition, rule) = disposition_json(c.disposition());
     let outer_check = match c.outer_check() {
@@ -121,6 +160,7 @@ fn candidate_json(c: &Candidate) -> Value {
         "outer_check": outer_check,
         "marks": marks,
         "edits": edits,
+        "basis": basis_json(c.basis()),
     })
 }
 
@@ -133,8 +173,8 @@ fn log_json(e: &LogEntry) -> Value {
     })
 }
 
-/// Adds the `freshness` fields (`actual` for a stale entry, `len` for an out-of-range one) of an
-/// entry of a `stale` blocking.
+/// Adds the `freshness` fields (`actual` for a stale entry, `len` for an out-of-range one) of a
+/// file or read drift of a `stale` blocking.
 fn add_freshness(o: &mut Value, f: &Freshness) {
     match f {
         Freshness::Fresh => o["freshness"] = json!("fresh"),
@@ -156,33 +196,10 @@ fn blocking_json(b: &Blocking) -> Value {
             "kind": "unverifiable", "blueprint": blueprint,
             "path": path.to_string(), "role": role_str(*role),
         }),
-        Blocking::Stale { bases, reads, .. } => {
-            let bases: Vec<Value> = bases
-                .iter()
-                .map(|(b, f)| {
-                    let mut o = json!({
-                        "path": b.path().to_string(),
-                        "fingerprint": b.fingerprint().to_string(),
-                    });
-                    add_freshness(&mut o, f);
-                    o
-                })
-                .collect();
-            let reads: Vec<Value> = reads
-                .iter()
-                .map(|(r, f)| {
-                    let mut o = json!({
-                        "path": r.path().to_string(),
-                        "start": r.range().start(),
-                        "end": r.range().end(),
-                        "fingerprint": r.fingerprint().to_string(),
-                    });
-                    add_freshness(&mut o, f);
-                    o
-                })
-                .collect();
-            json!({"kind": "stale", "blueprint": blueprint, "bases": bases, "reads": reads})
-        }
+        Blocking::Stale { drift, .. } => json!({
+            "kind": "stale", "blueprint": blueprint,
+            "drift": drift.iter().map(drift_json).collect::<Vec<_>>(),
+        }),
         Blocking::MissingFile { path, .. } => json!({
             "kind": "missing_file", "blueprint": blueprint, "path": path.to_string(),
         }),
@@ -209,13 +226,16 @@ fn blocking_json(b: &Blocking) -> Value {
 ///
 /// # Contract
 /// - C1: a `Decided` resolution lists each candidate's disposition, rule id (or `null`),
-///   `outer_check` reasons (or `null`), marks and edits, in that vocabulary and sorted order.
+///   `outer_check` reasons (or `null`), marks and edits, in that vocabulary and sorted order, and
+///   its `basis`: the `files` it edits (path, `fingerprint`) and the `reads` of files it only
+///   reads (path, `start`, `end`, `fingerprint`).
 ///   tested: resolution_json::tests::outer_check_lists_reasons
 ///   tested: resolution_json::tests::decided_lists_the_rule_id
 ///   tested: tests/apply.rs apply_rename_local_is_decided
+///   tested: tests/apply.rs decided_candidate_lists_its_basis
 /// - C2: a `Failed` resolution lists each blocker with its `kind` and the blueprint; a stale
-///   blocking lists its `bases` (path, expected `fingerprint`, `freshness`, `actual`) and its
-///   `reads`, each with its freshness.
+///   blocking lists its `drift`, each entry a `file` (path, expected `fingerprint`, `freshness`,
+///   `actual`), a `read` (path, range, `fingerprint`, freshness) or a `missing` path.
 ///   tested: resolution_json::tests::failed_lists_stale_reads
 ///   tested: tests/apply.rs apply_after_disk_change_is_failed_stale
 ///   tested: tests/apply.rs apply_after_insert_above_is_failed_stale
@@ -556,25 +576,30 @@ mod tests {
         );
         let stale = Blocking::Stale {
             blueprint: b,
-            bases: vec![(
-                base,
-                Freshness::Stale {
-                    expected: Fingerprint::of(b"abc"),
-                    actual: Fingerprint::of(b"abcd"),
+            drift: vec![
+                Drift::File {
+                    base,
+                    now: Freshness::Stale {
+                        expected: Fingerprint::of(b"abc"),
+                        actual: Fingerprint::of(b"abcd"),
+                    },
                 },
-            )],
-            reads: vec![(
-                read.clone(),
-                Freshness::Stale {
-                    expected: Fingerprint::of(b"abc"),
-                    actual: Fingerprint::of(b"abd"),
+                Drift::Read {
+                    read: read.clone(),
+                    now: Freshness::Stale {
+                        expected: Fingerprint::of(b"abc"),
+                        actual: Fingerprint::of(b"abd"),
+                    },
                 },
-            )],
+                Drift::Missing(RelPath::parse("src/gone.rs").unwrap()),
+            ],
         };
         let oor = Blocking::Stale {
             blueprint: b,
-            bases: vec![],
-            reads: vec![(read, Freshness::OutOfRange { len: 2 })],
+            drift: vec![Drift::Read {
+                read,
+                now: Freshness::OutOfRange { len: 2 },
+            }],
         };
         let inf = Infeasible::new(vec![stale, oor], vec![], false).expect("blocking");
         let v = resolution_to_json(&Resolution::Failed(inf));
@@ -583,24 +608,27 @@ mod tests {
         let first = &v["blocking"][0];
         assert_eq!(first["kind"], "stale");
         assert_eq!(first["blueprint"], b.to_string());
-        assert_eq!(first["bases"][0]["path"], "src/lib.rs");
+        assert!(first.get("bases").is_none() && first.get("reads").is_none());
+        let file = &first["drift"][0];
+        assert_eq!(file["kind"], "file");
+        assert_eq!(file["path"], "src/lib.rs");
+        assert_eq!(file["fingerprint"], Fingerprint::of(b"abc").to_string());
+        assert_eq!(file["freshness"], "stale");
+        assert_eq!(file["actual"], Fingerprint::of(b"abcd").to_string());
+        let read = &first["drift"][1];
+        assert_eq!(read["kind"], "read");
+        assert_eq!(read["start"], 1);
+        assert_eq!(read["end"], 4);
+        assert_eq!(read["freshness"], "stale");
+        assert_eq!(read["actual"], Fingerprint::of(b"abd").to_string());
         assert_eq!(
-            first["bases"][0]["fingerprint"],
-            Fingerprint::of(b"abc").to_string()
+            first["drift"][2],
+            serde_json::json!({"kind": "missing", "path": "src/gone.rs"})
         );
-        assert_eq!(first["bases"][0]["freshness"], "stale");
-        assert_eq!(
-            first["bases"][0]["actual"],
-            Fingerprint::of(b"abcd").to_string()
-        );
-        assert_eq!(first["reads"][0]["freshness"], "stale");
-        assert_eq!(
-            first["reads"][0]["actual"],
-            Fingerprint::of(b"abd").to_string()
-        );
-        assert_eq!(v["blocking"][1]["bases"], serde_json::json!([]));
-        assert_eq!(v["blocking"][1]["reads"][0]["freshness"], "out_of_range");
-        assert_eq!(v["blocking"][1]["reads"][0]["len"], 2);
+        let oor = &v["blocking"][1]["drift"][0];
+        assert_eq!(oor["kind"], "read");
+        assert_eq!(oor["freshness"], "out_of_range");
+        assert_eq!(oor["len"], 2);
     }
 
     #[test]

@@ -181,6 +181,23 @@ fn apply_rename_local_is_decided() {
 }
 
 #[test]
+fn decided_candidate_lists_its_basis() {
+    let ws = Ws::new("apply_basis", &[]);
+    let bp = rename_acc(&ws);
+    // Taken before apply: the fingerprint of the loaded text.
+    let expected = base(&ws, "src/lib.rs");
+    let (code, out, err) = apply(&ws, &bp, None);
+    assert_eq!(code, Some(0), "{err}\n{out}");
+    let basis = &out["candidates"][0]["basis"];
+    let file = &basis["files"][0];
+    assert_eq!(file["path"], expected["path"], "{out}");
+    assert_eq!(file["fingerprint"], expected["fingerprint"], "{out}");
+    assert_eq!(basis["files"].as_array().unwrap().len(), 1, "{out}");
+    // The read is of the edited file, which its base covers.
+    assert!(basis["reads"].as_array().unwrap().is_empty(), "{out}");
+}
+
+#[test]
 fn apply_breaking_rename_is_failed_new_errors() {
     let ws = Ws::new("apply_breaking", &[]);
     let name = at(LIB, "pub fn twice", 0, 7, 5);
@@ -223,18 +240,11 @@ fn apply_after_disk_change_is_failed_stale() {
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(2), "{err}\n{out}");
     assert_eq!(out["blocking"][0]["kind"], "stale", "{out}");
-    assert_eq!(
-        out["blocking"][0]["bases"][0]["path"], "src/lib.rs",
-        "{out}"
-    );
-    assert_eq!(
-        out["blocking"][0]["bases"][0]["freshness"], "stale",
-        "{out}"
-    );
-    assert!(
-        out["blocking"][0]["reads"].as_array().unwrap().is_empty(),
-        "{out}"
-    );
+    let drift = out["blocking"][0]["drift"].as_array().unwrap();
+    assert_eq!(drift.len(), 1, "{out}");
+    assert_eq!(drift[0]["kind"], "file", "{out}");
+    assert_eq!(drift[0]["path"], "src/lib.rs", "{out}");
+    assert_eq!(drift[0]["freshness"], "stale", "{out}");
 }
 
 #[test]
@@ -257,14 +267,10 @@ fn apply_after_insert_above_is_failed_stale() {
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(2), "{err}\n{out}");
     assert_eq!(out["blocking"][0]["kind"], "stale", "{out}");
-    assert_eq!(
-        out["blocking"][0]["bases"][0]["path"], "src/lib.rs",
-        "{out}"
-    );
-    assert_eq!(
-        out["blocking"][0]["bases"][0]["freshness"], "stale",
-        "{out}"
-    );
+    let drift = &out["blocking"][0]["drift"][0];
+    assert_eq!(drift["kind"], "file", "{out}");
+    assert_eq!(drift["path"], "src/lib.rs", "{out}");
+    assert_eq!(drift["freshness"], "stale", "{out}");
 }
 
 #[test]

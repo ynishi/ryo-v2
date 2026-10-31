@@ -5,8 +5,8 @@
 //! intent check, freshness and the analyzer run later, in `app::apply`.
 
 use super::{
-    BaseFp, BlueprintId, DomainError, IntentCall, MutationSpec, NonEmpty, ReadRange, RelPath,
-    TextRange,
+    BaseFp, Basis, BlueprintId, DomainError, IntentCall, MutationSpec, NonEmpty, ReadRange,
+    RelPath, TextRange,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -279,6 +279,15 @@ impl Blueprint {
     /// Who proposed it and why.
     pub fn record(&self) -> &DecisionRecord {
         &self.record
+    }
+
+    /// What the Blueprint rests on in the text it was made against.
+    ///
+    /// # Contract
+    /// - C1: its base fingerprints, and its reads of files without one.
+    ///   tested: domain::basis::tests::basis_check_lists_every_drift
+    pub fn basis(&self) -> Basis {
+        Basis::new(self.bases().to_vec(), self.reads().to_vec())
     }
 
     /// The specs grouped by file, files in path order, specs in the order given.
