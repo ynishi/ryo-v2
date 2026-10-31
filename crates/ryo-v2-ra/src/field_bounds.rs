@@ -27,15 +27,18 @@
 //! A type with const parameters and no type parameter needs no instantiation (a const parameter
 //! adds no bound), so its fields are judged as they are.
 //!
-//! Rustc also reports a derived `Clone` next to a derived `Copy` (E0277 at the field) on a type
-//! with a type or const parameter; only a type without parameters gets the shallow-copy `Clone`.
+//! A derived `Clone` next to a derived `Copy` is judged like any derived `Clone`: rustc reports
+//! E0277 at each field without `Clone` beside the E0204 at the head, on a type with or without
+//! type or const parameters (the shallow-copy `Clone` a type without parameters gets still asserts
+//! `Clone` of every field; measured on breakage-lab `derive-copy-clone-0..2`). A field that is
+//! `Clone` but not `Copy` gives only the E0204.
 //!
 //! Skipped, which loses recall and never precision: a field that mentions a const parameter of a
 //! type that also has type parameters (the instantiation leaves the const argument unknown), a
-//! written `Copy` impl with const parameters, `Clone` next to a derived `Copy` on a type without
-//! type or const parameters, `Eq` on a field that already fails `PartialEq`, `Default` on an enum
-//! (only its `#[default]` variant counts), the traits above that were not measured (`Hash`,
-//! `PartialOrd`, `Ord`), negative impls, cfg-disabled code and code inside macro calls.
+//! written `Copy` impl with const parameters, `Eq` on a field that already fails `PartialEq`,
+//! `Default` on an enum (only its `#[default]` variant counts), the traits above that were not
+//! measured (`Hash`, `PartialOrd`, `Ord`), negative impls, cfg-disabled code and code inside macro
+//! calls.
 
 use crate::duplicate::head;
 use crate::unresolved::Hit;
@@ -109,12 +112,7 @@ pub(crate) fn find(
                     let Some(&(t, imp)) = derived.get(trait_name) else {
                         continue;
                     };
-                    if (trait_name == "Clone"
-                        && derived.contains_key("Copy")
-                        && !has_param(&adt, false)
-                        && !generic)
-                        || (trait_name == "Default" && matches!(def, Adt::Enum(_)))
-                    {
+                    if trait_name == "Default" && matches!(def, Adt::Enum(_)) {
                         continue;
                     }
                     for (at, f) in &fields {
