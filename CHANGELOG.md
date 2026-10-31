@@ -62,6 +62,12 @@ and this project adheres to
   Blueprint is the same check. The `apply` and `search` JSON list `basis` per candidate, and a
   `stale` blocking lists `drift` in place of `bases` and `reads`. The candidates of one decision
   are alternatives: writing one makes every other on a shared file drift.
+- A Blueprint may build on one Blueprint listed before it in the set (`builds_on`, optional in the
+  Blueprint JSON): its specs, reads and bases are against that one's result, and `apply` checks it
+  on the composed state of the chain, as the search does; its candidate's path is the chain and its
+  basis is taken against the loaded text. A parent not listed before its child is refused; a child
+  whose parent did not pass is blocked as `parent_failed` (with its `parent`) and never checked. A
+  search root with `builds_on` is refused. `BlueprintParts` gains the field.
 - The stages before the check (file role, freshness, conformance, splice, marks) run in the domain,
   and a candidate is built only from their result; `NearMiss` fields are private (`blueprint()`,
   `new_errors()`).
