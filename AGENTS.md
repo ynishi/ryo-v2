@@ -6,8 +6,8 @@
 - Issue, branch, commit and PR conventions:
   [CONTRIBUTING.md](CONTRIBUTING.md)
 - Security reports: [SECURITY.md](SECURITY.md)
-- Decisions that outlive a change: the "Decisions in force" section of
-  [SEARCH_LEDGER.md](SEARCH_LEDGER.md)
+- How decisions are made and recorded, and how contracts change:
+  [CONTRIBUTING.md](CONTRIBUTING.md#decisions-and-contracts)
 - API detail lives in RustDoc (`cargo doc`); code documentation outranks stale
   issue text.
 - Never work on `main`; one branch per issue, cut from `origin/main` after a

@@ -94,15 +94,36 @@ rule. The test is whether deleting it lets somebody repeat the mistake. If
 deleting it costs nothing it is a report on how a change went, and that belongs
 in the commit message.
 
-A promise a caller may rely on is written as a clause under a `# Contract`
-heading in the rustdoc, with the tests that check it named beside it. The
-convention is stated in `crates/ryo-v2-core/tests/doc_contract.rs`, and
-`cargo test` fails when a named test does not exist. A clause may be tagged
-`[invariant]` or `[free]`, and clauses use the terms of the glossary in
-`crates/ryo-v2-core/src/domain/mod.rs`; the checker states both.
+## Decisions and contracts
 
-Decisions that outlive a single change are recorded in the "Decisions in force" section of
-`SEARCH_LEDGER.md`, one row per decision, with the measurement that settled it.
+What ryo-v2 promises to a caller is its contracts; what it has measured and decided is in the
+ledgers (`CHECK_LEDGER.md`, `SEARCH_LEDGER.md`), and a change is checked against both.
+
+**How a decision is made.** A technical question is settled by rating its options against the goal
+of the project — a fast engine whose changes are verified in-process on rust-analyzer — and taking
+the best; the rating and the reason are written down with the decision. A question goes to the
+maintainer only when the code, the measurements and the goal cannot settle it. Until the first
+release no input or output format carries a compatibility promise.
+
+**Where it is recorded.**
+
+- A decision that outlives a single change: a row of "Decisions in force" (`SEARCH_LEDGER.md` for
+  the search), with the measurement that settled it, the guard that fails when it is broken, when
+  to revisit it, and the options rejected.
+- Work a decision leaves open: a row of "Open work" in `CHECK_LEDGER.md`. Its direction is a
+  decision too; a change of direction says why in the row.
+- A promise a caller may rely on: a clause of a contract, below.
+
+**Contracts.** A promise a caller may rely on is written as a clause under a `# Contract` heading in
+the rustdoc, with the tests that check it named beside it. The convention is stated in
+`crates/ryo-v2-core/tests/doc_contract.rs`, and `cargo test` fails when a named test does not
+exist. A clause may be tagged `[invariant]` or `[free]`, and clauses use the terms of the glossary
+in `crates/ryo-v2-core/src/domain/mod.rs`; the checker states both.
+
+- A clause changes in the same commit as the behaviour it describes, with its named tests.
+- Weakening an `[invariant]` clause is a decision: it gets a "Decisions in force" row.
+- Retagging a clause from `[free]` to `[invariant]` names its test in the same change.
+- The ceilings of the checker only go down.
 
 ## Preferred commit format
 
