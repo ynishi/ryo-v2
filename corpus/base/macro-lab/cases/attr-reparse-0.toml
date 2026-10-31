@@ -1,0 +1,4 @@
+workspace = "base/macro-lab"
+overlay = "base/macro-lab/overlays/attr-reparse-0"
+group = "macro-attr"
+origin = "hand"

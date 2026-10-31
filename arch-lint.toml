@@ -11,6 +11,12 @@
 
 preset = "recommended"
 
+[analyzer]
+# corpus/ holds fixture workspaces the oracle measures (deliberately broken code, small proc-macro
+# crates); they are test data, not ryo-v2 code. Setting `exclude` replaces the default, so the
+# default entries are repeated.
+exclude = ["**/target/**", "**/vendor/**", "corpus/**"]
+
 [rules.no-sync-io]
 # Blocking I/O is fine in a synchronous program. Turn this on when the code runs on an async runtime.
 enabled = false

@@ -1,0 +1,4 @@
+workspace = "base/macro-lab"
+overlay = "base/macro-lab/overlays/derive-removed-1"
+group = "macro-derive"
+origin = "hand"

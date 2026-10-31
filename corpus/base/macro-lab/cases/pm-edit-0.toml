@@ -1,0 +1,4 @@
+workspace = "base/macro-lab"
+overlay = "base/macro-lab/overlays/pm-edit-0"
+group = "proc-macro-edit"
+origin = "hand"

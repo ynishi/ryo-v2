@@ -1,0 +1,3 @@
+[workspace]
+members = ["macros", "model"]
+resolver = "2"

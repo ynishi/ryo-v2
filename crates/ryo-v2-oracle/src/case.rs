@@ -220,6 +220,70 @@ fn rel_slash(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+/// One expected diagnostic of one case, tagged with the CHECK_LEDGER Gaps row
+/// it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GapTag {
+    /// Gaps row id, e.g. "G-B-4".
+    pub row: String,
+    /// `CaseOutcome::id` form: "<last component of workspace_rel>/<case id>".
+    pub case: String,
+    /// The tagged expected diagnostic.
+    pub diagnostic: Diagnostic,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GapTagRow {
+    row: String,
+    case: String,
+    code: String,
+    path: String,
+    line: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GapTagFile {
+    #[serde(default)]
+    tag: Vec<GapTagRow>,
+}
+
+/// Reads `<corpus>/gap-tags.toml`; a missing file is an empty list.
+/// Shape: `[[tag]]` tables with `row`, `case`, `code`, `path`, `line`
+/// (unknown fields are refused).
+pub fn load_gap_tags(corpus: &Path) -> Result<Vec<GapTag>, CaseError> {
+    let file = corpus.join("gap-tags.toml");
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(CaseError::Io { path: file, source }),
+    };
+    let parsed: GapTagFile = toml::from_str(&text).map_err(|source| CaseError::Toml {
+        path: file.clone(),
+        source,
+    })?;
+    let invalid = |reason: String| CaseError::Invalid {
+        path: file.clone(),
+        reason,
+    };
+    parsed
+        .tag
+        .into_iter()
+        .map(|r| {
+            Ok(GapTag {
+                row: r.row,
+                case: r.case,
+                diagnostic: Diagnostic {
+                    code: ErrorCode::parse(&r.code).map_err(|e| invalid(e.to_string()))?,
+                    path: RelPath::parse(&r.path).map_err(|e| invalid(e.to_string()))?,
+                    line: r.line,
+                },
+            })
+        })
+        .collect()
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExpectedRow {
@@ -299,7 +363,7 @@ mod tests {
         let cases = Case::load_all(&real_corpus()).unwrap();
         let ids: Vec<&str> = cases
             .iter()
-            .filter(|c| c.origin == "hand")
+            .filter(|c| c.origin == "hand" && c.workspace_rel == "base/extract-trait-multicrate")
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(
@@ -315,12 +379,68 @@ mod tests {
                 "valid-02"
             ]
         );
-        assert!(
-            cases
-                .iter()
-                .filter(|c| c.origin == "hand")
-                .all(|c| c.workspace_rel == "base/extract-trait-multicrate")
+    }
+
+    #[test]
+    fn load_all_finds_the_macro_lab_cases() {
+        let cases = Case::load_all(&real_corpus()).unwrap();
+        let lab: Vec<&Case> = cases
+            .iter()
+            .filter(|c| c.workspace_rel == "base/macro-lab")
+            .collect();
+        let ids: Vec<&str> = lab.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "attr-keep-0",
+                "attr-reparse-0",
+                "derive-removed-0",
+                "derive-removed-1",
+                "macro-valid-0",
+                "pm-edit-0",
+                "rules-body-0",
+                "rules-body-1",
+                "tokens-format-0",
+                "tokens-rules-0",
+                "tokens-vec-0"
+            ]
         );
+        assert!(lab.iter().all(|c| c.origin == "hand"));
+    }
+
+    #[test]
+    fn load_gap_tags_reads_the_corpus_file() {
+        let tags = load_gap_tags(&real_corpus()).unwrap();
+        assert!(tags.iter().all(|t| t.case.contains('/')), "{tags:?}");
+        // A missing file is an empty list.
+        let none = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/oracle-test-tmp"
+        ))
+        .join(format!("no-tags-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&none);
+        std::fs::create_dir_all(&none).unwrap();
+        assert!(load_gap_tags(&none).unwrap().is_empty());
+        // An unknown field is refused.
+        std::fs::write(
+            none.join("gap-tags.toml"),
+            "[[tag]]\nrow = \"G-B-4\"\ncase = \"a/b\"\ncode = \"E0425\"\npath = \"x/src/lib.rs\"\nline = 1\nextra = 2\n",
+        )
+        .unwrap();
+        let err = load_gap_tags(&none).unwrap_err();
+        assert!(
+            matches!(err, CaseError::Invalid { .. } | CaseError::Toml { .. }),
+            "{err}"
+        );
+        // A bad code is Invalid.
+        std::fs::write(
+            none.join("gap-tags.toml"),
+            "[[tag]]\nrow = \"G-B-4\"\ncase = \"a/b\"\ncode = \"nope\"\npath = \"x/src/lib.rs\"\nline = 1\n",
+        )
+        .unwrap();
+        let err = load_gap_tags(&none).unwrap_err();
+        let _ = std::fs::remove_dir_all(&none);
+        assert!(matches!(err, CaseError::Invalid { .. }), "{err}");
     }
 
     #[test]

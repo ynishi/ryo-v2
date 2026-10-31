@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use ryo_v2_core::domain::{Diagnostic, DomainError, RelPath};
 
+use crate::case::parse_expected;
 use crate::groups::Group;
 
 /// The kind of a breaking edit. `id()` is kebab-case.
@@ -215,8 +216,8 @@ pub const REGROUP_PRIORITY: [Group; 11] = [
 /// The group of a case from its expected diagnostics.
 ///
 /// A fixed group wins; no expected error is [`Group::Valid`]; otherwise each
-/// code maps to its group (first match in [`Group::ALL`] order, [`Group::Cfg`]
-/// excluded, unknown codes ignored) and the first group present in
+/// code maps to its group (first match in [`Group::ALL`] order, cause groups
+/// ([`Group::is_cause`]) excluded, unknown codes ignored) and the first group present in
 /// [`REGROUP_PRIORITY`] is taken, falling back to the kind's default group.
 pub fn group_for(kind: Kind, expected: &[Diagnostic]) -> Group {
     if let Some(g) = kind.fixed_group() {
@@ -230,7 +231,7 @@ pub fn group_for(kind: Kind, expected: &[Diagnostic]) -> Group {
         .filter_map(|d| {
             Group::ALL
                 .into_iter()
-                .filter(|g| *g != Group::Cfg)
+                .filter(|g| !g.is_cause())
                 .find(|g| g.codes().contains(&d.code.as_str()))
         })
         .collect();
@@ -306,9 +307,11 @@ pub fn generate(kind: Kind, seed: u32, files: &[SourceFile]) -> Option<Breakage>
 }
 
 /// `.rs` files under `ws`, skipping `target` `cases` `expected` `breakage`
-/// `.git` `.ryo`, in path order.
+/// `overlays` `.git` `.ryo`, in path order.
 pub fn read_sources(ws: &Path) -> Result<Vec<SourceFile>, BreakageError> {
-    const SKIP: [&str; 6] = ["target", "cases", "expected", "breakage", ".git", ".ryo"];
+    const SKIP: [&str; 7] = [
+        "target", "cases", "expected", "breakage", "overlays", ".git", ".ryo",
+    ];
     let io = |path: &Path| {
         let path = path.to_path_buf();
         move |source| BreakageError::Io { path, source }
@@ -350,6 +353,11 @@ pub fn read_sources(ws: &Path) -> Result<Vec<SourceFile>, BreakageError> {
 /// Writes `<corpus>/<ws_rel>/breakage/<kind>-<seed>/<site.path>` (the whole
 /// new text) and `<corpus>/<ws_rel>/cases/<kind>-<seed>.toml`. Overwrites.
 /// Returns the toml path.
+///
+/// The `group` line of the toml is, in order: the group of the existing toml
+/// (when the file exists and has a parseable `group = "<id>"` line); else
+/// [`group_for`] when `expected/<kind>-<seed>.check.json` exists and parses;
+/// else [`Kind::default_group`]. Everything else is rewritten as before.
 pub fn write_case(corpus: &Path, ws_rel: &str, b: &Breakage) -> Result<PathBuf, BreakageError> {
     if RelPath::parse(ws_rel).is_err() {
         return Err(BreakageError::Invalid {
@@ -376,17 +384,36 @@ pub fn write_case(corpus: &Path, ws_rel: &str, b: &Breakage) -> Result<PathBuf, 
         &b.new_text,
     )?;
     let note = b.note.replace(['\n', '\r'], " ");
+    let toml_path = ws.join("cases").join(format!("{id}.toml"));
+    let group = existing_group(&toml_path)
+        .or_else(|| {
+            let text =
+                std::fs::read_to_string(ws.join("expected").join(format!("{id}.check.json")))
+                    .ok()?;
+            let expected = parse_expected(&text).ok()?;
+            Some(group_for(b.kind, &expected))
+        })
+        .unwrap_or_else(|| b.kind.default_group());
     let toml = format!(
         "# breakage: {}:{} {note}\nworkspace = \"{ws_rel}\"\noverlay = \"{ws_rel}/breakage/{id}\"\ngroup = \"{}\"\norigin = \"breakage:{}:{}\"\n",
         b.site.path,
         b.site.line,
-        b.kind.default_group().id(),
+        group.id(),
         b.kind.id(),
         b.seed,
     );
-    let toml_path = ws.join("cases").join(format!("{id}.toml"));
     write(&toml_path, &toml)?;
     Ok(toml_path)
+}
+
+/// The group of an existing case toml: its `group = "<id>"` line, if the file
+/// exists and the id is a known group.
+fn existing_group(toml: &Path) -> Option<Group> {
+    let text = std::fs::read_to_string(toml).ok()?;
+    text.lines().find_map(|l| {
+        let id = l.trim().strip_prefix("group = \"")?.strip_suffix('"')?;
+        Group::parse(id)
+    })
 }
 
 /// A file split into lines, with the regions no kind edits marked.
@@ -794,6 +821,27 @@ mod tests {
             Group::ConstEval,
             "unknown codes fall back to the default group"
         );
+    }
+
+    #[test]
+    fn write_case_keeps_existing_group() {
+        let corpus = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/oracle-test-tmp"
+        ))
+        .join(format!("keep-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&corpus);
+        let b = generate(Kind::RemoveImport, 0, &src("use a::b;\nfn x() {}\n")).unwrap();
+        let toml = write_case(&corpus, "ws", &b).unwrap();
+        let first = std::fs::read_to_string(&toml).unwrap();
+        assert!(first.contains("group = \"unresolved-import\""), "{first}");
+        let edited = first.replace("group = \"unresolved-import\"", "group = \"borrow\"");
+        std::fs::write(&toml, &edited).unwrap();
+        write_case(&corpus, "ws", &b).unwrap();
+        let second = std::fs::read_to_string(&toml).unwrap();
+        let _ = std::fs::remove_dir_all(&corpus);
+        assert_eq!(second, edited);
+        assert!(second.contains("group = \"borrow\""));
     }
 
     #[test]

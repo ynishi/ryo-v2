@@ -1,0 +1,4 @@
+workspace = "base/macro-lab"
+overlay = "base/macro-lab/overlays/rules-body-1"
+group = "macro-rules"
+origin = "hand"

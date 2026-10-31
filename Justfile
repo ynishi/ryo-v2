@@ -26,6 +26,10 @@ deny:
 oracle:
     cargo test -p ryo-v2-oracle --test oracle -- --nocapture
 
+# The oracle with the proc-macro server off (prints the table; floors are not checked).
+oracle-off:
+    RYO_V2_ORACLE_PROC_MACRO=off cargo test -p ryo-v2-oracle --test oracle -- --nocapture
+
 # Rewrites corpus/<ws>/expected/*.check.json from cargo check: the only recipe that runs cargo check on the corpus.
 oracle-refresh ws="base/extract-trait-multicrate":
     cargo run -p ryo-v2-oracle --bin oracle-refresh -- {{ws}}

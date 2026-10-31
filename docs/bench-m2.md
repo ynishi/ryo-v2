@@ -84,13 +84,25 @@ Results to fill (from the logs only): N chosen and reason, the two ryo-rs rows o
 
 N = 10: repeat 1 gave T = 22.9 s over the 6 rows, so clamp(floor(300000 / 22853), 2, 10) = 10. new_errors per run: body-01 28, body-02 0, body-03 110 (body-03 carries the stale-overlay errors noted under Anomalies; body-01's 28 were not inspected). The Affected scope does narrow on ryo-rs: 41/504 for the leaf crate `ryo-cli` (body-03), 434/504 for `ryo-symbol` (body-01, depended on by most crates). So the 4/4 on the small fixture is the closure genuinely covering it, not a `rev_deps` fallback.
 
+### ryo-rs without assert_revert (`--no-assert-revert`, repeat 5, HEAD 7b13339)
+
+| variant | scope | warm check ms min/med/max | warm revert ms min/med/max |
+|---|---|---|---|
+| corpus/body-01 | affected | 2401/2621/3219 | 286/337/490 |
+| corpus/body-01 | workspace | 2526/2610/3179 | 335/358/462 |
+| corpus/body-02 | affected | 2068/2347/3251 | 270/275/333 |
+| corpus/body-02 | workspace | 2537/2744/2921 | 263/299/391 |
+| corpus/body-03 | affected | 309/407/596 | 20/39/59 |
+| corpus/body-03 | workspace | 2548/2721/4438 | 249/250/389 |
+
+Revert drops from 1.4–2.1 s to 0.04–0.36 s: the cost was the re-diagnosis that the assert does. The check times are not comparable with the repeat-10 table: the server was busier (baseline 67 s here against 35 s), and body-03 Affected fell to 0.4 s for a reason not investigated. `principle-15: holds (worst warm median check_ms 2744 at corpus/body-02 [workspace], limit 5000)`.
+
 ## Verdict
 
 - principle 15: holds on both. Small workspace worst warm median check 7 ms; ryo-rs worst warm median 4298 ms (body-03, Workspace scope), with assert_revert on. The run's line: `principle-15: holds (worst warm median check_ms 4298 at corpus/body-03 [workspace], limit 5000)`. The margin is small at Workspace scope; Affected keeps every row under 2.1 s. Revert costs about as much again (1.4 to 2.1 s median), so one candidate is check + revert, 3 to 6 s.
 - ryo-rs memory: RSS 5.0 GB after load, 5.75 GB after 60 runs. It grows in steps (slope up to 22 MB/iter in the rows that diagnose most files) and flattens where little is diagnosed (body-02 Affected 0.3 MB/iter); leak_suspect is false in every row. Not a confirmed leak; whether it levels off needs a longer run.
 - comparison with the earlier prototype of this verifier (a single-purpose rust-analyzer checker that is not part of this repository; its own changelog, 0.2.0, gives a first load of about 25 s and about 100 ms warm per candidate): cold load 29 s is in line; the per-candidate check is 14 to 43 times slower than that 100 ms. Not investigated; candidates are the next trait solver, ra 0.0.343 to 0.0.358, the shared server, or the prototype's number being for a smaller scope.
-- memory: on the small workspace no leak suspect (RSS plateau at about 522 MB, slope 0.0 to 0.1 kB/iter over 100 runs, i.e. a few kB in total). The RSS here is the process only; the separate proc-macro-srv process is not included. glibc malloc does not return freed memory, so a plateau is not a leak, and a rising series would need to be read for linear versus levelling-off trend before calling it a leak. The ryo-rs verdict is pending.
-- comparison with the earlier prototype of this verifier (a single-purpose rust-analyzer checker that is not part of this repository; its own changelog, 0.2.0, gives a first load of about 25 s and about 100 ms warm per candidate): pending the ryo-rs numbers.
+- memory: on the small workspace no leak suspect (RSS plateau at about 522 MB, slope 0.0 to 0.1 kB/iter over 100 runs, i.e. a few kB in total). The RSS here is the process only; the separate proc-macro-srv process is not included. glibc malloc does not return freed memory, so a plateau is not a leak, and a rising series would need to be read for linear versus levelling-off trend before calling it a leak. The ryo-rs memory line above is the ryo-rs verdict.
 
 ## Why simultaneous forks were not built
 

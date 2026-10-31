@@ -1,0 +1,12 @@
+[
+  {
+    "code": "E0308",
+    "path": "model/src/lib.rs",
+    "line": 19
+  },
+  {
+    "code": "E0308",
+    "path": "model/src/lib.rs",
+    "line": 54
+  }
+]

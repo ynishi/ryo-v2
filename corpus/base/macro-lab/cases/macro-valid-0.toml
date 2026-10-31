@@ -1,0 +1,4 @@
+workspace = "base/macro-lab"
+overlay = "base/macro-lab/overlays/macro-valid-0"
+group = "valid"
+origin = "hand"

@@ -13,18 +13,19 @@ use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::Scope;
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_oracle::case::Case;
+use ryo_v2_oracle::case::{Case, load_gap_tags};
 use ryo_v2_oracle::groups::{CaseOutcome, Counts, Group, Outcome, Report, compare};
 use ryo_v2_oracle::materials::Materials;
 use ryo_v2_ra::{RaAnalyzer, RaConfig};
 
-// Floors: the least number of passing cases a group must keep. Raised, never
-// lowered; lowering one needs the id of its CHECK_LEDGER row written next to it.
-const FLOOR_UNRESOLVED_IMPORT: usize = 3;
+// Floors: the least number of recall hits (`hit`; `exact` for valid) a group
+// must keep. Raised, never lowered; lowering one needs the id of its
+// CHECK_LEDGER row written next to it.
+const FLOOR_UNRESOLVED_IMPORT: usize = 4;
 const FLOOR_UNRESOLVED_NAME: usize = 0;
 const FLOOR_UNRESOLVED_TYPE: usize = 0;
-const FLOOR_NO_METHOD: usize = 9;
-const FLOOR_TYPE_MISMATCH: usize = 3;
+const FLOOR_NO_METHOD: usize = 10;
+const FLOOR_TYPE_MISMATCH: usize = 7;
 const FLOOR_TRAIT_BOUND: usize = 3;
 const FLOOR_ARITY: usize = 0;
 const FLOOR_FIELD: usize = 1;
@@ -32,7 +33,12 @@ const FLOOR_BORROW: usize = 0;
 const FLOOR_PRIVACY: usize = 4;
 const FLOOR_CONST_EVAL: usize = 0;
 const FLOOR_CFG: usize = 1;
-const FLOOR_VALID: usize = 4;
+const FLOOR_MACRO_DERIVE: usize = 2;
+const FLOOR_MACRO_ATTR: usize = 2;
+const FLOOR_MACRO_RULES: usize = 0;
+const FLOOR_MACRO_TOKENS: usize = 2;
+const FLOOR_PROC_MACRO_EDIT: usize = 0;
+const FLOOR_VALID: usize = 5;
 
 fn floor(g: Group) -> usize {
     match g {
@@ -48,17 +54,22 @@ fn floor(g: Group) -> usize {
         Group::Privacy => FLOOR_PRIVACY,
         Group::ConstEval => FLOOR_CONST_EVAL,
         Group::Cfg => FLOOR_CFG,
+        Group::MacroDerive => FLOOR_MACRO_DERIVE,
+        Group::MacroAttr => FLOOR_MACRO_ATTR,
+        Group::MacroRules => FLOOR_MACRO_RULES,
+        Group::MacroTokens => FLOOR_MACRO_TOKENS,
+        Group::ProcMacroEdit => FLOOR_PROC_MACRO_EDIT,
         Group::Valid => FLOOR_VALID,
     }
 }
 
-fn recall_text(c: &Counts) -> String {
-    let denom = c.pass + c.fn_;
-    if denom == 0 {
-        "-".to_string()
-    } else {
-        format!("{:.2}", c.pass as f64 / denom as f64)
-    }
+/// The metric a floor is checked against: `exact` for valid, `hit` otherwise.
+fn floor_metric(g: Group, c: &Counts) -> usize {
+    if g == Group::Valid { c.exact } else { c.hit }
+}
+
+fn ratio_text(r: Option<f64>) -> String {
+    r.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"))
 }
 
 fn listed<T: std::fmt::Debug>(items: &[T], full: bool) -> String {
@@ -136,6 +147,7 @@ fn oracle() {
         let _ = observer.take();
         for case in ws_cases {
             let mut check_ms = None;
+            let mut expected_diags = Vec::new();
             let outcome = if let Some(why) = &case.skip {
                 Outcome::Skip(why.clone())
             } else {
@@ -162,7 +174,9 @@ fn oracle() {
                                         check_ms = Some(ms);
                                     }
                                 }
-                                compare(&expected, &verdict.new_errors)
+                                let out = compare(&expected, &verdict.new_errors);
+                                expected_diags = expected;
+                                out
                             }
                             Err(e) => {
                                 infra_errors.push(format!("{}: {e}", case.id));
@@ -176,34 +190,83 @@ fn oracle() {
             report.outcomes.push(CaseOutcome {
                 id: format!("{ws_name}/{}", case.id),
                 group: case.group,
+                expected: expected_diags,
                 outcome,
                 check_ms,
             });
         }
     }
 
+    let filtered = !report.excluded.is_empty();
+    let tags = match load_gap_tags(&m.corpus) {
+        Ok(t) => t,
+        Err(e) => {
+            infra_errors.push(format!("gap tags: {e}"));
+            Vec::new()
+        }
+    };
+    if !filtered {
+        for t in &tags {
+            let found = report
+                .outcomes
+                .iter()
+                .find(|o| o.id == t.case)
+                .is_some_and(|o| o.expected.contains(&t.diagnostic));
+            if !found {
+                infra_errors.push(format!(
+                    "stale gap tag: {} {} {} {}:{} (case not in the run, or diagnostic not expected)",
+                    t.row, t.case, t.diagnostic.code, t.diagnostic.path, t.diagnostic.line
+                ));
+            }
+        }
+    }
+
     let counts = report.counts();
-    println!("group | cases | pass | FN | FP | skip | floor | recall");
+    println!("group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision");
     for g in Group::ALL {
         let Some(c) = counts.get(&g) else { continue };
         println!(
-            "{} | {} | {} | {} | {} | {} | {} | {}",
+            "{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}",
             g.id(),
             c.cases,
-            c.pass,
-            c.fn_,
-            c.fp,
             c.skip,
+            c.of,
+            c.hit,
+            c.fn_,
+            c.exact,
+            c.fp,
             floor(g),
-            recall_text(c)
+            ratio_text(c.recall()),
+            ratio_text(c.precision())
         );
     }
+    println!("other code | missed | extra | cases");
+    for (code, c) in report.other_codes() {
+        println!("{code} | {} | {} | {}", c.missed, c.extra, c.cases);
+    }
     match report.primary_recall() {
-        Some((p, n)) => println!(
-            "H7 primary recall: {p}/{n} = {:.2} (adopt >= 0.80, discard < 0.50)",
-            p as f64 / n as f64
+        Some((hit, of)) => println!(
+            "H7 primary recall: {hit}/{of} = {:.2} (adopt >= 0.80, discard < 0.50)",
+            hit as f64 / of as f64
         ),
         None => println!("H7 primary recall: - (no primary case compared)"),
+    }
+    let without = report.primary_recall_without(&tags, &["G-B-3", "G-B-4"]);
+    match without {
+        Some((hit, of)) => println!(
+            "H7 primary recall without G-B-3, G-B-4: {hit}/{of} = {:.2}",
+            hit as f64 / of as f64
+        ),
+        None => println!("H7 primary recall without G-B-3, G-B-4: - (no primary case compared)"),
+    }
+    for o in report.misgrouped() {
+        let codes: Vec<&str> = o.expected.iter().map(|d| d.code.as_str()).collect();
+        println!(
+            "MISGROUPED {} [{}] expected codes: {}",
+            o.id,
+            o.group.id(),
+            codes.join(",")
+        );
     }
     let full = std::env::var_os("RYO_V2_ORACLE_FULL").is_some();
     for o in &report.outcomes {
@@ -230,7 +293,12 @@ fn oracle() {
     if let Ok(path) = std::env::var("RYO_V2_ORACLE_REPORT") {
         // A relative path is relative to the repo root, not to the test's cwd.
         let dest = m.repo_root.join(&path);
-        let json = serde_json::to_string_pretty(&report.to_json()).expect("report json");
+        let mut value = report.to_json();
+        value["primary_recall_without_gb34"] = match without {
+            Some((hit, of)) => serde_json::json!({"hit": hit, "of": of}),
+            None => serde_json::Value::Null,
+        };
+        let json = serde_json::to_string_pretty(&value).expect("report json");
         std::fs::write(&dest, json + "\n")
             .unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
     }
@@ -246,10 +314,16 @@ fn oracle() {
         let below: Vec<String> = Group::ALL
             .into_iter()
             .filter_map(|g| {
-                let pass = counts.get(&g).map_or(0, |c| c.pass);
-                (pass < floor(g)).then(|| format!("{}: pass {pass} < floor {}", g.id(), floor(g)))
+                let got = counts.get(&g).map_or(0, |c| floor_metric(g, c));
+                let name = if g == Group::Valid { "exact" } else { "hit" };
+                (got < floor(g)).then(|| format!("{}: {name} {got} < floor {}", g.id(), floor(g)))
             })
             .collect();
         assert!(below.is_empty(), "below floor:\n{}", below.join("\n"));
+        // Ceiling: an edit of a proc-macro crate must stay a false negative.
+        assert!(
+            counts.get(&Group::ProcMacroEdit).is_none_or(|c| c.hit == 0),
+            "proc-macro-edit: ra reported an edit of a proc-macro crate; the load-time dylib assumption (CHECK_LEDGER) no longer holds"
+        );
     }
 }

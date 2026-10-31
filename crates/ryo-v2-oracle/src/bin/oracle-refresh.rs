@@ -18,7 +18,9 @@ use ryo_v2_oracle::case::{Case, render_expected};
 use ryo_v2_oracle::materials::Materials;
 
 /// Directories of the base workspace that are not part of the build.
-const SKIP_DIRS: [&str; 6] = ["target", "cases", "expected", "breakage", ".git", ".ryo"];
+const SKIP_DIRS: [&str; 7] = [
+    "target", "cases", "expected", "breakage", "overlays", ".git", ".ryo",
+];
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
