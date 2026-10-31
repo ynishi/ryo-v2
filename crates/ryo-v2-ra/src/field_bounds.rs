@@ -15,16 +15,31 @@
 //! A derived impl is an impl of the type for one of these traits of a `core`/`std` crate that ra
 //! holds without a source (`Impl::source` is `None` for builtin derives only), so a written impl
 //! of `Debug` or a proc-macro derive is never read as derived. A field fails when its type is
-//! known and ra's trait solver says it does not implement the trait. Skipped, which loses
-//! recall and never precision: types with type or const parameters (the derived impl adds a
-//! bound per parameter, which the field types are not checked under), `Clone` next to a derived
-//! `Copy`, `Eq` on a field that already fails `PartialEq`, `Default` on an enum (only its
-//! `#[default]` variant counts), the traits above that were not measured (`Hash`, `PartialOrd`,
-//! `Ord`), negative impls, cfg-disabled code and code inside macro calls.
+//! known and ra's trait solver says it does not implement the trait.
+//!
+//! A field is judged in the param env of the impl that asks for the trait. For a type with type
+//! parameters the field type is instantiated with the arguments of the derived impl's self type,
+//! so the solver sees the bounds the derive puts on the parameters (`T: Trait` for each type
+//! parameter, plus the predicates the type declares in its bounds and where clause): `a: T`,
+//! `Vec<T>`, `Option<T>` and `PhantomData<T>` pass, a field that lacks the trait whatever `T` is
+//! fails. A written `Copy` impl of a generic type is judged the same way in the impl's own env
+//! (`impl<T: Copy> Copy for W<T> {}`), also for a concrete instance (`impl Copy for W<u8> {}`).
+//! A type with const parameters and no type parameter needs no instantiation (a const parameter
+//! adds no bound), so its fields are judged as they are.
+//!
+//! Rustc also reports a derived `Clone` next to a derived `Copy` (E0277 at the field) on a type
+//! with a type or const parameter; only a type without parameters gets the shallow-copy `Clone`.
+//!
+//! Skipped, which loses recall and never precision: a field that mentions a const parameter of a
+//! type that also has type parameters (the instantiation leaves the const argument unknown), a
+//! written `Copy` impl with const parameters, `Clone` next to a derived `Copy` on a type without
+//! type or const parameters, `Eq` on a field that already fails `PartialEq`, `Default` on an enum
+//! (only its `#[default]` variant counts), the traits above that were not measured (`Hash`,
+//! `PartialOrd`, `Ord`), negative impls, cfg-disabled code and code inside macro calls.
 
 use crate::duplicate::head;
 use crate::unresolved::Hit;
-use ra_ap_hir::{Adt, HasSource, Impl, Semantics, Trait, Type};
+use ra_ap_hir::{Adt, Field, HasSource, Impl, Semantics, Trait, Type};
 use ra_ap_ide::{TextRange, TextSize};
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_syntax::SyntaxKind;
@@ -73,9 +88,6 @@ pub(crate) fn find(
                 continue;
             }
             if let Some(adt) = ast::Adt::cast(node.clone()) {
-                if has_type_params(&adt) {
-                    continue;
-                }
                 let Some(def) = sema.to_def(&adt) else {
                     continue;
                 };
@@ -84,29 +96,36 @@ pub(crate) fn find(
                     continue;
                 }
                 let fields = fields_of(&sema, &adt);
+                let generic = has_param(&adt, true);
                 let name = def.name(db).as_str().to_owned();
-                if let Some(copy) = derived.get("Copy")
-                    && fields.iter().any(|(_, ty)| lacks(db, ty, *copy))
+                if let Some(&(copy, imp)) = derived.get("Copy")
+                    && fields
+                        .iter()
+                        .any(|(_, f)| lacks(db, &field_ty(db, f, imp, generic), copy))
                 {
                     push("E0204", copy_message(&name), head(adt.syntax()));
                 }
                 for (trait_name, code) in DERIVED {
-                    let Some(t) = derived.get(trait_name) else {
+                    let Some(&(t, imp)) = derived.get(trait_name) else {
                         continue;
                     };
-                    if (trait_name == "Clone" && derived.contains_key("Copy"))
+                    if (trait_name == "Clone"
+                        && derived.contains_key("Copy")
+                        && !has_param(&adt, false)
+                        && !generic)
                         || (trait_name == "Default" && matches!(def, Adt::Enum(_)))
                     {
                         continue;
                     }
-                    for (at, ty) in &fields {
-                        if !lacks(db, ty, *t) {
+                    for (at, f) in &fields {
+                        let ty = field_ty(db, f, imp, generic);
+                        if !lacks(db, &ty, t) {
                             continue;
                         }
                         if trait_name == "Eq"
-                            && derived
-                                .get("PartialEq")
-                                .is_some_and(|pe| lacks(db, ty, *pe))
+                            && derived.get("PartialEq").is_some_and(|&(pe, pe_imp)| {
+                                lacks(db, &field_ty(db, f, pe_imp, generic), pe)
+                            })
                         {
                             continue;
                         }
@@ -118,7 +137,7 @@ pub(crate) fn find(
                     }
                 }
             } else if let Some(imp) = ast::Impl::cast(node) {
-                if imp.excl_token().is_some() || has_type_params(&imp) {
+                if imp.excl_token().is_some() || has_param(&imp, false) {
                     continue;
                 }
                 let Some(trait_ty) = imp.trait_() else {
@@ -133,7 +152,16 @@ pub(crate) fn find(
                 let Some(adt) = def.self_ty(db).as_adt() else {
                     continue;
                 };
-                if adt_fields(db, adt).iter().any(|ty| lacks(db, ty, t)) {
+                // The arguments of the written self type (`W<T>`, or `W<u8>`), in the impl's env.
+                let args: Vec<Type<'_>> = def.self_ty(db).type_arguments().collect();
+                if adt_fields(db, adt).iter().any(|f| {
+                    let ty = if args.is_empty() {
+                        f.ty(db)
+                    } else {
+                        f.ty(db).instantiate(&args)
+                    };
+                    lacks(db, &ty, t)
+                }) {
                     push(
                         "E0204",
                         copy_message(adt.name(db).as_str()),
@@ -152,7 +180,7 @@ fn copy_message(name: &str) -> String {
 
 /// The traits of `core`/`std` that `adt` derives (builtin derives, which have no source), by
 /// name: `Copy` and the names of [`DERIVED`].
-fn derived_traits(db: &RootDatabase, adt: Adt) -> BTreeMap<&'static str, Trait> {
+fn derived_traits(db: &RootDatabase, adt: Adt) -> BTreeMap<&'static str, (Trait, Impl)> {
     let mut out = BTreeMap::new();
     for imp in Impl::all_for_type(db, adt.ty(db)) {
         if imp.source(db).is_some() {
@@ -161,7 +189,7 @@ fn derived_traits(db: &RootDatabase, adt: Adt) -> BTreeMap<&'static str, Trait> 
         let Some(t) = imp.trait_(db) else { continue };
         for name in std::iter::once("Copy").chain(DERIVED.iter().map(|(n, _)| *n)) {
             if is_core_trait(db, t, name) {
-                out.insert(name, t);
+                out.insert(name, (t, imp));
             }
         }
     }
@@ -173,11 +201,8 @@ fn is_core_trait(db: &RootDatabase, t: Trait, name: &str) -> bool {
     t.name(db).as_str() == name && t.module(db).krate(db).is_builtin(db)
 }
 
-/// Where each field of the type starts, with its type (from ra), in source order.
-fn fields_of<'db>(
-    sema: &Semantics<'db, RootDatabase>,
-    adt: &ast::Adt,
-) -> Vec<(TextSize, Type<'db>)> {
+/// Where each field of the type starts, with the field (from ra), in source order.
+fn fields_of(sema: &Semantics<'_, RootDatabase>, adt: &ast::Adt) -> Vec<(TextSize, Field)> {
     let lists: Vec<ast::FieldList> = match adt {
         ast::Adt::Struct(s) => s.field_list().into_iter().collect(),
         ast::Adt::Union(u) => u
@@ -192,21 +217,20 @@ fn fields_of<'db>(
             .filter_map(|v| v.field_list())
             .collect(),
     };
-    let db = sema.db;
     let mut out = Vec::new();
     for list in lists {
         match list {
             ast::FieldList::RecordFieldList(l) => {
                 for f in l.fields() {
                     if let Some(def) = sema.to_def(&f) {
-                        out.push((head(f.syntax()), def.ty(db)));
+                        out.push((head(f.syntax()), def));
                     }
                 }
             }
             ast::FieldList::TupleFieldList(l) => {
                 for f in l.fields() {
                     if let Some(def) = sema.to_def(&f) {
-                        out.push((head(f.syntax()), def.ty(db)));
+                        out.push((head(f.syntax()), def));
                     }
                 }
             }
@@ -215,8 +239,8 @@ fn fields_of<'db>(
     out
 }
 
-/// The field types of a type ra resolved (for a written `Copy` impl).
-fn adt_fields(db: &RootDatabase, adt: Adt) -> Vec<Type<'_>> {
+/// The fields of a type ra resolved (for a written `Copy` impl).
+fn adt_fields(db: &RootDatabase, adt: Adt) -> Vec<Field> {
     let fields = match adt {
         Adt::Struct(s) => s.fields(db),
         Adt::Union(u) => u.fields(db),
@@ -226,7 +250,19 @@ fn adt_fields(db: &RootDatabase, adt: Adt) -> Vec<Type<'_>> {
             .flat_map(|v| v.fields(db))
             .collect(),
     };
-    fields.into_iter().map(|f| f.ty(db)).collect()
+    fields
+}
+
+/// The type of `f` as the derived impl `imp` sees it. A generic type's fields are instantiated
+/// with the arguments of the impl's self type, so the solver runs in the param env of the derived
+/// impl: the type's own predicates plus `T: Trait` for each type parameter `T`. A const
+/// parameter becomes an unknown argument, which [`lacks`] does not judge.
+fn field_ty<'db>(db: &'db RootDatabase, f: &Field, imp: Impl, generic: bool) -> Type<'db> {
+    if !generic {
+        return f.ty(db);
+    }
+    let args: Vec<Type<'db>> = imp.self_ty(db).type_arguments().collect();
+    f.ty(db).instantiate(&args)
 }
 
 /// Whether the type is known and does not implement `t` (with `Self` as the only other
@@ -243,10 +279,12 @@ fn lacks(db: &RootDatabase, ty: &Type<'_>, t: Trait) -> bool {
     !ty.impls_trait(db, t, &args)
 }
 
-/// Whether the item has a type or const parameter (lifetimes alone do not count).
-fn has_type_params(item: &impl HasGenericParams) -> bool {
-    item.generic_param_list()
-        .is_some_and(|l| l.type_or_const_params().next().is_some())
+/// Whether the item has a type parameter (`ty`) or a const parameter (lifetimes do not count).
+fn has_param(item: &impl HasGenericParams, ty: bool) -> bool {
+    item.generic_param_list().is_some_and(|l| {
+        l.type_or_const_params()
+            .any(|p| matches!(p, ast::TypeOrConstParam::Type(_)) == ty)
+    })
 }
 
 /// Whether the node is cfg-disabled or inside a macro call or definition.

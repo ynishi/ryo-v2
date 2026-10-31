@@ -1,0 +1,4 @@
+workspace = "base/breakage-lab"
+overlay = "base/breakage-lab/overlays/derive-generic-copy-0"
+group = "copy-impl"
+origin = "hand"

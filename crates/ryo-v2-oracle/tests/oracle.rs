@@ -41,16 +41,16 @@ const FLOOR_BORROW: usize = 0;
 const FLOOR_PRIVACY: usize = 4;
 const FLOOR_CONST_EVAL: usize = 0;
 const FLOOR_DUPLICATE_NAME: usize = 2;
-const FLOOR_COPY_IMPL: usize = 3;
+const FLOOR_COPY_IMPL: usize = 6;
 const FLOOR_CFG: usize = 1;
 const FLOOR_CFG_TEST: usize = 5;
 const FLOOR_MACRO_DERIVE: usize = 2;
-const FLOOR_DERIVE_FIELD: usize = 5;
+const FLOOR_DERIVE_FIELD: usize = 10;
 const FLOOR_MACRO_ATTR: usize = 2;
 const FLOOR_MACRO_RULES: usize = 0;
 const FLOOR_MACRO_TOKENS: usize = 2;
 const FLOOR_PROC_MACRO_EDIT: usize = 0;
-const FLOOR_VALID: usize = 9;
+const FLOOR_VALID: usize = 11;
 const PRIMARY_OF_FLOOR: usize = 32; // raised, never lowered (same rule as the floors)
 
 fn floor(g: Group) -> usize {
