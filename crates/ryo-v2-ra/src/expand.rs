@@ -1573,6 +1573,10 @@ fn generate(
 ///   tested: tests/expand_gen.rs move_item_collapses_a_reexport_under_a_comment
 ///   tested: tests/expand_gen.rs move_item_collapses_an_item_with_a_trailing_comment
 ///   tested: expand::tests::a_trailing_line_comment_ends_the_item_at_its_line_end
+/// - C12: every proposed Blueprint carries one `BaseFp` per edited file, fingerprinting the text
+///   of the given state, not the loaded text.
+///   tested: tests/expand.rs expansion_reads_the_given_state
+///   tested: tests/expand.rs every_expansion_conforms
 impl Expander for RaAnalyzer {
     type Session = RaSession;
 

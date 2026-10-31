@@ -169,7 +169,7 @@ fn extract_variable_restores_a_call_folded_into_a_let_initializer() {
     );
 }
 
-/// Cause 2 (CHECK_LEDGER S-6): a call folded into the value of a struct-literal field
+/// Cause 2 (SEARCH_LEDGER "Generation", once CHECK_LEDGER S-6): a call folded into the value of a struct-literal field
 /// (`Slot { width }` became `Slot { width: needed(v) }`). Rust-analyzer names the variable after
 /// the field and writes the field as the shorthand; the expander writes the same.
 #[test]
