@@ -233,6 +233,7 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   tested: resolution_json::tests::decided_lists_the_rule_id
 ///   tested: tests/apply.rs apply_rename_local_is_decided
 ///   tested: tests/apply.rs decided_candidate_lists_its_basis
+///   tested: resolution_json::tests::decided_lists_the_reads_of_files_only_read
 /// - C2: a `Failed` resolution lists each blocker with its `kind` and the blueprint; a stale
 ///   blocking lists its `drift`, each entry a `file` (path, expected `fingerprint`, `freshness`,
 ///   `actual`), a `read` (path, range, `fingerprint`, freshness) or a `missing` path.
@@ -527,6 +528,45 @@ mod tests {
         ));
         assert_eq!(none["candidates"][0]["outer_check"], Value::Null);
         assert_eq!(none["candidates"][0]["marks"], json!([]));
+    }
+
+    #[test]
+    fn decided_lists_the_reads_of_files_only_read() {
+        let (lib, other) = (rel("src/lib.rs"), rel("src/o.rs"));
+        let text = "let a = 1;";
+        let read = ReadRange::capture(other.clone(), "abcdef", tr(1, 4)).expect("a read");
+        let bp = Blueprint::new(BlueprintParts {
+            id: id(),
+            intent: IntentCall::RenameLocal {
+                from: Ident::parse("a").expect("ident"),
+                to: Ident::parse("b").expect("ident"),
+            },
+            specs: vec![MutationSpec::replace(lib.clone(), tr(4, 5), "b").expect("a spec")],
+            // the read of the edited file is covered by its base and is not in the basis
+            reads: vec![
+                ReadRange::capture(lib.clone(), text, tr(0, 10)).expect("a read"),
+                read.clone(),
+            ],
+            bases: vec![BaseFp::capture(lib, text)],
+            spec_refs: vec![],
+            record: DecisionRecord::new("agent", "because").expect("a record"),
+        })
+        .expect("a blueprint");
+        let fake = Fake::with(&[("src/lib.rs", text), ("src/o.rs", "abcdef")]);
+        let v = resolution_to_json(&decided(&fake, vec![bp], &RuleCatalog::default()));
+        assert_eq!(
+            v["candidates"][0]["basis"],
+            json!({
+                "files": [{
+                    "path": "src/lib.rs",
+                    "fingerprint": Fingerprint::of(text.as_bytes()).to_string(),
+                }],
+                "reads": [{
+                    "path": "src/o.rs", "start": 1, "end": 4,
+                    "fingerprint": read.fingerprint().to_string(),
+                }],
+            })
+        );
     }
 
     #[test]

@@ -72,8 +72,9 @@ impl Acc {
 ///   a candidate whose `outer_check` is `Some`, which is never `AutoApplicable`.
 ///   tested: app::apply::tests::crate_graph_edits_never_pass_silently
 /// - C3: a base fingerprint or a read of a file the analyzer does not have gives
-///   `MissingFile`, and the check is not called.
+///   `MissingFile`, also when other entries drifted, and the check is not called.
 ///   tested: app::apply::tests::missing_file_is_blocking
+///   tested: app::apply::tests::read_of_file_without_base_is_checked
 /// - C4: an `Err` of the check returns `ApplyError::Check` at once.
 ///   tested: app::apply::tests::check_error_is_apply_error
 /// - C5: the result is `Decided` when at least one Blueprint passed, with the candidates in
@@ -527,6 +528,19 @@ mod tests {
                 path: other.clone()
             }]
         );
+        // missing wins over drift elsewhere: the edited file changed as well
+        fake.texts
+            .insert(rel("src/lib.rs"), "let a = 2;".to_owned());
+        let i = failed(run(&fake, vec![bp.clone()], &RuleCatalog::default()));
+        assert_eq!(fake.checks.get(), 0);
+        assert_eq!(
+            i.blocking(),
+            &[Blocking::MissingFile {
+                blueprint: bid(1),
+                path: other.clone()
+            }]
+        );
+        fake.texts.insert(rel("src/lib.rs"), BASE.to_owned());
         // it changed
         fake.texts.insert(other.clone(), "abd".to_owned());
         let i = failed(run(&fake, vec![bp.clone()], &RuleCatalog::default()));

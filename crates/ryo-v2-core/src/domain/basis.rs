@@ -256,6 +256,13 @@ mod tests {
         );
         assert_eq!(drift[2], Drift::Missing(rel("c.rs")));
         assert_eq!(drift[2].path(), &rel("c.rs"));
+
+        // an edited file that is gone is missing too, before the reads
+        let gone = texts(&[("b.rs", B)]);
+        assert_eq!(
+            basis.check(&view(&gone)),
+            vec![Drift::Missing(rel("a.rs")), Drift::Missing(rel("c.rs"))]
+        );
     }
 
     #[test]
