@@ -1,0 +1,4 @@
+workspace = "base/extract-trait-multicrate"
+overlay = "broken-04"
+group = "unresolved-import"
+origin = "hand"

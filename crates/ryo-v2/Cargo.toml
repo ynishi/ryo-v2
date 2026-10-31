@@ -1,0 +1,14 @@
+[package]
+name = "ryo-v2"
+description = "Speculative refactoring engine for Rust: Blueprints explored and verified in-process on rust-analyzer, built once after commit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+[dependencies]
+ryo-v2-core.workspace = true

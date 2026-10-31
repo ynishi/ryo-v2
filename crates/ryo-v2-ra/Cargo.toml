@@ -1,0 +1,24 @@
+[package]
+name = "ryo-v2-ra"
+description = "rust-analyzer adapter of ryo-v2: in-memory code state, forks and HIR diagnostics over the ra_ap_* crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+[dependencies]
+ryo-v2-core.workspace = true
+ra_ap_ide.workspace = true
+ra_ap_hir.workspace = true
+ra_ap_base_db.workspace = true
+ra_ap_vfs.workspace = true
+ra_ap_load-cargo.workspace = true
+ra_ap_project_model.workspace = true
+triomphe.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

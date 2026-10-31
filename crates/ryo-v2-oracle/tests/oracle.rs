@@ -1,0 +1,250 @@
+//! Compares the in-memory verifier (`ryo-v2-ra`) with the expected diagnostics
+//! `cargo check` gave for each corpus case. Never runs cargo check itself.
+//!
+//! Env: `RYO_V2_ORACLE_ONLY=<group>,..`, `RYO_V2_ORACLE_LIMIT=<n>`,
+//! `RYO_V2_ORACLE_FULL` (list every diagnostic), `RYO_V2_ORACLE_REPORT=<file>`,
+//! `RYO_V2_ORACLE_PROC_MACRO=off` (print the table, ignore floors).
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use ryo_v2_core::app::ports::{Analyzer, Event};
+use ryo_v2_core::app::verify::verify;
+use ryo_v2_core::domain::Scope;
+use ryo_v2_core::infra::clock::MonotonicClock;
+use ryo_v2_core::infra::observer::RecordingObserver;
+use ryo_v2_oracle::case::Case;
+use ryo_v2_oracle::groups::{CaseOutcome, Counts, Group, Outcome, Report, compare};
+use ryo_v2_oracle::materials::Materials;
+use ryo_v2_ra::{RaAnalyzer, RaConfig};
+
+// Floors: the least number of passing cases a group must keep. Raised, never
+// lowered; lowering one needs the id of its CHECK_LEDGER row written next to it.
+const FLOOR_UNRESOLVED_IMPORT: usize = 2;
+const FLOOR_UNRESOLVED_NAME: usize = 0;
+const FLOOR_UNRESOLVED_TYPE: usize = 0;
+const FLOOR_NO_METHOD: usize = 2;
+const FLOOR_TYPE_MISMATCH: usize = 1;
+const FLOOR_TRAIT_BOUND: usize = 0;
+const FLOOR_ARITY: usize = 0;
+const FLOOR_FIELD: usize = 1;
+const FLOOR_BORROW: usize = 0;
+const FLOOR_PRIVACY: usize = 1;
+const FLOOR_VALID: usize = 1;
+
+fn floor(g: Group) -> usize {
+    match g {
+        Group::UnresolvedImport => FLOOR_UNRESOLVED_IMPORT,
+        Group::UnresolvedName => FLOOR_UNRESOLVED_NAME,
+        Group::UnresolvedType => FLOOR_UNRESOLVED_TYPE,
+        Group::NoMethod => FLOOR_NO_METHOD,
+        Group::TypeMismatch => FLOOR_TYPE_MISMATCH,
+        Group::TraitBound => FLOOR_TRAIT_BOUND,
+        Group::Arity => FLOOR_ARITY,
+        Group::Field => FLOOR_FIELD,
+        Group::Borrow => FLOOR_BORROW,
+        Group::Privacy => FLOOR_PRIVACY,
+        Group::Valid => FLOOR_VALID,
+    }
+}
+
+fn recall_text(c: &Counts) -> String {
+    let denom = c.pass + c.fn_;
+    if denom == 0 {
+        "-".to_string()
+    } else {
+        format!("{:.2}", c.pass as f64 / denom as f64)
+    }
+}
+
+fn listed<T: std::fmt::Debug>(items: &[T], full: bool) -> String {
+    let shown: Vec<String> = items
+        .iter()
+        .take(if full { usize::MAX } else { 5 })
+        .map(|i| format!("{i:?}"))
+        .collect();
+    let more = if items.len() > shown.len() {
+        format!(" (+{} more)", items.len() - shown.len())
+    } else {
+        String::new()
+    };
+    format!("[{}]{more}", shown.join(", "))
+}
+
+#[test]
+fn oracle() {
+    let m = Materials::find().expect("materials");
+    let mut cases = Case::load_all(&m.corpus).expect("load cases");
+    let mut report = Report::default();
+
+    if let Ok(only) = std::env::var("RYO_V2_ORACLE_ONLY") {
+        let groups: Vec<Group> = only
+            .split(',')
+            .map(|s| {
+                Group::parse(s.trim())
+                    .unwrap_or_else(|| panic!("RYO_V2_ORACLE_ONLY: unknown group {s:?}"))
+            })
+            .collect();
+        cases.retain(|c| {
+            let keep = groups.contains(&c.group);
+            if !keep {
+                report.excluded.push((c.id.clone(), "only".into()));
+            }
+            keep
+        });
+    }
+    if let Ok(limit) = std::env::var("RYO_V2_ORACLE_LIMIT") {
+        let n: usize = limit.parse().expect("RYO_V2_ORACLE_LIMIT is a number");
+        for c in cases.iter().skip(n) {
+            report.excluded.push((c.id.clone(), "limit".into()));
+        }
+        cases.truncate(n);
+    }
+
+    if m.proc_macro && m.proc_macro_srv.is_none() {
+        println!("warning: proc-macro srv not found; results equal proc-macro off");
+    }
+
+    let observer = Arc::new(RecordingObserver::default());
+    let mut infra_errors: Vec<String> = Vec::new();
+
+    let mut by_ws: BTreeMap<String, Vec<&Case>> = BTreeMap::new();
+    for c in &cases {
+        by_ws.entry(c.workspace_rel.clone()).or_default().push(c);
+    }
+    for (ws, ws_cases) in &by_ws {
+        let analyzer = RaAnalyzer::new(
+            RaConfig {
+                proc_macro: m.proc_macro,
+                threads: None,
+                assert_revert: true,
+            },
+            Arc::new(MonotonicClock::new()),
+            observer.clone(),
+        );
+        let mut session = match analyzer.load(&ws_cases[0].workspace) {
+            Ok(s) => s,
+            Err(e) => {
+                infra_errors.push(format!("load {ws}: {e}"));
+                continue;
+            }
+        };
+        let _ = observer.take();
+        for case in ws_cases {
+            let mut check_ms = None;
+            let outcome = if let Some(why) = &case.skip {
+                Outcome::Skip(why.clone())
+            } else {
+                match case.expected() {
+                    Err(e) => {
+                        infra_errors.push(format!("{}: {e}", case.id));
+                        continue;
+                    }
+                    Ok(None) => {
+                        Outcome::Skip(format!("no expected file; run just oracle-refresh {ws}"))
+                    }
+                    Ok(Some(expected)) => {
+                        let edits = match case.edits() {
+                            Ok(e) => e,
+                            Err(e) => {
+                                infra_errors.push(format!("{}: {e}", case.id));
+                                continue;
+                            }
+                        };
+                        match verify(&analyzer, &mut session, &edits, Scope::Affected) {
+                            Ok(verdict) => {
+                                for ev in observer.take() {
+                                    if let Event::Checked { check_ms: ms, .. } = ev {
+                                        check_ms = Some(ms);
+                                    }
+                                }
+                                compare(&expected, &verdict.new_errors)
+                            }
+                            Err(e) => {
+                                infra_errors.push(format!("{}: {e}", case.id));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            };
+            report.outcomes.push(CaseOutcome {
+                id: case.id.clone(),
+                group: case.group,
+                outcome,
+                check_ms,
+            });
+        }
+    }
+
+    let counts = report.counts();
+    println!("group | cases | pass | FN | FP | skip | floor | recall");
+    for g in Group::ALL {
+        let Some(c) = counts.get(&g) else { continue };
+        println!(
+            "{} | {} | {} | {} | {} | {} | {} | {}",
+            g.id(),
+            c.cases,
+            c.pass,
+            c.fn_,
+            c.fp,
+            c.skip,
+            floor(g),
+            recall_text(c)
+        );
+    }
+    match report.primary_recall() {
+        Some((p, n)) => println!(
+            "H7 primary recall: {p}/{n} = {:.2} (adopt >= 0.80, discard < 0.50)",
+            p as f64 / n as f64
+        ),
+        None => println!("H7 primary recall: - (no primary case compared)"),
+    }
+    let full = std::env::var_os("RYO_V2_ORACLE_FULL").is_some();
+    for o in &report.outcomes {
+        if let Outcome::Fail {
+            missed,
+            extra,
+            unmapped,
+        } = &o.outcome
+        {
+            println!(
+                "FAIL {} [{}] missed: {} | extra: {} | unmapped: {}",
+                o.id,
+                o.group.id(),
+                listed(missed, full),
+                listed(extra, full),
+                listed(unmapped, full)
+            );
+        }
+        if let Outcome::Skip(why) = &o.outcome {
+            println!("SKIP {} [{}] {why}", o.id, o.group.id());
+        }
+    }
+
+    if let Ok(path) = std::env::var("RYO_V2_ORACLE_REPORT") {
+        // A relative path is relative to the repo root, not to the test's cwd.
+        let dest = m.repo_root.join(&path);
+        let json = serde_json::to_string_pretty(&report.to_json()).expect("report json");
+        std::fs::write(&dest, json + "\n")
+            .unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    }
+
+    assert!(
+        infra_errors.is_empty(),
+        "infrastructure errors:\n{}",
+        infra_errors.join("\n")
+    );
+
+    // A filtered run sees fewer cases than the floors count, so it skips them.
+    if m.proc_macro && report.excluded.is_empty() {
+        let below: Vec<String> = Group::ALL
+            .into_iter()
+            .filter_map(|g| {
+                let pass = counts.get(&g).map_or(0, |c| c.pass);
+                (pass < floor(g)).then(|| format!("{}: pass {pass} < floor {}", g.id(), floor(g)))
+            })
+            .collect();
+        assert!(below.is_empty(), "below floor:\n{}", below.join("\n"));
+    }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "ryo-v2-cli"
+description = "Command-line interface of ryo-v2: Speculative refactoring engine for Rust: Blueprints explored and verified in-process on rust-analyzer, built once after commit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "ryo-v2"
+path = "src/main.rs"
+
+[dependencies]
+ryo-v2-core.workspace = true
+ryo-v2-ra.workspace = true
+anyhow.workspace = true
+clap.workspace = true

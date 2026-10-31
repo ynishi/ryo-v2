@@ -1,0 +1,3 @@
+[workspace]
+members = ["lib", "user", "facade", "viewer"]
+resolver = "2"

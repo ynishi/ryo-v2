@@ -1,0 +1,21 @@
+[package]
+name = "ryo-v2-oracle"
+description = "Oracle harness of ryo-v2: corpus cases, expected cargo check diagnostics, and the recall of the in-memory verifier against them"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+publish = false
+
+[dependencies]
+ryo-v2-core.workspace = true
+ryo-v2-ra.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
