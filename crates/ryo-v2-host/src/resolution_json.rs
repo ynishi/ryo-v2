@@ -133,6 +133,22 @@ fn log_json(e: &LogEntry) -> Value {
     })
 }
 
+/// Adds the `freshness` fields (`actual` for a stale entry, `len` for an out-of-range one) of an
+/// entry of a `stale` blocking.
+fn add_freshness(o: &mut Value, f: &Freshness) {
+    match f {
+        Freshness::Fresh => o["freshness"] = json!("fresh"),
+        Freshness::Stale { actual, .. } => {
+            o["freshness"] = json!("stale");
+            o["actual"] = json!(actual.to_string());
+        }
+        Freshness::OutOfRange { len } => {
+            o["freshness"] = json!("out_of_range");
+            o["len"] = json!(len);
+        }
+    }
+}
+
 fn blocking_json(b: &Blocking) -> Value {
     let blueprint = b.blueprint().to_string();
     match b {
@@ -140,7 +156,18 @@ fn blocking_json(b: &Blocking) -> Value {
             "kind": "unverifiable", "blueprint": blueprint,
             "path": path.to_string(), "role": role_str(*role),
         }),
-        Blocking::Stale { reads, .. } => {
+        Blocking::Stale { bases, reads, .. } => {
+            let bases: Vec<Value> = bases
+                .iter()
+                .map(|(b, f)| {
+                    let mut o = json!({
+                        "path": b.path().to_string(),
+                        "fingerprint": b.fingerprint().to_string(),
+                    });
+                    add_freshness(&mut o, f);
+                    o
+                })
+                .collect();
             let reads: Vec<Value> = reads
                 .iter()
                 .map(|(r, f)| {
@@ -150,21 +177,11 @@ fn blocking_json(b: &Blocking) -> Value {
                         "end": r.range().end(),
                         "fingerprint": r.fingerprint().to_string(),
                     });
-                    match f {
-                        Freshness::Fresh => o["freshness"] = json!("fresh"),
-                        Freshness::Stale { actual, .. } => {
-                            o["freshness"] = json!("stale");
-                            o["actual"] = json!(actual.to_string());
-                        }
-                        Freshness::OutOfRange { len } => {
-                            o["freshness"] = json!("out_of_range");
-                            o["len"] = json!(len);
-                        }
-                    }
+                    add_freshness(&mut o, f);
                     o
                 })
                 .collect();
-            json!({"kind": "stale", "blueprint": blueprint, "reads": reads})
+            json!({"kind": "stale", "blueprint": blueprint, "bases": bases, "reads": reads})
         }
         Blocking::MissingFile { path, .. } => json!({
             "kind": "missing_file", "blueprint": blueprint, "path": path.to_string(),
@@ -197,9 +214,11 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   tested: resolution_json::tests::decided_lists_the_rule_id
 ///   tested: tests/apply.rs apply_rename_local_is_decided
 /// - C2: a `Failed` resolution lists each blocker with its `kind` and the blueprint; a stale
-///   read carries its freshness.
+///   blocking lists its `bases` (path, expected `fingerprint`, `freshness`, `actual`) and its
+///   `reads`, each with its freshness.
 ///   tested: resolution_json::tests::failed_lists_stale_reads
 ///   tested: tests/apply.rs apply_after_disk_change_is_failed_stale
+///   tested: tests/apply.rs apply_after_insert_above_is_failed_stale
 ///   tested: resolution_json::tests::budget_exhausted_blocking_is_listed
 /// - C3: a `Decided` resolution lists, per candidate, the Blueprints of its path with intent,
 ///   proposer, rationale and spec refs, and the evidence lists the provenance: analyzer,
@@ -276,9 +295,10 @@ mod tests {
     use ryo_v2_core::app::apply::apply_blueprints;
     use ryo_v2_core::app::ports::{CheckError, FileFacts, Verifier};
     use ryo_v2_core::domain::{
-        Blueprint, BlueprintId, BlueprintSet, DecisionRecord, Edit, Finding, Fingerprint, Ident,
-        Infeasible, IntentCall, IntentKind, MutationSpec, Provenance, ReadRange, RelPath,
-        ReviewRecord, Rule, RuleCatalog, RuleId, ScopedFindings, SpecRef, TextRange,
+        BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, DecisionRecord, Edit,
+        Finding, Fingerprint, Ident, Infeasible, IntentCall, IntentKind, MutationSpec, Provenance,
+        ReadRange, RelPath, ReviewRecord, Rule, RuleCatalog, RuleId, ScopedFindings, SpecRef,
+        TextRange,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -346,22 +366,29 @@ mod tests {
         }
     }
 
+    /// Every read here covers the whole file, so its fingerprint is the base of the file.
     fn blueprint(
         intent: IntentCall,
         specs: Vec<MutationSpec>,
         reads: Vec<ReadRange>,
         refs: &[&str],
     ) -> Blueprint {
-        Blueprint::new(
-            id(),
+        let bases = reads
+            .iter()
+            .map(|r| BaseFp::new(r.path().clone(), r.fingerprint()))
+            .collect();
+        Blueprint::new(BlueprintParts {
+            id: id(),
             intent,
             specs,
             reads,
-            refs.iter()
+            bases,
+            spec_refs: refs
+                .iter()
                 .map(|r| SpecRef::parse(r).expect("a spec ref"))
                 .collect(),
-            DecisionRecord::new("agent", "because").expect("a record"),
-        )
+            record: DecisionRecord::new("agent", "because").expect("a record"),
+        })
         .expect("a blueprint")
     }
     /// Renames `a` to `b` in `let a = 1;` at `path`.
@@ -523,8 +550,19 @@ mod tests {
             TextRange::new(1, 4).unwrap(),
             Fingerprint::of(b"abc"),
         );
+        let base = BaseFp::new(
+            RelPath::parse("src/lib.rs").unwrap(),
+            Fingerprint::of(b"abc"),
+        );
         let stale = Blocking::Stale {
             blueprint: b,
+            bases: vec![(
+                base,
+                Freshness::Stale {
+                    expected: Fingerprint::of(b"abc"),
+                    actual: Fingerprint::of(b"abcd"),
+                },
+            )],
             reads: vec![(
                 read.clone(),
                 Freshness::Stale {
@@ -535,6 +573,7 @@ mod tests {
         };
         let oor = Blocking::Stale {
             blueprint: b,
+            bases: vec![],
             reads: vec![(read, Freshness::OutOfRange { len: 2 })],
         };
         let inf = Infeasible::new(vec![stale, oor], vec![], false).expect("blocking");
@@ -544,6 +583,16 @@ mod tests {
         let first = &v["blocking"][0];
         assert_eq!(first["kind"], "stale");
         assert_eq!(first["blueprint"], b.to_string());
+        assert_eq!(first["bases"][0]["path"], "src/lib.rs");
+        assert_eq!(
+            first["bases"][0]["fingerprint"],
+            Fingerprint::of(b"abc").to_string()
+        );
+        assert_eq!(first["bases"][0]["freshness"], "stale");
+        assert_eq!(
+            first["bases"][0]["actual"],
+            Fingerprint::of(b"abcd").to_string()
+        );
         assert_eq!(first["reads"][0]["freshness"], "stale");
         assert_eq!(
             first["reads"][0]["actual"],

@@ -28,8 +28,9 @@ use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, ExpandError, Expander};
 use ryo_v2_core::domain::text::revert_intact;
 use ryo_v2_core::domain::{
-    Blueprint, BlueprintId, DecisionRecord, DeriveName, Edit, Fingerprint, Ident, IntentCall,
-    IntentKind, MutationSpec, NonEmpty, ReadRange, RelPath, SpecKind, StateFp, Target, TextRange,
+    BaseFp, Blueprint, BlueprintId, BlueprintParts, DecisionRecord, DeriveName, Edit, Fingerprint,
+    Ident, IntentCall, IntentKind, MutationSpec, NonEmpty, ReadRange, RelPath, SpecKind, StateFp,
+    Target, TextRange,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -486,7 +487,20 @@ impl<'a> Env<'a> {
         }
         let id = blueprint_id(self.state_fp, &c.intent, &c.specs)?;
         let record = DecisionRecord::new(PROPOSER, &c.rationale).ok()?;
-        Blueprint::new(id, c.intent, c.specs, reads, Vec::new(), record).ok()
+        let bases = base
+            .iter()
+            .map(|(p, t)| BaseFp::capture(p.clone(), t))
+            .collect();
+        Blueprint::new(BlueprintParts {
+            id,
+            intent: c.intent,
+            specs: c.specs,
+            reads,
+            bases,
+            spec_refs: Vec::new(),
+            record,
+        })
+        .ok()
     }
 
     /// The indels of a change that touches one file, as mutation specs.

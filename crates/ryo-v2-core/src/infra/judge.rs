@@ -94,8 +94,9 @@ impl Judge for ReplayJudge {
 mod tests {
     use super::*;
     use crate::domain::{
-        Blueprint, BlueprintId, CleanDelta, Criterion, DecisionRecord, ExtDelta, Ident, IntentCall,
-        MutationSpec, Proposal, ReadRange, RelPath, SpecRef, StaticMetrics, TextRange,
+        BaseFp, Blueprint, BlueprintId, BlueprintParts, CleanDelta, Criterion, DecisionRecord,
+        ExtDelta, Ident, IntentCall, MutationSpec, Proposal, ReadRange, RelPath, SpecRef,
+        StaticMetrics, TextRange,
     };
 
     const TEXT: &str = "let a = 1;";
@@ -108,17 +109,18 @@ mod tests {
     }
     /// A rename of `a` to `to`; different `to` give different proposals.
     fn rename(n: u16, to: &str) -> Blueprint {
-        Blueprint::new(
-            BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a{n:04x}")).unwrap(),
-            IntentCall::RenameLocal {
+        Blueprint::new(BlueprintParts {
+            id: BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a{n:04x}")).unwrap(),
+            intent: IntentCall::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse(to).unwrap(),
             },
-            vec![MutationSpec::replace(rel(), tr(4, 5), to).unwrap()],
-            vec![ReadRange::capture(rel(), TEXT, tr(0, 10)).unwrap()],
-            vec![SpecRef::parse("spec#t").unwrap()],
-            DecisionRecord::new("agent", "why").unwrap(),
-        )
+            specs: vec![MutationSpec::replace(rel(), tr(4, 5), to).unwrap()],
+            reads: vec![ReadRange::capture(rel(), TEXT, tr(0, 10)).unwrap()],
+            bases: vec![BaseFp::capture(rel(), TEXT)],
+            spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
+            record: DecisionRecord::new("agent", "why").unwrap(),
+        })
         .unwrap()
     }
     fn proposal(n: u16, to: &str, m: StaticMetrics) -> Proposal {
