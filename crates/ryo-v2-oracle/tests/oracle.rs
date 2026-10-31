@@ -7,7 +7,9 @@
 //! `RYO_V2_ORACLE_UNRESOLVED=off` (switch the unresolved-path detector off; ignore floors),
 //! `RYO_V2_ORACLE_CFG_TEST=off` (ra without `cfg(test)`, as before the V2 decision; ignore floors).
 //! The expected files are `cargo check --workspace --all-targets`, so the floors hold only with
-//! proc-macro on, the detector on and cfg-test on.
+//! proc-macro on, the detector on and cfg-test on. Independent of those switches, an unfiltered
+//! run also asserts that the primary denominator holds its floor and that no case is skipped or
+//! misgrouped.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -37,13 +39,14 @@ const FLOOR_BORROW: usize = 0;
 const FLOOR_PRIVACY: usize = 4;
 const FLOOR_CONST_EVAL: usize = 0;
 const FLOOR_CFG: usize = 1;
-const FLOOR_CFG_TEST: usize = 4;
+const FLOOR_CFG_TEST: usize = 5;
 const FLOOR_MACRO_DERIVE: usize = 2;
 const FLOOR_MACRO_ATTR: usize = 2;
 const FLOOR_MACRO_RULES: usize = 0;
 const FLOOR_MACRO_TOKENS: usize = 2;
 const FLOOR_PROC_MACRO_EDIT: usize = 0;
 const FLOOR_VALID: usize = 5;
+const PRIMARY_OF_FLOOR: usize = 32; // raised, never lowered (same rule as the floors)
 
 fn floor(g: Group) -> usize {
     match g {
@@ -324,6 +327,17 @@ fn oracle() {
         "infrastructure errors:\n{}",
         infra_errors.join("\n")
     );
+
+    // These quantities depend on the expected files only, so this holds with proc-macro, the
+    // detector or cfg-test off too. A filtered run sees fewer cases, so it skips the check.
+    if report.excluded.is_empty() {
+        let problems = report.ratchet_problems(PRIMARY_OF_FLOOR);
+        assert!(
+            problems.is_empty(),
+            "the run does not stand as the H7 measurement:\n{}",
+            problems.join("\n")
+        );
+    }
 
     // A filtered run sees fewer cases than the floors count, so it skips them.
     if m.proc_macro && unresolved_on && cfg_test_on && report.excluded.is_empty() {
