@@ -28,9 +28,13 @@ and this project adheres to
 - `SEARCH_LEDGER.md`: the first search-recall runs on ryo-rs (a verification repository used as a
   large sample): recall, generation, outer check and perf triggers, verdict insufficient;
   `CHECK_LEDGER.md` "Open work" holds what they found.
+- `RaSession::expander_panics()`: the panics the expander contained, with edit kind, file and
+  message. `search-recall run` prints `contained panics: <n> detector, <n> expander` and one line
+  per panic, also in `--markdown` and under `contained_panics` in `--report`.
 
 ### Changed
 
+- The oracle prints the contained detector and expander panics and fails when there is any.
 - Details of private execution environments are removed from the documentation; commands use the
   placeholders `<BASE>` and `<OUT>`.
 - `PUBLIC_DEVELOPMENT.md`, `CONTRIBUTING.md` and `AGENTS.md` agree with the development flow:
@@ -55,3 +59,10 @@ and this project adheres to
   instead of `-- -D warnings`, which invalidated the build cache; `just rust-clippy` and
   `just rust-test` run with `--locked`. `crates/ryo-v2-core/tests/manifest.rs` also checks these
   recipes.
+
+### Fixed
+
+- The expander no longer panics on the value of a struct-literal field that has an attribute
+  (`#[cfg(..)] k: v`): extract-variable refuses it, since rust-analyzer would build the variable's
+  name from the whole field text. A panic inside the expander now costs one call of one edit kind,
+  not every child of the state being expanded.
