@@ -15,7 +15,9 @@
 //! so a narrow beam is how the ranking is stressed.
 //! `--exhaustive` checks up to 200 children per depth with no wall limit (the full-reward best is
 //! then ranked among everything); `--outer-check` runs `cargo check` on every decided candidate in
-//! a copy of the workspace (server only).
+//! a copy of the workspace (server only). The time of that outer check is reported apart and
+//! left out of trigger 4, which also judges only runs within the default budget (decision D4 in
+//! SEARCH_LEDGER.md).
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -329,6 +331,8 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
     let mut outer_counts = Outer::default();
     let mut panics = ContainedPanics::default();
     let mut done = 0usize;
+    // The oracle's own `cargo check`, outside every search: trigger 4 leaves it out (D4).
+    let mut outer_ms = std::time::Duration::ZERO;
     for (workspace, ws_cases) in &by_ws {
         let analyzer = RaAnalyzer::new(
             RaConfig {
@@ -355,7 +359,10 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         };
         let _ = observer.take();
         let baseline = if outer {
-            cargo_check(workspace, &tmp.join("build-base")).unwrap_or_default()
+            let t = Instant::now();
+            let base = cargo_check(workspace, &tmp.join("build-base")).unwrap_or_default();
+            outer_ms += t.elapsed();
+            base
         } else {
             CheckOutput::default()
         };
@@ -389,13 +396,16 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                         for (nth, edits) in run.decided_edits.iter().enumerate() {
                             outer_counts.checked += 1;
                             outer_counts.best_checked += usize::from(nth == 0);
-                            match outer_new_errors(
+                            let t = Instant::now();
+                            let new = outer_new_errors(
                                 workspace,
                                 edits,
                                 &baseline,
                                 &tmp,
                                 outer_counts.checked,
-                            ) {
+                            );
+                            outer_ms += t.elapsed();
+                            match new {
                                 Ok(new) if new.is_empty() => {}
                                 Ok(new) => {
                                     outer_counts.failed += 1;
@@ -443,11 +453,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
-    let triggers = RunInfo {
-        beam: budget.beam,
-        harness_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        rss_kb: rss_kb(),
-    };
+    let triggers = RunInfo::of_run(budget, started.elapsed(), outer_ms, rss_kb());
     let mut text = terminal(&rows, triggers);
     if outer {
         text.push_str(&outer_counts.summary());

@@ -92,15 +92,17 @@ enum Command {
         #[arg(long)]
         no_proc_macro: bool,
     },
-    /// Print the `reads` entry (path, range, fingerprint) of a byte range of a file, read from disk.
+    /// Print the fingerprint of a file, read from disk: the `reads` entry (path, range,
+    /// fingerprint) of a byte range `START..END`, or without a range the `bases` entry (path,
+    /// fingerprint) of the whole file.
     Fingerprint {
         /// The workspace root.
         workspace: PathBuf,
         /// The file, relative to the workspace.
         path: String,
-        /// Byte range `START..END`.
+        /// Byte range `START..END`; without it the whole file.
         #[arg(value_parser = parse_range)]
-        range: TextRange,
+        range: Option<TextRange>,
     },
 }
 
@@ -306,11 +308,19 @@ mod tests {
             .expect("parses");
         match ok.command {
             Command::Fingerprint { range, .. } => {
+                let range = range.expect("a range");
                 assert_eq!((range.start(), range.end()), (3, 9));
             }
             _ => panic!("not fingerprint"),
         }
         assert!(Cli::try_parse_from(["ryo-v2", "fingerprint", "/ws", "p", "3-9"]).is_err());
+        let whole = Cli::try_parse_from(["ryo-v2", "fingerprint", "/ws", "src/lib.rs"])
+            .map_err(|e| e.to_string())
+            .expect("parses without a range");
+        match whole.command {
+            Command::Fingerprint { range, .. } => assert!(range.is_none()),
+            _ => panic!("not fingerprint"),
+        }
     }
 
     #[test]
