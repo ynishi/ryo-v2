@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use ryo_v2_core::domain::{
-    Blueprint, BlueprintId, BlueprintSet, DecisionRecord, DeriveName, Fingerprint, Ident,
-    IntentCall, MutationSpec, NonEmpty, ReadRange, RelPath, SpecRef, TextRange,
+    BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, DecisionRecord, DeriveName,
+    Fingerprint, Ident, IntentCall, MutationSpec, NonEmpty, ReadRange, RelPath, SpecRef, TextRange,
 };
 use serde::Deserialize;
 
@@ -27,6 +27,7 @@ struct BlueprintJson {
     intent: IntentJson,
     specs: Vec<SpecJson>,
     reads: Vec<ReadJson>,
+    bases: Vec<BaseJson>,
     #[serde(default)]
     spec_refs: Vec<String>,
     record: RecordJson,
@@ -123,6 +124,13 @@ struct ReadJson {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct BaseJson {
+    path: String,
+    fingerprint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecordJson {
     proposer: String,
     rationale: String,
@@ -200,6 +208,17 @@ fn read(index: usize, j: ReadJson) -> Result<ReadRange> {
     ))
 }
 
+fn base(index: usize, j: BaseJson) -> Result<BaseFp> {
+    Ok(BaseFp::new(
+        rel(index, "bases.path", &j.path)?,
+        field(
+            index,
+            "bases.fingerprint",
+            Fingerprint::parse(&j.fingerprint),
+        )?,
+    ))
+}
+
 /// Parses the blueprint input JSON. A missing `id` is filled with a fresh UUID v7 (reported in
 /// `generated`); no other part of the program generates ids.
 ///
@@ -212,6 +231,9 @@ fn read(index: usize, j: ReadJson) -> Result<ReadRange> {
 /// - C3: a domain constructor error (a spec no read covers) is an error naming the blueprint
 ///   index; nothing is loaded for it.
 ///   tested: blueprint_json::tests::uncovered_spec_is_a_parse_error
+/// - C4: `bases` is required, and a blueprint whose spec is in a file without a base, or with
+///   two bases of one path, is an error naming the blueprint index (and the spec).
+///   tested: blueprint_json::tests::missing_base_is_a_parse_error
 pub(crate) fn parse_blueprints(json: &str) -> Result<ParsedBlueprints> {
     let input: Input = serde_json::from_str(json).context("blueprint JSON")?;
     build(input.blueprints)
@@ -252,6 +274,11 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
             .into_iter()
             .map(|r| read(index, r))
             .collect::<Result<Vec<_>>>()?;
+        let bases = bp
+            .bases
+            .into_iter()
+            .map(|b| base(index, b))
+            .collect::<Result<Vec<_>>>()?;
         let spec_refs = bp
             .spec_refs
             .iter()
@@ -265,14 +292,15 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
         let blueprint = field(
             index,
             "blueprint",
-            Blueprint::new(
+            Blueprint::new(BlueprintParts {
                 id,
-                intent(index, bp.intent)?,
+                intent: intent(index, bp.intent)?,
                 specs,
                 reads,
+                bases,
                 spec_refs,
                 record,
-            ),
+            }),
         )?;
         items.push(blueprint);
     }
@@ -284,8 +312,19 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
 mod tests {
     use super::*;
 
-    fn json(intent: &str, with_id: bool, with_read: bool) -> String {
+    fn base_json() -> String {
         let fp = Fingerprint::of(b"a = 1");
+        format!("{{\"path\":\"src/lib.rs\",\"fingerprint\":\"{fp}\"}}")
+    }
+
+    fn json(intent: &str, with_id: bool, with_read: bool) -> String {
+        json_with(intent, with_id, with_read, Some(&base_json()))
+    }
+
+    /// The input document; `bases` is the content of the `bases` array, or the key is left out.
+    fn json_with(intent: &str, with_id: bool, with_read: bool, bases: Option<&str>) -> String {
+        let fp = Fingerprint::of(b"a = 1");
+        let bases = bases.map_or(String::new(), |b| format!("\"bases\":[{b}],"));
         let id = if with_id {
             format!("\"id\": \"{}\",", uuid::Uuid::now_v7())
         } else {
@@ -297,7 +336,7 @@ mod tests {
             String::new()
         };
         format!(
-            "{{\"blueprints\":[{{{id}\"intent\":{intent},\"specs\":[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"start\":0,\"end\":1,\"text\":\"b\"}}],\"reads\":[{reads}],\"record\":{{\"proposer\":\"p\",\"rationale\":\"r\"}}}}]}}"
+            "{{\"blueprints\":[{{{id}\"intent\":{intent},\"specs\":[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"start\":0,\"end\":1,\"text\":\"b\"}}],\"reads\":[{reads}],{bases}\"record\":{{\"proposer\":\"p\",\"rationale\":\"r\"}}}}]}}"
         )
     }
 
@@ -354,5 +393,34 @@ mod tests {
         let err =
             parse_blueprints(&json(RENAME, true, false)).expect_err("no read covers the spec");
         assert!(format!("{err:#}").contains("blueprint 0"), "{err:#}");
+    }
+
+    #[test]
+    fn missing_base_is_a_parse_error() {
+        // (a) no `bases` key
+        let err = parse_blueprints(&json_with(RENAME, true, true, None)).expect_err("required");
+        assert!(format!("{err:#}").contains("bases"), "{err:#}");
+        // (b) an empty list with a spec
+        let err = parse_blueprints(&json_with(RENAME, true, true, Some(""))).expect_err("no base");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("blueprint 0") && text.contains("spec 0"),
+            "{text}"
+        );
+        // (c) a base of the spec's file
+        let parsed = parse_blueprints(&json(RENAME, true, true)).expect("parse");
+        let bp = parsed.set.iter().next().expect("one");
+        assert_eq!(bp.bases().len(), 1);
+        assert_eq!(bp.bases()[0].path().as_str(), "src/lib.rs");
+        assert_eq!(bp.bases()[0].fingerprint(), Fingerprint::of(b"a = 1"));
+        // (d) two bases of one path
+        let twice = format!("{0},{0}", base_json());
+        let err = parse_blueprints(&json_with(RENAME, true, true, Some(&twice)))
+            .expect_err("duplicate base");
+        assert!(format!("{err:#}").contains("blueprint 0"), "{err:#}");
+        // a bad base fingerprint names the field
+        let bad = base_json().replace("fnv1a64:", "x:");
+        let err = parse_blueprints(&json_with(RENAME, true, true, Some(&bad))).expect_err("bad");
+        assert!(format!("{err:#}").contains("bases.fingerprint"), "{err:#}");
     }
 }

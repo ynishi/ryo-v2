@@ -10,15 +10,21 @@
 //! Format and checking: crates/ryo-v2-core/tests/doc_contract.rs.
 //!
 //! - Blueprint: one proposed change: an intent call, mutation specs against base text, the
-//!   read ranges it rests on, spec refs and a decision record.
+//!   read ranges it rests on, the base fingerprint of each file it edits, spec refs and a
+//!   decision record.
+//! - BlueprintParts: the parts of a blueprint before they are checked against each other.
+//! - BaseFp: the fingerprint of the whole base text of one file a blueprint edits; the file is
+//!   fresh only while its whole text is unchanged.
 //! - BlueprintSet: the blueprints submitted together in one apply, the candidates for one decision.
 //! - MutationSpec: one splice on one file of a text range of the base text.
 //!   includes: Replace, Insert, Delete
 //! - TextRange: a half-open UTF-8 byte range `[start, end)` of one file's base text.
 //! - ReadRange: a path, a text range and its fingerprint: the text the proposer read, checked
-//!   before anything is written.
-//! - Fingerprint: an algorithm-tagged hash of the bytes of a range, a pure function of the text.
-//! - Freshness: the result of checking a read range against the current text.
+//!   for the files a blueprint only reads.
+//! - Fingerprint: an algorithm-tagged hash of the bytes of a range or of a whole text, a pure
+//!   function of the text.
+//! - Freshness: the result of checking a read range or a base fingerprint against the current
+//!   text.
 //!   includes: Fresh, Stale, OutOfRange
 //! - Edit: the whole new text of one file, built by splicing; what the verifier consumes.
 //! - IntentKind: a typed action of the one-layer action space.
@@ -105,7 +111,9 @@ pub mod scope;
 pub mod search;
 pub mod text;
 pub mod verdict;
-pub use blueprint::{Blueprint, BlueprintError, BlueprintSet, DecisionRecord, SpecRef};
+pub use blueprint::{
+    Blueprint, BlueprintError, BlueprintParts, BlueprintSet, DecisionRecord, SpecRef,
+};
 pub use diagnostic::{Diagnostic, Diagnostics, UnmappedDiagnostic};
 pub use edit::Edit;
 pub use error::DomainError;
@@ -132,5 +140,5 @@ pub use search::{
     Pruned, Reward, Scored, SearchBudget, SearchNode, SearchTree, StateFp, StaticMetrics, Target,
     Weights,
 };
-pub use text::{Fingerprint, FpAlgo, Freshness, ReadRange, SpliceError, TextRange};
+pub use text::{BaseFp, Fingerprint, FpAlgo, Freshness, ReadRange, SpliceError, TextRange};
 pub use verdict::Verdict;

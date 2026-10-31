@@ -651,7 +651,8 @@ impl SearchTree {
 mod tests {
     use super::*;
     use crate::domain::{
-        BlueprintId, DEFAULT_BUDGET, DecisionRecord, IntentCall, MutationSpec, ReadRange,
+        BaseFp, BlueprintId, BlueprintParts, DEFAULT_BUDGET, DecisionRecord, IntentCall,
+        MutationSpec, ReadRange,
     };
 
     fn rel(s: &str) -> RelPath {
@@ -665,17 +666,18 @@ mod tests {
     }
     fn bp() -> Blueprint {
         let read = ReadRange::capture(rel("a.rs"), "let a = a;", tr(0, 10)).unwrap();
-        Blueprint::new(
-            BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap(),
-            IntentCall::RenameLocal {
+        Blueprint::new(BlueprintParts {
+            id: BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap(),
+            intent: IntentCall::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
-            vec![read],
-            vec![],
-            DecisionRecord::new("agent", "because").unwrap(),
-        )
+            specs: vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
+            reads: vec![read],
+            bases: vec![BaseFp::capture(rel("a.rs"), "let a = a;")],
+            spec_refs: vec![],
+            record: DecisionRecord::new("agent", "because").unwrap(),
+        })
         .unwrap()
     }
     fn new_node(parent: NodeId, edits: Vec<Edit>) -> NewNode {

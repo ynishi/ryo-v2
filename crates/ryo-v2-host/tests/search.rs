@@ -73,6 +73,17 @@ fn read(ws: &Ws, path: &str, range: (usize, usize)) -> Value {
     serde_json::from_slice(&out.stdout).expect("fingerprint line")
 }
 
+/// A `bases` entry from the `fingerprint` subcommand without a range (the disk at call time).
+fn base(ws: &Ws, path: &str) -> Value {
+    let out = ryo(&["fingerprint", ws.dir.to_str().unwrap(), path]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("fingerprint line")
+}
+
 fn replace(path: &str, range: (usize, usize), text: &str) -> Value {
     json!({"op": "replace", "path": path, "start": range.0, "end": range.1, "text": text})
 }
@@ -95,6 +106,7 @@ fn rename_acc(ws: &Ws, id: &str) -> Value {
             replace("src/lib.rs", at(LIB, "acc", 2, 0, 3), "sum"),
         ],
         "reads": [read(ws, "src/lib.rs", total)],
+        "bases": [base(ws, "src/lib.rs")],
         "record": {"proposer": "test", "rationale": "test"},
     })
 }
