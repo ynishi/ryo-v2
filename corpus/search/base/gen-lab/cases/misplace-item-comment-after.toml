@@ -1,0 +1,13 @@
+# hand: misplace-item move `LIMIT` to src/plan.rs; the comment after it on its line moves with it
+workspace = "search/base/gen-lab"
+overlay = "planted/misplace-item-comment-after"
+kinds = ["misplace-item"]
+depth = 1
+origin = "hand:misplace-item:misplace-item-comment-after"
+targets = [
+    { path = "src/lib.rs", start = 318, end = 342 },
+    { path = "src/plan.rs", start = 78, end = 129 },
+]
+probes = [
+    { kind = "add-field", type = "Slot" },
+]

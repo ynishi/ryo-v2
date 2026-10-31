@@ -1,0 +1,13 @@
+# hand: misplace-item move `WIDE` to src/plan.rs; the comment above it stays above the re-export
+workspace = "search/base/gen-lab"
+overlay = "planted/misplace-item-comment-above"
+kinds = ["misplace-item"]
+depth = 1
+origin = "hand:misplace-item:misplace-item-comment-above"
+targets = [
+    { path = "src/lib.rs", start = 292, end = 319 },
+    { path = "src/plan.rs", start = 78, end = 103 },
+]
+probes = [
+    { kind = "add-field", type = "Slot" },
+]
