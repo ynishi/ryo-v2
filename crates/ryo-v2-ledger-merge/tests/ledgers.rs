@@ -1,5 +1,5 @@
-//! The files merged by the ledger driver: `.gitattributes` names the ledgers with
-//! `merge=ledger`, and none of those files holds a conflict marker (a merge resolved by hand once
+//! The files merged by the ledger driver: `.gitattributes` names every `*_LEDGER.md` of the
+//! root with `merge=ledger`, and none of those files holds a conflict marker (a merge resolved by hand once
 //! left one in a ledger).
 
 use std::fs;
@@ -7,8 +7,17 @@ use std::path::{Path, PathBuf};
 
 use ryo_v2_ledger_merge::conflict_markers;
 
-/// The files that must be merged by the driver.
-const LEDGERS: [&str; 2] = ["CHECK_LEDGER.md", "SEARCH_LEDGER.md"];
+/// The files that must be merged by the driver: every `*_LEDGER.md` at the root.
+fn ledgers() -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(root())
+        .expect("workspace root")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with("_LEDGER.md"))
+        .collect();
+    out.sort();
+    out
+}
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -32,9 +41,11 @@ fn ledger_patterns(attributes: &str) -> Vec<&str> {
 fn gitattributes_route_both_ledgers_to_the_driver() {
     let text = fs::read_to_string(root().join(".gitattributes")).expect(".gitattributes");
     let patterns = ledger_patterns(&text);
-    for ledger in LEDGERS {
+    let ledgers = ledgers();
+    assert!(!ledgers.is_empty(), "no *_LEDGER.md at the root");
+    for ledger in &ledgers {
         assert!(
-            patterns.contains(&ledger),
+            patterns.contains(&ledger.as_str()),
             ".gitattributes does not give {ledger} `merge=ledger` (it has {patterns:?})"
         );
     }
