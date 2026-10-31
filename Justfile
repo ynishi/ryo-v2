@@ -30,9 +30,43 @@ oracle:
 oracle-off:
     RYO_V2_ORACLE_PROC_MACRO=off cargo test -p ryo-v2-oracle --test oracle -- --nocapture
 
-# Rewrites corpus/<ws>/expected/*.check.json from `cargo check --workspace --all-targets`: the only recipe that runs cargo check on the corpus.
+# Rewrites corpus/<ws>/expected/*.check.json from `cargo check --workspace --all-targets`: the only binary that runs cargo check on the corpus (`oracle-refresh-all` calls it per case).
 oracle-refresh ws="base/extract-trait-multicrate":
     cargo run -p ryo-v2-oracle --bin oracle-refresh -- {{ws}}
+
+# Runs oracle-refresh on every case of every corpus/base workspace (or those matching <only>) and prints, per workspace, PASS (no refusal, expected unchanged) or FAIL with the refused cases and the diff of the expected files. Exits 1 on any refusal or change; the rewritten expected files stay in place.
+oracle-refresh-all only="*":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    snap="$(mktemp -d)"
+    trap 'rm -r "$snap"' EXIT
+    cargo build -q -p ryo-v2-oracle --bin oracle-refresh
+    bad=0
+    for cases in corpus/base/{{only}}/cases; do
+        dir="${cases%/cases}"
+        ws="${dir#corpus/}"
+        mkdir -p "$snap/$ws"
+        [ -d "$dir/expected" ] && cp -r "$dir/expected" "$snap/$ws/expected"
+        n=0
+        refused=()
+        for f in "$cases"/*.toml; do
+            id="$(basename "$f" .toml)"
+            n=$((n + 1))
+            if ! out="$(cargo run -q -p ryo-v2-oracle --bin oracle-refresh -- "$ws" --case "$id" 2>&1)"; then
+                refused+=("$id")
+                printf '%s\n' "$out"
+            fi
+        done
+        if d="$(diff -ruN "$snap/$ws/expected" "$dir/expected")"; then changed=0; else changed=1; fi
+        if [ "${#refused[@]}" -eq 0 ] && [ "$changed" -eq 0 ]; then
+            echo "oracle-refresh $ws: PASS ($n cases, expected unchanged)"
+        else
+            bad=1
+            echo "oracle-refresh $ws: FAIL ($n cases, refused: ${refused[*]:-none}, expected changed: $changed)"
+            [ "$changed" -eq 1 ] && printf '%s\n' "$d"
+        fi
+    done
+    exit "$bad"
 
 # History precision, step 1 (git only): writes the (parent, child) pairs of <repo> <range> under <out>/<name>. <out> must have no `target` component.
 history-export repo range name out max="20":
