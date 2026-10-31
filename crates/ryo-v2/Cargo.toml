@@ -3,6 +3,7 @@ name = "ryo-v2"
 description = "Speculative refactoring engine for Rust: Blueprints explored and verified in-process on rust-analyzer, built once after commit"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

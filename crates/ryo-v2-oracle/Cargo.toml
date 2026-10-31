@@ -3,6 +3,7 @@ name = "ryo-v2-oracle"
 description = "Oracle harness of ryo-v2: corpus cases, expected cargo check diagnostics, and the recall of the in-memory verifier against them"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

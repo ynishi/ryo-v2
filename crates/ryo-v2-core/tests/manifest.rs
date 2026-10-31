@@ -1,22 +1,32 @@
 //! Manifest rules: what the root `Cargo.toml` and every `crates/*/Cargo.toml` must keep. The
 //! rules are stated here, once, and `cargo test -p ryo-v2-core` fails when a manifest breaks one.
 //!
-//! 1. `[workspace.package]` states `rust-version` and has no `authors` (deprecated in Cargo).
+//! 1. `[workspace.package]` states `rust-version`, equal to the major.minor of the channel in
+//!    `rust-toolchain.toml`, and has no `authors` (deprecated in Cargo). Every member inherits
+//!    it with `rust-version.workspace = true`; a member without it publishes no minimum version.
 //! 2. The root sets `missing_docs` to `warn` or `deny` in `[workspace.lints.rust]`, and every
 //!    member opts into the workspace lints with `[lints] workspace = true`; without it Cargo
 //!    inherits none of `[workspace.lints]`.
-//! 3. A crate that is not `publish = false` has a `description`, a `documentation` URL ending in
+//! 3. The crates that are not `publish = false` are exactly those in [`PUBLISHED`]. Each has a `description`, a `documentation` URL ending in
 //!    `/<its own name>`, 1 to 5 `keywords` (each at most 20 characters, an ASCII letter first,
-//!    then ASCII letters, digits, `_`, `-` or `+`), and 1 to 5 `categories`.
-//! 4. Such a crate lists its package contents with `include`, which names `LICENSE-MIT` and
-//!    `LICENSE-APACHE` and takes nothing under `tests/`: no entry starts with `tests` and no
+//!    then ASCII letters, digits, `_`, `-` or `+`), and 1 to 5 non-empty `categories`.
+//! 4. Such a crate sets `readme` (Cargo copies the file into the package root) and lists its
+//!    package contents with `include`, which has an entry `src/**` or `src`, names `LICENSE-MIT`
+//!    and `LICENSE-APACHE`, and takes nothing under `tests/`: no entry starts with `tests` and no
 //!    entry is a top-level glob (`*...`), which would take `tests/` too. The tests reach the
 //!    corpus and the workspace root, which are outside the package, so they cannot run from it.
-//!    Both licence files exist in the crate directory (as symlinks to the root copies, which
-//!    `cargo package` flattens) with the content of the root copies; `include` skips a named
-//!    file that is missing without an error.
-//! 5. A dependency on another member (any table of dependencies, target-specific ones included)
-//!    is `<name>.workspace = true`, so the version and path are written once, in the root.
+//!    Both licence files are symlinks in the crate directory (`cargo package` flattens them)
+//!    whose content is that of the root copies, so the copies cannot drift; `include` skips a
+//!    named file that is missing without an error.
+//! 5. A dependency on another member (any table of dependencies, target-specific ones and the
+//!    underscore spellings included) is `<name>.workspace = true`, so the version and path are
+//!    written once, in the root.
+//! 6. No source file under `crates/*/src` sets the level of `missing_docs` in an attribute
+//!    (`#![warn(missing_docs)]`, `#[allow(missing_docs)]`, ...); the level is set once, by rule 2.
+//! 7. The gate recipes in the `Justfile`: `rust-clippy` runs with `CARGO_BUILD_WARNINGS=deny`
+//!    (warnings fail the gate) and `--locked`, `rust-test` with `--locked`, and `check` runs
+//!    both. `rust-clippy` runs first in `check`, so without its own `--locked` it would rewrite
+//!    a stale `Cargo.lock` before `rust-test` could refuse it.
 //!
 //! Each rule is a function returning its problems; the `workspace_*` tests run them on the real
 //! manifests, the others show that each rule reports a broken manifest.
@@ -26,6 +36,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
+
+/// The crates meant for crates.io; every other member is `publish = false`.
+const PUBLISHED: [&str; 4] = ["ryo-v2", "ryo-v2-core", "ryo-v2-host", "ryo-v2-ra"];
 
 /// One member manifest: the directory name under `crates/` and the parsed file.
 struct Member {
@@ -108,6 +121,57 @@ fn workspace_package_problems(root: &Table) -> Vec<String> {
     out
 }
 
+/// Rule 1, the toolchain: `rust-version` is the major.minor of the toolchain `channel`.
+fn rust_version_matches_toolchain(root: &Table, toolchain: &Table) -> Vec<String> {
+    let rv = root
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.get("rust-version"))
+        .and_then(Value::as_str);
+    let channel = toolchain
+        .get("toolchain")
+        .and_then(|t| t.get("channel"))
+        .and_then(Value::as_str);
+    match (rv, channel) {
+        (Some(rv), Some(ch)) if ch.splitn(3, '.').take(2).collect::<Vec<_>>().join(".") == rv => {
+            Vec::new()
+        }
+        (rv, ch) => vec![format!(
+            "root: rust-version {rv:?} is not the major.minor of the toolchain channel {ch:?}"
+        )],
+    }
+}
+
+/// Rule 1, the member half.
+fn member_rust_version_problems(m: &Member) -> Vec<String> {
+    let inherited = package(m)
+        .get("rust-version")
+        .and_then(|v| v.get("workspace"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if inherited {
+        Vec::new()
+    } else {
+        vec![format!(
+            "crates/{}: no `rust-version.workspace = true`",
+            m.dir
+        )]
+    }
+}
+
+/// Rule 3, the set: the publishable crates are exactly `expected`.
+fn published_set_problems(ms: &[Member], expected: &[&str]) -> Vec<String> {
+    let found: BTreeSet<&str> = ms.iter().filter(|m| is_published(m)).map(name).collect();
+    let expected: BTreeSet<&str> = expected.iter().copied().collect();
+    if found == expected {
+        Vec::new()
+    } else {
+        vec![format!(
+            "publishable crates are {found:?}, expected {expected:?} (`PUBLISHED`)"
+        )]
+    }
+}
+
 /// Rule 2, the root half.
 fn workspace_lints_problems(root: &Table) -> Vec<String> {
     let level = root
@@ -179,7 +243,7 @@ fn metadata_problems(m: &Member) -> Vec<String> {
         _ => out.push(format!("{n}: keywords must be a list of 1 to 5 strings")),
     }
     match strings(p.get("categories")) {
-        Some(cs) if (1..=5).contains(&cs.len()) => {}
+        Some(cs) if (1..=5).contains(&cs.len()) && cs.iter().all(|c| !c.trim().is_empty()) => {}
         _ => out.push(format!("{n}: categories must be a list of 1 to 5 strings")),
     }
     out
@@ -191,10 +255,21 @@ fn include_problems(m: &Member) -> Vec<String> {
         return Vec::new();
     }
     let n = name(m);
-    let Some(include) = strings(package(m).get("include")) else {
-        return vec![format!("{n}: no `include` list")];
-    };
     let mut out = Vec::new();
+    let readme = package(m).get("readme");
+    if !readme.is_some_and(|r| {
+        r.as_str().is_some_and(|r| !r.is_empty())
+            || r.get("workspace").and_then(Value::as_bool) == Some(true)
+    }) {
+        out.push(format!("{n}: no readme"));
+    }
+    let Some(include) = strings(package(m).get("include")) else {
+        out.push(format!("{n}: no `include` list"));
+        return out;
+    };
+    if !include.iter().any(|e| matches!(*e, "src/**" | "src")) {
+        out.push(format!("{n}: include has no `src/**` entry"));
+    }
     for licence in ["LICENSE-MIT", "LICENSE-APACHE"] {
         if !include.contains(&licence) {
             out.push(format!("{n}: include does not name {licence}"));
@@ -218,6 +293,9 @@ fn licence_file_problems(m: &Member, crate_dir: &Path, root_dir: &Path) -> Vec<S
     let mut out = Vec::new();
     for licence in ["LICENSE-MIT", "LICENSE-APACHE"] {
         let here = crate_dir.join(licence);
+        if !fs::symlink_metadata(&here).is_ok_and(|md| md.file_type().is_symlink()) {
+            out.push(format!("crates/{}: {licence} is not a symlink", m.dir));
+        }
         match (fs::read(&here), fs::read(root_dir.join(licence))) {
             (Ok(a), Ok(b)) if a == b => {}
             (Ok(_), Ok(_)) => out.push(format!(
@@ -233,7 +311,13 @@ fn licence_file_problems(m: &Member, crate_dir: &Path, root_dir: &Path) -> Vec<S
 
 /// Rule 5. `internal` is the set of member package names.
 fn internal_dependency_problems(m: &Member, internal: &BTreeSet<String>) -> Vec<String> {
-    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    const KINDS: [&str; 5] = [
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+        "dev_dependencies",
+        "build_dependencies",
+    ];
     let mut tables: Vec<(String, &Table)> = Vec::new();
     for kind in KINDS {
         if let Some(t) = m.manifest.get(kind).and_then(Value::as_table) {
@@ -270,6 +354,69 @@ fn internal_dependency_problems(m: &Member, internal: &BTreeSet<String>) -> Vec<
     out
 }
 
+/// Rule 6: the attribute lines of `text` that set a level for `missing_docs`.
+fn missing_docs_attribute_problems(rel_path: &str, text: &str) -> Vec<String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            let l = l.trim_start();
+            (l.starts_with("#![") || l.starts_with("#[")) && l.contains("missing_docs")
+        })
+        .map(|(i, _)| format!("{rel_path}:{}: sets missing_docs in an attribute", i + 1))
+        .collect()
+}
+
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The body lines of recipe `name` in a Justfile: the indented lines after `name:` or
+/// `name <params>:`; for `check` the dependency list on the header line is returned too.
+fn recipe<'a>(justfile: &'a str, name: &str) -> Vec<&'a str> {
+    let mut lines = justfile.lines();
+    let Some(header) = lines.by_ref().find(|l| {
+        l.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with(':') || rest.starts_with(' '))
+    }) else {
+        return Vec::new();
+    };
+    let mut out = vec![header];
+    out.extend(lines.take_while(|l| l.starts_with(' ') || l.starts_with('\t')));
+    out
+}
+
+/// Rule 7.
+fn gate_recipe_problems(justfile: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let clippy = recipe(justfile, "rust-clippy").join("\n");
+    for needle in ["CARGO_BUILD_WARNINGS=deny", "cargo clippy", "--locked"] {
+        if !clippy.contains(needle) {
+            out.push(format!("Justfile: rust-clippy does not contain `{needle}`"));
+        }
+    }
+    let test = recipe(justfile, "rust-test").join("\n");
+    for needle in ["cargo test", "--locked"] {
+        if !test.contains(needle) {
+            out.push(format!("Justfile: rust-test does not contain `{needle}`"));
+        }
+    }
+    let check = recipe(justfile, "check");
+    let deps = check.first().copied().unwrap_or("");
+    for dep in ["rust-clippy", "rust-test"] {
+        if !deps.split_whitespace().any(|d| d == dep) {
+            out.push(format!("Justfile: check does not run {dep}"));
+        }
+    }
+    out
+}
+
 fn assert_none(problems: Vec<String>) {
     assert!(
         problems.is_empty(),
@@ -280,7 +427,14 @@ fn assert_none(problems: Vec<String>) {
 
 #[test]
 fn workspace_package_states_rust_version_and_no_authors() {
-    assert_none(workspace_package_problems(&root_manifest()));
+    let root_manifest = root_manifest();
+    let mut problems = workspace_package_problems(&root_manifest);
+    problems.extend(rust_version_matches_toolchain(
+        &root_manifest,
+        &parse(&root().join("rust-toolchain.toml")),
+    ));
+    problems.extend(members().iter().flat_map(member_rust_version_problems));
+    assert_none(problems);
 }
 
 #[test]
@@ -293,8 +447,9 @@ fn workspace_members_inherit_the_workspace_lints() {
 #[test]
 fn workspace_published_crates_carry_their_metadata() {
     let ms = members();
-    assert!(ms.iter().any(is_published), "no publishable crate found");
-    assert_none(ms.iter().flat_map(metadata_problems).collect());
+    let mut problems = published_set_problems(&ms, &PUBLISHED);
+    problems.extend(ms.iter().flat_map(metadata_problems));
+    assert_none(problems);
 }
 
 #[test]
@@ -310,6 +465,32 @@ fn workspace_published_crates_ship_licences_and_no_tests() {
         ));
     }
     assert_none(problems);
+}
+
+#[test]
+fn workspace_sources_set_no_missing_docs_level() {
+    let root = root();
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root.join("crates"))
+        .expect("crates/")
+        .flatten()
+    {
+        rust_files(&entry.path().join("src"), &mut files);
+    }
+    assert!(!files.is_empty(), "no source files found");
+    let mut problems = Vec::new();
+    for f in files {
+        let text = fs::read_to_string(&f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        let rel = f.strip_prefix(&root).unwrap_or(&f).display().to_string();
+        problems.extend(missing_docs_attribute_problems(&rel, &text));
+    }
+    assert_none(problems);
+}
+
+#[test]
+fn workspace_gate_recipes_deny_warnings_and_lock() {
+    let justfile = fs::read_to_string(root().join("Justfile")).expect("Justfile");
+    assert_none(gate_recipe_problems(&justfile));
 }
 
 #[test]
@@ -333,6 +514,8 @@ fn member(text: &str) -> Member {
 const GOOD: &str = r#"
 [package]
 name = "x"
+rust-version.workspace = true
+readme.workspace = true
 description = "d"
 documentation = "https://docs.rs/x"
 keywords = ["a", "b-c"]
@@ -353,6 +536,7 @@ fn internal() -> BTreeSet<String> {
 #[test]
 fn good_manifest_has_no_problems() {
     let m = member(GOOD);
+    assert_none(member_rust_version_problems(&m));
     assert_none(lints_problems(&m));
     assert_none(metadata_problems(&m));
     assert_none(include_problems(&m));
@@ -363,6 +547,56 @@ fn good_manifest_has_no_problems() {
 fn missing_rust_version_and_authors_are_problems() {
     let root: Table = toml::from_str("[workspace.package]\nauthors = [\"a\"]\n").expect("parses");
     assert_eq!(workspace_package_problems(&root).len(), 2);
+    let m = member(&GOOD.replace("rust-version.workspace = true\n", ""));
+    assert_eq!(member_rust_version_problems(&m).len(), 1);
+}
+
+#[test]
+fn rust_version_off_the_toolchain_is_a_problem() {
+    let root = |rv: &str| -> Table {
+        toml::from_str(&format!("[workspace.package]\nrust-version = \"{rv}\"\n")).expect("parses")
+    };
+    let tc: Table = toml::from_str("[toolchain]\nchannel = \"1.98.1\"\n").expect("parses");
+    assert_none(rust_version_matches_toolchain(&root("1.98"), &tc));
+    assert_eq!(rust_version_matches_toolchain(&root("1.97"), &tc).len(), 1);
+    assert_eq!(
+        rust_version_matches_toolchain(&root("1.98.1"), &tc).len(),
+        1
+    );
+}
+
+#[test]
+fn publishable_set_other_than_expected_is_a_problem() {
+    let ms = [
+        member(GOOD),
+        member("[package]\nname = \"o\"\npublish = false\n"),
+    ];
+    assert_none(published_set_problems(&ms, &["x"]));
+    assert_eq!(published_set_problems(&ms, &["x", "o"]).len(), 1);
+    assert_eq!(published_set_problems(&ms, &[]).len(), 1);
+}
+
+#[test]
+fn missing_docs_attribute_in_source_is_a_problem() {
+    let text = "//! Doc.\n#![warn(missing_docs)]\n\n#[allow(missing_docs)]\npub fn f() {}\n// missing_docs in a comment\n";
+    assert_eq!(missing_docs_attribute_problems("lib.rs", text).len(), 2);
+}
+
+#[test]
+fn gate_recipes_without_deny_or_lock_are_problems() {
+    let good = "check: rust-fmt-check rust-clippy rust-test deny\n\nrust-clippy:\n    CARGO_BUILD_WARNINGS=deny cargo clippy --workspace --all-targets --locked\n\nrust-test:\n    cargo test --workspace --locked\n";
+    assert_none(gate_recipe_problems(good));
+    let bad = good
+        .replace("CARGO_BUILD_WARNINGS=deny ", "")
+        .replace("--all-targets --locked", "--all-targets")
+        .replace("--workspace --locked", "--workspace")
+        .replace(" rust-test deny", " deny");
+    assert_eq!(
+        gate_recipe_problems(&bad).len(),
+        4,
+        "{:?}",
+        gate_recipe_problems(&bad)
+    );
 }
 
 #[test]
@@ -381,9 +615,16 @@ fn missing_docs_not_set_in_the_workspace_is_a_problem() {
 fn missing_licence_file_is_a_problem() {
     let root = root();
     let m = member(GOOD);
-    assert_none(licence_file_problems(&m, &root, &root));
+    assert_none(licence_file_problems(
+        &m,
+        &root.join("crates/ryo-v2-core"),
+        &root,
+    ));
+    // The root copies are regular files, not symlinks.
+    assert_eq!(licence_file_problems(&m, &root, &root).len(), 2);
     let absent = root.join("crates").join("no-such-crate");
-    assert_eq!(licence_file_problems(&m, &absent, &root).len(), 2);
+    // Neither a symlink nor readable.
+    assert_eq!(licence_file_problems(&m, &absent, &root).len(), 4);
 }
 
 #[test]
@@ -410,6 +651,8 @@ fn wrong_documentation_and_keywords_are_problems() {
     assert_eq!(metadata_problems(&m).len(), 1);
     let m = member(&GOOD.replace(r#"categories = ["development-tools"]"#, ""));
     assert_eq!(metadata_problems(&m).len(), 1);
+    let m = member(&GOOD.replace(r#"["development-tools"]"#, r#"[" "]"#));
+    assert_eq!(metadata_problems(&m).len(), 1);
 }
 
 #[test]
@@ -423,9 +666,14 @@ fn unpublished_crate_needs_no_metadata() {
 fn include_without_licence_or_with_tests_is_a_problem() {
     let m = member(&GOOD.replace(r#", "LICENSE-APACHE""#, r#", "tests/**""#));
     assert_eq!(include_problems(&m).len(), 2, "{:?}", include_problems(&m));
+    // A top-level glob takes tests/, and the list then has no `src/**` entry.
     let m = member(&GOOD.replace(r#""src/**""#, r#""**/*.rs""#));
+    assert_eq!(include_problems(&m).len(), 2);
+    let m = member(&GOOD.replace(r#""src/**", "#, ""));
     assert_eq!(include_problems(&m).len(), 1);
     let m = member(&GOOD.replace("include = ", "exclude = "));
+    assert_eq!(include_problems(&m).len(), 1);
+    let m = member(&GOOD.replace("readme.workspace = true\n", ""));
     assert_eq!(include_problems(&m).len(), 1);
 }
 
@@ -433,11 +681,12 @@ fn include_without_licence_or_with_tests_is_a_problem() {
 fn internal_dependency_by_path_is_a_problem() {
     let m = member(
         &(GOOD.replace("y.workspace = true", r#"y = { path = "../y" }"#)
-            + "\n[target.'cfg(unix)'.dev-dependencies]\nz = { package = \"x\", version = \"0.1\" }\n"),
+            + "\n[target.'cfg(unix)'.dev-dependencies]\nz = { package = \"x\", version = \"0.1\" }\n"
+            + "\n[build_dependencies]\ny = \"0.1\"\n"),
     );
     assert_eq!(
         internal_dependency_problems(&m, &internal()).len(),
-        2,
+        3,
         "{:?}",
         internal_dependency_problems(&m, &internal())
     );

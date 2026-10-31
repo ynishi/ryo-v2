@@ -3,6 +3,7 @@ name = "ryo-v2-ra"
 description = "rust-analyzer adapter of ryo-v2: in-memory code state, forks and HIR diagnostics over the ra_ap_* crates"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

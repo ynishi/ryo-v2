@@ -3,6 +3,7 @@ name = "ryo-v2-core"
 description = "Core of ryo-v2: the domain types, use cases and ports of the speculative refactoring engine (Blueprints, verdicts, search), free of rust-analyzer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

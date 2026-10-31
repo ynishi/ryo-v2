@@ -3,6 +3,7 @@ name = "ryo-v2-host"
 description = "Host of ryo-v2: the `ryo-v2` binary, which runs the engine behind a front such as the command line"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
