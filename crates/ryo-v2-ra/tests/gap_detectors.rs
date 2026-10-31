@@ -491,3 +491,29 @@ pub struct Note {\n    pub text: String,\n}\n";
             .expect("check is not poisoned");
     }
 }
+
+/// A file with a macro call rust-analyzer could not expand (here an `include!` of `OUT_DIR`, which
+/// the probe never sets) is skipped by the unresolved-path detector only: the duplicate-name and
+/// field-bounds detectors still report on it.
+#[test]
+fn unexpanded_macro_file_keeps_the_other_detectors() {
+    let p = Probe::new("unexpanded-others");
+    std::fs::write(
+        p.dir.join("build.rs"),
+        "fn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(std::path::Path::new(&out).join(\"generated.rs\"), \"pub struct Generated;\\n\").unwrap();\n}\n",
+    )
+    .unwrap();
+    let text = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\npub fn make(_g: Generated) {}\n\npub fn f() {}\npub mod m {\n    pub fn f() {}\n}\nuse m::f;\n\n#[derive(Clone, Copy)]\npub struct Note {\n    pub text: String,\n}\n";
+    let got = p.errors_of(true, text);
+    assert!(codes_of(&got, "E0425").is_empty(), "got {got:?}");
+    assert_eq!(
+        codes_of(&got, "E0255"),
+        at("E0255", line_of(text, "use m::f;")),
+        "got {got:?}"
+    );
+    assert_eq!(
+        codes_of(&got, "E0204"),
+        at("E0204", line_of(text, "pub struct Note")),
+        "got {got:?}"
+    );
+}

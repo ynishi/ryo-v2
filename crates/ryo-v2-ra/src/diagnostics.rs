@@ -157,6 +157,11 @@ impl GapDetector {
     /// could not expand. Only the unresolved-path detector is: a name the missing expansion would
     /// define cannot be told from a missing one, so it would report a false error. The other two
     /// only lose findings, never gain false ones, from an item that is missing.
+    ///
+    /// # Contract
+    /// - C1: on a file with a macro call rust-analyzer could not expand, the duplicate-name and
+    ///   field-bounds detectors still report.
+    ///   tested: tests/gap_detectors.rs unexpanded_macro_file_keeps_the_other_detectors
     pub fn skips_files_with_unexpanded_macros(self) -> bool {
         matches!(self, GapDetector::UnresolvedPath)
     }
