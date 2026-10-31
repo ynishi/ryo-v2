@@ -46,6 +46,19 @@ fn one_planted_case_runs_end_to_end() {
             "every committed case carries probes: {} has none",
             c.id
         );
+        let src = workspace_sources(&c.workspace);
+        for p in &c.probes {
+            let (item, ty) = match p {
+                ChangeProbe::AddVariant { ty } => ("enum", ty),
+                ChangeProbe::AddField { ty } => ("struct", ty),
+                ChangeProbe::AddMethod { ty } => ("trait", ty),
+            };
+            assert!(
+                src.contains(&format!("pub {item} {} ", ty.as_str())),
+                "probe {p:?} of {} names no `{item}` of its workspace",
+                c.id
+            );
+        }
     }
 
     let analyzer = RaAnalyzer::new(
@@ -92,4 +105,21 @@ fn one_planted_case_runs_end_to_end() {
         "and it survives a beam of 5 (fate {:?}): {row:?}",
         row.fate
     );
+}
+
+/// The text of every `.rs` file under `dir`, outside `target` and the planted overlays.
+fn workspace_sources(dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    for entry in std::fs::read_dir(dir).expect("read workspace dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if path.is_dir() {
+            if !matches!(name, "target" | "planted" | ".git") {
+                out.push_str(&workspace_sources(&path));
+            }
+        } else if name.ends_with(".rs") {
+            out.push_str(&std::fs::read_to_string(&path).expect("read source"));
+        }
+    }
+    out
 }

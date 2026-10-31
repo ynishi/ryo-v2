@@ -114,7 +114,9 @@ or reads: a new shape (`add-variant` on `Shape`) where the code goes over shapes
 new field on `Bin` for the one breakage-lab case. Neither workspace defines a trait of its own (the
 only `impl` of a trait is `Default for Store`), so no `add-method` probe is plausible and none is
 used. The test `one_planted_case_runs_end_to_end` (`crates/ryo-v2-oracle/tests/search_recall.rs`)
-checks that the probes of a case file reach the case and that every committed case has probes.
+checks that the probes of a case file reach the case, that every committed case has probes, and
+that each probe names a type its workspace defines as the matching item (`enum` for add-variant,
+`struct` for add-field, `trait` for add-method), so an add-method probe on these workspaces fails it.
 
 | case kind (decisions) | probes | add-variant | add-field | per case |
 |---|---|---|---|---|
