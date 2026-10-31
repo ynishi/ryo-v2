@@ -5,15 +5,12 @@
 //! [`Candidate`] that carries the whole-file [`Edit`]s it would make.
 
 use crate::app::ports::{CheckError, Verifier};
-use crate::domain::file_role::file_role;
-use crate::domain::resolution::{DEFAULT_BUDGET, NEAR_MISS_MAX, risk_marks};
-use crate::domain::text::splice;
+use crate::domain::resolution::DEFAULT_BUDGET;
+use crate::domain::stage::{On, Refused, stage};
 use crate::domain::{
-    BaseFp, Blocking, Blueprint, BlueprintId, BlueprintSet, Candidate, DecisionLog, Edit, Evidence,
-    FileRole, Freshness, Infeasible, LogEntry, NearMiss, NonEmpty, ReadRange, RelPath, Resolution,
-    RuleCatalog, Scope, Stage, Verdict,
+    Blocking, Blueprint, BlueprintId, BlueprintSet, Candidate, DecisionLog, Evidence, Infeasible,
+    LogEntry, NearMiss, NonEmpty, Resolution, RuleCatalog, Scope, Stage, Verdict,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 /// Why `apply_blueprints` could not finish.
 #[derive(Debug, thiserror::Error)]
@@ -57,52 +54,27 @@ impl Acc {
     }
 }
 
-/// The text of a path in some state: `None` when the state has no such file.
-pub(crate) type View<'a> = dyn Fn(&RelPath) -> Option<String> + 'a;
-
-/// A Blueprint that passed the stages before the analyzer check.
-pub(crate) struct Ready {
-    /// Whole-file edits, spliced against the view.
-    pub(crate) edits: Vec<Edit>,
-    /// The roles of the files it touches.
-    pub(crate) roles: BTreeSet<FileRole>,
-}
-
-/// Outcome of the stages before the analyzer check.
-pub(crate) enum Prepared {
-    /// All stages passed.
-    Ready(Ready),
-    /// A stage refused it.
-    Blocked {
-        /// The stage that refused.
-        stage: Stage,
-        /// Why.
-        blocking: Blocking,
-    },
-}
-
-fn blocked(stage: Stage, blocking: Blocking) -> Prepared {
-    Prepared::Blocked { stage, blocking }
-}
-
 /// Verifies every Blueprint of `set` against the analyzer and sorts out which may be applied.
 ///
 /// # Contract
-/// - C1: a Blueprint with a base fingerprint that is not fresh, or a read of a file without a
-///   base fingerprint that is not fresh, is blocked by one `Blocking::Stale` that lists every
-///   such base and read, and `Verifier::check` is not called for it.
+/// - C1: the freshness stage is `Basis::check` of `Blueprint::basis` (the check a candidate's
+///   basis is checked with): a Blueprint with a base fingerprint that is not fresh, or a read
+///   of a file without a base fingerprint that is not fresh, is blocked by one
+///   `Blocking::Stale` that lists every such drift, and `Verifier::check` is not called for it.
 ///   tested: app::apply::tests::stale_blueprint_is_failed_and_never_checked
 ///   tested: app::apply::tests::identical_line_inserted_above_is_stale
 ///   tested: app::apply::tests::read_of_file_without_base_is_checked
 ///   tested: app::apply::tests::stale_lists_every_base_and_read
 ///   tested: app::apply::tests::read_of_file_with_base_but_no_spec_is_covered_by_its_base
+///   tested: app::apply::tests::candidate_basis_is_stale_after_outside_change
 /// - C2: a spec in a file whose role is `Manifest` is blocked as `Unverifiable` before
 ///   anything is read, and the check is not called; a build script or proc-macro file gives
 ///   a candidate whose `outer_check` is `Some`, which is never `AutoApplicable`.
 ///   tested: app::apply::tests::crate_graph_edits_never_pass_silently
 /// - C3: a base fingerprint or a read of a file the analyzer does not have gives
-///   `MissingFile`, and the check is not called.
+///   `MissingFile`, also when other entries drifted, and the check is not called.
 ///   tested: app::apply::tests::missing_file_is_blocking
+///   tested: app::apply::tests::read_of_file_without_base_is_checked
 /// - C4: an `Err` of the check returns `ApplyError::Check` at once.
 ///   tested: app::apply::tests::check_error_is_apply_error
 /// - C5: the result is `Decided` when at least one Blueprint passed, with the candidates in
@@ -173,160 +145,6 @@ pub fn apply_blueprints<V: Verifier>(
     Ok(Resolution::Failed(infeasible))
 }
 
-/// The stages before the analyzer check, against the texts of `view`: file role, freshness of
-/// the base fingerprints and of the reads of files without one, conformance, splice and marks.
-/// Each stage logs one entry to `acc`, `ok` false at the stage that refuses.
-pub(crate) fn prepare<V: Verifier>(
-    v: &V,
-    s: &V::Session,
-    bp: &Blueprint,
-    view: &View<'_>,
-    acc: &mut Acc,
-) -> Prepared {
-    let id = bp.id();
-    let by_file = bp.edits_by_file();
-
-    // 1. file roles
-    let mut roles = BTreeSet::new();
-    for path in by_file.keys() {
-        let role = file_role(path, &v.facts(s, path));
-        if role == FileRole::Manifest {
-            acc.note(id, Stage::FileRole, false, format!("{path} is a {role}"));
-            return blocked(
-                Stage::FileRole,
-                Blocking::Unverifiable {
-                    blueprint: id,
-                    path: (*path).clone(),
-                    role,
-                },
-            );
-        }
-        roles.insert(role);
-    }
-    acc.note(
-        id,
-        Stage::FileRole,
-        true,
-        format!("{} file(s)", by_file.len()),
-    );
-
-    // 2. freshness
-    let missing = |acc: &mut Acc, path: &RelPath| {
-        acc.note(
-            id,
-            Stage::Freshness,
-            false,
-            format!("{path} is not in the workspace"),
-        );
-        blocked(
-            Stage::Freshness,
-            Blocking::MissingFile {
-                blueprint: id,
-                path: path.clone(),
-            },
-        )
-    };
-    let mut stale_bases: Vec<(BaseFp, Freshness)> = Vec::new();
-    for base in bp.bases() {
-        let Some(current) = view(base.path()) else {
-            return missing(acc, base.path());
-        };
-        acc.fingerprints_checked += 1;
-        match base.check(&current) {
-            Freshness::Fresh => {}
-            other => stale_bases.push((base.clone(), other)),
-        }
-    }
-    let based: BTreeSet<&RelPath> = bp.bases().iter().map(BaseFp::path).collect();
-    let mut stale_reads: Vec<(ReadRange, Freshness)> = Vec::new();
-    let mut reads_checked = 0usize;
-    for read in bp.reads().iter().filter(|r| !based.contains(r.path())) {
-        let Some(current) = view(read.path()) else {
-            return missing(acc, read.path());
-        };
-        acc.fingerprints_checked += 1;
-        reads_checked += 1;
-        match read.check(&current) {
-            Freshness::Fresh => {}
-            other => stale_reads.push((read.clone(), other)),
-        }
-    }
-    if !stale_bases.is_empty() || !stale_reads.is_empty() {
-        acc.note(
-            id,
-            Stage::Freshness,
-            false,
-            format!(
-                "{} base(s) and {} read(s) are not fresh",
-                stale_bases.len(),
-                stale_reads.len()
-            ),
-        );
-        return blocked(
-            Stage::Freshness,
-            Blocking::Stale {
-                blueprint: id,
-                bases: stale_bases,
-                reads: stale_reads,
-            },
-        );
-    }
-    acc.note(
-        id,
-        Stage::Freshness,
-        true,
-        format!(
-            "{} base(s) and {reads_checked} read(s) fresh",
-            bp.bases().len()
-        ),
-    );
-
-    // 3. conformance
-    let base: BTreeMap<RelPath, String> = by_file
-        .keys()
-        .filter_map(|p| view(p).map(|t| ((*p).clone(), t)))
-        .collect();
-    if let Err(why) = bp.intent().conforms(bp.specs(), &base) {
-        acc.note(id, Stage::Conformance, false, why.to_string());
-        return blocked(
-            Stage::Conformance,
-            Blocking::Nonconforming { blueprint: id, why },
-        );
-    }
-    acc.note(id, Stage::Conformance, true, bp.intent().to_string());
-
-    // 4. splice
-    let mut edits = Vec::new();
-    for (path, specs) in &by_file {
-        let Some(text) = base.get(*path) else {
-            // Cannot happen after the freshness stage; reported as a missing file all the same.
-            acc.note(id, Stage::Splice, false, format!("{path} has no text"));
-            return blocked(
-                Stage::Splice,
-                Blocking::MissingFile {
-                    blueprint: id,
-                    path: (*path).clone(),
-                },
-            );
-        };
-        match splice(text, specs) {
-            Ok(new_text) => edits.push(Edit::write((*path).clone(), new_text)),
-            Err(err) => {
-                acc.note(id, Stage::Splice, false, err.to_string());
-                return blocked(Stage::Splice, Blocking::Splice { blueprint: id, err });
-            }
-        }
-    }
-    acc.note(id, Stage::Splice, true, format!("{} edit(s)", edits.len()));
-
-    // 5. marks
-    let marks = risk_marks([bp.intent().kind()], roles.iter().copied());
-    let names: Vec<String> = marks.iter().map(ToString::to_string).collect();
-    acc.note(id, Stage::Marks, true, names.join(", "));
-
-    Prepared::Ready(Ready { edits, roles })
-}
-
 fn decide<V: Verifier>(
     v: &V,
     s: &mut V::Session,
@@ -337,13 +155,20 @@ fn decide<V: Verifier>(
     acc: &mut Acc,
 ) -> Result<Outcome, ApplyError> {
     let id = bp.id();
-    let prepared = {
+    let staged = {
         let session: &V::Session = s;
-        prepare(v, session, bp, &|p| v.text(session, p), acc)
+        stage(
+            bp,
+            On::Start(&[]),
+            &|p| v.text(session, p),
+            &|p| v.facts(session, p),
+            &mut acc.log,
+            &mut acc.fingerprints_checked,
+        )
     };
-    let Ready { edits, roles } = match prepared {
-        Prepared::Ready(r) => r,
-        Prepared::Blocked { blocking, .. } => {
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(Refused { blocking, .. }) => {
             return Ok(Outcome::Blocked {
                 blocking,
                 near_miss: None,
@@ -353,7 +178,7 @@ fn decide<V: Verifier>(
 
     // 6. check
     let found = v
-        .check(s, &edits, scope)
+        .check(s, staged.edits(), scope)
         .map_err(|source| ApplyError::Check {
             blueprint: id,
             source,
@@ -369,23 +194,13 @@ fn decide<V: Verifier>(
     );
 
     // 7. candidate
-    match Candidate::new(
-        NonEmpty::one(bp.clone()),
-        &roles,
-        edits,
-        verdict,
-        rules,
-        scope,
-    ) {
+    match Candidate::new(staged, verdict, rules, scope) {
         Ok(c) => {
             acc.note(id, Stage::Candidate, true, c.disposition().to_string());
             Ok(Outcome::Candidate(Box::new(c)))
         }
         Err(verdict) => {
-            let near_miss = (1..=NEAR_MISS_MAX).contains(&errors).then_some(NearMiss {
-                blueprint: id,
-                new_errors: errors,
-            });
+            let near_miss = NearMiss::of(id, errors);
             Ok(Outcome::Blocked {
                 blocking: Blocking::NewErrors {
                     blueprint: id,
@@ -401,14 +216,16 @@ fn decide<V: Verifier>(
 mod tests {
     use super::*;
     use crate::app::ports::FileFacts;
+    use crate::domain::resolution::NEAR_MISS_MAX;
     use crate::domain::{
-        BlueprintError, BlueprintParts, DecisionRecord, DeriveName, Disposition, ErrorCode,
-        Finding, FindingCode, Ident, IntentCall, IntentKind, MutationSpec, NonEmpty,
-        Nonconformance, OuterCheckReason, Provenance, ReviewReason, ReviewRecord, RiskMark, Rule,
-        RuleId, ScopedFindings, SpecRef, TextRange,
+        BaseFp, BlueprintError, BlueprintParts, DecisionRecord, DeriveName, Disposition, Drift,
+        Edit, ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident, IntentCall, IntentKind,
+        MutationSpec, NonEmpty, Nonconformance, OuterCheckReason, Provenance, ReadRange, RelPath,
+        ReviewReason, ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, VecDeque};
 
     #[derive(Default)]
     struct Fake {
@@ -629,17 +446,15 @@ mod tests {
         assert_eq!(fake.checks.get(), 0);
         assert_eq!(i.blocking().len(), 1);
         match &i.blocking()[0] {
-            Blocking::Stale {
-                blueprint,
-                bases,
-                reads,
-            } => {
+            Blocking::Stale { blueprint, drift } => {
                 assert_eq!(*blueprint, bid(1));
-                assert_eq!(bases.len(), 1);
-                assert_eq!(bases[0].0.path(), &rel("src/lib.rs"));
-                assert!(matches!(bases[0].1, Freshness::Stale { .. }));
                 // the read is of a file with a base, so the base covers it
-                assert!(reads.is_empty());
+                assert_eq!(drift.len(), 1);
+                assert!(matches!(
+                    &drift[0],
+                    Drift::File { base, now: Freshness::Stale { .. } }
+                        if base.path() == &rel("src/lib.rs")
+                ));
             }
             other => panic!("{other:?}"),
         }
@@ -672,11 +487,12 @@ mod tests {
         assert_eq!(fake.checks.get(), 0);
         assert_eq!(i.blocking().len(), 1);
         match &i.blocking()[0] {
-            Blocking::Stale { bases, reads, .. } => {
-                assert_eq!(bases.len(), 1);
-                assert_eq!(bases[0].0.path(), &path);
-                assert!(matches!(bases[0].1, Freshness::Stale { .. }));
-                assert!(reads.is_empty());
+            Blocking::Stale { drift, .. } => {
+                assert_eq!(drift.len(), 1);
+                assert!(matches!(
+                    &drift[0],
+                    Drift::File { base, now: Freshness::Stale { .. } } if base.path() == &path
+                ));
             }
             other => panic!("{other:?}"),
         }
@@ -712,15 +528,30 @@ mod tests {
                 path: other.clone()
             }]
         );
+        // missing wins over drift elsewhere: the edited file changed as well
+        fake.texts
+            .insert(rel("src/lib.rs"), "let a = 2;".to_owned());
+        let i = failed(run(&fake, vec![bp.clone()], &RuleCatalog::default()));
+        assert_eq!(fake.checks.get(), 0);
+        assert_eq!(
+            i.blocking(),
+            &[Blocking::MissingFile {
+                blueprint: bid(1),
+                path: other.clone()
+            }]
+        );
+        fake.texts.insert(rel("src/lib.rs"), BASE.to_owned());
         // it changed
         fake.texts.insert(other.clone(), "abd".to_owned());
         let i = failed(run(&fake, vec![bp.clone()], &RuleCatalog::default()));
         assert_eq!(fake.checks.get(), 0);
         match &i.blocking()[0] {
-            Blocking::Stale { bases, reads, .. } => {
-                assert!(bases.is_empty());
-                assert_eq!(reads.len(), 1);
-                assert_eq!(reads[0].0.path(), &other);
+            Blocking::Stale { drift, .. } => {
+                assert_eq!(drift.len(), 1);
+                assert!(matches!(
+                    &drift[0],
+                    Drift::Read { read, now: Freshness::Stale { .. } } if read.path() == &other
+                ));
             }
             other => panic!("{other:?}"),
         }
@@ -768,11 +599,16 @@ mod tests {
         assert_eq!(fake.checks.get(), 0);
         assert_eq!(i.blocking().len(), 1);
         match &i.blocking()[0] {
-            Blocking::Stale { bases, reads, .. } => {
-                let paths: Vec<&RelPath> = bases.iter().map(|(b, _)| b.path()).collect();
-                assert_eq!(paths, vec![&a, &b]);
-                assert_eq!(reads.len(), 1);
-                assert_eq!(reads[0].0.path(), &c);
+            Blocking::Stale { drift, .. } => {
+                let kinds: Vec<(&str, &RelPath)> = drift
+                    .iter()
+                    .map(|d| match d {
+                        Drift::File { .. } => ("file", d.path()),
+                        Drift::Read { .. } => ("read", d.path()),
+                        Drift::Missing(_) => ("missing", d.path()),
+                    })
+                    .collect();
+                assert_eq!(kinds, vec![("file", &a), ("file", &b), ("read", &c)]);
             }
             other => panic!("{other:?}"),
         }
@@ -802,6 +638,67 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert!(!fresh[0].ok());
         assert_eq!(fresh[0].note(), "2 base(s) and 1 read(s) are not fresh");
+    }
+
+    #[test]
+    fn candidate_basis_is_stale_after_outside_change() {
+        let lib = rel("src/lib.rs");
+        let fake = Fake::with_text("src/lib.rs", BASE);
+        let r = run(
+            &fake,
+            vec![rename(1, "src/lib.rs")],
+            &RuleCatalog::default(),
+        )
+        .unwrap();
+        let Resolution::Decided { blueprints, .. } = r else {
+            panic!("expected Decided");
+        };
+        let basis = blueprints.first().basis();
+        assert_eq!(basis.files()[0], BaseFp::capture(lib.clone(), BASE));
+        let original = |p: &RelPath| (p == &lib).then(|| BASE.to_owned());
+        assert!(basis.check(&original).is_empty());
+        let changed = |p: &RelPath| (p == &lib).then(|| format!("{BASE} //"));
+        let drift = basis.check(&changed);
+        assert_eq!(drift.len(), 1);
+        assert!(matches!(
+            &drift[0],
+            Drift::File { base, now: Freshness::Stale { .. } } if base.path() == &lib
+        ));
+    }
+
+    #[test]
+    fn second_alternative_is_stale_after_first_is_written() {
+        let lib = rel("src/lib.rs");
+        let second = make(
+            2,
+            IntentCall::RenameLocal {
+                from: Ident::parse("a").unwrap(),
+                to: Ident::parse("c").unwrap(),
+            },
+            vec![MutationSpec::replace(lib.clone(), tr(4, 5), "c").unwrap()],
+            "src/lib.rs",
+            BASE,
+        )
+        .unwrap();
+        let fake = Fake::with_text("src/lib.rs", BASE);
+        let r = run(
+            &fake,
+            vec![rename(1, "src/lib.rs"), second],
+            &RuleCatalog::default(),
+        )
+        .unwrap();
+        let Resolution::Decided { blueprints, .. } = r else {
+            panic!("expected Decided");
+        };
+        assert_eq!(blueprints.len(), 2);
+        let (c1, c2) = (&blueprints.as_slice()[0], &blueprints.as_slice()[1]);
+        let written = c1.edits()[0].new_text.clone().unwrap();
+        let after = |p: &RelPath| (p == &lib).then(|| written.clone());
+        let drift = c2.basis().check(&after);
+        assert_eq!(drift.len(), 1);
+        assert!(matches!(&drift[0], Drift::File { .. }));
+        let original = |p: &RelPath| (p == &lib).then(|| BASE.to_owned());
+        assert!(c1.basis().check(&original).is_empty());
     }
 
     #[test]
@@ -904,13 +801,7 @@ mod tests {
         ));
         assert_eq!(i.blocking().len(), 2);
         assert!(matches!(i.blocking()[0], Blocking::NewErrors { .. }));
-        assert_eq!(
-            i.near_miss(),
-            &[NearMiss {
-                blueprint: bid(2),
-                new_errors: 1
-            }]
-        );
+        assert_eq!(i.near_miss(), &[NearMiss::of(bid(2), 1).unwrap()]);
     }
 
     #[test]

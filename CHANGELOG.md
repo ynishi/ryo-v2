@@ -49,6 +49,16 @@ and this project adheres to
   input written without it no longer parses; `ryo-v2 fingerprint WORKSPACE PATH` without a range
   prints such an entry; a `stale` blocking lists `bases` beside `reads`; `fingerprints_checked`
   counts the bases and the reads of files without one. `Blueprint::new` takes a `BlueprintParts`.
+- A decided candidate carries its basis (`Candidate::basis`): the base fingerprint of every file
+  its path edits, taken from the loaded text, and the read ranges of the files it only reads.
+  `Basis::check` lists every drift (`file`, `read`, `missing`); a writer writes the candidate's
+  texts only when it is empty, and otherwise the decision is re-run. The freshness stage of a
+  Blueprint is the same check. The `apply` and `search` JSON list `basis` per candidate, and a
+  `stale` blocking lists `drift` in place of `bases` and `reads`. The candidates of one decision
+  are alternatives: writing one makes every other on a shared file drift.
+- The stages before the check (file role, freshness, conformance, splice, marks) run in the domain,
+  and a candidate is built only from their result; `NearMiss` fields are private (`blueprint()`,
+  `new_errors()`).
 - A candidate's risk marks and Rule are derived by the domain from its Blueprints and the roles of
   the files they edit; `Candidate`, `Evidence` and decision-log entries can no longer be built
   outside the core crate, and the `Verifier` port gains `provenance`.

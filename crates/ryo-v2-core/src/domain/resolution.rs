@@ -8,10 +8,11 @@
 //! and the roles of the files it edits ([`risk_marks`], [`covering_rule`]); a caller never
 //! hands them over.
 
+use super::stage::Staged;
 use super::{
-    BaseFp, Blueprint, BlueprintId, DomainError, Edit, FileRole, Fingerprint, Freshness,
-    IntentKind, NonEmpty, Nonconformance, ReadRange, RelPath, RiskMark, Rule, RuleCatalog, RuleId,
-    Scope, SpliceError, Verdict,
+    Basis, Blueprint, BlueprintId, DomainError, Drift, Edit, FileRole, Fingerprint, IntentKind,
+    NonEmpty, Nonconformance, RelPath, RiskMark, Rule, RuleCatalog, RuleId, Scope, SpliceError,
+    Verdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -226,11 +227,18 @@ pub fn covering_rule<'r>(kinds: &[IntentKind], rules: &'r RuleCatalog) -> Option
 /// // Only the engine builds a candidate: its marks and Rule are derived, never handed over.
 /// let _ = Candidate::new;
 /// ```
+///
+/// # Contract
+/// - C1 [invariant]: its `edits` are the texts of the state its basis was taken on; they may be
+///   written only when the basis has no drift against the files, and nothing splices them onto
+///   a changed text: a drifted candidate is decided again.
+///   tested: app::apply::tests::candidate_basis_is_stale_after_outside_change
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     path: NonEmpty<Blueprint>,
     edits: Vec<Edit>,
     verdict: Verdict,
+    basis: Basis,
     marks: BTreeSet<RiskMark>,
     outer_check: Option<OuterCheck>,
     disposition: Disposition,
@@ -239,22 +247,21 @@ pub struct Candidate {
 impl Candidate {
     /// Builds the candidate of a passing verdict.
     ///
-    /// `path` holds the Blueprints that lead to it, the root first and the leaf last (one for
-    /// an apply); `roles` the roles of every file the path edits.
+    /// `staged` holds the Blueprints that lead to it, the root first and the leaf last (one for
+    /// an apply), the edits they make, the roles of every file they edit and their basis.
     ///
     /// # Contract
     /// - C1: returns `Err(verdict)` unless `verdict.passed()`.
     ///   tested: domain::resolution::tests::candidate_refuses_failed_verdict
-    /// - C2: the marks are [`risk_marks`] of the intent kinds of `path` and `roles`, the Rule is
-    ///   [`covering_rule`] of those kinds, and `outer_check` and `disposition` follow from them
-    ///   with [`outer_check`] and [`disposition`]; a path with an intent whose catalog risks hold
-    ///   `Behaviour` is `NeedsReview{Behaviour}` whatever the catalog holds.
+    /// - C2: the marks are [`risk_marks`] of the intent kinds of the path of `staged` and its
+    ///   roles, the Rule is [`covering_rule`] of those kinds, and `outer_check` and
+    ///   `disposition` follow from them with [`outer_check`] and [`disposition`]; a path with an
+    ///   intent whose catalog risks hold `Behaviour` is `NeedsReview{Behaviour}` whatever the
+    ///   catalog holds.
     ///   tested: domain::resolution::tests::candidate_derives_marks_and_rule
     ///   tested: domain::resolution::tests::crate_graph_edits_never_pass_silently
     pub(crate) fn new(
-        path: NonEmpty<Blueprint>,
-        roles: &BTreeSet<FileRole>,
-        edits: Vec<Edit>,
+        staged: Staged,
         verdict: Verdict,
         rules: &RuleCatalog,
         scope: Scope,
@@ -262,6 +269,7 @@ impl Candidate {
         if !verdict.passed() {
             return Err(verdict);
         }
+        let (path, edits, roles, basis) = staged.into_parts();
         let kinds: Vec<IntentKind> = path.iter().map(|b| b.intent().kind()).collect();
         let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
         let rule = covering_rule(&kinds, rules);
@@ -269,6 +277,7 @@ impl Candidate {
             path,
             edits,
             verdict,
+            basis,
             outer_check: outer_check(&marks),
             disposition: disposition(&marks, rule, scope),
             marks,
@@ -293,6 +302,15 @@ impl Candidate {
     /// The (passing) verdict.
     pub fn verdict(&self) -> &Verdict {
         &self.verdict
+    }
+
+    /// What its verdict rests on; check it against the files before writing `edits`.
+    ///
+    /// The `edits` are the texts of the checked state. They may be written only when
+    /// `basis().check` of the files is empty, and nothing splices them onto a changed text: a
+    /// drifted candidate is decided again.
+    pub fn basis(&self) -> &Basis {
+        &self.basis
     }
 
     /// The risks it carries.
@@ -323,15 +341,12 @@ pub enum Blocking {
         /// Its role.
         role: FileRole,
     },
-    /// Something the Blueprint rests on has changed: lists every base fingerprint and every
-    /// read (of a file without a base) that is not fresh.
+    /// Something the Blueprint rests on has changed. Lists every drift.
     Stale {
         /// The Blueprint.
         blueprint: BlueprintId,
-        /// The base fingerprints that are not fresh, with their state.
-        bases: Vec<(BaseFp, Freshness)>,
-        /// The reads of files without a base that are not fresh, with their state.
-        reads: Vec<(ReadRange, Freshness)>,
+        /// Every way the files no longer match its basis.
+        drift: Vec<Drift>,
     },
     /// A file the Blueprint reads or edits is not in the workspace.
     MissingFile {
@@ -397,16 +412,20 @@ impl std::fmt::Display for Blocking {
                 path,
                 role,
             } => write!(f, "{blueprint}: {path} ({role}) cannot be verified"),
-            Blocking::Stale {
-                blueprint,
-                bases,
-                reads,
-            } => write!(
-                f,
-                "{blueprint}: {} base(s) and {} read(s) are stale",
-                bases.len(),
-                reads.len()
-            ),
+            Blocking::Stale { blueprint, drift } => {
+                let files = drift
+                    .iter()
+                    .filter(|d| matches!(d, Drift::File { .. }))
+                    .count();
+                let reads = drift
+                    .iter()
+                    .filter(|d| matches!(d, Drift::Read { .. }))
+                    .count();
+                write!(
+                    f,
+                    "{blueprint}: {files} base(s) and {reads} read(s) are stale"
+                )
+            }
             Blocking::MissingFile { blueprint, path } => {
                 write!(f, "{blueprint}: {path} is not in the workspace")
             }
@@ -438,10 +457,32 @@ pub const OUTER_CHECK_MAX: usize = 3;
 /// A Blueprint that failed by only a few new errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NearMiss {
+    blueprint: BlueprintId,
+    new_errors: usize,
+}
+
+impl NearMiss {
+    /// The near miss of a Blueprint that failed with `new_errors` new errors (unmapped included).
+    ///
+    /// # Contract
+    /// - C1: `Some` if and only if `new_errors` is from 1 to `NEAR_MISS_MAX`.
+    ///   tested: domain::resolution::tests::near_miss_is_one_to_max_errors
+    pub(crate) fn of(blueprint: BlueprintId, new_errors: usize) -> Option<Self> {
+        (1..=NEAR_MISS_MAX).contains(&new_errors).then_some(Self {
+            blueprint,
+            new_errors,
+        })
+    }
+
     /// The Blueprint.
-    pub blueprint: BlueprintId,
+    pub fn blueprint(&self) -> BlueprintId {
+        self.blueprint
+    }
+
     /// New errors plus unmapped ones.
-    pub new_errors: usize,
+    pub fn new_errors(&self) -> usize {
+        self.new_errors
+    }
 }
 
 /// The task and the code disagree about what was asked. No value exists yet: this is the
@@ -811,6 +852,12 @@ impl Evidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
     /// At least one Blueprint passed, in input order.
+    ///
+    /// # Contract
+    /// - C1: the candidates are alternatives on the loaded state, not parts of one change; each
+    ///   one's basis is what to check before writing it, and writing one makes every other
+    ///   candidate on a shared file drift.
+    ///   tested: app::apply::tests::second_alternative_is_stale_after_first_is_written
     Decided {
         /// The candidates.
         blueprints: NonEmpty<Candidate>,
@@ -830,9 +877,13 @@ mod tests {
     use super::*;
     use crate::domain::DeriveName;
     use crate::domain::{
-        BlueprintParts, DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident, IntentCall,
-        MutationSpec, ReviewRecord, TextRange,
+        BaseFp, BlueprintParts, DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident,
+        IntentCall, MutationSpec, ReadRange, ReviewRecord, TextRange,
     };
+
+    fn empty_basis() -> Basis {
+        Basis::new(vec![], vec![])
+    }
 
     const ALL_MARKS: [RiskMark; 5] = [
         RiskMark::Borrow,
@@ -911,6 +962,9 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+    fn staged(kinds: &[IntentKind], roles: BTreeSet<FileRole>, edits: Vec<Edit>) -> Staged {
+        Staged::for_tests(path_of(kinds), roles, edits, empty_basis())
     }
     const ALL_ROLES: [FileRole; 4] = [
         FileRole::Source,
@@ -1081,9 +1135,7 @@ mod tests {
         let rules = RuleCatalog::new(vec![rule()]).unwrap();
         for role in [FileRole::BuildScript, FileRole::ProcMacroSource] {
             let c = Candidate::new(
-                path_of(&[IntentKind::MoveItem]),
-                &BTreeSet::from([role]),
-                vec![],
+                staged(&[IntentKind::MoveItem], BTreeSet::from([role]), vec![]),
                 passing(),
                 &rules,
                 Scope::Workspace,
@@ -1098,13 +1150,20 @@ mod tests {
     }
 
     #[test]
+    fn near_miss_is_one_to_max_errors() {
+        assert_eq!(NearMiss::of(bid(), 0), None);
+        let one = NearMiss::of(bid(), 1).unwrap();
+        assert_eq!((one.blueprint(), one.new_errors()), (bid(), 1));
+        assert!(NearMiss::of(bid(), NEAR_MISS_MAX).is_some());
+        assert_eq!(NearMiss::of(bid(), NEAR_MISS_MAX + 1), None);
+    }
+
+    #[test]
     fn candidate_refuses_failed_verdict() {
         let v = failing();
         let none = RuleCatalog::default();
         let err = Candidate::new(
-            path_of(&[IntentKind::MoveItem]),
-            &BTreeSet::new(),
-            vec![],
+            staged(&[IntentKind::MoveItem], BTreeSet::new(), vec![]),
             v.clone(),
             &none,
             Scope::Affected,
@@ -1112,9 +1171,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, v);
         let ok = Candidate::new(
-            path_of(&[IntentKind::RenameLocal, IntentKind::MoveItem]),
-            &BTreeSet::new(),
-            vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
+            staged(
+                &[IntentKind::RenameLocal, IntentKind::MoveItem],
+                BTreeSet::new(),
+                vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
+            ),
             passing(),
             &none,
             Scope::Affected,
@@ -1150,9 +1211,13 @@ mod tests {
             for roles in role_subsets() {
                 for rules in &catalogs {
                     for scope in [Scope::Affected, Scope::Workspace] {
-                        let c =
-                            Candidate::new(path_of(kinds), &roles, vec![], passing(), rules, scope)
-                                .unwrap();
+                        let c = Candidate::new(
+                            staged(kinds, roles.clone(), vec![]),
+                            passing(),
+                            rules,
+                            scope,
+                        )
+                        .unwrap();
                         let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
                         let rule = covering_rule(kinds, rules);
                         assert_eq!(c.marks(), &marks);
