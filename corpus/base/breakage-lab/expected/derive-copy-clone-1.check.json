@@ -1,0 +1,12 @@
+[
+  {
+    "code": "E0204",
+    "path": "app/src/lib.rs",
+    "line": 56
+  },
+  {
+    "code": "E0277",
+    "path": "app/src/lib.rs",
+    "line": 59
+  }
+]
