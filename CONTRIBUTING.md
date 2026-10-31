@@ -94,8 +94,8 @@ convention is stated in `crates/ryo-v2-core/tests/doc_contract.rs`, and
 `[invariant]` or `[free]`, and clauses use the terms of the glossary in
 `crates/ryo-v2-core/src/domain/mod.rs`; the checker states both.
 
-Decisions that outlive a single change are recorded under `docs/adr/`, one decision per file, with the measurement that
-settled it.
+Decisions that outlive a single change are recorded in the "Decisions in force" section of
+`SEARCH_LEDGER.md`, one row per decision, with the measurement that settled it.
 
 ## Preferred commit format
 
@@ -180,3 +180,26 @@ The PR body records what changed, what was verified — or a statement that
 it was not — and what it
 deliberately does not cover, under the same disclosure policy as everything
 else.
+
+## Development flow
+
+This is repository policy for every implementer, human or agent.
+
+- Each implementer works in its own worktree and branch. Until the code base is functionally
+  complete, integration into `main` is a local merge done by the maintainer, conflicts included;
+  pull requests are not required in this phase.
+- Work to be done is written into a ledger (`CHECK_LEDGER.md` or `SEARCH_LEDGER.md`, section "Open
+  work") or into the task's contract, and handed over from there. No separate issue tracker is
+  used.
+- A decision that code or data must keep (a grouping, a denominator, a threshold) gets a test or a
+  ceiling in the same change that makes the decision; prose alone does not keep it.
+- A verification repository may be used as a sample (today ryo-rs). Wherever a file names it, the
+  file says that it is a verification repository used as a sample.
+- Files and commit messages never describe the execution environment. Commands use placeholders
+  such as `<BASE>` and `<OUT>`.
+- Review adds one question: for each decision the change makes, which test or ceiling guards it,
+  and would it fail if the decision were broken.
+- Weak tests are managed as a measured risk, not driven to zero. Once per milestone, (a) for each
+  main capability, a change that disables it must make some test fail; (b) a sample of n contract
+  clauses each gets a mutant that breaks the promise, and the share k/n of named tests that still
+  pass is recorded with its confidence bound in `CHECK_LEDGER.md` (section "Test strength (risk)").
