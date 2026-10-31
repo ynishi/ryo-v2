@@ -7,4 +7,6 @@ origin = "planted:obscure-name:3"
 targets = [
     { path = "geo/src/lib.rs", start = 487, end = 651 },
 ]
-probes = []
+probes = [
+    { kind = "add-variant", type = "Shape" },
+]

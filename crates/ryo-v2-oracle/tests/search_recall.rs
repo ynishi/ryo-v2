@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ryo_v2_core::app::ports::Analyzer;
 use ryo_v2_core::app::search::{ASSERT_REVERT_EVERY, DEFAULT_SEARCH_BUDGET};
+use ryo_v2_core::domain::{ChangeProbe, Ident};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::judge::MetricJudge;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -25,7 +26,27 @@ fn one_planted_case_runs_end_to_end() {
         .find(|c| c.id == "obscure-name-0")
         .expect("obscure-name-0 is a case of search-lab");
     assert_eq!(case.depth, 1);
-    assert!(case.probes.is_empty(), "probes are filled by hand later");
+    assert_eq!(
+        case.probes,
+        vec![
+            ChangeProbe::AddVariant {
+                ty: Ident::parse("Shape").unwrap()
+            },
+            ChangeProbe::AddField {
+                ty: Ident::parse("Report").unwrap()
+            },
+        ],
+        "the probes of the case file reach the case"
+    );
+    let breakage = PlantedCase::load_all(&m.corpus.join("search/base/breakage-lab"), &m.corpus)
+        .expect("load breakage-lab cases");
+    for c in cases.iter().chain(&breakage) {
+        assert!(
+            !c.probes.is_empty(),
+            "every committed case carries probes: {} has none",
+            c.id
+        );
+    }
 
     let analyzer = RaAnalyzer::new(
         RaConfig {

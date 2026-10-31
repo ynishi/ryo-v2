@@ -7,4 +7,6 @@ origin = "planted:inline-variable:7"
 targets = [
     { path = "geo/src/store.rs", start = 1213, end = 1344 },
 ]
-probes = []
+probes = [
+    { kind = "add-variant", type = "Shape" },
+]

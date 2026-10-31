@@ -7,4 +7,6 @@ origin = "planted:obscure-name:2"
 targets = [
     { path = "app/src/plan.rs", start = 216, end = 390 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Bounds" },
+]

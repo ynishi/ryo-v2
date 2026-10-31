@@ -11,4 +11,8 @@ targets = [
     { path = "geo/src/lib.rs", start = 305, end = 334 },
     { path = "geo/src/store.rs", start = 1470, end = 1499 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Rect" },
+    { kind = "add-field", type = "Slot" },
+    { kind = "add-variant", type = "Shape" },
+]

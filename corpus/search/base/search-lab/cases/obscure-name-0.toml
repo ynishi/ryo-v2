@@ -7,4 +7,7 @@ origin = "planted:obscure-name:0"
 targets = [
     { path = "app/src/lib.rs", start = 601, end = 782 },
 ]
-probes = []
+probes = [
+    { kind = "add-variant", type = "Shape" },
+    { kind = "add-field", type = "Report" },
+]

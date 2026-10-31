@@ -9,4 +9,7 @@ targets = [
     { path = "app/src/lib.rs", start = 873, end = 1011 },
     { path = "geo/src/report.rs", start = 1297, end = 1420 },
 ]
-probes = []
+probes = [
+    { kind = "add-variant", type = "Shape" },
+    { kind = "add-field", type = "Line" },
+]

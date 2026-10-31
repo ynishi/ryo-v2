@@ -9,5 +9,9 @@ targets = [
     { path = "app/src/lib.rs", start = 601, end = 782 },
     { path = "geo/src/shapes.rs", start = 1724, end = 1893 },
 ]
-probes = []
+probes = [
+    { kind = "add-variant", type = "Shape" },
+    { kind = "add-field", type = "Report" },
+    { kind = "add-field", type = "Bounds" },
+]
 original_fn = "wider"

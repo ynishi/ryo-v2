@@ -7,5 +7,7 @@ origin = "planted:inline-function:2"
 targets = [
     { path = "geo/src/store.rs", start = 901, end = 1129 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Store" },
+]
 original_fn = "free_room"

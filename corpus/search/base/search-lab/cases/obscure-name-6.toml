@@ -7,4 +7,6 @@ origin = "planted:obscure-name:6"
 targets = [
     { path = "geo/src/report.rs", start = 1297, end = 1420 },
 ]
-probes = []
+probes = [
+    { kind = "add-field", type = "Line" },
+]
