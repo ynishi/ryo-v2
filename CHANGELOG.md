@@ -39,3 +39,5 @@ and this project adheres to
   which test or ceiling guards each decision; branch types include `refactor` and `chore`.
 - `docs/bench-m2.md`: the large-run steps export ryo-rs with `git archive` as the run did, with
   placeholders instead of a path.
+- `CONTRIBUTING.md`: where a review is recorded — a GitHub review or the PR body, or, with a local
+  merge, the hand-over note and `Reviewed:` / `Verified:` lines in the merge commit's body.
