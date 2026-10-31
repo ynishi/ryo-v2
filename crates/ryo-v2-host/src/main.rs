@@ -22,8 +22,14 @@ use ryo_v2_core::domain::{Scope, TextRange};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// The command's help summary. Written out rather than taken from the package
+/// description (clap's bare `about`), so that describing the crate does not
+/// rewrite the command's help.
+const ABOUT: &str = "Command-line interface of ryo-v2: Speculative refactoring engine for Rust: \
+                     Blueprints explored and verified in-process on rust-analyzer, built once after commit";
+
 #[derive(Parser)]
-#[command(name = "ryo-v2", version, about)]
+#[command(name = "ryo-v2", version, about = ABOUT)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -222,6 +228,19 @@ fn run() -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn help_summary_is_the_command_line_text() {
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            help.starts_with(
+                "Command-line interface of ryo-v2: Speculative refactoring engine for Rust: \
+                 Blueprints explored and verified in-process on rust-analyzer, built once after commit\n"
+            ),
+            "{help}"
+        );
+    }
 
     #[test]
     fn cli_parses_large_and_repeat() {

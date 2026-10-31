@@ -29,7 +29,7 @@ case "$mode" in
     if has_recipe oracle; then just oracle; else echo "$0: no 'oracle' recipe yet, skipped" >&2; fi
     ;;
   bench)
-    cargo run -q -p ryo-v2-cli -- bench "$@"
+    cargo run -q -p ryo-v2-host -- bench "$@"
     ;;
   *)
     echo "usage: $0 [check|oracle|all|bench ARGS...]" >&2
