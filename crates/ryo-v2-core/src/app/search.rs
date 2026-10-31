@@ -8,19 +8,19 @@
 //! The numbers of the budget are those of the decisions in force in `SEARCH_LEDGER.md`: D1 (time),
 //! D2 (revert audit), D3 (memory per session) and D4 (the triggers that call for perf work).
 
-use crate::app::apply::{Acc, Prepared, Ready, prepare};
+use crate::app::apply::Acc;
 use crate::app::ports::{
     Assessor, CheckError, Clock, ExpandError, Expander, Judge, JudgeError, RevertAudit,
 };
-use crate::domain::search::{compose, prune, rank_final, reward_score, score};
+use crate::domain::search::{prune, rank_final, reward_score, score};
+use crate::domain::stage::{On, Refused, Staged, stage, view_of};
 use crate::domain::{
-    Basis, Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, FileRole,
-    Infeasible, Inserted, IntentKind, JudgeRequest, NEAR_MISS_MAX, NearMiss, NewNode, NodeId,
-    NonEmpty, Noul, OUTER_CHECK_MAX, Prior, Proposal, ProposalId, ProviderTag, PruneStage, RelPath,
-    Resolution, Reward, RuleCatalog, Scope, Scored, SearchBudget, SearchTree, Stage, StateFp,
-    StaticMetrics, Target, Verdict, Weights,
+    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, Infeasible, Inserted,
+    IntentKind, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, OUTER_CHECK_MAX, Prior,
+    Proposal, ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, RuleCatalog, Scope,
+    Scored, SearchBudget, SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroU16;
 
 /// The budget used when none is given: beam 20, 200 children per depth from the best 4 parents,
@@ -250,12 +250,10 @@ struct Child {
 }
 
 /// A child that passed the stages, waiting for the prune and the check.
-struct Staged {
+struct Pending {
     trace: usize,
     parent: NodeId,
-    bp: Blueprint,
-    edits: Vec<Edit>,
-    roles: BTreeSet<FileRole>,
+    staged: Staged,
     metrics: StaticMetrics,
     prior: Prior,
     noul: Option<Noul>,
@@ -388,6 +386,7 @@ where
     let mut run = Run::default();
     let mut passing: Vec<NodeId> = Vec::new();
     let mut last_passing: Vec<NodeId> = Vec::new();
+    let mut staged_of: BTreeMap<NodeId, Staged> = BTreeMap::new();
 
     for d in 1..=b.max_depth {
         // 1. parents and children
@@ -448,10 +447,19 @@ where
         stats.expand_ms = t_stage.saturating_sub(t_expand);
 
         // 2. stages and assessment, against the parent's text
-        let mut staged: Vec<Option<Staged>> = Vec::new();
+        let mut staged: Vec<Option<Pending>> = Vec::new();
         for child in children {
             let Some(parent) = tree.node(child.parent) else {
                 continue;
+            };
+            let on = if child.parent == tree.root() {
+                On::Start(input.start)
+            } else {
+                match staged_of.get(&child.parent) {
+                    Some(parent_staged) => On::Parent(parent_staged),
+                    // Parents are passing nodes, each with its staged path.
+                    None => continue,
+                }
             };
             let bp = child.bp;
             let proposal = ProposalId::of(&bp);
@@ -473,43 +481,38 @@ where
             });
             let sess: &V::Session = &*s;
             let base = |p: &RelPath| v.text(sess, p);
-            let view = |p: &RelPath| -> Option<String> {
-                match parent.edits().iter().rev().find(|ed| ed.path == *p) {
-                    Some(ed) => ed.new_text.clone(),
-                    None => base(p),
-                }
-            };
-            match prepare(v, sess, &bp, &view, &mut run.acc) {
-                Prepared::Blocked { stage, blocking } => {
+            let facts = |p: &RelPath| v.facts(sess, p);
+            match stage(
+                &bp,
+                on,
+                &base,
+                &facts,
+                &mut run.acc.log,
+                &mut run.acc.fingerprints_checked,
+            ) {
+                Err(Refused { stage, blocking }) => {
                     run.trace[ix].fate = Fate::Blocked(stage);
                     run.blocking.push(blocking);
                 }
-                Prepared::Ready(Ready {
-                    edits: own,
-                    roles: own_roles,
-                }) => {
-                    let edits = compose(parent.edits(), &own, &base);
-                    let mut roles = parent.roles().clone();
-                    roles.extend(own_roles);
-                    let before: Vec<Edit> = own
+                Ok(done) => {
+                    let before: Vec<Edit> = done
+                        .own()
                         .iter()
-                        .map(|ed| match view(&ed.path) {
+                        .map(|ed| match view_of(parent.edits(), &base, &ed.path) {
                             Some(text) => Edit::write(ed.path.clone(), text),
                             None => Edit::delete(ed.path.clone()),
                         })
                         .collect();
-                    let metrics = a.assess(&before, &own, input.probes);
-                    let state = StateFp::of(&edits);
+                    let metrics = a.assess(&before, done.own(), input.probes);
+                    let state = StateFp::of(done.edits());
                     run.trace[ix].state = Some(state);
                     if input.keep_trace_edits {
-                        run.trace[ix].edits = Some(edits.clone());
+                        run.trace[ix].edits = Some(done.edits().to_vec());
                     }
-                    staged.push(Some(Staged {
+                    staged.push(Some(Pending {
                         trace: ix,
                         parent: child.parent,
-                        bp,
-                        edits,
-                        roles,
+                        staged: done,
                         metrics,
                         prior: Prior::NEUTRAL,
                         noul: None,
@@ -529,7 +532,7 @@ where
             .iter()
             .flatten()
             .filter(|c| !c.root)
-            .map(|c| Proposal::new(&c.bp, d, c.metrics))
+            .map(|c| Proposal::new(c.staged.path().last(), d, c.metrics))
             .collect();
         if !proposals.is_empty() {
             match j.judge(&JudgeRequest::new(proposals)) {
@@ -594,8 +597,12 @@ where
                 continue;
             };
             run.trace[c.trace].fate = Fate::Pruned(stage);
-            run.acc
-                .note(c.bp.id(), Stage::Prune, false, stage.to_string());
+            run.acc.note(
+                c.staged.path().last().id(),
+                Stage::Prune,
+                false,
+                stage.to_string(),
+            );
         }
         stats.kept = sat16(pruned.kept.len());
         stats.audited = sat16(pruned.audit.len());
@@ -622,7 +629,7 @@ where
             let Some(c) = staged[i].take() else {
                 continue;
             };
-            let bp_id = c.bp.id();
+            let bp_id = c.staged.path().last().id();
             let t = c.trace;
             if run.budget_exhausted {
                 run.trace[t].fate = Fate::TimedOut;
@@ -647,9 +654,9 @@ where
             }
             let id = match tree.insert(NewNode {
                 parent: c.parent,
-                blueprint: c.bp,
-                edits: c.edits,
-                roles: c.roles,
+                blueprint: c.staged.path().last().clone(),
+                edits: c.staged.edits().to_vec(),
+                roles: c.staged.roles().clone(),
                 metrics: c.metrics,
                 prior: c.prior,
             }) {
@@ -689,6 +696,7 @@ where
                             .filter_map(|n| tree.node(*n).map(|x| *x.metrics()))
                             .collect();
                         tree.set_reward(id, Reward::along(&along, true));
+                        staged_of.insert(id, c.staged);
                         run.verdicts.insert(id, verdict);
                         passing.push(id);
                         depth_passing.push(id);
@@ -696,12 +704,7 @@ where
                         stats.passed = stats.passed.saturating_add(1);
                     } else {
                         run.trace[t].fate = Fate::Failed { new_errors: errors };
-                        if (1..=NEAR_MISS_MAX).contains(&errors) {
-                            run.near_miss.push(NearMiss {
-                                blueprint: bp_id,
-                                new_errors: errors,
-                            });
-                        }
+                        run.near_miss.extend(NearMiss::of(bp_id, errors));
                         run.blocking.push(Blocking::NewErrors {
                             blueprint: bp_id,
                             verdict,
@@ -775,33 +778,12 @@ where
         .collect();
     let mut candidates = Vec::new();
     for r in ranking.iter().take(OUTER_CHECK_MAX) {
-        let (Some(n), Some(verdict)) = (tree.node(r.node), run.verdicts.get(&r.node)) else {
+        let (Some(verdict), Some(done)) = (run.verdicts.get(&r.node), staged_of.remove(&r.node))
+        else {
             continue;
         };
-        let blueprints: Vec<Blueprint> = tree
-            .path(r.node)
-            .iter()
-            .filter_map(|p| tree.node(*p).and_then(|x| x.blueprint()).cloned())
-            .collect();
-        let Some(path) = NonEmpty::new(blueprints) else {
-            continue;
-        };
-        let leaf = path.last().id();
-        // The basis is against the loaded text, never a parent's state.
-        let basis = {
-            let session: &V::Session = s;
-            let chain: Vec<&Blueprint> = path.iter().collect();
-            Basis::of_chain(&chain, n.edits(), &|p| v.text(session, p))
-        };
-        if let Ok(c) = Candidate::new(
-            path,
-            n.roles(),
-            n.edits().to_vec(),
-            verdict.clone(),
-            basis,
-            input.rules,
-            input.scope,
-        ) {
+        let leaf = done.path().last().id();
+        if let Ok(c) = Candidate::new(done, verdict.clone(), input.rules, input.scope) {
             run.acc
                 .note(leaf, Stage::Candidate, true, c.disposition().to_string());
             candidates.push(c);
@@ -850,6 +832,7 @@ mod tests {
         RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 

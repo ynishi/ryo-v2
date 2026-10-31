@@ -5,15 +5,12 @@
 //! [`Candidate`] that carries the whole-file [`Edit`]s it would make.
 
 use crate::app::ports::{CheckError, Verifier};
-use crate::domain::file_role::file_role;
-use crate::domain::resolution::{DEFAULT_BUDGET, NEAR_MISS_MAX, risk_marks};
-use crate::domain::text::splice;
+use crate::domain::resolution::DEFAULT_BUDGET;
+use crate::domain::stage::{On, Refused, stage};
 use crate::domain::{
-    Basis, Blocking, Blueprint, BlueprintId, BlueprintSet, Candidate, DecisionLog, Drift, Edit,
-    Evidence, FileRole, Infeasible, LogEntry, NearMiss, NonEmpty, RelPath, Resolution, RuleCatalog,
-    Scope, Stage, Verdict,
+    Blocking, Blueprint, BlueprintId, BlueprintSet, Candidate, DecisionLog, Evidence, Infeasible,
+    LogEntry, NearMiss, NonEmpty, Resolution, RuleCatalog, Scope, Stage, Verdict,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 /// Why `apply_blueprints` could not finish.
 #[derive(Debug, thiserror::Error)]
@@ -55,33 +52,6 @@ impl Acc {
     ) {
         self.log.push(LogEntry::new(blueprint, stage, ok, note));
     }
-}
-
-pub(crate) use crate::domain::basis::View;
-
-/// A Blueprint that passed the stages before the analyzer check.
-pub(crate) struct Ready {
-    /// Whole-file edits, spliced against the view.
-    pub(crate) edits: Vec<Edit>,
-    /// The roles of the files it touches.
-    pub(crate) roles: BTreeSet<FileRole>,
-}
-
-/// Outcome of the stages before the analyzer check.
-pub(crate) enum Prepared {
-    /// All stages passed.
-    Ready(Ready),
-    /// A stage refused it.
-    Blocked {
-        /// The stage that refused.
-        stage: Stage,
-        /// Why.
-        blocking: Blocking,
-    },
-}
-
-fn blocked(stage: Stage, blocking: Blocking) -> Prepared {
-    Prepared::Blocked { stage, blocking }
 }
 
 /// Verifies every Blueprint of `set` against the analyzer and sorts out which may be applied.
@@ -174,145 +144,6 @@ pub fn apply_blueprints<V: Verifier>(
     Ok(Resolution::Failed(infeasible))
 }
 
-/// The stages before the analyzer check, against the texts of `view`: file role, freshness of
-/// the base fingerprints and of the reads of files without one, conformance, splice and marks.
-/// Each stage logs one entry to `acc`, `ok` false at the stage that refuses.
-pub(crate) fn prepare<V: Verifier>(
-    v: &V,
-    s: &V::Session,
-    bp: &Blueprint,
-    view: &View<'_>,
-    acc: &mut Acc,
-) -> Prepared {
-    let id = bp.id();
-    let by_file = bp.edits_by_file();
-
-    // 1. file roles
-    let mut roles = BTreeSet::new();
-    for path in by_file.keys() {
-        let role = file_role(path, &v.facts(s, path));
-        if role == FileRole::Manifest {
-            acc.note(id, Stage::FileRole, false, format!("{path} is a {role}"));
-            return blocked(
-                Stage::FileRole,
-                Blocking::Unverifiable {
-                    blueprint: id,
-                    path: (*path).clone(),
-                    role,
-                },
-            );
-        }
-        roles.insert(role);
-    }
-    acc.note(
-        id,
-        Stage::FileRole,
-        true,
-        format!("{} file(s)", by_file.len()),
-    );
-
-    // 2. freshness
-    let basis = bp.basis();
-    let drift = basis.check(view);
-    let missing = drift
-        .iter()
-        .filter(|d| matches!(d, Drift::Missing(_)))
-        .count();
-    acc.fingerprints_checked += basis.files().len() + basis.reads().len() - missing;
-    if let Some(Drift::Missing(path)) = drift.iter().find(|d| matches!(d, Drift::Missing(_))) {
-        acc.note(
-            id,
-            Stage::Freshness,
-            false,
-            format!("{path} is not in the workspace"),
-        );
-        return blocked(
-            Stage::Freshness,
-            Blocking::MissingFile {
-                blueprint: id,
-                path: path.clone(),
-            },
-        );
-    }
-    if !drift.is_empty() {
-        let files = drift
-            .iter()
-            .filter(|d| matches!(d, Drift::File { .. }))
-            .count();
-        acc.note(
-            id,
-            Stage::Freshness,
-            false,
-            format!(
-                "{files} base(s) and {} read(s) are not fresh",
-                drift.len() - files
-            ),
-        );
-        return blocked(
-            Stage::Freshness,
-            Blocking::Stale {
-                blueprint: id,
-                drift,
-            },
-        );
-    }
-    acc.note(
-        id,
-        Stage::Freshness,
-        true,
-        format!(
-            "{} base(s) and {} read(s) fresh",
-            basis.files().len(),
-            basis.reads().len()
-        ),
-    );
-
-    // 3. conformance
-    let base: BTreeMap<RelPath, String> = by_file
-        .keys()
-        .filter_map(|p| view(p).map(|t| ((*p).clone(), t)))
-        .collect();
-    if let Err(why) = bp.intent().conforms(bp.specs(), &base) {
-        acc.note(id, Stage::Conformance, false, why.to_string());
-        return blocked(
-            Stage::Conformance,
-            Blocking::Nonconforming { blueprint: id, why },
-        );
-    }
-    acc.note(id, Stage::Conformance, true, bp.intent().to_string());
-
-    // 4. splice
-    let mut edits = Vec::new();
-    for (path, specs) in &by_file {
-        let Some(text) = base.get(*path) else {
-            // Cannot happen after the freshness stage; reported as a missing file all the same.
-            acc.note(id, Stage::Splice, false, format!("{path} has no text"));
-            return blocked(
-                Stage::Splice,
-                Blocking::MissingFile {
-                    blueprint: id,
-                    path: (*path).clone(),
-                },
-            );
-        };
-        match splice(text, specs) {
-            Ok(new_text) => edits.push(Edit::write((*path).clone(), new_text)),
-            Err(err) => {
-                acc.note(id, Stage::Splice, false, err.to_string());
-                return blocked(Stage::Splice, Blocking::Splice { blueprint: id, err });
-            }
-        }
-    }
-    acc.note(id, Stage::Splice, true, format!("{} edit(s)", edits.len()));
-
-    // 5. marks
-    let marks = risk_marks([bp.intent().kind()], roles.iter().copied());
-    let names: Vec<String> = marks.iter().map(ToString::to_string).collect();
-    acc.note(id, Stage::Marks, true, names.join(", "));
-
-    Prepared::Ready(Ready { edits, roles })
-}
-
 fn decide<V: Verifier>(
     v: &V,
     s: &mut V::Session,
@@ -323,13 +154,20 @@ fn decide<V: Verifier>(
     acc: &mut Acc,
 ) -> Result<Outcome, ApplyError> {
     let id = bp.id();
-    let prepared = {
+    let staged = {
         let session: &V::Session = s;
-        prepare(v, session, bp, &|p| v.text(session, p), acc)
+        stage(
+            bp,
+            On::Start(&[]),
+            &|p| v.text(session, p),
+            &|p| v.facts(session, p),
+            &mut acc.log,
+            &mut acc.fingerprints_checked,
+        )
     };
-    let Ready { edits, roles } = match prepared {
-        Prepared::Ready(r) => r,
-        Prepared::Blocked { blocking, .. } => {
+    let staged = match staged {
+        Ok(staged) => staged,
+        Err(Refused { blocking, .. }) => {
             return Ok(Outcome::Blocked {
                 blocking,
                 near_miss: None,
@@ -339,16 +177,12 @@ fn decide<V: Verifier>(
 
     // 6. check
     let found = v
-        .check(s, &edits, scope)
+        .check(s, staged.edits(), scope)
         .map_err(|source| ApplyError::Check {
             blueprint: id,
             source,
         })?;
     let verdict = Verdict::from_baseline(baseline, &found);
-    let basis = {
-        let session: &V::Session = s;
-        Basis::of_chain(&[bp], &edits, &|p| v.text(session, p))
-    };
     acc.verdicts.push((id, verdict.clone()));
     let errors = verdict.new_errors.errors.len() + verdict.new_errors.unmapped.len();
     acc.note(
@@ -359,24 +193,13 @@ fn decide<V: Verifier>(
     );
 
     // 7. candidate
-    match Candidate::new(
-        NonEmpty::one(bp.clone()),
-        &roles,
-        edits,
-        verdict,
-        basis,
-        rules,
-        scope,
-    ) {
+    match Candidate::new(staged, verdict, rules, scope) {
         Ok(c) => {
             acc.note(id, Stage::Candidate, true, c.disposition().to_string());
             Ok(Outcome::Candidate(Box::new(c)))
         }
         Err(verdict) => {
-            let near_miss = (1..=NEAR_MISS_MAX).contains(&errors).then_some(NearMiss {
-                blueprint: id,
-                new_errors: errors,
-            });
+            let near_miss = NearMiss::of(id, errors);
             Ok(Outcome::Blocked {
                 blocking: Blocking::NewErrors {
                     blueprint: id,
@@ -392,14 +215,16 @@ fn decide<V: Verifier>(
 mod tests {
     use super::*;
     use crate::app::ports::FileFacts;
+    use crate::domain::resolution::NEAR_MISS_MAX;
     use crate::domain::{
-        BaseFp, BlueprintError, BlueprintParts, DecisionRecord, DeriveName, Disposition, ErrorCode,
-        Finding, FindingCode, Freshness, Ident, IntentCall, IntentKind, MutationSpec, NonEmpty,
-        Nonconformance, OuterCheckReason, Provenance, ReadRange, ReviewReason, ReviewRecord,
-        RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
+        BaseFp, BlueprintError, BlueprintParts, DecisionRecord, DeriveName, Disposition, Drift,
+        Edit, ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident, IntentCall, IntentKind,
+        MutationSpec, NonEmpty, Nonconformance, OuterCheckReason, Provenance, ReadRange, RelPath,
+        ReviewReason, ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
+    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, VecDeque};
 
     #[derive(Default)]
     struct Fake {
@@ -962,13 +787,7 @@ mod tests {
         ));
         assert_eq!(i.blocking().len(), 2);
         assert!(matches!(i.blocking()[0], Blocking::NewErrors { .. }));
-        assert_eq!(
-            i.near_miss(),
-            &[NearMiss {
-                blueprint: bid(2),
-                new_errors: 1
-            }]
-        );
+        assert_eq!(i.near_miss(), &[NearMiss::of(bid(2), 1).unwrap()]);
     }
 
     #[test]

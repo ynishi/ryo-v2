@@ -288,8 +288,8 @@ pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
             "resolution": "failed",
             "blocking": inf.blocking().iter().map(blocking_json).collect::<Vec<_>>(),
             "near_miss": inf.near_miss().iter().map(|n| json!({
-                "blueprint": n.blueprint.to_string(),
-                "new_errors": n.new_errors,
+                "blueprint": n.blueprint().to_string(),
+                "new_errors": n.new_errors(),
             })).collect::<Vec<_>>(),
             "budget_exhausted": inf.budget_exhausted(),
         }),

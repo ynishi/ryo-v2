@@ -39,6 +39,8 @@
 //!   includes: Borrow, BuildScript, ProcMacroCrate, Behaviour, Visibility
 //! - FileRole: what a touched file is to the crate graph.
 //!   includes: Source, BuildScript, ProcMacroSource, Manifest
+//! - Staged: a path of blueprints that passed every stage before the check, with the edits it
+//!   would make, the roles of the files it edits and its basis; the only input of a candidate.
 //! - Rule: the record of one review done at registration, allowing auto-apply of one intent kind.
 //! - RuleCatalog: the registered rules, at most one per intent kind.
 //! - Resolution: the outcome of resolving a set of blueprints.
@@ -115,6 +117,7 @@ pub mod resolution;
 pub mod rule;
 pub mod scope;
 pub mod search;
+pub(crate) mod stage;
 pub mod text;
 pub mod verdict;
 pub use basis::{Basis, Drift};

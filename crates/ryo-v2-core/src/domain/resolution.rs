@@ -8,6 +8,7 @@
 //! and the roles of the files it edits ([`risk_marks`], [`covering_rule`]); a caller never
 //! hands them over.
 
+use super::stage::Staged;
 use super::{
     Basis, Blueprint, BlueprintId, DomainError, Drift, Edit, FileRole, Fingerprint, IntentKind,
     NonEmpty, Nonconformance, RelPath, RiskMark, Rule, RuleCatalog, RuleId, Scope, SpliceError,
@@ -246,30 +247,29 @@ pub struct Candidate {
 impl Candidate {
     /// Builds the candidate of a passing verdict.
     ///
-    /// `path` holds the Blueprints that lead to it, the root first and the leaf last (one for
-    /// an apply); `roles` the roles of every file the path edits.
+    /// `staged` holds the Blueprints that lead to it, the root first and the leaf last (one for
+    /// an apply), the edits they make, the roles of every file they edit and their basis.
     ///
     /// # Contract
     /// - C1: returns `Err(verdict)` unless `verdict.passed()`.
     ///   tested: domain::resolution::tests::candidate_refuses_failed_verdict
-    /// - C2: the marks are [`risk_marks`] of the intent kinds of `path` and `roles`, the Rule is
-    ///   [`covering_rule`] of those kinds, and `outer_check` and `disposition` follow from them
-    ///   with [`outer_check`] and [`disposition`]; a path with an intent whose catalog risks hold
-    ///   `Behaviour` is `NeedsReview{Behaviour}` whatever the catalog holds.
+    /// - C2: the marks are [`risk_marks`] of the intent kinds of the path of `staged` and its
+    ///   roles, the Rule is [`covering_rule`] of those kinds, and `outer_check` and
+    ///   `disposition` follow from them with [`outer_check`] and [`disposition`]; a path with an
+    ///   intent whose catalog risks hold `Behaviour` is `NeedsReview{Behaviour}` whatever the
+    ///   catalog holds.
     ///   tested: domain::resolution::tests::candidate_derives_marks_and_rule
     ///   tested: domain::resolution::tests::crate_graph_edits_never_pass_silently
     pub(crate) fn new(
-        path: NonEmpty<Blueprint>,
-        roles: &BTreeSet<FileRole>,
-        edits: Vec<Edit>,
+        staged: Staged,
         verdict: Verdict,
-        basis: Basis,
         rules: &RuleCatalog,
         scope: Scope,
     ) -> Result<Self, Verdict> {
         if !verdict.passed() {
             return Err(verdict);
         }
+        let (path, edits, roles, basis) = staged.into_parts();
         let kinds: Vec<IntentKind> = path.iter().map(|b| b.intent().kind()).collect();
         let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
         let rule = covering_rule(&kinds, rules);
@@ -457,10 +457,32 @@ pub const OUTER_CHECK_MAX: usize = 3;
 /// A Blueprint that failed by only a few new errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NearMiss {
+    blueprint: BlueprintId,
+    new_errors: usize,
+}
+
+impl NearMiss {
+    /// The near miss of a Blueprint that failed with `new_errors` new errors (unmapped included).
+    ///
+    /// # Contract
+    /// - C1: `Some` if and only if `new_errors` is from 1 to `NEAR_MISS_MAX`.
+    ///   tested: domain::resolution::tests::near_miss_is_one_to_max_errors
+    pub(crate) fn of(blueprint: BlueprintId, new_errors: usize) -> Option<Self> {
+        (1..=NEAR_MISS_MAX).contains(&new_errors).then_some(Self {
+            blueprint,
+            new_errors,
+        })
+    }
+
     /// The Blueprint.
-    pub blueprint: BlueprintId,
+    pub fn blueprint(&self) -> BlueprintId {
+        self.blueprint
+    }
+
     /// New errors plus unmapped ones.
-    pub new_errors: usize,
+    pub fn new_errors(&self) -> usize {
+        self.new_errors
+    }
 }
 
 /// The task and the code disagree about what was asked. No value exists yet: this is the
@@ -941,6 +963,9 @@ mod tests {
         )
         .unwrap()
     }
+    fn staged(kinds: &[IntentKind], roles: BTreeSet<FileRole>, edits: Vec<Edit>) -> Staged {
+        Staged::for_tests(path_of(kinds), roles, edits, empty_basis())
+    }
     const ALL_ROLES: [FileRole; 4] = [
         FileRole::Source,
         FileRole::BuildScript,
@@ -1110,11 +1135,8 @@ mod tests {
         let rules = RuleCatalog::new(vec![rule()]).unwrap();
         for role in [FileRole::BuildScript, FileRole::ProcMacroSource] {
             let c = Candidate::new(
-                path_of(&[IntentKind::MoveItem]),
-                &BTreeSet::from([role]),
-                vec![],
+                staged(&[IntentKind::MoveItem], BTreeSet::from([role]), vec![]),
                 passing(),
-                empty_basis(),
                 &rules,
                 Scope::Workspace,
             )
@@ -1128,26 +1150,33 @@ mod tests {
     }
 
     #[test]
+    fn near_miss_is_one_to_max_errors() {
+        assert_eq!(NearMiss::of(bid(), 0), None);
+        let one = NearMiss::of(bid(), 1).unwrap();
+        assert_eq!((one.blueprint(), one.new_errors()), (bid(), 1));
+        assert!(NearMiss::of(bid(), NEAR_MISS_MAX).is_some());
+        assert_eq!(NearMiss::of(bid(), NEAR_MISS_MAX + 1), None);
+    }
+
+    #[test]
     fn candidate_refuses_failed_verdict() {
         let v = failing();
         let none = RuleCatalog::default();
         let err = Candidate::new(
-            path_of(&[IntentKind::MoveItem]),
-            &BTreeSet::new(),
-            vec![],
+            staged(&[IntentKind::MoveItem], BTreeSet::new(), vec![]),
             v.clone(),
-            empty_basis(),
             &none,
             Scope::Affected,
         )
         .unwrap_err();
         assert_eq!(err, v);
         let ok = Candidate::new(
-            path_of(&[IntentKind::RenameLocal, IntentKind::MoveItem]),
-            &BTreeSet::new(),
-            vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
+            staged(
+                &[IntentKind::RenameLocal, IntentKind::MoveItem],
+                BTreeSet::new(),
+                vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
+            ),
             passing(),
-            empty_basis(),
             &none,
             Scope::Affected,
         )
@@ -1183,11 +1212,8 @@ mod tests {
                 for rules in &catalogs {
                     for scope in [Scope::Affected, Scope::Workspace] {
                         let c = Candidate::new(
-                            path_of(kinds),
-                            &roles,
-                            vec![],
+                            staged(kinds, roles.clone(), vec![]),
                             passing(),
-                            empty_basis(),
                             rules,
                             scope,
                         )
