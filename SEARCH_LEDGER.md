@@ -260,6 +260,15 @@ After it all 42 generate the best. The causes, each with a case that fails befor
 | 3. move-item's reverse move read the `use` with the comment line above it: the planter moves the item's lines and leaves a plain `//` comment above the re-export, and rust-analyzer attaches that comment to the `use` node, so its text did not start with `[pub ]use`. | `gen-lab/misplace-item-comment-above` | the `use` is read after its leading comments, which stay (`after_leading_comments`; a `use` with an attribute first is still refused) | `tests/expand_gen.rs` `move_item_collapses_a_reexport_under_a_comment` |
 | 4. move-item's reverse move required a line end right after the moved item; the planter moves the whole line, and an item whose line ends with a `//` comment has its node end before the comment. | `gen-lab/misplace-item-comment-after` (before: no candidate at all, nothing else in its targets is offered) | the item runs to its line end when the rest of the line is a `//` comment, which moves with it (`line_end_after_comment`) | `tests/expand_gen.rs` `move_item_collapses_an_item_with_a_trailing_comment`; `expand::tests::a_trailing_line_comment_ends_the_item_at_its_line_end` |
 
+Reading the name from the edited text also showed that rust-analyzer names an extracted value
+without regard to the locals of the block: for `let width = ..; Slot { width: needed(v), count:
+width }` it proposes `width`, and the new `let` would shadow the old binding for `count`, a change
+of meaning that compiles. Extract-variable now refuses a name the block mentions outside the
+extracted expression (`tests/expand_gen.rs`
+`extract_variable_refuses_a_name_the_block_still_reads`). A planted restore never meets it (the
+planter's name occurs nowhere else in its function), and every run below gives the same rows with
+and without it.
+
 Causes 3 and 4 have one root: the planter's extent of an item is its lines, rust-analyzer's is
 its node with the comments it attaches. The expander now follows the lines at both ends; the
 forward move still offers only items whose node ends the line (no restore needs more).

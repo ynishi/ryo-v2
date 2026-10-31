@@ -157,6 +157,8 @@ struct ExtractVarSeed {
     /// When the expression is the value of a record-literal field `k: v`: the start of the field
     /// and `k`.
     field: Option<(u32, String)>,
+    /// End of the block the statement is in: the new binding is in scope up to there.
+    scope_end: u32,
 }
 
 struct ExtractFnSeed {
@@ -209,6 +211,11 @@ fn replace_word(text: &str, from: &str, to: &str) -> String {
     }
     out.push_str(&text[last..]);
     out
+}
+
+/// Whether `text` has `name` as a whole word.
+fn mentions(text: &str, name: &str) -> bool {
+    replace_word(text, name, "") != text
 }
 
 /// Whether `text` has `fn <name>` as a whole word.
@@ -769,6 +776,9 @@ impl<'a> Env<'a> {
                     at: line_start as u32,
                     indent: indent.to_owned(),
                     field: record_field_of(&e),
+                    scope_end: anchor
+                        .parent()
+                        .map_or(hi, |b| u32::from(b.text_range().end())),
                 });
             }
         }
@@ -807,6 +817,17 @@ impl<'a> Env<'a> {
             Some((start, field)) if *field == name => *start,
             _ => seed.lo,
         };
+        // Rust-analyzer's name may be one the block already binds; the new `let` would then
+        // shadow it for every later read in the block, a change of meaning no check sees.
+        let scope = text
+            .get(seed.at as usize..seed.scope_end as usize)
+            .unwrap_or("");
+        let (cut_lo, cut_hi) = ((lo - seed.at) as usize, (seed.hi - seed.at) as usize);
+        if scope.get(..cut_lo).is_none_or(|t| mentions(t, &name))
+            || scope.get(cut_hi..).is_none_or(|t| mentions(t, &name))
+        {
+            return Vec::new();
+        }
         let (Ok(ident), Ok(range)) = (Ident::parse(&name), TextRange::new(lo, seed.hi)) else {
             return Vec::new();
         };
@@ -1567,16 +1588,23 @@ fn generate(
 ///   tested: tests/expand_gen.rs extract_variable_restores_a_call_folded_into_a_let_initializer
 ///   tested: tests/expand_gen.rs extract_variable_restores_a_record_field_value_as_the_shorthand
 ///   tested: expand::tests::the_added_let_is_read_from_the_edited_text
+///   tested: expand::tests::a_record_field_value_names_its_field_unless_an_attribute_comes_first
 /// - C11: the reverse move of C6 also restores an item with a comment line above its re-export
 ///   (the comment stays) and an item whose last line ends with a `//` comment (the comment moves
 ///   with it).
 ///   tested: tests/expand_gen.rs move_item_collapses_a_reexport_under_a_comment
 ///   tested: tests/expand_gen.rs move_item_collapses_an_item_with_a_trailing_comment
 ///   tested: expand::tests::a_trailing_line_comment_ends_the_item_at_its_line_end
+///   tested: expand::tests::a_use_is_read_after_its_comments_and_refused_after_an_attribute
 /// - C12: every proposed Blueprint carries one `BaseFp` per edited file, fingerprinting the text
 ///   of the given state, not the loaded text.
 ///   tested: tests/expand.rs expansion_reads_the_given_state
 ///   tested: tests/expand.rs every_expansion_conforms
+/// - C13: extract-variable proposes no name that the block of the statement mentions outside the
+///   extracted expression (rust-analyzer's name may be a local already bound, and the new `let`
+///   would shadow it for the later reads).
+///   tested: tests/expand_gen.rs extract_variable_refuses_a_name_the_block_still_reads
+///   tested: expand::tests::a_mention_is_a_whole_word
 impl Expander for RaAnalyzer {
     type Session = RaSession;
 
@@ -1695,6 +1723,46 @@ mod tests {
             None
         );
         assert_eq!(line_end_after_comment("const N: u32 = 3;", 17), None);
+    }
+
+    #[test]
+    fn a_mention_is_a_whole_word() {
+        assert!(mentions("count: width }", "width"));
+        assert!(!mentions("count: widths, w.width_of()", "width"));
+        assert!(!mentions("", "width"));
+    }
+
+    #[test]
+    fn a_record_field_value_names_its_field_unless_an_attribute_comes_first() {
+        assert_eq!(
+            record_field_of(&first_call("fn g() { S { a: f() }; }")),
+            Some((13, "a".to_owned()))
+        );
+        assert_eq!(
+            record_field_of(&first_call("fn g() { S { #[cfg(x)] a: f() }; }")),
+            None
+        );
+        assert_eq!(record_field_of(&first_call("fn g() { h(f()); }")), None);
+    }
+
+    #[test]
+    fn a_use_is_read_after_its_comments_and_refused_after_an_attribute() {
+        let uses = |src: &str| -> Vec<Option<u32>> {
+            ast::SourceFile::parse(src, ra_ap_syntax::Edition::CURRENT)
+                .tree()
+                .syntax()
+                .descendants()
+                .filter_map(ast::Use::cast)
+                .map(|u| after_leading_comments(u.syntax()))
+                .collect()
+        };
+        assert_eq!(uses("// c\npub use crate::a::B;\n"), vec![Some(5)]);
+        assert_eq!(uses("pub use crate::a::B;\n"), vec![Some(0)]);
+        assert_eq!(uses("#[allow(unused)]\nuse crate::a::B;\n"), vec![None]);
+        assert_eq!(
+            uses("// c\n#[allow(unused)]\nuse crate::a::B;\n"),
+            vec![None]
+        );
     }
 
     #[test]

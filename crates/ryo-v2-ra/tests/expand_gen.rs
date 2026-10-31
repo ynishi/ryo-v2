@@ -9,7 +9,7 @@ mod common;
 use common::{Fixture, rel};
 use ryo_v2_core::app::ports::{Analyzer, Expander, Verifier};
 use ryo_v2_core::domain::text::splice;
-use ryo_v2_core::domain::{Blueprint, Edit, MutationSpec, RelPath, Target};
+use ryo_v2_core::domain::{Blueprint, Edit, IntentCall, MutationSpec, RelPath, Target};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
@@ -230,6 +230,32 @@ fn move_item_collapses_an_item_with_a_trailing_comment() {
         got,
         vec!["move-item LIMIT -> src/lib.rs".to_owned()],
         "the restore is generated: {:?}",
+        names(&bps)
+    );
+}
+
+/// Rust-analyzer names an extracted value without regard to the locals of the block: for the
+/// value of the field `width` it proposes `width` even when the block binds `width` already and
+/// reads it later (`count: width`). The new `let` would shadow that binding, so `count` would read
+/// the new value; the expander refuses the name.
+#[test]
+fn extract_variable_refuses_a_name_the_block_still_reads() {
+    let planted = LIB.replace(
+        "    let width = needed(v);\n    Slot { width, count: 1 }\n",
+        "    let width = needed(v);\n    Slot { width: needed(v), count: width }\n",
+    );
+    assert_ne!(planted, LIB);
+    let (bps, texts) = expand_planted("gen-shadow", &[(lib(), planted)]);
+    let rewritten: Vec<String> = bps
+        .iter()
+        .filter(|bp| matches!(bp.intent(), IntentCall::ExtractVariable { .. }))
+        .filter(|bp| !apply(bp, &texts)[&lib()].contains("Slot { width: needed(v), count: width }"))
+        .map(|bp| bp.intent().to_string())
+        .collect();
+    assert_eq!(
+        rewritten,
+        Vec::<String>::new(),
+        "no extraction of the field value shadows `width`: {:?}",
         names(&bps)
     );
 }
