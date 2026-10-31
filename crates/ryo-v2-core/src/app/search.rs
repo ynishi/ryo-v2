@@ -14,11 +14,11 @@ use crate::app::ports::{
 };
 use crate::domain::search::{compose, prune, rank_final, reward_score, score};
 use crate::domain::{
-    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, Infeasible, Inserted,
-    IntentKind, JudgeRequest, NEAR_MISS_MAX, NearMiss, NewNode, NodeId, NonEmpty, Noul,
+    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, FileRole, Infeasible,
+    Inserted, IntentKind, JudgeRequest, NEAR_MISS_MAX, NearMiss, NewNode, NodeId, NonEmpty, Noul,
     OUTER_CHECK_MAX, Prior, Proposal, ProposalId, ProviderTag, PruneStage, RelPath, Resolution,
-    Reward, RiskMark, Rule, RuleCatalog, Scope, Scored, SearchBudget, SearchTree, Stage, StateFp,
-    StaticMetrics, Target, Verdict, Weights,
+    Reward, RuleCatalog, Scope, Scored, SearchBudget, SearchTree, Stage, StateFp, StaticMetrics,
+    Target, Verdict, Weights,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
@@ -255,7 +255,7 @@ struct Staged {
     parent: NodeId,
     bp: Blueprint,
     edits: Vec<Edit>,
-    marks: BTreeSet<RiskMark>,
+    roles: BTreeSet<FileRole>,
     metrics: StaticMetrics,
     prior: Prior,
     noul: Option<Noul>,
@@ -287,22 +287,6 @@ fn sat32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// The rule that covers a whole path, or `None`.
-fn path_rule<'r>(tree: &SearchTree, leaf: NodeId, rules: &'r RuleCatalog) -> Option<&'r Rule> {
-    let mut best: Option<&Rule> = None;
-    for id in tree.path(leaf) {
-        let Some(bp) = tree.node(id).and_then(|n| n.blueprint()) else {
-            continue;
-        };
-        let rule = rules.for_intent(bp.intent().kind())?;
-        best = match best {
-            Some(b) if !rule.min_scope().covers(b.min_scope()) => Some(b),
-            _ => Some(rule),
-        };
-    }
-    best
-}
-
 /// Searches for the best verified changes that answer one decision.
 ///
 /// `v` checks, `e` proposes, `a` measures, `j` judges and `clock` is the only source of time.
@@ -321,10 +305,11 @@ fn path_rule<'r>(tree: &SearchTree, leaf: NodeId, rules: &'r RuleCatalog) -> Opt
 /// - C2: every child runs the stages of `apply_blueprints` against the text of its parent's
 ///   state, not the session base, so a read of the parent's text is fresh; a refusal is
 ///   `Fate::Blocked` with its `Blocking` and log entry and the child is never checked. A child
-///   that passes has the edits of its parent overridden by its own, the marks of its parent
+///   that passes has the edits of its parent overridden by its own, the file roles of its parent
 ///   plus its own, and the metrics the assessor gives for its change against the parent's text.
 ///   tested: app::search::tests::child_blueprint_reads_parent_state
 ///   tested: app::search::tests::best_planted_child_survives_with_fake_expander
+///   tested: app::search::tests::child_inherits_build_script_role_of_parent
 /// - C3: the judge is asked once per depth, about the children that passed the stages and
 ///   were not proposed by the Main AI, and not at all when there are none. A failed call
 ///   leaves every prior neutral and no flaw, and is recorded in the report; the provider of an
@@ -361,10 +346,11 @@ fn path_rule<'r>(tree: &SearchTree, leaf: NodeId, rules: &'r RuleCatalog) -> Opt
 ///   tested: app::search::tests::revert_audit_runs_once_at_end
 /// - C8: the ranking holds every node that passed, at any depth, by `rank_final`, each with
 ///   the Blueprints of its path and its prior. The resolution is `Decided` with the first
-///   `OUTER_CHECK_MAX` of the ranking as candidates in that order, each with the marks of its
-///   path and the rule of its path; the rule is `None` unless every intent on the path has a
-///   rule, and then the one with the widest `min_scope`, the leaf's on a tie. With no node that
-///   passed the resolution is `Failed` with every blocking, and the budget flag, of the search.
+///   `OUTER_CHECK_MAX` of the ranking as candidates in that order, each with the marks and
+///   the rule the domain derives from the Blueprints of its path and the file roles of its
+///   node; the rule is `None` unless every intent on the path has a rule, and then the one with
+///   the widest `min_scope`, the leaf's on a tie. With no node that passed the resolution is
+///   `Failed` with every blocking, and the budget flag, of the search.
 ///   tested: app::search::tests::decided_lists_top_outer_check_max_by_reward
 ///   tested: app::search::tests::path_rule_needs_a_rule_for_every_kind
 ///   tested: app::search::tests::hard_budget_with_nothing_verified_is_failed_exhausted
@@ -397,6 +383,7 @@ where
     let b = input.budget;
     let w = input.weights;
     let baseline = v.baseline(s);
+    let provenance = v.provenance(s);
     let mut tree = SearchTree::new(input.start.to_vec());
     let mut run = Run::default();
     let mut passing: Vec<NodeId> = Vec::new();
@@ -499,11 +486,11 @@ where
                 }
                 Prepared::Ready(Ready {
                     edits: own,
-                    marks: own_marks,
+                    roles: own_roles,
                 }) => {
                     let edits = compose(parent.edits(), &own, &base);
-                    let mut marks = parent.marks().clone();
-                    marks.extend(own_marks);
+                    let mut roles = parent.roles().clone();
+                    roles.extend(own_roles);
                     let before: Vec<Edit> = own
                         .iter()
                         .map(|ed| match view(&ed.path) {
@@ -522,7 +509,7 @@ where
                         parent: child.parent,
                         bp,
                         edits,
-                        marks,
+                        roles,
                         metrics,
                         prior: Prior::NEUTRAL,
                         noul: None,
@@ -662,7 +649,7 @@ where
                 parent: c.parent,
                 blueprint: c.bp,
                 edits: c.edits,
-                marks: c.marks,
+                roles: c.roles,
                 metrics: c.metrics,
                 prior: c.prior,
             }) {
@@ -791,24 +778,25 @@ where
         let (Some(n), Some(verdict)) = (tree.node(r.node), run.verdicts.get(&r.node)) else {
             continue;
         };
-        let Some(leaf) = n.blueprint() else {
+        let blueprints: Vec<Blueprint> = tree
+            .path(r.node)
+            .iter()
+            .filter_map(|p| tree.node(*p).and_then(|x| x.blueprint()).cloned())
+            .collect();
+        let Some(path) = NonEmpty::new(blueprints) else {
             continue;
         };
-        let rule = path_rule(&tree, r.node, input.rules);
+        let leaf = path.last().id();
         if let Ok(c) = Candidate::new(
-            leaf.id(),
+            path,
+            n.roles(),
             n.edits().to_vec(),
             verdict.clone(),
-            n.marks().clone(),
-            rule,
+            input.rules,
             input.scope,
         ) {
-            run.acc.note(
-                leaf.id(),
-                Stage::Candidate,
-                true,
-                c.disposition().to_string(),
-            );
+            run.acc
+                .note(leaf, Stage::Candidate, true, c.disposition().to_string());
             candidates.push(c);
         }
     }
@@ -816,13 +804,14 @@ where
         Some(blueprints) => Resolution::Decided {
             blueprints,
             decision_log: run.acc.log,
-            evidence: Evidence {
-                scope: input.scope,
-                fingerprints_checked: run.acc.fingerprints_checked,
-                baseline_size: baseline.len(),
-                verdicts: run.acc.verdicts,
-                budget: b.decision_budget(),
-            },
+            evidence: Evidence::new(
+                input.scope,
+                run.acc.fingerprints_checked,
+                baseline.len(),
+                run.acc.verdicts,
+                b.decision_budget(),
+                provenance,
+            ),
         },
         None => Resolution::Failed(
             Infeasible::new(run.blocking, run.near_miss, run.budget_exhausted)
@@ -850,7 +839,8 @@ mod tests {
     use crate::domain::{
         CleanDelta, Criterion, DEFAULT_BUDGET, DEFAULT_WEIGHTS, DecisionRecord, DeriveName,
         Disposition, ErrorCode, Finding, FindingCode, Ident, IntentCall, Judgement, MutationSpec,
-        ReadRange, ReviewReason, ReviewRecord, RuleId, ScopedFindings, SpecRef, TextRange,
+        Provenance, ReadRange, ReviewReason, ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings,
+        SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
     use std::sync::Arc;
@@ -893,7 +883,7 @@ mod tests {
             intent,
             specs,
             vec![ReadRange::capture(rel(LIB), text, tr(0, end)).unwrap()],
-            vec![SpecRef::new("t").unwrap()],
+            vec![SpecRef::parse("spec#t").unwrap()],
             DecisionRecord::new("agent", "why").unwrap(),
         )
         .unwrap()
@@ -960,6 +950,7 @@ mod tests {
 
     struct FakeV {
         texts: BTreeMap<RelPath, String>,
+        build_scripts: BTreeSet<RelPath>,
         rule: CheckRule,
         checks: RefCell<Vec<Vec<Edit>>>,
         events: RefCell<Vec<&'static str>>,
@@ -971,11 +962,17 @@ mod tests {
         fn text(&self, _: &(), path: &RelPath) -> Option<String> {
             self.texts.get(path).cloned()
         }
-        fn facts(&self, _: &(), _: &RelPath) -> FileFacts {
-            FileFacts::default()
+        fn facts(&self, _: &(), path: &RelPath) -> FileFacts {
+            FileFacts {
+                is_build_script: self.build_scripts.contains(path),
+                in_proc_macro_crate: false,
+            }
         }
         fn baseline(&self, _: &()) -> Vec<Finding> {
             vec![]
+        }
+        fn provenance(&self, _: &()) -> Provenance {
+            Provenance::new("fake", "0", BTreeMap::new(), BTreeMap::new()).unwrap()
         }
         fn check(
             &self,
@@ -1004,6 +1001,7 @@ mod tests {
         fn new(text: &str) -> Self {
             Self {
                 texts: BTreeMap::from([(rel(LIB), text.to_owned())]),
+                build_scripts: BTreeSet::new(),
                 rule: Box::new(|_| Ok(ScopedFindings::default())),
                 checks: RefCell::default(),
                 events: RefCell::default(),
@@ -1544,9 +1542,52 @@ mod tests {
         let last = decision_log
             .entries()
             .iter()
-            .rfind(|e| e.blueprint == bid(3))
+            .rfind(|e| e.blueprint() == bid(3))
             .unwrap();
-        assert_eq!((last.stage, last.ok), (Stage::Freshness, false));
+        assert_eq!((last.stage(), last.ok()), (Stage::Freshness, false));
+    }
+
+    #[test]
+    fn child_inherits_build_script_role_of_parent() {
+        let mut fx = Fx::new(BASE);
+        fx.budget = SearchBudget {
+            max_depth: 2,
+            ..DEFAULT_SEARCH_BUDGET
+        };
+        fx.v.texts.insert(rel("build.rs"), BASE.to_owned());
+        fx.v.build_scripts.insert(rel("build.rs"));
+        // The parent renames in the build script, the child in an ordinary source file.
+        let parent = Blueprint::new(
+            bid(1),
+            IntentCall::RenameLocal {
+                from: Ident::parse("a").unwrap(),
+                to: Ident::parse("b").unwrap(),
+            },
+            vec![MutationSpec::replace(rel("build.rs"), tr(4, 5), "b").unwrap()],
+            vec![ReadRange::capture(rel("build.rs"), BASE, tr(0, 10)).unwrap()],
+            vec![SpecRef::parse("spec#t").unwrap()],
+            DecisionRecord::new("agent", "why").unwrap(),
+        )
+        .unwrap();
+        fx.e.set(root_state(), vec![parent]);
+        fx.e.set(
+            state(vec![Edit::write(rel("build.rs"), "let b = 1;")]),
+            vec![rename(2, "a", "b", BASE)],
+        );
+        let r = fx.run().unwrap();
+
+        let child = decided(&r)
+            .iter()
+            .find(|c| c.blueprint() == bid(2))
+            .unwrap();
+        assert_eq!(child.path().len(), 2);
+        assert!(child.marks().contains(&RiskMark::BuildScript));
+        assert!(child.outer_check().is_some());
+        let parent = decided(&r)
+            .iter()
+            .find(|c| c.blueprint() == bid(1))
+            .unwrap();
+        assert!(parent.marks().contains(&RiskMark::BuildScript));
     }
 
     #[test]
@@ -1674,8 +1715,9 @@ mod tests {
         let Resolution::Decided { evidence, .. } = &r.resolution else {
             panic!("expected Decided");
         };
-        assert_eq!(evidence.verdicts.len(), 5);
-        assert_eq!(evidence.budget, fx.budget.decision_budget());
+        assert_eq!(evidence.verdicts().len(), 5);
+        assert_eq!(evidence.budget(), fx.budget.decision_budget());
+        assert_eq!(evidence.provenance().analyzer(), "fake");
     }
 
     /// The disposition of the candidate whose Blueprint is `leaf`.

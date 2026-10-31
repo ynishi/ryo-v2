@@ -9,32 +9,56 @@ use super::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A reference to the specification a Blueprint answers to (free text, never empty).
+/// A reference `<doc>#<item>` to one item of a specification document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpecRef(String);
+pub struct SpecRef {
+    doc: String,
+    item: String,
+}
 
 impl SpecRef {
-    /// Wraps a reference.
+    /// Parses `<doc>#<item>`.
     ///
     /// # Contract
-    /// - C1: refuses text that is empty after trimming, with [`DomainError::Empty`].
-    ///   tested: domain::blueprint::tests::records_and_refs_refuse_empty
-    pub fn new(s: &str) -> Result<Self, DomainError> {
-        if s.trim().is_empty() {
-            return Err(DomainError::Empty("spec reference".to_owned()));
+    /// - C1: `doc` is one or more of `[A-Za-z0-9_./-]` and `item` one or more of
+    ///   `[A-Za-z0-9_.:-]`, separated by exactly one `#`; anything else (empty, whitespace, no
+    ///   `#`, two `#`) is refused with [`DomainError::SpecRef`].
+    ///   tested: domain::blueprint::tests::spec_ref_is_doc_hash_item
+    pub fn parse(s: &str) -> Result<Self, DomainError> {
+        let bad = || DomainError::SpecRef(s.to_owned());
+        let (doc, item) = s.split_once('#').ok_or_else(bad)?;
+        let doc_ok = !doc.is_empty()
+            && doc
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'));
+        let item_ok = !item.is_empty()
+            && item
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'));
+        if doc_ok && item_ok {
+            Ok(Self {
+                doc: doc.to_owned(),
+                item: item.to_owned(),
+            })
+        } else {
+            Err(bad())
         }
-        Ok(Self(s.to_owned()))
     }
 
-    /// The reference as written.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// The document.
+    pub fn doc(&self) -> &str {
+        &self.doc
+    }
+
+    /// The item of the document.
+    pub fn item(&self) -> &str {
+        &self.item
     }
 }
 
 impl std::fmt::Display for SpecRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "{}#{}", self.doc, self.item)
     }
 }
 
@@ -283,7 +307,7 @@ mod tests {
             call(),
             specs,
             reads,
-            vec![SpecRef::new("spec#1").unwrap()],
+            vec![SpecRef::parse("spec#1").unwrap()],
             DecisionRecord::new("agent", "because").unwrap(),
         )
     }
@@ -293,13 +317,30 @@ mod tests {
 
     #[test]
     fn records_and_refs_refuse_empty() {
-        assert!(SpecRef::new("").is_err());
-        assert!(SpecRef::new("  ").is_err());
-        assert_eq!(SpecRef::new("m3#4").unwrap().as_str(), "m3#4");
         assert!(DecisionRecord::new("", "r").is_err());
         assert!(DecisionRecord::new("p", " ").is_err());
         let r = DecisionRecord::new("p", "r").unwrap();
         assert_eq!((r.proposer(), r.rationale()), ("p", "r"));
+    }
+
+    #[test]
+    fn spec_ref_is_doc_hash_item() {
+        let r = SpecRef::parse("docs/m3.md#4.1:a-b").unwrap();
+        assert_eq!((r.doc(), r.item()), ("docs/m3.md", "4.1:a-b"));
+        assert_eq!(r.to_string(), "docs/m3.md#4.1:a-b");
+        let u = SpecRef::parse("my_doc-2/a_b.md#item_1:x-9").unwrap();
+        assert_eq!((u.doc(), u.item()), ("my_doc-2/a_b.md", "item_1:x-9"));
+        assert_eq!(SpecRef::parse(&r.to_string()), Ok(r));
+        for bad in [
+            "", "  ", "m3", "#4", "m3#", "m3#4#5", "m 3#4", "m3#4 ", " m3#4", "m3#4/5", "m:3#4",
+            "m3##4", "é#4",
+        ] {
+            assert_eq!(
+                SpecRef::parse(bad),
+                Err(DomainError::SpecRef(bad.to_owned())),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

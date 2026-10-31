@@ -255,7 +255,7 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
         let spec_refs = bp
             .spec_refs
             .iter()
-            .map(|s| field(index, "spec_refs", SpecRef::new(s)))
+            .map(|s| field(index, "spec_refs", SpecRef::parse(s)))
             .collect::<Result<Vec<_>>>()?;
         let record = field(
             index,
