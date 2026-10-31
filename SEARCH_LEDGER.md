@@ -56,15 +56,20 @@ large sample.
 
 ## Counts
 
-Corpus and runs of the small bases: 2026-10-31, repo HEAD 64dcbfb plus the uncommitted M4 work (T1 to T4), rustc
-1.98.1, ra_ap 0.0.358, 12 threads, 30 GiB, proc-macro on,
-`RaConfig.assert_revert_every = 50` (decision D2), `MetricJudge`, `SyntaxAssessor`, Affected scope,
-one session per workspace, no probes.
+Corpus and runs of the small bases: 2026-11-01, branch `fix/expander-gen` over main 63db161,
+rustc 1.98.1, ra_ap 0.0.358, 16 cores and 30 GiB with other runs possibly on the machine,
+proc-macro on, `RaConfig.assert_revert_every = 50` (decision D2), `MetricJudge`,
+`SyntaxAssessor`, Affected scope, one session per workspace, with probes. "before" is the expander
+of main 63db161 on the same 42 cases; "after" is the expander of this change (section
+"Generation"). The rows of 2026-10-31 (39 cases, before the `gen-lab` cases and the detectors) are
+in the git history of this file.
 
-| corpus | decisions | depth 2 | skipped | generated | hit | recall@20 | generation | status |
-|---|---|---|---|---|---|---|---|---|
-| small bases (below) | 39 | 10 | 0 | 31 | 30 | 0.97 | 0.79 | verdict adopt, 31 compared |
-| ryo-rs | 11 | 2 | 0 | 6 | 6 | 1.00 | 0.55 | verdict insufficient, 6 compared |
+| corpus | expander | decisions | depth 2 | skipped | generated | hit | recall@20 | generation | status |
+|---|---|---|---|---|---|---|---|---|---|
+| small bases (below) | before | 42 | 10 | 0 | 31 | 30 | 0.97 | 0.74 | verdict adopt, 31 compared |
+| small bases (below) | after | 42 | 10 | 0 | 42 | 38 | 0.90 | 1.00 | verdict adopt, 42 compared |
+| ryo-rs | before | 11 | 2 | 0 | 6 | 6 | 1.00 | 0.55 | verdict insufficient, 6 compared |
+| ryo-rs | after | pending | | | | | | | |
 
 ryo-rs here is ryo-rs (a verification repository used as a large sample); its run, with the
 machine it ran on, is in section "ryo-rs (large run)".
@@ -77,34 +82,42 @@ planted edits) written to hold sites of every kind.
 | workspace | decisions | notes |
 |---|---|---|
 | `search/base/search-lab` | 38 | 28 at depth 1 (7 obscure-name, 9 inline-variable, 3 inline-function, 9 misplace-item) and 10 pairs |
+| `search/base/gen-lab` | 3 | hand cases, depth 1: two misplace-item (a re-export under a comment, an item with a trailing comment) and one inline-variable into a struct-literal field value, the shapes of section "Generation" |
 | `base/breakage-lab` | 1 | one obscure-name site (`store/src/lib.rs`); no other kind has a site |
 | `base/cfg-test-lab`, `base/macro-lab`, `base/extract-trait-multicrate` | 0 | no site of any kind |
 
-Run at beam 20 (`search-recall run corpus/search`, 14.6 s), without probes (every case had
-`probes = []`; the run with probes is in section "Probes" and gives the same numbers):
+Run at beam 20 (`search-recall run corpus/search`, 25.2 s after, 24.6 s before):
 
-| set | decisions | skipped | generated | hit | recall@20 | hit/all | generation | top-3 |
-|---|---|---|---|---|---|---|---|---|
-| all | 39 | 0 | 31 | 30 | 0.97 | 0.77 | 0.79 | 0.72 |
-| ws breakage-lab | 1 | 0 | 1 | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
-| ws search-lab | 38 | 0 | 30 | 29 | 0.97 | 0.76 | 0.79 | 0.71 |
-| kind inline-function | 6 | 0 | 5 | 4 | 0.80 | 0.67 | 0.83 | 0.33 |
-| kind inline-variable | 14 | 0 | 5 | 5 | 1.00 | 0.36 | 0.36 | 0.36 |
-| kind misplace-item | 14 | 0 | 13 | 13 | 1.00 | 0.93 | 0.93 | 0.86 |
-| kind obscure-name | 15 | 0 | 15 | 14 | 0.93 | 0.93 | 1.00 | 0.93 |
-| depth 1 | 29 | 0 | 24 | 24 | 1.00 | 0.83 | 0.83 | 0.79 |
-| depth 2 | 10 | 0 | 7 | 6 | 0.86 | 0.60 | 0.70 | 0.50 |
+| set | decisions | skipped | before: generated / hit / recall@20 / top-3 | after: generated | hit | recall@20 | hit/all | generation | top-3 |
+|---|---|---|---|---|---|---|---|---|---|
+| all | 42 | 0 | 31 / 30 / 0.97 / 0.67 | 42 | 38 | 0.90 | 0.90 | 1.00 | 0.86 |
+| ws breakage-lab | 1 | 0 | 1 / 1 / 1.00 / 1.00 | 1 | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
+| ws gen-lab | 3 | 0 | 0 / 0 / - / 0.00 | 3 | 3 | 1.00 | 1.00 | 1.00 | 1.00 |
+| ws search-lab | 38 | 0 | 30 / 29 / 0.97 / 0.71 | 38 | 34 | 0.89 | 0.89 | 1.00 | 0.84 |
+| kind inline-function | 6 | 0 | 5 / 4 / 0.80 / 0.33 | 6 | 4 | 0.67 | 0.67 | 1.00 | 0.33 |
+| kind inline-variable | 15 | 0 | 5 / 5 / 1.00 / 0.33 | 15 | 11 | 0.73 | 0.73 | 1.00 | 0.73 |
+| kind misplace-item | 16 | 0 | 13 / 13 / 1.00 / 0.75 | 16 | 15 | 0.94 | 0.94 | 1.00 | 0.88 |
+| kind obscure-name | 15 | 0 | 15 / 14 / 0.93 / 0.93 | 15 | 14 | 0.93 | 0.93 | 1.00 | 0.93 |
+| depth 1 | 32 | 0 | 24 / 24 / 1.00 / 0.72 | 32 | 32 | 1.00 | 1.00 | 1.00 | 0.97 |
+| depth 2 | 10 | 0 | 7 / 6 / 0.86 / 0.50 | 10 | 6 | 0.60 | 0.60 | 1.00 | 0.50 |
 
 A kind row counts the decisions that plant the kind, so a pair is in two rows.
 
-Verdict: **adopt** on the numbers (recall@20 0.97 over 31 generated decisions), with two
-reservations that the next sections spell out. 1 miss in 31 puts the true miss rate at most 0.14
-at 95 % (exact binomial, one-sided); at depth 1, 0 misses in 24 puts it at most 0.12.
+Verdict: **adopt** on the numbers after the change (recall@20 0.90 over 42 generated decisions,
+above the 0.8 of adoption), with three reservations that the next sections spell out. 4 misses in
+42 put the true miss rate at most 0.21 at 95 % (exact binomial, one-sided); at depth 1, 0 misses
+in 32 put it at most 0.09. Before the change it was 0.97 over 31 (1 miss, at most 0.14). Recall
+fell because the 11 bests the expander now generates include three depth-2 bests the pruning
+drops (section "Dropped at"), not because a best generated before is lost: the 31 decisions
+generated before keep their generated, hit and fate.
 
-1. At depth 1 the beam never fills: the expander proposes 2 to 11 children, so recall@20 at
-   depth 1 cannot be below 1.00. The pruning is exercised at depth 2, where 18 to 76 children are
-   proposed and the beam is full in 9 of the 10 pairs, and by the narrow-beam runs below.
+1. At depth 1 the beam never fills: the expander proposes 1 to 11 children, so recall@20 at
+   depth 1 cannot be below 1.00. The pruning is exercised at depth 2, where 16 to 80 children are
+   proposed and the beam is full in 9 of the 10 pairs, and by the narrow-beam runs below. At depth
+   2 recall@20 is 0.60 (6 of 10).
 2. `search-lab` is small and written for this harness: its sites are natural to the generator.
+3. The 3 `gen-lab` cases are written by hand for the causes of section "Generation"; they show
+   those causes, they are not a sample.
 
 ## Probes
 
@@ -119,6 +132,8 @@ used. The test `one_planted_case_runs_end_to_end` (`crates/ryo-v2-oracle/tests/s
 checks that the probes of a case file reach the case, that every committed case has probes, and
 that each probe names a type its workspace defines as the matching item (`enum` for add-variant,
 `struct` for add-field, `trait` for add-method), so an add-method probe on these workspaces fails it.
+The 3 hand cases of `gen-lab` (2026-11-01) carry one `add-field` probe each, on gen-lab's own
+`Slot`; that test does not load `gen-lab` yet.
 
 | case kind (decisions) | probes | add-variant | add-field | per case |
 |---|---|---|---|---|
@@ -127,7 +142,8 @@ that each probe names a type its workspace defines as the matching item (`enum` 
 | inline-function, depth 1 (3) | 4 | 1 | 3 | 1 to 2 |
 | misplace-item, depth 1 (9) | 11 | 2 | 9 | 1 to 2 |
 | pairs, depth 2 (10) | 24 | 6 | 18 | 2 to 3 |
-| all (39) | 61 | 18 | 43 | |
+| hand cases of `gen-lab`, depth 1 (3) | 3 | 0 | 3 | 1 |
+| all (42) | 64 | 18 | 46 | |
 
 Run with probes, beam 20 (`search-recall run corpus/search`, 19.7 s, repo HEAD 747c3d8 plus the
 probes), next to the run without probes above:
@@ -165,47 +181,53 @@ into a constructor, a match turned into a method), or once M5 replaces the metri
 
 ## Decisions (beam 20)
 
+After the change (section "Generation"). The table of the expander before it differs in the 11
+rows that are now generated (section "Generation" lists them) and in the proposed counts below.
+
 | decision | kinds | depth | generated | hit | beam rank | fate | final rank | proposed | kept | wall ms |
 |---|---|---|---|---|---|---|---|---|---|---|
-| breakage-lab/obscure-name-0 | obscure-name | 1 | yes | yes | 3 | passed | 1 | 6 | 6 | 62 |
-| search-lab/inline-function-0 | inline-function | 1 | yes | yes | 3 | passed | 3 | 10 | 10 | 48 |
-| search-lab/inline-function-1 | inline-function | 1 | yes | yes | 2 | passed | 2 | 7 | 7 | 190 |
-| search-lab/inline-function-2 | inline-function | 1 | yes | yes | 1 | passed | 1 | 9 | 9 | 172 |
-| search-lab/inline-variable-0 | inline-variable | 1 | no | no | - | - | - | 7 | 7 | 40 |
-| search-lab/inline-variable-1 | inline-variable | 1 | yes | yes | 2 | passed | 2 | 8 | 8 | 138 |
-| search-lab/inline-variable-2 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 111 |
-| search-lab/inline-variable-3 | inline-variable | 1 | no | no | - | - | - | 3 | 3 | 19 |
-| search-lab/inline-variable-4 | inline-variable | 1 | no | no | - | - | - | 7 | 7 | 116 |
-| search-lab/inline-variable-5 | inline-variable | 1 | no | no | - | - | - | 6 | 6 | 102 |
-| search-lab/inline-variable-6 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 97 |
-| search-lab/inline-variable-7 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 7 | 7 | 111 |
-| search-lab/inline-variable-8 | inline-variable | 1 | no | no | - | - | - | 6 | 6 | 104 |
-| search-lab/misplace-item-0 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 2 | 2 | 23 |
-| search-lab/misplace-item-1 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 4 | 4 | 131 |
-| search-lab/misplace-item-2 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 172 |
-| search-lab/misplace-item-3 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 50 |
-| search-lab/misplace-item-4 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 5 | 5 | 129 |
-| search-lab/misplace-item-5 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 4 | 4 | 107 |
-| search-lab/misplace-item-6 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 5 | 5 | 158 |
-| search-lab/misplace-item-7 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 170 |
-| search-lab/misplace-item-8 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 2 | 2 | 22 |
-| search-lab/obscure-name-0 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 9 | 9 | 49 |
-| search-lab/obscure-name-1 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 8 | 8 | 54 |
-| search-lab/obscure-name-2 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 39 |
-| search-lab/obscure-name-3 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 8 | 8 | 145 |
-| search-lab/obscure-name-4 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 8 | 8 | 141 |
-| search-lab/obscure-name-5 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 11 | 11 | 183 |
-| search-lab/obscure-name-6 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 11 | 11 | 194 |
-| search-lab/pair-inline-function-misplace-item-0 | inline-function+misplace-item | 2 | yes | yes | 7 | passed | 3 | 16/57 | 16/20 | 291 |
-| search-lab/pair-inline-variable-inline-function-0 | inline-variable+inline-function | 2 | no | no | - | - | - | 16/66 | 16/20 | 618 |
-| search-lab/pair-inline-variable-inline-variable-0 | inline-variable+inline-variable | 2 | no | no | - | - | - | 13/54 | 13/20 | 394 |
-| search-lab/pair-inline-variable-misplace-item-0 | inline-variable+misplace-item | 2 | no | no | - | - | - | 13/45 | 13/20 | 266 |
-| search-lab/pair-misplace-item-misplace-item-0 | misplace-item+misplace-item | 2 | yes | yes | 0 | passed | 0 | 6/18 | 6/10 | 374 |
-| search-lab/pair-obscure-name-inline-function-0 | obscure-name+inline-function | 2 | yes | no | - | dominated | - | 16/64 | 16/20 | 484 |
-| search-lab/pair-obscure-name-inline-variable-0 | obscure-name+inline-variable | 2 | yes | yes | 2 | passed | 2 | 16/65 | 16/20 | 477 |
-| search-lab/pair-obscure-name-misplace-item-0 | obscure-name+misplace-item | 2 | yes | yes | 0 | passed | 0 | 15/55 | 15/20 | 287 |
-| search-lab/pair-obscure-name-obscure-name-0 | obscure-name+obscure-name | 2 | yes | yes | 0 | passed | 0 | 17/68 | 17/20 | 418 |
-| search-lab/pair-obscure-name-obscure-name-1 | obscure-name+obscure-name | 2 | yes | yes | 0 | passed | 0 | 19/76 | 19/20 | 511 |
+| breakage-lab/obscure-name-0 | obscure-name | 1 | yes | yes | 3 | passed | 1 | 6 | 6 | 69 |
+| gen-lab/inline-variable-field | inline-variable | 1 | yes | yes | 1 | passed | 1 | 3 | 3 | 15 |
+| gen-lab/misplace-item-comment-above | misplace-item | 1 | yes | yes | 0 | passed | 0 | 2 | 2 | 10 |
+| gen-lab/misplace-item-comment-after | misplace-item | 1 | yes | yes | 0 | passed | 0 | 1 | 1 | 4 |
+| search-lab/inline-function-0 | inline-function | 1 | yes | yes | 3 | passed | 3 | 10 | 10 | 101 |
+| search-lab/inline-function-1 | inline-function | 1 | yes | yes | 2 | passed | 2 | 7 | 7 | 390 |
+| search-lab/inline-function-2 | inline-function | 1 | yes | yes | 1 | passed | 1 | 9 | 9 | 264 |
+| search-lab/inline-variable-0 | inline-variable | 1 | yes | yes | 2 | passed | 2 | 8 | 8 | 69 |
+| search-lab/inline-variable-1 | inline-variable | 1 | yes | yes | 2 | passed | 2 | 8 | 8 | 208 |
+| search-lab/inline-variable-2 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 173 |
+| search-lab/inline-variable-3 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 4 | 4 | 35 |
+| search-lab/inline-variable-4 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 8 | 8 | 174 |
+| search-lab/inline-variable-5 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 7 | 7 | 171 |
+| search-lab/inline-variable-6 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 140 |
+| search-lab/inline-variable-7 | inline-variable | 1 | yes | yes | 0 | passed | 0 | 7 | 7 | 165 |
+| search-lab/inline-variable-8 | inline-variable | 1 | yes | yes | 1 | passed | 1 | 7 | 7 | 167 |
+| search-lab/misplace-item-0 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 2 | 2 | 34 |
+| search-lab/misplace-item-1 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 4 | 4 | 153 |
+| search-lab/misplace-item-2 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 235 |
+| search-lab/misplace-item-3 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 73 |
+| search-lab/misplace-item-4 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 5 | 5 | 196 |
+| search-lab/misplace-item-5 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 4 | 4 | 167 |
+| search-lab/misplace-item-6 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 5 | 5 | 201 |
+| search-lab/misplace-item-7 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 218 |
+| search-lab/misplace-item-8 | misplace-item | 1 | yes | yes | 0 | passed | 0 | 2 | 2 | 31 |
+| search-lab/obscure-name-0 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 9 | 9 | 83 |
+| search-lab/obscure-name-1 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 9 | 9 | 81 |
+| search-lab/obscure-name-2 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 6 | 6 | 61 |
+| search-lab/obscure-name-3 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 8 | 8 | 224 |
+| search-lab/obscure-name-4 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 8 | 8 | 203 |
+| search-lab/obscure-name-5 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 11 | 11 | 343 |
+| search-lab/obscure-name-6 | obscure-name | 1 | yes | yes | 0 | passed | 0 | 11 | 11 | 302 |
+| search-lab/pair-inline-function-misplace-item-0 | inline-function+misplace-item | 2 | yes | yes | 8 | passed | 3 | 16/65 | 16/20 | 462 |
+| search-lab/pair-inline-variable-inline-function-0 | inline-variable+inline-function | 2 | yes | no | - | dominated | - | 17/70 | 17/20 | 932 |
+| search-lab/pair-inline-variable-inline-variable-0 | inline-variable+inline-variable | 2 | yes | no | - | dominated | - | 14/58 | 14/20 | 672 |
+| search-lab/pair-inline-variable-misplace-item-0 | inline-variable+misplace-item | 2 | yes | no | - | dominated | - | 14/57 | 14/20 | 527 |
+| search-lab/pair-misplace-item-misplace-item-0 | misplace-item+misplace-item | 2 | yes | yes | 0 | passed | 0 | 6/16 | 6/9 | 550 |
+| search-lab/pair-obscure-name-inline-function-0 | obscure-name+inline-function | 2 | yes | no | - | dominated | - | 16/64 | 16/20 | 827 |
+| search-lab/pair-obscure-name-inline-variable-0 | obscure-name+inline-variable | 2 | yes | yes | 2 | passed | 2 | 16/65 | 16/20 | 826 |
+| search-lab/pair-obscure-name-misplace-item-0 | obscure-name+misplace-item | 2 | yes | yes | 0 | passed | 0 | 15/61 | 15/20 | 480 |
+| search-lab/pair-obscure-name-obscure-name-0 | obscure-name+obscure-name | 2 | yes | yes | 0 | passed | 0 | 17/68 | 17/20 | 698 |
+| search-lab/pair-obscure-name-obscure-name-1 | obscure-name+obscure-name | 2 | yes | yes | 0 | passed | 0 | 20/80 | 20/20 | 874 |
 
 `proposed` and `kept` list one number per depth.
 
@@ -213,58 +235,96 @@ into a constructor, a match turned into a method), or once M5 replaces the metri
 
 | dropped at | decisions |
 |---|---|
-| dominated | 1 |
+| dominated | 4 |
 
-The one miss is a depth-2 best (`obscure-name` and `inline-function` planted) removed by the
-dominance rule of the pruning before the rank cut. In the exhaustive run below the same best is
-beam rank 25, final rank 9: it is not a bad candidate, it is a heavy one (the extract-function
-restore writes more bytes).
+All four misses are depth-2 bests removed by the dominance rule of the pruning before the rank
+cut: `pair-obscure-name-inline-function-0` (also the one miss before the change) and the three
+pairs with an `inline-variable` that the expander now generates (`inline-variable` plus
+`inline-function`, plus `inline-variable`, plus `misplace-item`). In the exhaustive run below
+the four bests survive, at beam rank 21 to 25 and final rank 7 to 34: they are not bad candidates,
+they are heavy ones (two restores write more bytes than one, and the extract-function restore more
+than the others). This is a loss of the pruning, outside the expander (KNOWN LIMITATIONS, untuned
+weights).
 
 ### Generation (kept beside recall, not in it)
 
-8 of 39 decisions did not generate the best. All 8 plant an `inline-variable` whose use is
-inside a `let` initializer (5 at depth 1: `pack`, `load`, `summary`, `fits`, `run`; 3 pairs that
-contain `run`). The M4 expander proposes extract-variable only for an expression that is not
-inside the initializer of a `let` of a plain name (its probe: the same expression in an
-expression statement, a compound assignment, a tail expression or a block is proposed, in a `let`
-it never is). Every `inline-variable` plant whose use is an expression statement or a tail
-expression was generated (5 of 5). This is a gap of the expander, found by the harness, not a
-pruning loss: its tests did not cover the `let` case.
+Before this change 11 of 42 decisions did not generate the best: 8 in `search-lab` (every
+`inline-variable` plant whose use is inside the initializer of a `let`: 5 at depth 1, `pack`,
+`load`, `summary`, `fits`, `run`, and 3 pairs that contain `run`) and the 3 `gen-lab` cases.
+After it all 42 generate the best. The causes, each with a case that fails before the change:
+
+| cause | cases on the small bases | fix (`crates/ryo-v2-ra/src/expand.rs`) | test (fails before) |
+|---|---|---|---|
+| 1. extract-variable read the new variable's name from the first inserted text of rust-analyzer's edit, which is a diff of unpredictable shape. A `let` inserted in front of another `let` lines up on their shared `let `: for `let fitted = fit(needed(v), limit);` the edit replaces `fitted` by `width`, `fit` by `needed`, `needed(v), limit)` by `v)` and inserts `let fitted = fit(width, limit);`, so the name read was `fitted`, the check that the edit writes `let fitted = needed(v);` failed and the candidate was dropped. The seeds were offered; only the name was lost. (The text here before said extract-variable was never proposed for such an expression; it was proposed and dropped.) | the 8 of `search-lab` above | the name is the one of the `let <name> = <expr>;` that applying rust-analyzer's edit adds, read from the edited text (`added_let_name`); exactly one such name, else no candidate | `tests/expand_gen.rs` `extract_variable_restores_a_call_folded_into_a_let_initializer`; `expand::tests::the_added_let_is_read_from_the_edited_text` |
+| 2. the same cause for the value of a struct-literal field (`Slot { width: needed(v) }`): the edit replaces `Slot` by `let` and the rest by `width = needed(v);` plus the statement with the shorthand `Slot { width, .. }`, so no inserted text held `let <name>` (CHECK_LEDGER S-6, now removed). The planter writes no such site (it plants only into a call argument). | `gen-lab/inline-variable-field` | as 1, and a field named like the variable (`k: v` with name `k`) is replaced by the shorthand `k`, as rust-analyzer writes it | `tests/expand_gen.rs` `extract_variable_restores_a_record_field_value_as_the_shorthand` |
+| 3. move-item's reverse move read the `use` with the comment line above it: the planter moves the item's lines and leaves a plain `//` comment above the re-export, and rust-analyzer attaches that comment to the `use` node, so its text did not start with `[pub ]use`. | `gen-lab/misplace-item-comment-above` | the `use` is read after its leading comments, which stay (`after_leading_comments`; a `use` with an attribute first is still refused) | `tests/expand_gen.rs` `move_item_collapses_a_reexport_under_a_comment` |
+| 4. move-item's reverse move required a line end right after the moved item; the planter moves the whole line, and an item whose line ends with a `//` comment has its node end before the comment. | `gen-lab/misplace-item-comment-after` (before: no candidate at all, nothing else in its targets is offered) | the item runs to its line end when the rest of the line is a `//` comment, which moves with it (`line_end_after_comment`) | `tests/expand_gen.rs` `move_item_collapses_an_item_with_a_trailing_comment`; `expand::tests::a_trailing_line_comment_ends_the_item_at_its_line_end` |
+
+Reading the name from the edited text also showed that rust-analyzer names an extracted value
+without regard to the locals of the block: for `let width = ..; Slot { width: needed(v), count:
+width }` it proposes `width`, and the new `let` would shadow the old binding for `count`, a change
+of meaning that compiles. Extract-variable now refuses a name the block mentions outside the
+extracted expression (`tests/expand_gen.rs`
+`extract_variable_refuses_a_name_the_block_still_reads`). A planted restore never meets it (the
+planter's name occurs nowhere else in its function), and every run below gives the same rows with
+and without it.
+
+Causes 3 and 4 have one root: the planter's extent of an item is its lines, rust-analyzer's is
+its node with the comments it attaches. The expander now follows the lines at both ends; the
+forward move still offers only items whose node ends the line (no restore needs more).
+
+New candidates (beam 20, all 42 decisions): 339 children proposed at depth 1 before, 352 after
+(+13), and 585 at depth 2 before, 604 after (+19); 570 checks before, 583 after. Each of the 13
+depth-1 decisions that gained a child gained exactly one: the restore itself in the 8
+`search-lab` and 3 `gen-lab` decisions, the collapse in `misplace-item-comment-after` (counted
+among the 3), and in `obscure-name-1` one extract-variable of a call inside a `let` initializer
+(a candidate of cause 1 that is not a restore). The depth-2 gains are in 6 pairs (the restores of the
+three inline-variable pairs among them; the harness prints no per-candidate kind). The 31
+decisions generated before keep their generated, hit, beam rank, fate and final rank. The outer check
+(`--outer-check`, 53 s) finds 0 failures in 117 decided candidates and 0 in the 42 first
+candidates.
 
 ## Narrow beams (the pruning, stressed)
 
-The same 39 decisions at a smaller beam (`search-recall run corpus/search --beam N`). The default
-beam prunes almost nothing at depth 1, so these runs are where the ranking is exercised.
+The same 42 decisions at a smaller beam (`search-recall run corpus/search --beam N`), after the
+change. The default beam prunes almost nothing at depth 1, so these runs are where the ranking is
+exercised. At a narrow beam a depth-2 best can be not generated because its depth-1 parent was
+pruned, so `generated` falls with the beam.
 
-| beam | generated | hit | recall | inline-function | misplace-item | obscure-name | depth 1 | depth 2 | dropped at |
-|---|---|---|---|---|---|---|---|---|---|
-| 20 | 31 | 30 | 0.97 | 4/5 | 13/13 | 14/15 | 24/24 | 6/7 | dominated 1 |
-| 5 | 31 | 29 | 0.94 | 3/5 | 12/13 | 14/15 | 24/24 | 5/7 | dominated 2 |
-| 3 | 31 | 27 | 0.87 | 2/5 | 12/13 | 13/15 | 22/24 | 5/7 | dominated 4 |
-| 1 | 31 | 23 | 0.74 | 0/5 | 12/13 | 12/15 | 19/24 | 4/7 | dominated 8 |
+| beam | generated | hit | recall | inline-function | inline-variable | misplace-item | obscure-name | depth 1 | depth 2 | dropped at |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 20 | 42 | 38 | 0.90 | 4/6 | 11/15 | 15/16 | 14/15 | 32/32 | 6/10 | dominated 4 |
+| 5 | 42 | 37 | 0.88 | 3/6 | 11/15 | 14/16 | 14/15 | 32/32 | 5/10 | dominated 5 |
+| 3 | 41 | 35 | 0.85 | 2/6 | 11/13 | 14/16 | 13/15 | 30/32 | 5/9 | dominated 6 |
+| 1 | 40 | 28 | 0.70 | 0/5 | 6/12 | 14/16 | 12/15 | 24/32 | 4/8 | dominated 11, rank 1 |
+| 1, before the change | 31 | 23 | 0.74 | 0/5 | 3/5 | 12/13 | 12/15 | 19/24 | 4/7 | dominated 8 |
 
-(`inline-variable` is 5/5 at beams 20, 5 and 3, and 3/5 at beam 1.) Every miss is `dominated`,
-never `rank`: the dominance rule, not the score order, is what removes the extract-function
-restore. Recall at beam 3 is 0.87 and at beam 1 it is 0.74 (a `hold`), so H6 does not rest on
-the beam being wide: it holds down to 3, and the weak spot is one stage.
+Every miss is `dominated` except one at beam 1 (`gen-lab/inline-variable-field`, `rank`): the
+dominance rule, not the score order, is what removes the heavier restores. Recall at beam 3 is
+0.85 and at beam 1 it is 0.70 (a `hold`), so H6 still does not rest on the beam being wide: it
+holds down to 3, and the weak spot is one stage. The 8 depth-1 bests generated only after the change
+(5 in `search-lab`, the 3 of `gen-lab`) give 5 hits and 3 misses at beam 1 (`inline-variable-0`
+and `-8` `dominated`, `inline-variable-field` `rank`: their bests are at beam rank 1 or 2 at beam
+20).
 
 ## Exhaustive (secondary truth)
 
-`search-recall run corpus/search --exhaustive` (beam 200, no wall limit, 18.4 s, 879 checks): every generated
-best survives (31 of 31, recall@200 1.00), so nothing is lost to the HIR check and the miss above
-is the pruning's. The final ranking by full reward puts the best at:
+`search-recall run corpus/search --exhaustive` (beam 200, no wall limit, 30.5 s, 929 checks; 897
+before the change): every generated best survives (42 of 42, recall@200 1.00; before 31 of 31), so
+nothing is lost to the HIR check and the misses above are the pruning's. The final ranking by full
+reward puts the best at:
 
 | kind (generated decisions) | final rank 0 | final rank 1 to 3 | later |
 |---|---|---|---|
 | obscure-name (15) | 12 | 2 (ranks 1 and 2) | 1 (rank 9, with an inline-function) |
-| misplace-item (13) | 12 | 1 (rank 3, with an inline-function) | 0 |
-| inline-variable (5) | 3 | 2 (rank 2 and 2) | 0 |
-| inline-function (5) | 0 | 4 (ranks 1, 2, 3 and 3) | 1 (rank 9, with an obscure-name) |
+| misplace-item (16) | 14 | 1 (rank 3, with an inline-function) | 1 (rank 7, with an inline-variable) |
+| inline-variable (15) | 6 | 5 (ranks 1, 1, 2, 2 and 2) | 4 (rank 7 with a misplace-item, 32 twice with an inline-variable, 34 with an inline-function) |
+| inline-function (6) | 0 | 4 (ranks 1, 2, 3 and 3) | 2 (rank 9 with an obscure-name, 34 with an inline-variable) |
 
-The restore of an inline-function plant is never the top reward: the score weights are untuned
-(KNOWN LIMITATIONS) and a bigger edit loses to a smaller one. top-3 is 0.72 overall and 0.33 for
-inline-function (the count over measured decisions, so a best that was not generated counts
-against it).
+The restore of an inline-function plant is never the top reward, and a depth-2 best that holds an
+inline-variable restore ranks 7 to 34: the score weights are untuned (KNOWN LIMITATIONS) and a
+bigger edit loses to a smaller one. top-3 is 0.86 overall and 0.33 for inline-function (the count
+over measured decisions).
 
 ## Noul audit
 
@@ -364,11 +424,11 @@ Every generated best survived the pruning (dropped at: none), and the noul audit
 flawed children checked anyway). At depth 1 the beam does not fill (at most 17 children proposed); in
 both pairs it is full at both depths, and the obscure-name pair keeps its best at beam rank 13.
 
-Generation is 6 of 11 (0.55; the small bases give 0.79). The five decisions whose best is never
-generated are `inline-variable-0` (no candidate at all, fate `no-candidates`), `inline-variable-2`,
-`misplace-item-0`, `misplace-item-1` and the pair `obscure-name` plus `inline-variable`. Their
-cause is not investigated (CHECK_LEDGER Open work S-4); whether the inline-variable ones are the
-`let`-initializer gap of section "Generation" is not checked.
+Generation is 6 of 11 (0.55; the small bases gave 0.79 then). The five decisions whose best is
+never generated are `inline-variable-0` (no candidate at all, fate `no-candidates`),
+`inline-variable-2`, `misplace-item-0`, `misplace-item-1` and the pair `obscure-name` plus
+`inline-variable`. The causes found on the small bases since (section "Generation") are fixed;
+which cause each of the five had is a hypothesis until a new run (CHECK_LEDGER Open work S-4).
 
 Run 2 (`--exhaustive --limit 10`: beam 200, no wall limit, the first 10 cases, which leaves out
 `pair-obscure-name-obscure-name-0`; 466,780 ms, 304 checks): 5 of the 10 decisions generate the
@@ -466,5 +526,8 @@ tree and `<OUT>` a directory without a `target` path component:
 - **A small corpus.** 39 decisions on tiny code, 28 of them depth 1 where the beam does not fill;
   the narrow-beam runs and the depth-2 pairs carry the evidence. A larger base is the large run,
   whose 11 decisions on ryo-rs (6 compared) decide nothing either.
-- **The `let`-initializer gap of the expander** limits which inline-variable plants are generated
-  (above).
+- **The expander offers extract-variable only for some expression shapes**: calls, method calls,
+  index, binary and nested field expressions. The planter folds any one-line initializer into a
+  call argument, so a plant whose initializer is another shape (`&x`, `x?`, `a.b`, a macro call,
+  a path) is never restored. No small-base case has such a plant; whether one of ryo-rs has is
+  open (CHECK_LEDGER S-4).

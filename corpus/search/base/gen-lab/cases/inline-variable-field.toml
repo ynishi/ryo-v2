@@ -1,0 +1,12 @@
+# hand: inline-variable inline `width` into the field `width` of the struct literal of fn slot (the planter writes no such site)
+workspace = "search/base/gen-lab"
+overlay = "planted/inline-variable-field"
+kinds = ["inline-variable"]
+depth = 1
+origin = "hand:inline-variable:inline-variable-field"
+targets = [
+    { path = "src/lib.rs", start = 683, end = 758 },
+]
+probes = [
+    { kind = "add-field", type = "Slot" },
+]

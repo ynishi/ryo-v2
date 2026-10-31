@@ -82,6 +82,16 @@ and this project adheres to
 
 ### Fixed
 
+- The expander proposes the restore of four planted shapes it dropped: an expression inside the
+  initializer of a `let` (extract-variable read the new name from rust-analyzer's diff, which in
+  front of another `let` holds the old statement's name), the value of a struct-literal field
+  (now written as the shorthand `k`, as rust-analyzer does), a re-export with a comment line above
+  it, and an item whose line ends with a `//` comment (move-item's reverse move). On the small
+  bases the generation rate goes from 0.74 to 1.00 and recall@20 from 0.97 (31 compared) to 0.90
+  (42 compared), verdict adopt; `corpus/search/base/gen-lab` holds a case of each new shape.
+- Extract-variable no longer proposes a name the block already reads outside the extracted
+  expression: rust-analyzer may name the value after a local in scope, and the new `let` would
+  shadow it for the later reads.
 - The expander no longer panics on the value of a struct-literal field that has an attribute
   (`#[cfg(..)] k: v`): extract-variable refuses it, since rust-analyzer would build the variable's
   name from the whole field text. A panic inside the expander now costs one call of one edit kind,
