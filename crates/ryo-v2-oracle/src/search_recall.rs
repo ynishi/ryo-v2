@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit};
 use ryo_v2_core::app::search::{
-    Fate, SearchError, SearchInput, SearchReport, TRIGGER_AFTER_CHECKS,
+    DEFAULT_SEARCH_BUDGET, Fate, SearchError, SearchInput, SearchReport, TRIGGER_AFTER_CHECKS,
     TRIGGER_CHECK_GROWTH_PERMILLE, TRIGGER_CHECK_MEDIAN_MS, TRIGGER_DECISION_MEDIAN_MS,
     TRIGGER_HARNESS_MS, TRIGGER_RSS_KB, TraceEntry, search_decision,
 };
@@ -794,17 +794,54 @@ pub fn check_growth_permille(checks: &[u64]) -> Option<u64> {
 }
 
 /// What a run reports besides its decisions: the beam it ran with and the trigger numbers of decision D4 in SEARCH_LEDGER.md.
+///
+/// The wall time is split in two because only one part is the search's: `outer_check_ms` is the
+/// oracle's own `cargo check` (the baseline of each workspace and every decided candidate under
+/// `--outer-check`), which runs after each search and outside it, and no perf step of D4
+/// shortens it. Trigger 4 reads [`RunInfo::search_ms`], the rest.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunInfo {
     /// The beam of the search: the "k" of recall@k. 0 reads as [`RECALL_K`].
     pub beam: u16,
-    /// Wall time of the whole run in ms.
+    /// Wall time of the whole run in ms, outer check included.
     pub harness_ms: u64,
+    /// The part of `harness_ms` spent in the outer `cargo check`, in ms (0 without
+    /// `--outer-check`).
+    pub outer_check_ms: u64,
+    /// The search budget the run used; `None` when unknown, which leaves trigger 4 not measured.
+    pub budget: Option<SearchBudget>,
     /// Resident set size at the end of the run in kB, when known.
     pub rss_kb: Option<u64>,
 }
 
+/// Whether a run with `budget` is judged by trigger 4 (decision D4 in SEARCH_LEDGER.md): its
+/// budget is nowhere larger than `DEFAULT_SEARCH_BUDGET`.
+///
+/// A larger budget (`--exhaustive`, a wider `--beam`) lifts the limits the promise is made
+/// under, so its time breaks no promise; a narrower one can only be faster, so a fire there is a
+/// fire at the default too. `max_depth` is set per case and `audit_every` costs no time, so
+/// neither is compared.
+///
+/// # Contract
+/// - C1: true iff `beam`, `max_expand`, `beam_parents`, `per_candidate_ms`, `soft_ms` and
+///   `hard_ms` are each at most their value in `DEFAULT_SEARCH_BUDGET`.
+///   tested: search_recall::tests::trigger_4_judges_runs_within_the_default_budget
+pub fn trigger_4_judges(budget: &SearchBudget) -> bool {
+    let d = DEFAULT_SEARCH_BUDGET;
+    budget.beam <= d.beam
+        && budget.max_expand <= d.max_expand
+        && budget.beam_parents <= d.beam_parents
+        && budget.per_candidate_ms <= d.per_candidate_ms
+        && budget.soft_ms <= d.soft_ms
+        && budget.hard_ms <= d.hard_ms
+}
+
 impl RunInfo {
+    /// The wall time of the run without the outer check: what trigger 4 compares.
+    pub fn search_ms(&self) -> u64 {
+        self.harness_ms.saturating_sub(self.outer_check_ms)
+    }
+
     /// The k of recall@k.
     pub fn k(&self) -> usize {
         if self.beam == 0 {
@@ -824,6 +861,11 @@ impl RunInfo {
 ///   measured, else "not fired".
 ///   tested: search_recall::tests::trigger_3_reads_the_growth_limit
 ///   tested: search_recall::tests::triggers_follow_the_decided_numbers
+/// - C2: trigger 4 compares [`RunInfo::search_ms`] (the run without its outer check) with
+///   `TRIGGER_HARNESS_MS`: FIRED above it, "not fired" at or below it; "not measured" when the
+///   budget is unknown or [`trigger_4_judges`] refuses it, whatever the time. The line also
+///   prints the outer-check and whole-run times.
+///   tested: search_recall::tests::trigger_4_reads_the_search_time_of_a_default_run
 pub fn trigger_lines(rows: &[DecisionRow], t: RunInfo) -> Vec<String> {
     let measured: Vec<&DecisionRow> = rows.iter().filter(|r| r.skipped.is_none()).collect();
     let decision = median(measured.iter().map(|r| r.wall_ms).collect());
@@ -870,9 +912,15 @@ pub fn trigger_lines(rows: &[DecisionRow], t: RunInfo) -> Vec<String> {
             status(growth_fired)
         ),
         format!(
-            "trigger 4, one run > {TRIGGER_HARNESS_MS} ms: {} ms ({})",
+            "trigger 4, one run without the outer check > {TRIGGER_HARNESS_MS} ms: {} ms (outer check {} ms, whole run {} ms) ({})",
+            t.search_ms(),
+            t.outer_check_ms,
             t.harness_ms,
-            status(Some(t.harness_ms > TRIGGER_HARNESS_MS))
+            match t.budget {
+                Some(b) if trigger_4_judges(&b) => status(Some(t.search_ms() > TRIGGER_HARNESS_MS)),
+                Some(_) => "not measured: budget beyond the default",
+                None => "not measured: budget unknown",
+            }
         ),
     ]
 }
@@ -1098,6 +1146,8 @@ pub fn report_json(rows: &[DecisionRow], t: RunInfo) -> Value {
         "top3_rate": all.top3_rate(),
         "verdict": verdict(all.generated, all.recall()).id(),
         "harness_ms": t.harness_ms,
+        "outer_check_ms": t.outer_check_ms,
+        "search_ms": t.search_ms(),
         "rss_kb": t.rss_kb,
         "triggers": trigger_lines(rows, t),
         "rows": rows.iter().map(DecisionRow::to_json).collect::<Vec<_>>(),
@@ -1441,7 +1491,9 @@ mod tests {
             RunInfo {
                 beam: 5,
                 harness_ms: 5,
+                budget: Some(DEFAULT_SEARCH_BUDGET),
                 rss_kb: Some(1),
+                ..RunInfo::default()
             },
         );
         assert!(lines[0].contains("FIRED"), "{lines:?}");
@@ -1451,6 +1503,108 @@ mod tests {
         );
         assert!(lines[2].contains("not measured"), "{lines:?}");
         assert!(lines[3].contains("not fired"), "{lines:?}");
+    }
+
+    #[test]
+    fn trigger_4_reads_the_search_time_of_a_default_run() {
+        let line = |harness_ms: u64, outer_check_ms: u64, budget: Option<SearchBudget>| {
+            let lines = trigger_lines(
+                &[row("a", true, true)],
+                RunInfo {
+                    harness_ms,
+                    outer_check_ms,
+                    budget,
+                    ..RunInfo::default()
+                },
+            );
+            assert!(lines[3].starts_with("trigger 4, "), "{lines:?}");
+            lines[3].clone()
+        };
+        let default = Some(DEFAULT_SEARCH_BUDGET);
+        let at = line(TRIGGER_HARNESS_MS, 0, default);
+        assert!(
+            at.ends_with("(not fired)"),
+            "the limit itself does not fire: {at}"
+        );
+        let over = line(TRIGGER_HARNESS_MS + 1, 0, default);
+        assert!(over.ends_with("(FIRED)"), "one ms above it fires: {over}");
+        assert!(
+            over.contains(&format!("{} ms (outer check 0 ms", TRIGGER_HARNESS_MS + 1)),
+            "{over}"
+        );
+        // Run 3 of SEARCH_LEDGER "ryo-rs (large run)": over the limit only by its outer check.
+        let outer = line(983_033, 634_965, default);
+        assert!(
+            outer.ends_with("(not fired)"),
+            "outer check is excluded: {outer}"
+        );
+        assert!(
+            outer.contains(": 348068 ms (outer check 634965 ms, whole run 983033 ms)"),
+            "{outer}"
+        );
+        let outer_over = line(TRIGGER_HARNESS_MS + 1 + 5, 5, default);
+        assert!(outer_over.ends_with("(FIRED)"), "{outer_over}");
+        let mut narrow = DEFAULT_SEARCH_BUDGET;
+        narrow.beam = 5;
+        assert!(line(TRIGGER_HARNESS_MS + 1, 0, Some(narrow)).ends_with("(FIRED)"));
+        let mut exhaustive = DEFAULT_SEARCH_BUDGET;
+        exhaustive.beam = 200;
+        exhaustive.soft_ms = u64::MAX;
+        exhaustive.hard_ms = u64::MAX;
+        let wide = line(TRIGGER_HARNESS_MS + 1, 0, Some(exhaustive));
+        assert!(
+            wide.ends_with("(not measured: budget beyond the default)"),
+            "an exhaustive run is not judged: {wide}"
+        );
+        let unknown = line(TRIGGER_HARNESS_MS + 1, 0, None);
+        assert!(
+            unknown.ends_with("(not measured: budget unknown)"),
+            "{unknown}"
+        );
+        let json = report_json(
+            &[row("a", true, true)],
+            RunInfo {
+                harness_ms: 983_033,
+                outer_check_ms: 634_965,
+                budget: default,
+                ..RunInfo::default()
+            },
+        );
+        assert_eq!(json["search_ms"], 348_068);
+        assert_eq!(json["outer_check_ms"], 634_965);
+        assert_eq!(json["harness_ms"], 983_033);
+    }
+
+    #[test]
+    fn trigger_4_judges_runs_within_the_default_budget() {
+        let d = DEFAULT_SEARCH_BUDGET;
+        assert!(trigger_4_judges(&d));
+        let mut depth = d;
+        depth.max_depth = u8::MAX;
+        assert!(trigger_4_judges(&depth), "max_depth is set per case");
+        let narrow = SearchBudget {
+            beam: 1,
+            max_expand: 1,
+            beam_parents: 1,
+            per_candidate_ms: 1,
+            soft_ms: 1,
+            hard_ms: 1,
+            ..d
+        };
+        assert!(trigger_4_judges(&narrow));
+        let widen: [fn(&mut SearchBudget); 6] = [
+            |b| b.beam += 1,
+            |b| b.max_expand += 1,
+            |b| b.beam_parents += 1,
+            |b| b.per_candidate_ms += 1,
+            |b| b.soft_ms += 1,
+            |b| b.hard_ms += 1,
+        ];
+        for (i, f) in widen.iter().enumerate() {
+            let mut b = d;
+            f(&mut b);
+            assert!(!trigger_4_judges(&b), "knob {i} above the default");
+        }
     }
 
     #[test]
@@ -1470,6 +1624,7 @@ mod tests {
                     beam: 5,
                     harness_ms: 5,
                     rss_kb: Some(1),
+                    ..RunInfo::default()
                 },
             );
             let growth = lines[2]
