@@ -21,5 +21,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 arch-lint.workspace = true
+toml.workspace = true
 # Crate-local on purpose; move to [workspace.dependencies] when a second crate needs syn.
 syn = { version = "2", features = ["full", "visit"] }
