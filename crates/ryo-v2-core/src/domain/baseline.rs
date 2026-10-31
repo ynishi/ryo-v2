@@ -51,14 +51,17 @@ pub fn restrict(findings: &[Finding], files: &[RelPath]) -> Vec<Finding> {
 ///   tested: domain::baseline::tests::moved_existing_error_is_not_new
 /// - C3: an added copy of an existing error is new.
 ///   tested: domain::baseline::tests::added_copy_of_existing_error_is_new
-/// - C4: the same code and path with another message on another line is new.
+/// - C4: the same code and path with another message on another line is new; a finding of
+///   another code or another path is never paired.
 ///   tested: domain::baseline::tests::other_message_on_another_line_is_new
+///   tested: domain::baseline::tests::another_path_or_code_is_never_paired
 /// - C5: analyzer codes are diffed by the same rule as rustc codes.
 ///   tested: domain::baseline::tests::analyzer_codes_are_diffed_too
 /// - C6: the result is sorted.
 ///   tested: domain::baseline::tests::result_is_sorted
 /// - C7: the same code, path and line with another message is not new.
 ///   tested: domain::baseline::tests::changed_message_on_the_same_line_is_not_new
+///   tested: domain::baseline::tests::a_moved_error_is_paired_before_a_changed_message
 /// - C8: the known cost of C7: a new error of the same code on the line of an existing error that
 ///   went away is taken for that error.
 ///   tested: domain::baseline::tests::replaced_error_on_the_same_line_is_taken_for_the_old_one
@@ -136,6 +139,8 @@ pub fn new_findings(baseline: &[Finding], checked: &ScopedFindings) -> Vec<Findi
 ///   tested: domain::baseline::tests::same_findings_ignores_lines_counts_copies
 /// - C2: copies are counted.
 ///   tested: domain::baseline::tests::same_findings_ignores_lines_counts_copies
+/// - C3: another message or another path is a difference.
+///   tested: domain::baseline::tests::same_findings_sees_another_message_or_path
 pub fn same_findings(a: &[Finding], b: &[Finding]) -> bool {
     let mut ka: Vec<Key> = a.iter().map(key).collect();
     let mut kb: Vec<Key> = b.iter().map(key).collect();
@@ -248,6 +253,37 @@ mod tests {
         let mut sorted = out.clone();
         sorted.sort();
         assert_eq!(out, sorted);
+        // The groups come out in (code, path) order, which is not the order of `Finding`
+        // (code, message, path, line): only the final sort puts `a` before `z`.
+        let c = checked(
+            &["a.rs", "b.rs"],
+            vec![f("E0599", "z", "a.rs", 1), f("E0599", "a", "b.rs", 1)],
+        );
+        assert_eq!(
+            new_findings(&[], &c),
+            vec![f("E0599", "a", "b.rs", 1), f("E0599", "z", "a.rs", 1)]
+        );
+    }
+
+    #[test]
+    fn another_path_or_code_is_never_paired() {
+        let base = vec![f("E0599", "m", "a.rs", 1)];
+        let c = checked(&["a.rs", "b.rs"], vec![f("E0599", "m", "b.rs", 1)]);
+        assert_eq!(new_findings(&base, &c), vec![f("E0599", "m", "b.rs", 1)]);
+        let c = checked(&["a.rs"], vec![f("E0308", "m", "a.rs", 1)]);
+        assert_eq!(new_findings(&base, &c), vec![f("E0308", "m", "a.rs", 1)]);
+    }
+
+    #[test]
+    fn a_moved_error_is_paired_before_a_changed_message() {
+        // m2 moved from line 9 to 1 and m1 from 1 to 5: both are existing errors. Pairing by
+        // line first would take m2@1 for m1@1 and leave m1@5 new.
+        let base = vec![f("E0599", "m1", "a.rs", 1), f("E0599", "m2", "a.rs", 9)];
+        let c = checked(
+            &["a.rs"],
+            vec![f("E0599", "m2", "a.rs", 1), f("E0599", "m1", "a.rs", 5)],
+        );
+        assert!(new_findings(&base, &c).is_empty());
     }
 
     #[test]
@@ -273,5 +309,12 @@ mod tests {
         let two = vec![f("E0599", "m", "a.rs", 1), f("E0599", "m", "a.rs", 2)];
         assert!(!same_findings(&a, &two));
         assert!(!same_findings(&two, &a));
+    }
+
+    #[test]
+    fn same_findings_sees_another_message_or_path() {
+        let a = vec![f("E0599", "m", "a.rs", 1)];
+        assert!(!same_findings(&a, &[f("E0599", "other", "a.rs", 1)]));
+        assert!(!same_findings(&a, &[f("E0599", "m", "b.rs", 1)]));
     }
 }
