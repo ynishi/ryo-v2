@@ -98,6 +98,17 @@ and this project adheres to
 
 ### Fixed
 
+- The field-bounds detector checks types with type or const parameters: a field of a generic type
+  is judged under the bounds the derived impl puts on the parameters (and the bounds the type
+  declares), a written `Copy` impl in its own env, so an add-derive on a generic type whose field
+  lacks the trait fails the verifier as it fails `cargo check`. Ten generic cases on breakage-lab;
+  the floors rise to copy-impl 6, derive-field 10, valid 11.
+- The Evidence provenance fingerprints the root and member `Cargo.toml` files and the root
+  `Cargo.lock` with the `.rs` files, so a manifest or lock change moves the workspace fingerprint,
+  and records the toolchain (`rustc --version` in the workspace root) under the config key
+  `toolchain`.
+- The probe check of the search-recall end-to-end test loads every case under `corpus/search`,
+  the gen-lab cases included.
 - The expander proposes the restore of four planted shapes it dropped: an expression inside the
   initializer of a `let` (extract-variable read the new name from rust-analyzer's diff, which in
   front of another `let` holds the old statement's name), the value of a struct-literal field
