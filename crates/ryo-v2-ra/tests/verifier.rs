@@ -4,7 +4,7 @@ use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, Event, Verifi
 use ryo_v2_core::domain::{Edit, ErrorCode, FindingCode, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
+use ryo_v2_ra::{GapDetector, RaAnalyzer, RaConfig, RaSession};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -60,7 +60,7 @@ fn load(
             proc_macro: false,
             threads: Some(1),
             assert_revert: false,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: every.and_then(std::num::NonZeroU32::new),
             cfg_test,
         },
@@ -196,14 +196,14 @@ fn assert_analyzer(fault: bool) -> RaAnalyzer {
             proc_macro: false,
             threads: Some(1),
             assert_revert: true,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
     );
-    a.with_detector_fault(fault.then(|| rel("src/lib.rs")))
+    a.with_detector_fault(fault.then(|| (GapDetector::UnresolvedPath, rel("src/lib.rs"))))
 }
 
 #[test]
@@ -252,4 +252,42 @@ fn discard_reassert_mismatch_poisons_the_session() {
     );
     let next = Analyzer::fork(&healthy, &mut s);
     assert!(next.is_err(), "a poisoned session must refuse a fork");
+}
+
+#[test]
+fn provenance_records_the_gap_detector_switch() {
+    for on in [true, false] {
+        let f = Fixture::single(&format!("verifier_prov_gap_{on}"), LIB);
+        let a = RaAnalyzer::new(
+            RaConfig {
+                proc_macro: false,
+                threads: Some(1),
+                assert_revert: false,
+                gap_detectors: on,
+                assert_revert_every: None,
+                cfg_test: false,
+            },
+            Arc::new(MonotonicClock::new()),
+            Arc::new(RecordingObserver::default()),
+        );
+        let s = a.load(&f.dir).expect("load fixture");
+        let p = Verifier::provenance(&a, &s);
+        let config = p.config();
+        assert_eq!(
+            config.get("gap_detectors").map(String::as_str),
+            Some(on.to_string().as_str()),
+            "got {config:?}"
+        );
+        assert!(!config.contains_key("unresolved_paths"), "got {config:?}");
+        let keys: Vec<&str> = config.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "cfg_test",
+                "check_timeout_ms",
+                "gap_detectors",
+                "proc_macro"
+            ]
+        );
+    }
 }

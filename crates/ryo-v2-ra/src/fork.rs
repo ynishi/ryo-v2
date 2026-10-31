@@ -179,7 +179,7 @@ pub(crate) fn diagnostics(
         &session.host,
         &diag_scope,
         session.threads,
-        session.unresolved_paths,
+        session.gap_detectors,
         session.deadline.as_ref(),
         Detector {
             fault: a.detector_fault.as_ref(),
@@ -246,7 +246,7 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
             &session.host,
             &assert_scope,
             session.threads,
-            session.unresolved_paths,
+            session.gap_detectors,
             // Revert is outside the cut-off.
             None,
             Detector {

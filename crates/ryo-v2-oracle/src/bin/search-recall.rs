@@ -339,7 +339,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                 proc_macro,
                 threads: None,
                 assert_revert: false,
-                unresolved_paths: true,
+                gap_detectors: true,
                 assert_revert_every: assert_every,
                 cfg_test: true,
             },

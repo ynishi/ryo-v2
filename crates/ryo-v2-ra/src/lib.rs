@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use assess::SyntaxAssessor;
+pub use diagnostics::GapDetector;
 pub use fork::RaFork;
 pub use session::{DetectorPanic, ExpanderPanic, RaSession};
 
@@ -36,8 +37,8 @@ pub struct RaConfig {
     pub assert_revert: bool,
     /// ra が診断しない error の detector を走らせる: 未解決の型名と path 先頭 (E0405/E0425/E0433)、
     /// item と `use` が同じ module で同じ名前を定義する (E0255)、derive した impl と手書きの
-    /// `Copy` impl が field に求める trait (E0204/E0277/E0369)。名前は最初の detector のまま。
-    pub unresolved_paths: bool,
+    /// `Copy` impl が field に求める trait (E0204/E0277/E0369)。全ての [`GapDetector`] を一斉に切り替える。以前の名前は `unresolved_paths`(最初の detector の名前)。
+    pub gap_detectors: bool,
     /// `Verifier::check` が n 回に 1 回、巻き戻し後の診断を baseline と突き合わせる。None = 突き合わせない。
     ///
     /// # Contract
@@ -60,7 +61,7 @@ impl Default for RaConfig {
             proc_macro: true,
             threads: None,
             assert_revert: false,
-            unresolved_paths: true,
+            gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
         }
@@ -75,8 +76,8 @@ pub struct RaAnalyzer {
     /// Cut-off of the diagnostics of one `Verifier::check`, in ms. A field of the analyzer and
     /// not of `RaConfig`, so literals of `RaConfig` elsewhere keep compiling.
     pub(crate) check_timeout_ms: Option<u64>,
-    /// File on which the unresolved-path detector is made to panic; a test hook.
-    pub(crate) detector_fault: Option<RelPath>,
+    /// Detector and file on which it is made to panic; a test hook.
+    pub(crate) detector_fault: Option<(GapDetector, RelPath)>,
 }
 
 impl RaAnalyzer {
@@ -91,11 +92,11 @@ impl RaAnalyzer {
         }
     }
 
-    /// Makes the unresolved-path detector panic on `path` in every collect this analyzer runs.
+    /// Makes that detector panic on that file in every collect this analyzer runs.
     /// For the tests of the containment and of the re-assert; nothing else sets it.
     #[doc(hidden)]
-    pub fn with_detector_fault(mut self, path: Option<RelPath>) -> RaAnalyzer {
-        self.detector_fault = path;
+    pub fn with_detector_fault(mut self, fault: Option<(GapDetector, RelPath)>) -> RaAnalyzer {
+        self.detector_fault = fault;
         self
     }
 

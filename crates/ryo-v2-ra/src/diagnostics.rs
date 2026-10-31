@@ -122,25 +122,57 @@ impl Deadline {
 /// line of each error it finds in a file, given the cfg-disabled ranges and the line of an offset.
 type Detect = fn(&RootDatabase, FileId, &[TextRange], &dyn Fn(TextSize) -> u32) -> Vec<Hit>;
 
-/// Name of the unresolved-path detector, the one the test fault hook targets.
-const UNRESOLVED: &str = "unresolved-path";
+/// One detector of an error rust-analyzer 0.0.358 does not report (a gap detector). All of them
+/// run when [`crate::RaConfig::gap_detectors`] is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GapDetector {
+    /// Unresolved type names and path prefixes (E0405, E0425, E0433), `unresolved.rs`.
+    UnresolvedPath,
+    /// A name an item and a `use` both define (E0255), `duplicate.rs`.
+    DuplicateName,
+    /// The trait a field owes to a derived impl or a written `Copy` impl (E0204, E0277, E0369), `field_bounds.rs`.
+    FieldBounds,
+}
+
+impl GapDetector {
+    /// Every gap detector, in the order a collect runs them.
+    pub const ALL: [GapDetector; 3] = [
+        GapDetector::UnresolvedPath,
+        GapDetector::DuplicateName,
+        GapDetector::FieldBounds,
+    ];
+
+    /// "unresolved-path", "duplicate-name", "field-bounds".
+    pub fn name(self) -> &'static str {
+        match self {
+            GapDetector::UnresolvedPath => "unresolved-path",
+            GapDetector::DuplicateName => "duplicate-name",
+            GapDetector::FieldBounds => "field-bounds",
+        }
+    }
+}
+
+impl std::fmt::Display for GapDetector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// The detectors a collect runs when it has a database, in this order: unresolved type names and
 /// path prefixes (E0405, E0425, E0433), names an item and a `use` both define (E0255), and the
 /// trait a field owes to a derived impl or a written `Copy` impl (E0204, E0277, E0369).
-const DETECTORS: [(&str, Detect); 3] = [
-    (UNRESOLVED, unresolved::find),
-    ("duplicate-name", duplicate::find),
-    ("field-bounds", field_bounds::find),
+const DETECTORS: [(GapDetector, Detect); 3] = [
+    (GapDetector::UnresolvedPath, unresolved::find),
+    (GapDetector::DuplicateName, duplicate::find),
+    (GapDetector::FieldBounds, field_bounds::find),
 ];
 
 /// What a collect needs to run, and to report on, the detectors of [`DETECTORS`].
 #[derive(Clone, Copy)]
 pub(crate) struct Detector<'a> {
-    /// File on which the unresolved-path detector is made to panic (test hook).
-    pub(crate) fault: Option<&'a RelPath>,
-    /// Where a contained detector panic is recorded (a detector other than the unresolved-path
-    /// one prefixes its name to the message).
+    /// Detector and file on which that detector is made to panic (test hook).
+    pub(crate) fault: Option<&'a (GapDetector, RelPath)>,
+    /// Where a contained detector panic is recorded.
     pub(crate) panics: &'a Mutex<BTreeSet<DetectorPanic>>,
 }
 
@@ -188,12 +220,12 @@ fn collect_errors(
             }
             if let Some(db) = db {
                 let line_of = |at: TextSize| index.line_col(at).line + 1;
-                for (name, run) in DETECTORS {
+                for (which, run) in DETECTORS {
                     // Each detector is contained on its own: a panic in one costs this file
                     // that detector's findings, not the others' and not the collect.
                     let hits = catch_unwind(AssertUnwindSafe(|| {
-                        if name == UNRESOLVED && detector.fault == Some(rel) {
-                            panic!("unresolved-path detector fault injected on {rel}");
+                        if detector.fault.is_some_and(|(d, r)| *d == which && r == rel) {
+                            panic!("{} detector fault injected on {rel}", which);
                         }
                         run(db, *file_id, &inactive, &line_of)
                     }))
@@ -209,12 +241,9 @@ fn collect_errors(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(DetectorPanic {
+                                detector: which,
                                 path: rel.clone(),
-                                message: if name == UNRESOLVED {
-                                    message
-                                } else {
-                                    format!("{name} detector: {message}")
-                                },
+                                message,
                             });
                         Vec::new()
                     });
@@ -241,18 +270,18 @@ fn collect_errors(
 }
 
 /// Parallel [`collect_errors`]: chunks the files and diagnoses each chunk on its own snapshot.
-/// `unresolved` switches the [`DETECTORS`] on; each chunk then also takes
+/// `gap_detectors` switches the [`DETECTORS`] on; each chunk then also takes
 /// its own database clone, dropped before this function returns.
 pub(crate) fn collect_errors_par(
     host: &AnalysisHost,
     files: &[(FileId, RelPath)],
     threads: usize,
-    unresolved: bool,
+    gap_detectors: bool,
     deadline: Option<&Deadline>,
     detector: Detector<'_>,
 ) -> Result<Vec<Finding>, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
-        let db = unresolved.then(|| host.raw_database().clone());
+        let db = gap_detectors.then(|| host.raw_database().clone());
         return collect_errors(&host.analysis(), db.as_ref(), files, deadline, detector);
     }
     let chunk_size = files.len().div_ceil(threads);
@@ -261,7 +290,7 @@ pub(crate) fn collect_errors_par(
         .map(|_| {
             (
                 host.analysis(),
-                unresolved.then(|| host.raw_database().clone()),
+                gap_detectors.then(|| host.raw_database().clone()),
             )
         })
         .collect();

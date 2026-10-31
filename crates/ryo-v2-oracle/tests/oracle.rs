@@ -4,10 +4,11 @@
 //! Env: `RYO_V2_ORACLE_ONLY=<group>,..`, `RYO_V2_ORACLE_LIMIT=<n>`,
 //! `RYO_V2_ORACLE_FULL` (list every diagnostic), `RYO_V2_ORACLE_REPORT=<file>`,
 //! `RYO_V2_ORACLE_PROC_MACRO=off` (print the table, ignore floors),
-//! `RYO_V2_ORACLE_UNRESOLVED=off` (switch the unresolved-path detector off; ignore floors),
+//! `RYO_V2_ORACLE_GAP_DETECTORS=off` (switch every gap detector off; ignore floors; renamed from
+//! `RYO_V2_ORACLE_UNRESOLVED`, which now stops the run),
 //! `RYO_V2_ORACLE_CFG_TEST=off` (ra without `cfg(test)`, as before the V2 decision; ignore floors).
 //! The expected files are `cargo check --workspace --all-targets`, so the floors hold only with
-//! proc-macro on, the detector on and cfg-test on. Independent of those switches, an unfiltered
+//! proc-macro on, the gap detectors on and cfg-test on. Independent of those switches, an unfiltered
 //! run also asserts that the primary denominator holds its floor and that no case is skipped or
 //! misgrouped, and that no detector or expander panic was contained.
 
@@ -104,6 +105,10 @@ fn listed<T: std::fmt::Debug>(items: &[T], full: bool) -> String {
 
 #[test]
 fn oracle() {
+    assert!(
+        std::env::var_os("RYO_V2_ORACLE_UNRESOLVED").is_none(),
+        "RYO_V2_ORACLE_UNRESOLVED was renamed to RYO_V2_ORACLE_GAP_DETECTORS (=off switches every gap detector off)"
+    );
     let m = Materials::find().expect("materials");
     let mut cases = Case::load_all(&m.corpus).expect("load cases");
     let mut report = Report::default();
@@ -136,10 +141,11 @@ fn oracle() {
         println!("warning: proc-macro srv not found; results equal proc-macro off");
     }
 
-    let unresolved_on = std::env::var("RYO_V2_ORACLE_UNRESOLVED").map_or(true, |v| v != "off");
+    let gap_detectors_on =
+        std::env::var("RYO_V2_ORACLE_GAP_DETECTORS").map_or(true, |v| v != "off");
     println!(
-        "unresolved-paths: {}",
-        if unresolved_on { "on" } else { "off" }
+        "gap-detectors: {}",
+        if gap_detectors_on { "on" } else { "off" }
     );
     let cfg_test_on = std::env::var("RYO_V2_ORACLE_CFG_TEST").map_or(true, |v| v != "off");
     println!("cfg-test: {}", if cfg_test_on { "on" } else { "off" });
@@ -157,7 +163,7 @@ fn oracle() {
                 proc_macro: m.proc_macro,
                 threads: None,
                 assert_revert: true,
-                unresolved_paths: unresolved_on,
+                gap_detectors: gap_detectors_on,
                 assert_revert_every: None,
                 cfg_test: cfg_test_on,
             },
@@ -358,7 +364,7 @@ fn oracle() {
     }
 
     // A filtered run sees fewer cases than the floors count, so it skips them.
-    if m.proc_macro && unresolved_on && cfg_test_on && report.excluded.is_empty() {
+    if m.proc_macro && gap_detectors_on && cfg_test_on && report.excluded.is_empty() {
         let below: Vec<String> = Group::ALL
             .into_iter()
             .filter_map(|g| {

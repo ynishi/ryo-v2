@@ -1,7 +1,7 @@
 //! Loading a workspace into a session.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{Deadline, Detector, collect_errors_par, panic_message};
+use crate::diagnostics::{Deadline, Detector, GapDetector, collect_errors_par, panic_message};
 use crate::rev_deps::{PathFacts, RevDeps, build_rev_deps};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -14,13 +14,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// A file whose unresolved-path detector panicked: in the collect that hit it the file kept
-/// its rust-analyzer findings and contributed no detector findings.
+/// A file on which a gap detector panicked: in the collect that hit it the file kept its
+/// rust-analyzer findings and the other detectors' findings, and contributed none of that
+/// detector's.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DetectorPanic {
+    /// The detector that panicked.
+    pub detector: GapDetector,
     /// The file.
     pub path: RelPath,
-    /// The panic message.
+    /// The raw panic message.
     pub message: String,
 }
 
@@ -51,8 +54,8 @@ pub struct RaSession {
     pub(crate) poisoned: Option<String>,
     pub(crate) threads: usize,
     pub(crate) assert_revert: bool,
-    /// Whether `unresolved::find` runs; baseline and fork diagnostics must agree on it.
-    pub(crate) unresolved_paths: bool,
+    /// Whether the gap detectors run; baseline and fork diagnostics must agree on it.
+    pub(crate) gap_detectors: bool,
     pub(crate) live_fork: bool,
     /// Build-script sources and proc-macro member dirs, from `cargo metadata`.
     pub(crate) path_facts: PathFacts,
@@ -83,10 +86,12 @@ impl RaSession {
     /// Every distinct detector panic since load, the baseline's included, sorted.
     ///
     /// # Contract
-    /// - C1: a panic of the detector on one file leaves load and the session usable (not
-    ///   poisoned); the file keeps its rust-analyzer findings, has no detector finding in that
-    ///   collect, and is listed here with the message.
+    /// - C1: a panic of any gap detector on one file leaves load and the session usable (not
+    ///   poisoned); the file keeps its rust-analyzer findings and the other detectors' findings,
+    ///   has none of that detector's findings in that collect, and is listed here with the
+    ///   detector and the message.
     ///   tested: tests/unresolved.rs detector_panic_is_contained_per_file
+    ///   tested: tests/gap_detectors.rs each_detector_panic_is_contained_on_its_own
     pub fn detector_panics(&self) -> Vec<DetectorPanic> {
         self.detector_panics
             .lock()
@@ -191,7 +196,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         &host,
         &files,
         threads,
-        a.config.unresolved_paths,
+        a.config.gap_detectors,
         None,
         Detector {
             fault: a.detector_fault.as_ref(),
@@ -216,7 +221,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         poisoned: None,
         threads,
         assert_revert: a.config.assert_revert,
-        unresolved_paths: a.config.unresolved_paths,
+        gap_detectors: a.config.gap_detectors,
         live_fork: false,
         path_facts,
         check_count: 0,

@@ -5,7 +5,7 @@ use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::{Diagnostic, Edit, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
+use ryo_v2_ra::{GapDetector, RaAnalyzer, RaConfig, RaSession};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,13 +32,13 @@ impl Probe {
         Self { dir }
     }
 
-    fn load(&self, unresolved_paths: bool) -> (RaAnalyzer, RaSession) {
+    fn load(&self, gap_detectors: bool) -> (RaAnalyzer, RaSession) {
         let a = RaAnalyzer::new(
             RaConfig {
                 proc_macro: false,
                 threads: Some(1),
                 assert_revert: true,
-                unresolved_paths,
+                gap_detectors,
                 assert_revert_every: None,
                 cfg_test: false,
             },
@@ -51,8 +51,8 @@ impl Probe {
     }
 
     /// New errors of writing `text` to src/lib.rs.
-    fn errors_of(&self, unresolved_paths: bool, text: &str) -> Vec<Diagnostic> {
-        let (a, mut s) = self.load(unresolved_paths);
+    fn errors_of(&self, gap_detectors: bool, text: &str) -> Vec<Diagnostic> {
+        let (a, mut s) = self.load(gap_detectors);
         let edit = Edit::write(RelPath::parse("src/lib.rs").unwrap(), text.to_owned());
         verify(&a, &mut s, &[edit], Scope::Affected)
             .expect("verify")
@@ -207,10 +207,10 @@ fn baseline_keys(a: &RaAnalyzer, s: &RaSession) -> Vec<String> {
     keys
 }
 
-fn load_corpus(path: &Path, unresolved_paths: bool) -> (RaAnalyzer, RaSession) {
+fn load_corpus(path: &Path, gap_detectors: bool) -> (RaAnalyzer, RaSession) {
     let a = RaAnalyzer::new(
         RaConfig {
-            unresolved_paths,
+            gap_detectors,
             ..RaConfig::default()
         },
         Arc::new(MonotonicClock::new()),
@@ -284,7 +284,7 @@ fn detector_panic_is_contained_per_file() {
                 proc_macro: false,
                 threads: Some(1),
                 assert_revert: true,
-                unresolved_paths: true,
+                gap_detectors: true,
                 assert_revert_every: None,
                 cfg_test: false,
             },
@@ -301,7 +301,7 @@ fn detector_panic_is_contained_per_file() {
     assert!(base0.iter().any(|f| is_detector(&f)), "got {base0:?}");
     assert!(s0.detector_panics().is_empty());
 
-    let a = analyzer().with_detector_fault(Some(lib_rel.clone()));
+    let a = analyzer().with_detector_fault(Some((GapDetector::UnresolvedPath, lib_rel.clone())));
     let mut s = a.load(&p.dir).expect("load survives a detector panic");
     let base = Verifier::baseline(&a, &s);
     assert!(
@@ -311,6 +311,7 @@ fn detector_panic_is_contained_per_file() {
     assert!(!base.iter().any(|f| is_detector(&f)), "got {base:?}");
     let panics = s.detector_panics();
     assert_eq!(panics.len(), 1, "got {panics:?}");
+    assert_eq!(panics[0].detector, GapDetector::UnresolvedPath);
     assert_eq!(panics[0].path, lib_rel);
     assert!(
         panics[0].message.contains("fault injected"),
