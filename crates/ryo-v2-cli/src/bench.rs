@@ -75,6 +75,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
             proc_macro: args.proc_macro,
             threads: None,
             assert_revert: args.assert_revert,
+            unresolved_paths: true,
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),

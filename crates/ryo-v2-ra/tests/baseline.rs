@@ -38,6 +38,7 @@ impl Probe {
                 proc_macro: false,
                 threads: Some(1),
                 assert_revert: true,
+                unresolved_paths: true,
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),

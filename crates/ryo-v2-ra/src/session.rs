@@ -28,6 +28,8 @@ pub struct RaSession {
     pub(crate) poisoned: Option<String>,
     pub(crate) threads: usize,
     pub(crate) assert_revert: bool,
+    /// Whether `unresolved::find` runs; baseline and fork diagnostics must agree on it.
+    pub(crate) unresolved_paths: bool,
     pub(crate) live_fork: bool,
 }
 
@@ -94,7 +96,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
 
     let t1 = a.clock.now_ms();
-    let baseline = collect_errors_par(&host, &files, threads)?;
+    let baseline = collect_errors_par(&host, &files, threads, a.config.unresolved_paths)?;
     let baseline_ms = a.clock.now_ms().saturating_sub(t1);
 
     a.observer.observe(Event::Loaded {
@@ -113,6 +115,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         poisoned: None,
         threads,
         assert_revert: a.config.assert_revert,
+        unresolved_paths: a.config.unresolved_paths,
         live_fork: false,
     })
 }

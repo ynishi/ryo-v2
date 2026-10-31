@@ -175,7 +175,12 @@ pub(crate) fn diagnostics(
         .collect();
     diag_scope.extend(fork.created.iter().cloned());
 
-    let findings = collect_errors_par(&session.host, &diag_scope, session.threads)?;
+    let findings = collect_errors_par(
+        &session.host,
+        &diag_scope,
+        session.threads,
+        session.unresolved_paths,
+    )?;
     let mut files: Vec<RelPath> = diag_scope.iter().map(|(_, r)| r.clone()).collect();
     files.sort();
     files.dedup();
@@ -232,7 +237,12 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
             .collect();
         let paths: Vec<RelPath> = assert_scope.iter().map(|(_, r)| r.clone()).collect();
         let want = restrict(&session.baseline, &paths);
-        let after = collect_errors_par(&session.host, &assert_scope, session.threads)?;
+        let after = collect_errors_par(
+            &session.host,
+            &assert_scope,
+            session.threads,
+            session.unresolved_paths,
+        )?;
         Some(same_findings(&after, &want))
     } else {
         None

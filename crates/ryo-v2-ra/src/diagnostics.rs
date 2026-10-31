@@ -1,12 +1,14 @@
 //! Error diagnostics out of rust-analyzer, as domain [`Finding`]s.
 
+use crate::unresolved;
 use ra_ap_hir::PrefixKind;
 use ra_ap_ide::{
     Analysis, AnalysisHost, AssistResolveStrategy, DiagnosticCode, DiagnosticsConfig,
     ExprFillDefaultMode, Severity,
 };
-use ra_ap_ide_db::SnippetCap;
+use ra_ap_ide::{TextRange, TextSize};
 use ra_ap_ide_db::imports::insert_use::{ImportGranularity, InsertUseConfig};
+use ra_ap_ide_db::{RootDatabase, SnippetCap};
 use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::AnalyzerError;
 use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath};
@@ -76,9 +78,11 @@ pub(crate) fn diagnostics_config() -> DiagnosticsConfig {
     }
 }
 
-/// Error diagnostics of the files, sorted.
+/// Error diagnostics of the files, sorted. With `db`, the unresolved names ra does not
+/// diagnose are added (see [`crate::unresolved`]).
 fn collect_errors(
     analysis: &Analysis,
+    db: Option<&RootDatabase>,
     files: &[(FileId, RelPath)],
 ) -> Result<Vec<Finding>, AnalyzerError> {
     let diag_config = diagnostics_config();
@@ -89,43 +93,81 @@ fn collect_errors(
                 .full_diagnostics(&diag_config, AssistResolveStrategy::None, *file_id)
                 .map_err(|_| ())?;
             let index = analysis.file_line_index(*file_id).map_err(|_| ())?;
-            Ok::<_, ()>((diags, index))
+            let mut found = Vec::new();
+            let mut ra_keys: Vec<(FindingCode, u32)> = Vec::new();
+            let mut inactive: Vec<TextRange> = Vec::new();
+            for d in diags {
+                if matches!(d.code, DiagnosticCode::RaLint("inactive_code", _))
+                    && d.range.file_id == *file_id
+                {
+                    inactive.push(d.range.range);
+                }
+                if d.severity == Severity::Error {
+                    let code = classify(&d.code);
+                    let line = index.line_col(d.range.range.start()).line + 1;
+                    ra_keys.push((code.clone(), line));
+                    found.push(Finding {
+                        code,
+                        message: d.message,
+                        path: rel.clone(),
+                        line,
+                    });
+                }
+            }
+            if let Some(db) = db {
+                let line_of = |at: TextSize| index.line_col(at).line + 1;
+                for (code, message, line) in unresolved::find(db, *file_id, &inactive, &line_of) {
+                    // The same code on the same line: ra already says it.
+                    if !ra_keys.contains(&(code.clone(), line)) {
+                        found.push(Finding {
+                            code,
+                            message,
+                            path: rel.clone(),
+                            line,
+                        });
+                    }
+                }
+            }
+            Ok::<_, ()>(found)
         }))
         .map_err(|p| AnalyzerError::Panicked(panic_message(p)))?;
-        let (diags, index) = got.map_err(|()| AnalyzerError::Cancelled)?;
-        for d in diags {
-            if d.severity == Severity::Error {
-                errors.push(Finding {
-                    code: classify(&d.code),
-                    message: d.message,
-                    path: rel.clone(),
-                    line: index.line_col(d.range.range.start()).line + 1,
-                });
-            }
-        }
+        errors.extend(got.map_err(|()| AnalyzerError::Cancelled)?);
     }
     errors.sort();
     Ok(errors)
 }
 
 /// Parallel [`collect_errors`]: chunks the files and diagnoses each chunk on its own snapshot.
+/// `unresolved` switches the detector of [`crate::unresolved`] on; each chunk then also takes
+/// its own database clone, dropped before this function returns.
 pub(crate) fn collect_errors_par(
     host: &AnalysisHost,
     files: &[(FileId, RelPath)],
     threads: usize,
+    unresolved: bool,
 ) -> Result<Vec<Finding>, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
-        return collect_errors(&host.analysis(), files);
+        let db = unresolved.then(|| host.raw_database().clone());
+        return collect_errors(&host.analysis(), db.as_ref(), files);
     }
     let chunk_size = files.len().div_ceil(threads);
     let chunks: Vec<&[(FileId, RelPath)]> = files.chunks(chunk_size).collect();
-    let snapshots: Vec<Analysis> = (0..chunks.len()).map(|_| host.analysis()).collect();
+    let snapshots: Vec<(Analysis, Option<RootDatabase>)> = (0..chunks.len())
+        .map(|_| {
+            (
+                host.analysis(),
+                unresolved.then(|| host.raw_database().clone()),
+            )
+        })
+        .collect();
     let mut errors = Vec::new();
     std::thread::scope(|s| -> Result<(), AnalyzerError> {
         let handles: Vec<_> = chunks
             .into_iter()
             .zip(snapshots)
-            .map(|(chunk, analysis)| s.spawn(move || collect_errors(&analysis, chunk)))
+            .map(|(chunk, (analysis, db))| {
+                s.spawn(move || collect_errors(&analysis, db.as_ref(), chunk))
+            })
             .collect();
         for h in handles {
             let got = h

@@ -3,7 +3,8 @@
 //!
 //! Env: `RYO_V2_ORACLE_ONLY=<group>,..`, `RYO_V2_ORACLE_LIMIT=<n>`,
 //! `RYO_V2_ORACLE_FULL` (list every diagnostic), `RYO_V2_ORACLE_REPORT=<file>`,
-//! `RYO_V2_ORACLE_PROC_MACRO=off` (print the table, ignore floors).
+//! `RYO_V2_ORACLE_PROC_MACRO=off` (print the table, ignore floors),
+//! `RYO_V2_ORACLE_UNRESOLVED=off` (switch the unresolved-path detector off; ignore floors).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ use ryo_v2_ra::{RaAnalyzer, RaConfig};
 // Floors: the least number of recall hits (`hit`; `exact` for valid) a group
 // must keep. Raised, never lowered; lowering one needs the id of its
 // CHECK_LEDGER row written next to it.
-const FLOOR_UNRESOLVED_IMPORT: usize = 4;
-const FLOOR_UNRESOLVED_NAME: usize = 0;
+const FLOOR_UNRESOLVED_IMPORT: usize = 7;
+const FLOOR_UNRESOLVED_NAME: usize = 5;
 const FLOOR_UNRESOLVED_TYPE: usize = 0;
 const FLOOR_NO_METHOD: usize = 10;
 const FLOOR_TYPE_MISMATCH: usize = 7;
@@ -120,6 +121,11 @@ fn oracle() {
         println!("warning: proc-macro srv not found; results equal proc-macro off");
     }
 
+    let unresolved_on = std::env::var("RYO_V2_ORACLE_UNRESOLVED").map_or(true, |v| v != "off");
+    println!(
+        "unresolved-paths: {}",
+        if unresolved_on { "on" } else { "off" }
+    );
     let observer = Arc::new(RecordingObserver::default());
     let mut infra_errors: Vec<String> = Vec::new();
 
@@ -133,6 +139,7 @@ fn oracle() {
                 proc_macro: m.proc_macro,
                 threads: None,
                 assert_revert: true,
+                unresolved_paths: unresolved_on,
             },
             Arc::new(MonotonicClock::new()),
             observer.clone(),
@@ -310,7 +317,7 @@ fn oracle() {
     );
 
     // A filtered run sees fewer cases than the floors count, so it skips them.
-    if m.proc_macro && report.excluded.is_empty() {
+    if m.proc_macro && unresolved_on && report.excluded.is_empty() {
         let below: Vec<String> = Group::ALL
             .into_iter()
             .filter_map(|g| {

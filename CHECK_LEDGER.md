@@ -31,9 +31,99 @@ extra diagnostic whose code is outside the group of its case, and every
 unmapped one (as `ra:<code>`), goes to the "other codes" table. The floors
 were re-based from `pass` to `hit` (`exact` for valid); no group's floor went
 down (unresolved-import 3 to 4, no-method 9 to 10, type-mismatch 3 to 7, valid
-4 to 5 with the new macro-valid-0; the five macro groups are new).
+4 to 5 with the new macro-valid-0; the five macro groups are new). The
+unresolved-path detector (`ryo-v2-ra/src/unresolved.rs`) then raised
+unresolved-import 4 to 7 and unresolved-name 0 to 5, the measured `hit`; the
+floors are checked only with proc-macro on and the detector on
+(`RYO_V2_ORACLE_UNRESOLVED=off` skips them).
 
-### after: 2026-10-31, ra_ap 0.0.358, proc-macro on
+### after: HEAD 1d5a2a6 plus the unresolved-path detector, proc-macro on
+
+| group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| unresolved-import | 7 | 0 | 7 | 7 | 0 | 5 | 2 | 7 | 1.00 | 0.90 |
+| unresolved-name | 5 | 0 | 5 | 5 | 0 | 4 | 1 | 5 | 1.00 | 1.00 |
+| unresolved-type | 2 | 0 | 2 | 0 | 2 | 0 | 1 | 0 | 0.00 | - |
+| no-method | 10 | 0 | 10 | 10 | 0 | 9 | 1 | 10 | 1.00 | 0.91 |
+| type-mismatch | 7 | 0 | 7 | 7 | 0 | 3 | 4 | 7 | 1.00 | 0.69 |
+| trait-bound | 3 | 0 | 3 | 3 | 0 | 3 | 0 | 3 | 1.00 | 1.00 |
+| field | 7 | 0 | 7 | 1 | 6 | 1 | 6 | 1 | 0.14 | 0.07 |
+| borrow | 10 | 0 | 10 | 0 | 10 | 0 | 0 | 0 | 0.00 | - |
+| privacy | 5 | 0 | 5 | 4 | 1 | 4 | 0 | 4 | 0.80 | 1.00 |
+| const-eval | 2 | 0 | 2 | 0 | 2 | 0 | 0 | 0 | 0.00 | - |
+| cfg | 2 | 0 | 2 | 1 | 1 | 1 | 0 | 1 | 0.50 | 1.00 |
+| macro-derive | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-attr | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-rules | 2 | 0 | 2 | 0 | 2 | 0 | 2 | 0 | 0.00 | 0.20 |
+| macro-tokens | 3 | 0 | 3 | 2 | 1 | 2 | 1 | 2 | 0.67 | 0.75 |
+| proc-macro-edit | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0.00 | - |
+| valid | 5 | 0 | 0 | 0 | 0 | 5 | 0 | 5 | - | - |
+
+The FP column equals the before table in every row: the detector adds no extra
+diagnostic (E0405, E0425 or E0433) to any case.
+
+### after: HEAD 1d5a2a6 plus the unresolved-path detector, proc-macro off
+
+Floors are not checked with proc-macro off (the floor column is the on value).
+
+| group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| unresolved-import | 7 | 0 | 7 | 7 | 0 | 5 | 2 | 7 | 1.00 | 0.90 |
+| unresolved-name | 5 | 0 | 5 | 5 | 0 | 4 | 1 | 5 | 1.00 | 1.00 |
+| unresolved-type | 2 | 0 | 2 | 0 | 2 | 0 | 1 | 0 | 0.00 | - |
+| no-method | 10 | 0 | 10 | 10 | 0 | 9 | 1 | 10 | 1.00 | 0.91 |
+| type-mismatch | 7 | 0 | 7 | 7 | 0 | 3 | 4 | 7 | 1.00 | 0.69 |
+| trait-bound | 3 | 0 | 3 | 3 | 0 | 3 | 0 | 3 | 1.00 | 1.00 |
+| field | 7 | 0 | 7 | 1 | 6 | 1 | 6 | 1 | 0.14 | 0.07 |
+| borrow | 10 | 0 | 10 | 0 | 10 | 0 | 0 | 0 | 0.00 | - |
+| privacy | 5 | 0 | 5 | 4 | 1 | 4 | 0 | 4 | 0.80 | 1.00 |
+| const-eval | 2 | 0 | 2 | 0 | 2 | 0 | 0 | 0 | 0.00 | - |
+| cfg | 2 | 0 | 2 | 1 | 1 | 1 | 0 | 1 | 0.50 | 1.00 |
+| macro-derive | 2 | 0 | 2 | 0 | 2 | 0 | 0 | 2 | 0.00 | - |
+| macro-attr | 2 | 0 | 2 | 1 | 1 | 1 | 1 | 2 | 0.50 | 0.50 |
+| macro-rules | 2 | 0 | 2 | 0 | 2 | 0 | 2 | 0 | 0.00 | 0.20 |
+| macro-tokens | 3 | 0 | 3 | 2 | 1 | 2 | 1 | 2 | 0.67 | 0.75 |
+| proc-macro-edit | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0.00 | - |
+| valid | 5 | 0 | 0 | 0 | 0 | 5 | 0 | 5 | - | - |
+
+### after: other codes (detector on, proc-macro on; the same off)
+
+| other code | missed | extra | cases |
+|---|---|---|---|
+| E0277 | 0 | 4 | 3 |
+| E0282 | 0 | 2 | 2 |
+| E0392 | 1 | 0 | 1 |
+| E0599 | 0 | 2 | 2 |
+
+E0405, E0425 and E0433 are gone from the table (missed 1, 1 and 4 before).
+
+### with `RYO_V2_ORACLE_UNRESOLVED=off`, proc-macro on
+
+The detector off gives the before table below, row for row (the floor column
+shows the raised floors, which are not checked in this mode), and the other
+codes table with E0405 1, E0425 1 and E0433 4 missed; H7 is 24/32 = 0.75.
+
+| group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision |
+|---|---|---|---|---|---|---|---|---|---|---|
+| unresolved-import | 7 | 0 | 7 | 4 | 3 | 3 | 2 | 7 | 0.57 | 0.80 |
+| unresolved-name | 5 | 0 | 5 | 0 | 5 | 0 | 1 | 5 | 0.00 | - |
+| unresolved-type | 2 | 0 | 2 | 0 | 2 | 0 | 1 | 0 | 0.00 | - |
+| no-method | 10 | 0 | 10 | 10 | 0 | 9 | 1 | 10 | 1.00 | 0.91 |
+| type-mismatch | 7 | 0 | 7 | 7 | 0 | 3 | 4 | 7 | 1.00 | 0.69 |
+| trait-bound | 3 | 0 | 3 | 3 | 0 | 3 | 0 | 3 | 1.00 | 1.00 |
+| field | 7 | 0 | 7 | 1 | 6 | 1 | 6 | 1 | 0.14 | 0.07 |
+| borrow | 10 | 0 | 10 | 0 | 10 | 0 | 0 | 0 | 0.00 | - |
+| privacy | 5 | 0 | 5 | 4 | 1 | 4 | 0 | 4 | 0.80 | 1.00 |
+| const-eval | 2 | 0 | 2 | 0 | 2 | 0 | 0 | 0 | 0.00 | - |
+| cfg | 2 | 0 | 2 | 1 | 1 | 1 | 0 | 1 | 0.50 | 1.00 |
+| macro-derive | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-attr | 2 | 0 | 2 | 2 | 0 | 2 | 0 | 2 | 1.00 | 1.00 |
+| macro-rules | 2 | 0 | 2 | 0 | 2 | 0 | 2 | 0 | 0.00 | 0.20 |
+| macro-tokens | 3 | 0 | 3 | 2 | 1 | 2 | 1 | 2 | 0.67 | 0.75 |
+| proc-macro-edit | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0.00 | - |
+| valid | 5 | 0 | 0 | 0 | 0 | 5 | 0 | 5 | - | - |
+
+### before: HEAD 1d5a2a6 (no unresolved-path detector), 2026-10-31, ra_ap 0.0.358, proc-macro on
 
 | group | cases | skip | of | hit | FN | exact | FP | floor | recall | precision |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -55,7 +145,7 @@ down (unresolved-import 3 to 4, no-method 9 to 10, type-mismatch 3 to 7, valid
 | proc-macro-edit | 1 | 0 | 1 | 0 | 1 | 0 | 0 | 0 | 0.00 | - |
 | valid | 5 | 0 | 0 | 0 | 0 | 5 | 0 | 5 | - | - |
 
-### after: 2026-10-31, ra_ap 0.0.358, proc-macro off
+### before: HEAD 1d5a2a6 (no unresolved-path detector), proc-macro off
 
 Floors are not checked with proc-macro off (the floor column is the on value).
 
@@ -82,7 +172,7 @@ Floors are not checked with proc-macro off (the floor column is the on value).
 On and off differ only in macro-derive (hit 2 to 0) and macro-attr (hit 2 to
 1); every other row is the same.
 
-### after: other codes (proc-macro on; the same off)
+### before: HEAD 1d5a2a6 (no unresolved-path detector), other codes (proc-macro on; the same off)
 
 Expected or reported codes outside the group of the case they appeared in.
 
@@ -146,27 +236,31 @@ use).
 H7 primary recall, new definition (hit / of over the five primary groups,
 proc-macro on and off alike; the old definition gave 18/26 = 0.69):
 
-1. New definition: 24/32 = 0.75. By primary group: unresolved-import 4/7 =
-   0.57, unresolved-name 0/5 = 0.00, no-method 10/10 = 1.00, type-mismatch 7/7
-   = 1.00, trait-bound 3/3 = 1.00. It falls in the hold band (0.50 <= 0.75 <
-   0.80): neither adopted nor discarded.
-2. New definition with G-B-3 and G-B-4 excluded: 24/24 = 1.00. `corpus/gap-tags.toml`
-   tags 20 expected diagnostics of primary-group cases (9 G-B-3, E0433; 11
-   G-B-4, E0425), each tagged after reading its line in the overlay file; the 8
-   cases whose group-code diagnostics are all tagged leave the denominator
-   (bl remove-import-1, -2, typo-type-1, -2; et remove-import-1, -2, typo-type-1,
-   -2, where bl is breakage-lab and et extract-trait-multicrate). They are
-   exactly the 8 primary FN, so the remaining 24 cases all hit. It falls in the
-   adopt band (>= 0.80). The number is only as good as the tags; the E0425 in
-   breakage-lab remove-import-0 (unresolved-type, not primary) and the one in
-   cfg-gate-0 (cfg, a value) are not tagged.
-3. All 8 primary FN are G-B-3 and G-B-4 (ra has no diagnostic for an
-   unresolved type or path-prefix name), so no G-A row has to be fixed to move
+1. Primary recall `hit / of`. Before the detector: 24/32 = 0.75 (hold band, 0.50
+   <= 0.75 < 0.80): unresolved-import 4/7 = 0.57, unresolved-name 0/5 = 0.00,
+   no-method 10/10, type-mismatch 7/7, trait-bound 3/3. With the detector:
+   32/32 = 1.00 (adopt band, >= 0.80): unresolved-import 7/7, unresolved-name
+   5/5, the other three unchanged.
+2. Primary recall without G-B-3 and G-B-4 (cases whose group-code diagnostics
+   are all tagged in `corpus/gap-tags.toml` leave the denominator). Before the
+   detector: 24/24 = 1.00; the file tagged 20 expected diagnostics of
+   primary-group cases (9 G-B-3, E0433; 11 G-B-4, E0425), each after reading
+   its line in the overlay file, and the 8 cases they emptied were exactly the
+   8 primary FN (bl remove-import-1, -2, typo-type-1, -2; et remove-import-1,
+   -2, typo-type-1, -2, where bl is breakage-lab and et
+   extract-trait-multicrate). With the detector: 32/32 = 1.00, equal to number 1
+   because no tag is left (the detector found all 20). The tags that remain in
+   the file are only diagnostics the detector misses.
+3. All 8 primary FN were G-B-3 and G-B-4 (ra has no diagnostic for an
+   unresolved type or path-prefix name), so no G-A row had to be fixed to move
    the recall; G-A-1 and G-A-2 only remove FP. Every primary group has at least
    3 compared cases with a group code, so no group's verdict is provisional.
    rustc 1.98.1 reports an unresolved type name as E0425 ("cannot find type"),
    not E0412, so such cases land in unresolved-name under the settled code
-   table.
+   table. The detector reports E0405 for a trait position, E0425 for any
+   other type position and E0433 for the first segment of a path, so
+   breakage-lab remove-import-0 (unresolved-type, not primary) lost its E0405
+   and E0425 misses too.
 
 Which definition H7 uses is the user's decision; this ledger does not choose.
 
@@ -189,9 +283,7 @@ Which definition H7 uses is the user's decision; this ledger does not choose.
 |---|---|---|---|---|---|---|
 | G-B-1 | borrow | 10 cases (E0382 2, E0499 2, E0502 2, E0505 2, E0506 2) | breakage-lab store/src/lib.rs:37 (use-after-move-0), :49 (double-mut-borrow-0), :63 (shared-then-mut-0), :75 (move-while-borrowed-0), :88 (assign-while-borrowed-0) | Diagnostic: ra's semantic diagnostics do not report MIR borrowck results (E0382/E0499/E0502/E0505/E0506) as Errors; ra reported nothing for any of the 10 | keep (outside automatic application; commit-time CI catches it) | open |
 | G-B-2 | const-eval | 2 cases (E0080 2) | breakage-lab shapes/src/lib.rs:62 (const-eval-0), :63 (const-eval-1) | Diagnostic: ra does not report a failed const evaluation (overflow, out-of-bounds index) as an Error | keep (commit-time CI catches it) | open |
-| G-B-3 | unresolved-import, unresolved-name | 4 cases, 9 diagnostics (E0433) | breakage-lab shapes/src/lib.rs:40,41,50 (remove-import-2, `fmt::` path), app/src/lib.rs:38 (typo-type-1, `Binn::new`); extract-trait-multicrate user/src/lib.rs:29 (typo-type-2, `Case022::area`), user/src/lib.rs:28,31,32,35 (remove-import-1) | Diagnostic: ra reports nothing when the first segment of a path (`fmt::Display`, `Binn::new`) does not resolve | keep (not applied automatically; commit-time CI catches it) | open |
-| G-B-4 | unresolved-name, unresolved-type | 6 cases, 12 diagnostics (E0425) | breakage-lab store/src/lib.rs:26 (remove-import-1), store/src/lib.rs:35 (typo-type-2, `b: Binn`), app/src/lib.rs:16 (remove-import-0); extract-trait-multicrate user/src/lib.rs:18,21,27,30,41,47 (remove-import-1), viewer/src/lib.rs:11,14 (remove-import-2), lib/src/lib.rs:129 (typo-type-1, `impl Case055`) | Diagnostic: ra reports nothing for an unresolved type name in a signature or `impl` head. rustc 1.98.1 gives this E0425 ("cannot find type"), not E0412, so the cases are grouped as unresolved-name | keep (same class as E0412 in the G-B definition) | open |
-| G-B-5 | unresolved-type | 2 cases, 8 diagnostics (E0422 7, E0405 1) | breakage-lab app/src/lib.rs:16,21,25,29,44 and :9 (remove-import-0), app/src/lib.rs:22,45 (typo-type-0, `Rectt { w, h }`) | Diagnostic: ra reports nothing for an unresolved struct name in a struct literal (E0422) or a trait name in a bound (E0405) | keep | open |
+| G-B-5 | unresolved-type | 2 cases, 7 diagnostics (E0422 7) | breakage-lab app/src/lib.rs:16,21,25,29,44 (remove-import-0), app/src/lib.rs:22,45 (typo-type-0, `Rectt { w, h }`) | Diagnostic: ra reports nothing for an unresolved struct name in a struct literal (E0422). The E0405 of remove-import-0 (app/src/lib.rs:9, `impl<T: Area>`) is found by the detector | keep | open |
 | G-B-6 | privacy | 1 case (E0603) | breakage-lab app/src/lib.rs:34 (call-private-2, `lab_shapes::scale` made private) | Diagnostic: ra reports no private-item error for a path into another crate (private methods, E0624, are reported: extract-trait-multicrate call-private-0..2 and broken-03 pass) | keep | open |
 | G-B-7 | cfg | 1 case (E0425) | breakage-lab app/src/lib.rs:49 (cfg-gate-0, `lab_shapes::extra_only()` across crates). The same-crate bare call, shapes/src/lib.rs:75 (cfg-gate-1), is reported and passes | Diagnostic: ra is silent on a path to a cfg-disabled item in another crate, and reports E0425 for the bare name in the same crate | keep | open |
 | G-B-8 | field | 1 case (E0392) | breakage-lab app/src/lib.rs:6 (remove-field-0, `Wrapper<T>` with no field of type T). The code is in no group of the table | Diagnostic: ra does not report an unused type parameter | keep | open |
@@ -209,3 +301,15 @@ edited line and `#[reparse]` at the call-site line) and the tokens of
 `format!` and `vec!` (macro-tokens tokens-format-0, tokens-vec-0; also with
 the server off). The counts of the rows above G-D-2 are unchanged by the new
 recall definition (they count cases and diagnostics, not pass or hit).
+
+## Fixed
+
+| id | group | count | examples | root cause (concept) | decision | state |
+|---|---|---|---|---|---|---|
+| G-B-3 | unresolved-import, unresolved-name | 4 cases, 9 diagnostics (E0433) | breakage-lab shapes/src/lib.rs:40,41,50 (remove-import-2, `fmt::` path), app/src/lib.rs:38 (typo-type-1, `Binn::new`); extract-trait-multicrate user/src/lib.rs:29 (typo-type-2, `Case022::area`), user/src/lib.rs:28,31,32,35 (remove-import-1) | Diagnostic: ra reports nothing when the first segment of a path (`fmt::Display`, `Binn::new`) does not resolve | detector in ryo-v2-ra (unresolved.rs), RaConfig.unresolved_paths | fixed |
+| G-B-4 | unresolved-name, unresolved-type | 6 cases, 12 diagnostics (E0425) | breakage-lab store/src/lib.rs:26 (remove-import-1), store/src/lib.rs:35 (typo-type-2, `b: Binn`), app/src/lib.rs:16 (remove-import-0); extract-trait-multicrate user/src/lib.rs:18,21,27,30,41,47 (remove-import-1), viewer/src/lib.rs:11,14 (remove-import-2), lib/src/lib.rs:129 (typo-type-1, `impl Case055`) | Diagnostic: ra reports nothing for an unresolved type name in a signature or `impl` head. rustc 1.98.1 gives this E0425 ("cannot find type"), not E0412, so the cases are grouped as unresolved-name | detector in ryo-v2-ra (unresolved.rs), RaConfig.unresolved_paths | fixed |
+
+The detector skips a name some `use` of the file introduces (rustc reports only
+the failed import), cfg-disabled code, macro input, and files with a glob import
+ra cannot resolve. It is switched off with `RaConfig.unresolved_paths = false`
+(oracle: `RYO_V2_ORACLE_UNRESOLVED=off`).

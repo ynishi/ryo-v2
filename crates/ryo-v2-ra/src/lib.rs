@@ -10,6 +10,7 @@ mod diagnostics;
 mod fork;
 mod rev_deps;
 mod session;
+mod unresolved;
 
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Clock, Observer};
 use ryo_v2_core::domain::{Edit, Finding, Scope, ScopedFindings};
@@ -28,6 +29,8 @@ pub struct RaConfig {
     pub threads: Option<usize>,
     /// discard ごとに巻き戻し後の診断が baseline と一致するか検査する。
     pub assert_revert: bool,
+    /// ra が診断しない未解決の型名と path 先頭を検出する (E0405/E0425/E0433)。
+    pub unresolved_paths: bool,
 }
 
 impl Default for RaConfig {
@@ -36,6 +39,7 @@ impl Default for RaConfig {
             proc_macro: true,
             threads: None,
             assert_revert: false,
+            unresolved_paths: true,
         }
     }
 }
