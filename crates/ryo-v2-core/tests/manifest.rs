@@ -29,6 +29,11 @@
 //!    both (comment lines in a recipe do not count). `rust-clippy` runs before `rust-test` in
 //!    `check`, so without its own `--locked` it would rewrite a stale `Cargo.lock` before
 //!    `rust-test` could refuse it.
+//! 8. The base and the ledgers in the `Justfile`: `check` runs `base-check` (as does
+//!    `branch-check`), and `base-check` refuses a branch that `origin/main`, or the local `main`,
+//!    is no ancestor of (`merge-base --is-ancestor`), saying in one line that it skipped outside
+//!    a git checkout; `ledger-merge-install` sets `merge.ledger.driver` to the driver with git's
+//!    arguments `%O %A %B %L %P`, falling back to `git merge-file`.
 //!
 //! Each rule is a function returning its problems; the `workspace_*` tests run them on the real
 //! manifests, the others show that each rule reports a broken manifest.
@@ -435,6 +440,42 @@ fn gate_recipe_problems(justfile: &str) -> Vec<String> {
     out
 }
 
+/// Rule 8.
+fn base_and_ledger_recipe_problems(justfile: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for runner in ["check", "branch-check"] {
+        let header = recipe(justfile, runner).first().copied().unwrap_or("");
+        let deps = header.split_once(':').map_or("", |(_, d)| d);
+        if !deps.split_whitespace().any(|d| d == "base-check") {
+            out.push(format!("Justfile: {runner} does not run base-check"));
+        }
+    }
+    let base = recipe(justfile, "base-check").join("\n");
+    for needle in [
+        "merge-base --is-ancestor",
+        "refs/remotes/origin/main",
+        "refs/heads/main",
+        "base-check: skipped (not a git checkout)",
+    ] {
+        if !base.contains(needle) {
+            out.push(format!("Justfile: base-check does not contain `{needle}`"));
+        }
+    }
+    let install = recipe(justfile, "ledger-merge-install").join("\n");
+    for needle in [
+        "merge.ledger.driver",
+        "%O %A %B %L %P",
+        "git merge-file --marker-size=%L %A %O %B",
+    ] {
+        if !install.contains(needle) {
+            out.push(format!(
+                "Justfile: ledger-merge-install does not contain `{needle}`"
+            ));
+        }
+    }
+    out
+}
+
 fn assert_none(problems: Vec<String>) {
     assert!(
         problems.is_empty(),
@@ -509,6 +550,32 @@ fn workspace_rust_files_set_no_missing_docs_level() {
 fn workspace_gate_recipes_deny_warnings_and_lock() {
     let justfile = fs::read_to_string(root().join("Justfile")).expect("Justfile");
     assert_none(gate_recipe_problems(&justfile));
+}
+
+#[test]
+fn workspace_base_check_and_ledger_driver_recipes_are_in_place() {
+    let justfile = fs::read_to_string(root().join("Justfile")).expect("Justfile");
+    assert_none(base_and_ledger_recipe_problems(&justfile));
+}
+
+#[test]
+fn missing_base_check_or_ledger_driver_is_a_problem() {
+    let good = "check: base-check rust-test\n\nbranch-check: base-check\n    echo ok\n\nbase-check:\n    if git rev-parse --verify --quiet refs/remotes/origin/main; then base=origin/main\n    elif git rev-parse --verify --quiet refs/heads/main; then base=main; fi\n    echo \"base-check: skipped (not a git checkout)\"\n    git merge-base --is-ancestor \"$base\" HEAD\n\nledger-merge-install:\n    git config merge.ledger.driver \"x %O %A %B %L %P || git merge-file --marker-size=%L %A %O %B\"\n";
+    assert_none(base_and_ledger_recipe_problems(good));
+    let bad = good
+        .replace("check: base-check rust-test", "check: rust-test")
+        .replace("branch-check: base-check", "branch-check:")
+        .replace("--is-ancestor", "--octopus")
+        .replace(
+            "    git config merge.ledger.driver",
+            "    # git config merge.ledger.driver",
+        );
+    assert_eq!(
+        base_and_ledger_recipe_problems(&bad).len(),
+        6,
+        "{:?}",
+        base_and_ledger_recipe_problems(&bad)
+    );
 }
 
 #[test]

@@ -1,0 +1,5 @@
+# The ledgers merge by section and table row (crates/ryo-v2-ledger-merge). The driver
+# itself is set in each checkout's own git config by `just ledger-merge-install`; a checkout
+# without it merges these files line by line, as before.
+CHECK_LEDGER.md merge=ledger
+SEARCH_LEDGER.md merge=ledger
