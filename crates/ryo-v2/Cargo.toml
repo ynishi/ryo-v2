@@ -4,11 +4,12 @@ description = "Speculative refactoring engine for Rust: Blueprints explored and 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation.workspace = true
+documentation = "https://docs.rs/ryo-v2"
 readme.workspace = true
+keywords = ["refactoring", "rust-analyzer", "codemod", "static-analysis", "code-search"]
+categories = ["development-tools"]
 
 [lints]
 workspace = true
