@@ -286,8 +286,96 @@ fn provenance_records_the_gap_detector_switch() {
                 "cfg_test",
                 "check_timeout_ms",
                 "gap_detectors",
-                "proc_macro"
+                "proc_macro",
+                "toolchain"
             ]
+        );
+    }
+}
+
+fn provenance_of(f: &Fixture) -> ryo_v2_core::domain::Provenance {
+    let a = RaAnalyzer::new(
+        RaConfig {
+            proc_macro: false,
+            threads: Some(1),
+            assert_revert: false,
+            gap_detectors: true,
+            assert_revert_every: None,
+            cfg_test: false,
+        },
+        Arc::new(MonotonicClock::new()),
+        Arc::new(RecordingObserver::default()),
+    );
+    let s = a.load(&f.dir).expect("load fixture");
+    Verifier::provenance(&a, &s)
+}
+
+#[test]
+fn provenance_fingerprints_manifests_lock_and_toolchain() {
+    let f = Fixture::single("verifier_prov_inputs", LIB);
+    let p = provenance_of(&f);
+    assert_eq!(p.analyzer(), "rust-analyzer");
+    assert_eq!(p.version(), "0.0.358");
+    let names: Vec<String> = p.files().keys().map(|k| format!("{k:?}")).collect();
+    for want in ["src/lib.rs", "Cargo.toml", "Cargo.lock"] {
+        assert!(
+            p.files().contains_key(&RelPath::parse(want).unwrap()),
+            "{want} missing from {names:?}"
+        );
+    }
+    let toolchain = p.config().get("toolchain").expect("toolchain entry");
+    assert!(toolchain.starts_with("rustc "), "got {toolchain:?}");
+
+    // Same `.rs` text, different manifest: the workspace fingerprint differs.
+    let manifest = |extra: &str| {
+        format!(
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n{extra}"
+        )
+    };
+    let a = Fixture::new(
+        "verifier_prov_manifest_a",
+        &[("Cargo.toml", &manifest("")), ("src/lib.rs", LIB)],
+    );
+    let b = Fixture::new(
+        "verifier_prov_manifest_b",
+        &[
+            ("Cargo.toml", &manifest("\n[features]\nextra = []\n")),
+            ("src/lib.rs", LIB),
+        ],
+    );
+    let (pa, pb) = (provenance_of(&a), provenance_of(&b));
+    let lib = RelPath::parse("src/lib.rs").unwrap();
+    assert_eq!(pa.files().get(&lib), pb.files().get(&lib));
+    assert_ne!(pa.workspace(), pb.workspace());
+}
+
+#[test]
+fn provenance_fingerprints_each_member_manifest() {
+    let f = Fixture::new(
+        "verifier_prov_members",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "a/Cargo.toml",
+                "[package]\nname = \"ma\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("a/src/lib.rs", "pub fn a() {}\n"),
+            (
+                "b/Cargo.toml",
+                "[package]\nname = \"mb\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nma = { path = \"../a\" }\n",
+            ),
+            ("b/src/lib.rs", "pub fn b() { ma::a() }\n"),
+        ],
+    );
+    let p = provenance_of(&f);
+    for want in ["Cargo.toml", "a/Cargo.toml", "b/Cargo.toml", "Cargo.lock"] {
+        assert!(
+            p.files().contains_key(&RelPath::parse(want).unwrap()),
+            "{want} missing from {:?}",
+            p.files().keys().collect::<Vec<_>>()
         );
     }
 }
