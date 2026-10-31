@@ -153,6 +153,9 @@ struct ExtractVarSeed {
     at: u32,
     /// Whitespace before that statement on its line.
     indent: String,
+    /// When the expression is the value of a record-literal field `k: v`: the start of the field
+    /// and `k`.
+    field: Option<(u32, String)>,
 }
 
 struct ExtractFnSeed {
@@ -218,14 +221,38 @@ fn declares_fn_named(text: &str, name: &str) -> bool {
     })
 }
 
-/// The name a `let <name>` in `text` binds; `None` for `let mut` and patterns.
-fn let_name(text: &str) -> Option<String> {
-    let rest = &text[text.find("let ")? + 4..];
-    let name: String = rest.chars().take_while(|c| is_ident_char(*c)).collect();
-    if name.is_empty() || name == "mut" {
-        None
-    } else {
-        Some(name)
+/// The name of the `let <name> = <init>;` that an edit adds: the one name whose statement occurs
+/// more often in `applied` (the text after the edit) than in `text`. `None` when there is no such
+/// name or more than one; `let mut` and patterns are never read. The name is read from the edited
+/// text, not from the edit's indels: rust-analyzer's edit is a diff, and a `let` inserted in front
+/// of another `let` lines up on their shared `let `, so no indel holds the new statement.
+fn added_let_name(text: &str, applied: &str, init: &str) -> Option<String> {
+    let tail = format!(" = {init};");
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for (i, _) in applied.match_indices(&tail) {
+        let before = &applied[..i];
+        let len = before
+            .chars()
+            .rev()
+            .take_while(|c| is_ident_char(*c))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        let (head, name) = before.split_at(before.len() - len);
+        let keyword = head
+            .strip_suffix("let ")
+            .is_some_and(|h| h.chars().next_back().is_none_or(|c| !is_ident_char(c)));
+        if name.is_empty() || !keyword || name == "mut" {
+            continue;
+        }
+        let stmt = format!("let {name}{tail}");
+        if applied.matches(&stmt).count() > text.matches(&stmt).count() {
+            names.insert(name.to_owned());
+        }
+    }
+    let mut it = names.into_iter();
+    match (it.next(), it.next()) {
+        (Some(n), None) => Some(n),
+        _ => None,
     }
 }
 
@@ -727,6 +754,7 @@ impl<'a> Env<'a> {
                     hi,
                     at: line_start as u32,
                     indent: indent.to_owned(),
+                    field: record_field_of(&e),
                 });
             }
         }
@@ -735,8 +763,11 @@ impl<'a> Env<'a> {
 
     /// rust-analyzer decides whether the expression can be extracted and names it; its edit is a
     /// text diff of unpredictable shape, so the specs are built here: `let <name> = <expr>;` before
-    /// the statement and the expression replaced by the name. A candidate is kept only when
-    /// applying rust-analyzer's own edit writes the same `let`.
+    /// the statement and the expression replaced by the name. The name is the one of the
+    /// `let <name> = <expr>;` that applying rust-analyzer's own edit adds ([`added_let_name`]); a
+    /// candidate is kept only when there is exactly one. The value of a record-literal field
+    /// named like the variable (`k: v` with name `k`) is replaced, with its field name, by the
+    /// shorthand `k`, as rust-analyzer writes it.
     fn extract_var_realize(&self, seed: &ExtractVarSeed) -> Vec<Cand> {
         let Some(assist) = self.run_assist(seed.file, seed.lo, seed.hi, "extract_variable") else {
             return Vec::new();
@@ -751,17 +782,18 @@ impl<'a> Env<'a> {
         let Some((edit, _)) = change.source_file_edits.get(&seed.file) else {
             return Vec::new();
         };
-        let name = edit.iter().find_map(|i| let_name(&i.insert));
-        let Some(name) = name.filter(|n| n != VAR_NAME) else {
-            return Vec::new();
-        };
         let mut applied = text.to_string();
         edit.apply(&mut applied);
         let init = &text[seed.lo as usize..seed.hi as usize];
-        if !applied.contains(&format!("let {name} = {init};")) {
+        let name = added_let_name(&text, &applied, init);
+        let Some(name) = name.filter(|n| n != VAR_NAME) else {
             return Vec::new();
-        }
-        let (Ok(ident), Ok(range)) = (Ident::parse(&name), TextRange::new(seed.lo, seed.hi)) else {
+        };
+        let lo = match &seed.field {
+            Some((start, field)) if *field == name => *start,
+            _ => seed.lo,
+        };
+        let (Ok(ident), Ok(range)) = (Ident::parse(&name), TextRange::new(lo, seed.hi)) else {
             return Vec::new();
         };
         let (Ok(ins), Ok(rep)) = (
@@ -1088,10 +1120,13 @@ impl<'a> Env<'a> {
             if !t.hits(u.syntax().text_range()) {
                 continue;
             }
-            let use_start = u32::from(u.syntax().text_range().start());
+            // A comment right above the `use` is part of its node; it stays where it is.
+            let Some(use_start) = after_leading_comments(u.syntax()) else {
+                continue;
+            };
             let use_end = u32::from(u.syntax().text_range().end());
-            let use_text = u.syntax().text().to_string();
-            let Some((vis, mod_path, name)) = parse_crate_use(&use_text) else {
+            let use_text = &text[use_start as usize..use_end as usize];
+            let Some((vis, mod_path, name)) = parse_crate_use(use_text) else {
                 continue;
             };
             let Some(&m_id) = map.by_path.get(&(*krate, mod_path)) else {
@@ -1114,11 +1149,13 @@ impl<'a> Env<'a> {
             };
             let node = m_item.syntax();
             let is = u32::from(node.text_range().start()) as usize;
-            let ie = u32::from(node.text_range().end()) as usize;
-            if is == 0
-                || m_text.as_bytes()[is - 1] != b'\n'
-                || m_text.as_bytes().get(ie) != Some(&b'\n')
-            {
+            // The item runs to its line end: a comment after it on its last line moves with it.
+            let Some(ie) =
+                line_end_after_comment(&m_text, u32::from(node.text_range().end()) as usize)
+            else {
+                continue;
+            };
+            if is == 0 || m_text.as_bytes()[is - 1] != b'\n' {
                 continue;
             }
             // The item with its visibility set to the one of the `use`.
@@ -1341,6 +1378,33 @@ fn is_nameable_field_value(e: &ast::Expr) -> bool {
     field.syntax().text().to_string().starts_with(name.text())
 }
 
+/// `(start of the field, field name)` when `e` is the value of a record-literal field `k: v`
+/// whose text starts with its name (see [`is_nameable_field_value`]).
+fn record_field_of(e: &ast::Expr) -> Option<(u32, String)> {
+    let field = e.syntax().parent().and_then(ast::RecordExprField::cast)?;
+    let name = field.name_ref()?;
+    let start = u32::from(name.syntax().text_range().start());
+    (start == u32::from(field.syntax().text_range().start()))
+        .then(|| (start, name.text().to_string()))
+}
+
+/// Start of the code of `node` after the comments rust-analyzer attaches in front of it; `None`
+/// when an attribute comes first.
+fn after_leading_comments(node: &SyntaxNode) -> Option<u32> {
+    let first = node
+        .children_with_tokens()
+        .find(|e| !matches!(e.kind(), SyntaxKind::COMMENT | SyntaxKind::WHITESPACE))?;
+    (first.kind() != SyntaxKind::ATTR).then(|| u32::from(first.text_range().start()))
+}
+
+/// The end of the line `end` is on, when the rest of that line is empty or a `//` comment, as
+/// in `const N: u32 = 3; // per slot`; `None` otherwise or without a line end.
+fn line_end_after_comment(text: &str, end: usize) -> Option<usize> {
+    let eol = end + text.get(end..)?.find('\n')?;
+    let rest = text[end..eol].trim_start_matches([' ', '\t']);
+    (rest.is_empty() || (rest.starts_with("//") && !rest.starts_with("///"))).then_some(eol)
+}
+
 /// Whether `e` is the left side of an assignment.
 fn is_assign_target(e: &ast::Expr) -> bool {
     e.syntax()
@@ -1483,6 +1547,18 @@ fn generate(
 ///   its name (rust-analyzer would build a name from the whole field text and panic); the other
 ///   expressions of the same function are still offered.
 ///   tested: tests/expand_panics.rs extract_variable_skips_the_value_of_an_attributed_record_field
+/// - C10: extract-variable names the variable after the `let` that rust-analyzer's edit adds,
+///   read from the edited text, so an expression inside the initializer of a `let` is extracted
+///   too; the value of a record-literal field named like the variable becomes the shorthand.
+///   tested: tests/expand_gen.rs extract_variable_restores_a_call_folded_into_a_let_initializer
+///   tested: tests/expand_gen.rs extract_variable_restores_a_record_field_value_as_the_shorthand
+///   tested: expand::tests::the_added_let_is_read_from_the_edited_text
+/// - C11: the reverse move of C6 also restores an item with a comment line above its re-export
+///   (the comment stays) and an item whose last line ends with a `//` comment (the comment moves
+///   with it).
+///   tested: tests/expand_gen.rs move_item_collapses_a_reexport_under_a_comment
+///   tested: tests/expand_gen.rs move_item_collapses_an_item_with_a_trailing_comment
+///   tested: expand::tests::a_trailing_line_comment_ends_the_item_at_its_line_end
 impl Expander for RaAnalyzer {
     type Session = RaSession;
 
@@ -1559,6 +1635,48 @@ mod tests {
     fn a_field_value_behind_an_attribute_is_not_nameable() {
         let e = first_call("fn g() { S { #[cfg(x)] a: f() }; }");
         assert!(!is_nameable_field_value(&e));
+    }
+
+    #[test]
+    fn the_added_let_is_read_from_the_edited_text() {
+        let text = "    let fitted = fit(needed(v), limit);\n";
+        // The shape of rust-analyzer's edit does not matter, only the text after it.
+        let applied = "    let width = needed(v);\n    let fitted = fit(width, limit);\n";
+        assert_eq!(
+            added_let_name(text, applied, "needed(v)").as_deref(),
+            Some("width")
+        );
+        // A statement that was there before is not the added one.
+        let before = "    let width = needed(v);\n    g(needed(v));\n";
+        let after = "    let width = needed(v);\n    let width1 = needed(v);\n    g(width1);\n";
+        assert_eq!(
+            added_let_name(before, after, "needed(v)").as_deref(),
+            Some("width1")
+        );
+        // `let mut`, a name that only ends in `let`, and two new names give nothing.
+        assert_eq!(added_let_name("", "let mut w = f();", "f()"), None);
+        assert_eq!(added_let_name("", "outlet w = f();", "f()"), None);
+        assert_eq!(
+            added_let_name("", "let a = f();\nlet b = f();", "f()"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_trailing_line_comment_ends_the_item_at_its_line_end() {
+        let text = "const N: u32 = 3; // per slot\nconst M: u32 = 4;\nfn f() {} g();\n";
+        let n_end = text.find(';').unwrap() + 1;
+        assert_eq!(line_end_after_comment(text, n_end), Some(29));
+        let m_end = text.find("4;").unwrap() + 2;
+        assert_eq!(line_end_after_comment(text, m_end), Some(m_end));
+        // Code after the item on its line, a doc comment, or no line end: not an item line.
+        let f_end = text.find("{}").unwrap() + 2;
+        assert_eq!(line_end_after_comment(text, f_end), None);
+        assert_eq!(
+            line_end_after_comment("const N: u32 = 3; /// d\n", 17),
+            None
+        );
+        assert_eq!(line_end_after_comment("const N: u32 = 3;", 17), None);
     }
 
     #[test]

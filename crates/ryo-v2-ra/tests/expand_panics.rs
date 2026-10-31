@@ -72,9 +72,8 @@ fn load(f: &Fixture) -> (RaAnalyzer, RaSession) {
 /// Rust-analyzer's extract-variable names the variable after the whole text of the record
 /// field whose value it extracts; with an attribute in front that text is no identifier and its
 /// syntax factory panics. The expander refuses that value and still offers the other
-/// expressions of the function. (Values of fields without an attribute are not extracted either,
-/// for another reason: rust-analyzer's edit for them is one diff that rewrites the whole
-/// statement, which the expander does not read; CHECK_LEDGER Open work.)
+/// expressions of the function. (The value of a field without an attribute is extracted, as the
+/// shorthand: `tests/expand_gen.rs`.)
 #[test]
 fn extract_variable_skips_the_value_of_an_attributed_record_field() {
     let f = gated_fixture("expand-gated-field");
