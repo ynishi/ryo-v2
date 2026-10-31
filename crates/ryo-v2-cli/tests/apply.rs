@@ -161,12 +161,11 @@ fn apply_rename_local_is_decided() {
         LIB
     );
 
-    let (rv, id) = rules("rename-local");
-    let (code, out, err) = apply(&ws, &bp, Some(&rv));
-    assert_eq!(code, Some(0), "{err}");
-    let c = &out["candidates"][0];
-    assert_eq!(c["disposition"], "auto_applicable");
-    assert_eq!(c["rule"], id);
+    // A rename is checked by text match only, so no rule may cover it.
+    let (rv, _) = rules("rename-local");
+    let (code, _, err) = apply(&ws, &bp, Some(&rv));
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("text match"), "{err}");
 }
 
 #[test]
@@ -249,11 +248,6 @@ fn apply_build_rs_edit_needs_outer_check() {
     let c = &out["candidates"][0];
     assert_eq!(c["outer_check"], json!(["build_script"]), "{out}");
     assert_eq!(c["disposition"], "needs_review/no_rule");
-
-    let (rv, _) = rules("rename-local");
-    let (code, out, err) = apply(&ws, &bp, Some(&rv));
-    assert_eq!(code, Some(0), "{err}\n{out}");
-    assert_eq!(out["candidates"][0]["disposition"], "after_outer_check");
 }
 
 #[test]

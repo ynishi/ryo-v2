@@ -115,6 +115,9 @@ fn blocked(stage: Stage, blocking: Blocking) -> Prepared {
 /// - C7: the marks of an intent with `Borrow` and `Behaviour` risks give an outer check and
 ///   `NeedsReview{Behaviour}`, with or without a Rule for another intent.
 ///   tested: app::apply::tests::borrow_intent_reports_needs_outer_check
+/// - C8: a passing Blueprint of rename-local or add-derive is `NeedsReview{NoRule}` under a
+///   catalog that holds every Rule that can be registered.
+///   tested: app::apply::tests::text_match_intents_need_review_under_every_rule
 pub fn apply_blueprints<V: Verifier>(
     v: &V,
     s: &mut V::Session,
@@ -369,9 +372,9 @@ mod tests {
     use super::*;
     use crate::app::ports::FileFacts;
     use crate::domain::{
-        BlueprintError, DecisionRecord, Disposition, ErrorCode, Finding, FindingCode, Ident,
-        IntentCall, IntentKind, MutationSpec, OuterCheckReason, ReviewReason, ReviewRecord, Rule,
-        RuleId, ScopedFindings, SpecRef, TextRange,
+        BlueprintError, DecisionRecord, DeriveName, Disposition, ErrorCode, Finding, FindingCode,
+        Ident, IntentCall, IntentKind, MutationSpec, NonEmpty, OuterCheckReason, ReviewReason,
+        ReviewRecord, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -490,20 +493,42 @@ mod tests {
                 .collect(),
         }
     }
-    fn rename_rule() -> RuleCatalog {
-        RuleCatalog::new(vec![
-            Rule::register(
-                RuleId::parse("01890a5d-ac96-774b-bcce-b302099a8099").unwrap(),
-                IntentKind::RenameLocal,
-                ReviewRecord {
-                    reviewer: "me".to_owned(),
-                    reviewed_at_ms: 1,
-                    note: String::new(),
-                },
-                Scope::Affected,
-            )
-            .unwrap(),
-        ])
+    /// One Rule for each kind of `IntentKind::ALL` that `Rule::register` accepts.
+    fn every_rule() -> RuleCatalog {
+        let rules = IntentKind::ALL
+            .iter()
+            .zip(0u8..)
+            .filter_map(|(k, n)| {
+                Rule::register(
+                    RuleId::parse(&format!(
+                        "01890a5d-ac96-774b-bcce-b302099a80{:02x}",
+                        0x90 + n
+                    ))
+                    .unwrap(),
+                    *k,
+                    ReviewRecord {
+                        reviewer: "me".to_owned(),
+                        reviewed_at_ms: 1,
+                        note: String::new(),
+                    },
+                    Scope::Affected,
+                )
+                .ok()
+            })
+            .collect();
+        RuleCatalog::new(rules).unwrap()
+    }
+    fn add_derive(n: u8, path: &str) -> Blueprint {
+        let text = "struct S;";
+        make(
+            n,
+            IntentCall::AddDerive {
+                derives: NonEmpty::new(vec![DeriveName::parse("Clone").unwrap()]).unwrap(),
+            },
+            vec![MutationSpec::insert(rel(path), 0, "#[derive(Clone)]\n").unwrap()],
+            path,
+            text,
+        )
         .unwrap()
     }
     fn run(
@@ -555,7 +580,7 @@ mod tests {
                 rename(2, "src/lib.rs"),
                 rename(3, "src/lib.rs"),
             ],
-            &rename_rule(),
+            &every_rule(),
         )
         .unwrap();
         assert_eq!(fake.checks.get(), 3);
@@ -573,8 +598,8 @@ mod tests {
         assert_eq!(c.edits(), &[Edit::write(rel("src/lib.rs"), "let b = 1;")]);
         assert_eq!(
             c.disposition(),
-            Disposition::AutoApplicable {
-                rule: RuleId::parse("01890a5d-ac96-774b-bcce-b302099a8099").unwrap()
+            Disposition::NeedsReview {
+                reason: ReviewReason::NoRule
             }
         );
         assert_eq!(evidence.verdicts.len(), 3);
@@ -616,7 +641,7 @@ mod tests {
     #[test]
     fn borrow_intent_reports_needs_outer_check() {
         let fake = Fake::with_text("src/lib.rs", "f(1 + 2);");
-        for rules in [RuleCatalog::default(), rename_rule()] {
+        for rules in [RuleCatalog::default(), every_rule()] {
             let r = run(&fake, vec![extract(1, "src/lib.rs")], &rules).unwrap();
             let Resolution::Decided { blueprints, .. } = r else {
                 panic!("expected Decided");
@@ -633,6 +658,30 @@ mod tests {
                 }
             );
             assert_eq!(c.edits().len(), 1);
+        }
+    }
+
+    #[test]
+    fn text_match_intents_need_review_under_every_rule() {
+        let mut fake = Fake::with_text("src/lib.rs", BASE);
+        fake.texts.insert(rel("src/d.rs"), "struct S;".to_owned());
+        let r = run(
+            &fake,
+            vec![rename(1, "src/lib.rs"), add_derive(2, "src/d.rs")],
+            &every_rule(),
+        )
+        .unwrap();
+        let Resolution::Decided { blueprints, .. } = r else {
+            panic!("expected Decided");
+        };
+        assert_eq!(blueprints.len(), 2);
+        for c in blueprints.as_slice() {
+            assert_eq!(
+                c.disposition(),
+                Disposition::NeedsReview {
+                    reason: ReviewReason::NoRule
+                }
+            );
         }
     }
 
@@ -715,7 +764,7 @@ mod tests {
 
     #[test]
     fn crate_graph_edits_never_pass_silently() {
-        let rules = rename_rule();
+        let rules = every_rule();
         // A manifest is not verifiable, whatever the facts say, and is never checked.
         let mut fake = Fake::with_text("Cargo.toml", BASE);
         fake.facts.insert(
@@ -765,10 +814,12 @@ mod tests {
         let cs = blueprints.as_slice();
         assert_eq!(cs.len(), 2);
         assert!(cs[0].outer_check().is_some() && cs[1].outer_check().is_some());
-        assert!(matches!(
+        assert_eq!(
             cs[0].disposition(),
-            Disposition::AfterOuterCheck { .. }
-        ));
+            Disposition::NeedsReview {
+                reason: ReviewReason::NoRule
+            }
+        );
         assert_eq!(
             cs[1].disposition(),
             Disposition::NeedsReview {

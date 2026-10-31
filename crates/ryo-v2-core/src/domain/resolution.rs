@@ -585,7 +585,7 @@ mod tests {
     fn rule() -> Rule {
         Rule::register(
             RuleId::parse("01890a5d-ac96-774b-bcce-b302099a8058").unwrap(),
-            IntentKind::RenameLocal,
+            IntentKind::MoveItem,
             ReviewRecord {
                 reviewer: "me".to_owned(),
                 reviewed_at_ms: 1,

@@ -32,6 +32,10 @@ pub enum RuleError {
     /// The intent can change behaviour: a review of the kind cannot cover every use.
     #[error("{0} can change behaviour and cannot be registered as a rule")]
     BehaviourChanging(IntentKind),
+    /// The conformance check of the intent is a text match only (CHECK_LEDGER M-1): no
+    /// review of the kind can cover every use until the engine generates its specs.
+    #[error("{0} is checked by text match only and cannot be registered as a rule")]
+    TextMatchOnly(IntentKind),
     /// A second rule for one intent kind.
     #[error("a rule for {0} is already registered")]
     Duplicate(IntentKind),
@@ -45,6 +49,12 @@ impl Rule {
     ///   never auto-applicable.
     ///   tested: domain::rule::tests::behaviour_intent_cannot_be_registered
     ///   tested: domain::rule::tests::extract_function_cannot_be_registered
+    /// - C2: refuses an intent whose `text_match_only()` is true with `TextMatchOnly`, so
+    ///   rename-local and add-derive are never covered by a Rule and a passing candidate of
+    ///   either always ends as `NeedsReview`; `Behaviour` is checked first, then
+    ///   `TextMatchOnly`.
+    ///   tested: domain::rule::tests::text_match_intents_cannot_be_registered
+    ///   tested: app::apply::tests::text_match_intents_need_review_under_every_rule
     pub fn register(
         id: RuleId,
         intent: IntentKind,
@@ -54,12 +64,31 @@ impl Rule {
         if intent.spec().risks.contains(&RiskMark::Behaviour) {
             return Err(RuleError::BehaviourChanging(intent));
         }
-        Ok(Rule {
+        if intent.text_match_only() {
+            return Err(RuleError::TextMatchOnly(intent));
+        }
+        Ok(Self::build(id, intent, review, min_scope))
+    }
+
+    fn build(id: RuleId, intent: IntentKind, review: ReviewRecord, min_scope: Scope) -> Rule {
+        Rule {
             id,
             intent,
             review,
             min_scope,
-        })
+        }
+    }
+
+    /// A Rule without the registration checks, for the path-rule tests of `app::search`
+    /// only (they need two kinds with a Rule; production can register only move-item).
+    #[cfg(test)]
+    pub(crate) fn unchecked_for_tests(
+        id: RuleId,
+        intent: IntentKind,
+        review: ReviewRecord,
+        min_scope: Scope,
+    ) -> Rule {
+        Self::build(id, intent, review, min_scope)
     }
 
     /// The id.
@@ -136,12 +165,32 @@ mod tests {
             ),
             Err(RuleError::BehaviourChanging(IntentKind::ExtractVariable))
         );
-        let r =
-            Rule::register(rid(1), IntentKind::RenameLocal, review(), Scope::Workspace).unwrap();
+        let r = Rule::register(rid(1), IntentKind::MoveItem, review(), Scope::Workspace).unwrap();
         assert_eq!(r.id(), rid(1));
-        assert_eq!(r.intent(), IntentKind::RenameLocal);
+        assert_eq!(r.intent(), IntentKind::MoveItem);
         assert_eq!(r.min_scope(), Scope::Workspace);
         assert_eq!(r.review().reviewer, "me");
+    }
+
+    #[test]
+    fn text_match_intents_cannot_be_registered() {
+        for k in [IntentKind::RenameLocal, IntentKind::AddDerive] {
+            assert!(Rule::register(rid(1), k, review(), Scope::Workspace).is_err());
+            assert_eq!(
+                Rule::register(rid(1), k, review(), Scope::Workspace),
+                Err(RuleError::TextMatchOnly(k))
+            );
+        }
+        assert!(Rule::register(rid(1), IntentKind::MoveItem, review(), Scope::Workspace).is_ok());
+        assert_eq!(
+            Rule::register(
+                rid(1),
+                IntentKind::ExtractVariable,
+                review(),
+                Scope::Workspace
+            ),
+            Err(RuleError::BehaviourChanging(IntentKind::ExtractVariable))
+        );
     }
 
     #[test]
@@ -164,18 +213,17 @@ mod tests {
         let mk = |n, k| Rule::register(rid(n), k, review(), Scope::Affected).unwrap();
         assert_eq!(
             RuleCatalog::new(vec![
-                mk(1, IntentKind::RenameLocal),
-                mk(2, IntentKind::AddDerive),
-                mk(3, IntentKind::RenameLocal)
+                mk(1, IntentKind::MoveItem),
+                mk(2, IntentKind::MoveItem)
             ]),
-            Err(RuleError::Duplicate(IntentKind::RenameLocal))
+            Err(RuleError::Duplicate(IntentKind::MoveItem))
         );
-        let cat = RuleCatalog::new(vec![mk(1, IntentKind::RenameLocal)]).unwrap();
-        assert!(cat.for_intent(IntentKind::RenameLocal).is_some());
+        let cat = RuleCatalog::new(vec![mk(1, IntentKind::MoveItem)]).unwrap();
+        assert!(cat.for_intent(IntentKind::MoveItem).is_some());
         assert!(cat.for_intent(IntentKind::AddDerive).is_none());
         assert!(
             RuleCatalog::default()
-                .for_intent(IntentKind::RenameLocal)
+                .for_intent(IntentKind::MoveItem)
                 .is_none()
         );
     }
