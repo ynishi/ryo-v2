@@ -1859,6 +1859,26 @@ mod tests {
         assert_eq!(verdict("3"), Some(false));
         let got = shapes("fn g() { g(&a.b + 1); }", refs_and_lits);
         assert!(got.iter().all(|(t, v)| t != "&a.b" || !v), "{got:?}");
+        // A `?` expression or a macro call as a whole argument is not offered either, nor a
+        // reference or literal in a tuple or an array argument.
+        let got = shapes(
+            "fn g() { f(a?, m!(1)); f((&a.b, 2), [3]); }",
+            |e: &ast::Expr| {
+                matches!(
+                    e,
+                    ast::Expr::TryExpr(_)
+                        | ast::Expr::MacroExpr(_)
+                        | ast::Expr::RefExpr(_)
+                        | ast::Expr::Literal(_)
+                )
+            },
+        );
+        let verdict = |t: &str| got.iter().find(|(s, _)| s == t).map(|(_, v)| *v);
+        assert_eq!(verdict("a?"), Some(false));
+        assert_eq!(verdict("m!(1)"), Some(false));
+        assert_eq!(verdict("&a.b"), Some(false));
+        assert_eq!(verdict("2"), Some(false));
+        assert_eq!(verdict("3"), Some(false));
     }
 
     #[test]
