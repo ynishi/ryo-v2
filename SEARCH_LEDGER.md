@@ -384,9 +384,10 @@ measured) and 983,033 ms, trigger 4 printed as fired. Triggers 1 and 2 fired in 
 trigger 3 is not measured on ryo-rs: no run reached 1,000 checks.
 
 Trigger 4 in run 3: the decisions of run 3 take about as long as those of run 1 (their wall times
-sum to 277,368 ms against 289,838 ms), so the rest of the run, 705,665 ms against 70,700 ms in
-run 1, is the outer `cargo check` of the 30 decided candidates (about 21 s per candidate, derived
-from these sums, not measured per candidate), which runs after each search and outside it. D4
+sum to 277,368 ms against 289,838 ms), and the rest of the run is 705,665 ms against 70,700 ms
+in run 1. The difference, 634,965 ms, is the outer `cargo check` of the 30 decided candidates
+(about 21 s per candidate, derived from these sums, not measured per candidate), which runs after
+each search and outside it. D4
 states trigger 4 for one recall run in CI; none of the three runs ran in CI, and the recall run
 without the outer check (run 1) is below the limit. By D4's text, trigger 4 therefore opens no perf
 task, and none of the steps (a) to (d) of its work order would shorten the outer check. Whether a
