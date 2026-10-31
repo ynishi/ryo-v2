@@ -94,6 +94,8 @@ fn blocked(stage: Stage, blocking: Blocking) -> Prepared {
 ///   tested: app::apply::tests::stale_blueprint_is_failed_and_never_checked
 ///   tested: app::apply::tests::identical_line_inserted_above_is_stale
 ///   tested: app::apply::tests::read_of_file_without_base_is_checked
+///   tested: app::apply::tests::stale_lists_every_base_and_read
+///   tested: app::apply::tests::read_of_file_with_base_but_no_spec_is_covered_by_its_base
 /// - C2: a spec in a file whose role is `Manifest` is blocked as `Unverifiable` before
 ///   anything is read, and the check is not called; a build script or proc-macro file gives
 ///   a candidate whose `outer_check` is `Some`, which is never `AutoApplicable`.
@@ -728,6 +730,111 @@ mod tests {
         let Resolution::Decided { evidence, .. } = r else {
             panic!("expected Decided");
         };
+        assert_eq!(evidence.fingerprints_checked(), 2);
+    }
+
+    #[test]
+    fn stale_lists_every_base_and_read() {
+        let (a, b, c) = (rel("src/a.rs"), rel("src/b.rs"), rel("src/c.rs"));
+        let bp = |n: u8| {
+            Blueprint::new(BlueprintParts {
+                id: bid(n),
+                intent: IntentCall::RenameLocal {
+                    from: Ident::parse("a").unwrap(),
+                    to: Ident::parse("b").unwrap(),
+                },
+                specs: vec![
+                    MutationSpec::replace(a.clone(), tr(4, 5), "b").unwrap(),
+                    MutationSpec::replace(b.clone(), tr(4, 5), "b").unwrap(),
+                ],
+                reads: vec![
+                    ReadRange::capture(a.clone(), BASE, tr(0, 10)).unwrap(),
+                    ReadRange::capture(b.clone(), BASE, tr(0, 10)).unwrap(),
+                    ReadRange::capture(c.clone(), "abc", tr(0, 3)).unwrap(),
+                ],
+                bases: vec![
+                    BaseFp::capture(b.clone(), BASE),
+                    BaseFp::capture(a.clone(), BASE),
+                ],
+                spec_refs: vec![],
+                record: DecisionRecord::new("agent", "why").unwrap(),
+            })
+            .unwrap()
+        };
+        let mut fake = Fake::with_text("src/a.rs", "x let a = 1;");
+        fake.texts.insert(b.clone(), "let a = 1; y".to_owned());
+        fake.texts.insert(c.clone(), "abd".to_owned());
+        let i = failed(run(&fake, vec![bp(1)], &RuleCatalog::default()));
+        assert_eq!(fake.checks.get(), 0);
+        assert_eq!(i.blocking().len(), 1);
+        match &i.blocking()[0] {
+            Blocking::Stale { bases, reads, .. } => {
+                let paths: Vec<&RelPath> = bases.iter().map(|(b, _)| b.path()).collect();
+                assert_eq!(paths, vec![&a, &b]);
+                assert_eq!(reads.len(), 1);
+                assert_eq!(reads[0].0.path(), &c);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            i.blocking()[0]
+                .to_string()
+                .ends_with("2 base(s) and 1 read(s) are stale"),
+            "{}",
+            i.blocking()[0]
+        );
+        // the same Blueprint next to one that passes: the log keeps the counts
+        fake.texts.insert(rel("src/ok.rs"), BASE.to_owned());
+        let r = run(
+            &fake,
+            vec![bp(1), rename(2, "src/ok.rs")],
+            &RuleCatalog::default(),
+        )
+        .unwrap();
+        let Resolution::Decided { decision_log, .. } = r else {
+            panic!("expected Decided");
+        };
+        let fresh: Vec<_> = decision_log
+            .entries()
+            .iter()
+            .filter(|e| e.blueprint() == bid(1) && e.stage() == Stage::Freshness)
+            .collect();
+        assert_eq!(fresh.len(), 1);
+        assert!(!fresh[0].ok());
+        assert_eq!(fresh[0].note(), "2 base(s) and 1 read(s) are not fresh");
+    }
+
+    #[test]
+    fn read_of_file_with_base_but_no_spec_is_covered_by_its_base() {
+        let (a, c) = (rel("src/a.rs"), rel("src/c.rs"));
+        let bp = Blueprint::new(BlueprintParts {
+            id: bid(1),
+            intent: IntentCall::RenameLocal {
+                from: Ident::parse("a").unwrap(),
+                to: Ident::parse("b").unwrap(),
+            },
+            specs: vec![MutationSpec::replace(a.clone(), tr(4, 5), "b").unwrap()],
+            reads: vec![
+                ReadRange::capture(a.clone(), BASE, tr(0, 10)).unwrap(),
+                // wrong on purpose: were it checked, it would be stale
+                ReadRange::new(
+                    c.clone(),
+                    tr(0, 10),
+                    crate::domain::Fingerprint::of(b"other"),
+                ),
+            ],
+            bases: vec![BaseFp::capture(a, BASE), BaseFp::capture(c, BASE)],
+            spec_refs: vec![],
+            record: DecisionRecord::new("agent", "why").unwrap(),
+        })
+        .unwrap();
+        let mut fake = Fake::with_text("src/a.rs", BASE);
+        fake.texts.insert(rel("src/c.rs"), BASE.to_owned());
+        let r = run(&fake, vec![bp], &RuleCatalog::default()).unwrap();
+        let Resolution::Decided { evidence, .. } = r else {
+            panic!("expected Decided");
+        };
+        assert_eq!(fake.checks.get(), 1);
         assert_eq!(evidence.fingerprints_checked(), 2);
     }
 

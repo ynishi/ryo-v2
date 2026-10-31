@@ -598,6 +598,7 @@ mod tests {
             first["reads"][0]["actual"],
             Fingerprint::of(b"abd").to_string()
         );
+        assert_eq!(v["blocking"][1]["bases"], serde_json::json!([]));
         assert_eq!(v["blocking"][1]["reads"][0]["freshness"], "out_of_range");
         assert_eq!(v["blocking"][1]["reads"][0]["len"], 2);
     }

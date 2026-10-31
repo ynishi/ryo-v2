@@ -530,6 +530,14 @@ mod tests {
         // edits is covered by its `BaseFp`.
         assert_eq!(r.check(&format!("{base} // more")), Freshness::Fresh);
         assert_eq!(r.check(&base[..15]), Freshness::OutOfRange { len: 15 });
+        // no relocation: the read's bytes are still in the text, once, at another offset
+        assert_eq!(
+            r.check(&format!("// x\n{base}")),
+            Freshness::Stale {
+                expected: Fingerprint::of(b"a = 1"),
+                actual: Fingerprint::of(b" let "),
+            }
+        );
         assert_eq!(
             r.check("é").to_string(),
             "out of range (text is 2 bytes)".to_owned()

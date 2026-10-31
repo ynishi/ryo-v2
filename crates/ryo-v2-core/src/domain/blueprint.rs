@@ -490,6 +490,15 @@ mod tests {
             make_with(bid(1), specs(), reads(), vec![base("b.rs")]),
             Err(BlueprintError::NoBase { spec: 0 })
         );
+        // both lack a base: the lowest spec index is reported
+        assert_eq!(
+            make_with(bid(1), specs(), reads(), vec![]),
+            Err(BlueprintError::NoBase { spec: 0 })
+        );
+        assert_eq!(
+            make_with(bid(1), specs(), reads(), vec![base("z.rs")]),
+            Err(BlueprintError::NoBase { spec: 0 })
+        );
         assert_eq!(
             make_with(
                 bid(1),
