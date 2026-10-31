@@ -121,7 +121,10 @@ Refs <issue: #<n>, or a ledger id such as S-2>
   `Signed-off-by`. `just commit-msg-check` looks for them.
 - `cargo fmt` output and clippy fixes go in their own commits, separate from
   behaviour changes.
-- Update `CHANGELOG.md` under `## [Unreleased]` as its own commit.
+- Do not edit `CHANGELOG.md` by hand. It is generated from the commit messages when a release is
+  cut, so the subject and body of each commit are what the changelog will say. This replaced the
+  rule of a hand-written `## [Unreleased]` entry per change, which conflicted in nearly every
+  merge of parallel branches and duplicated the commit messages.
 - Never commit working notes, another checkout, or local agent state; `.gitignore` names them. If a commit needs `git add -f`, stop:
   something is filed wrong.
 - A pull request title reaches `main`'s merge commit, and GitHub reads a CI skip
