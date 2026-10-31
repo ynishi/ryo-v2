@@ -1,6 +1,6 @@
 [package]
-name = "ryo-v2-cli"
-description = "Command-line interface of ryo-v2: Speculative refactoring engine for Rust: Blueprints explored and verified in-process on rust-analyzer, built once after commit"
+name = "ryo-v2-host"
+description = "Host of ryo-v2: the `ryo-v2` binary, which runs the engine behind a front such as the command line"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

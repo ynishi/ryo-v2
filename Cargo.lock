@@ -2209,7 +2209,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "ryo-v2-cli"
+name = "ryo-v2-core"
+version = "0.1.0"
+dependencies = [
+ "arch-lint",
+ "syn 2.0.119",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "ryo-v2-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2218,16 +2228,6 @@ dependencies = [
  "ryo-v2-ra",
  "serde",
  "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "ryo-v2-core"
-version = "0.1.0"
-dependencies = [
- "arch-lint",
- "syn 2.0.119",
- "thiserror",
  "uuid",
 ]
 

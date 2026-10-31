@@ -9,7 +9,7 @@ Goal: measure Vision principle 15 ("inner verification is equivalent to 5 second
 - date: 2026-10-31
 - machine (small run): 12 threads, 30 GiB RAM
 - rustc: 1.98.1 (48a229cea 2026-09-01); ra_ap `=0.0.358`
-- profile: dev (deps opt-level 2), via `cargo run -q -p ryo-v2-cli`
+- profile: dev (deps opt-level 2), via `cargo run -q -p ryo-v2-cli` (the package was renamed `ryo-v2-host` afterwards, with the same binary; the commands below use the new name)
 - proc-macro: on; assert_revert: on
 - another build may run in the same checkout while a run is in progress, which adds noise to wall-clock numbers; the small run is only ~9 s, and no concurrent cargo was checked for.
 
@@ -18,7 +18,7 @@ Goal: measure Vision principle 15 ("inner verification is equivalent to 5 second
 Command (repo root):
 
 ```
-cargo run -q -p ryo-v2-cli -- bench corpus/base/extract-trait-multicrate corpus/broken-01 corpus/broken-04 corpus/valid-02 --repeat 100 --scope both > target/bench-m2/small.log 2> target/bench-m2/small.err
+cargo run -q -p ryo-v2-host -- bench corpus/base/extract-trait-multicrate corpus/broken-01 corpus/broken-04 corpus/valid-02 --repeat 100 --scope both > target/bench-m2/small.log 2> target/bench-m2/small.err
 ```
 
 Exit 0; 600 run lines, 6 summary lines, all `revert_ok true`. The log was kept locally and is not committed.
@@ -60,13 +60,13 @@ Steps for the large run (from the ryo-v2 repo root, so `corpus/body-0N` resolves
 git -C <RYO_RS> archive 67b0ebfb | tar -x -C <BASE>
 mkdir -p target/bench-m2
 # (b0) cold load (target empty) + estimate of cost; this run's [load] is the "cold load (target empty)" row
-cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat 1 --scope both > target/bench-m2/large-r1.log 2>&1
+cargo run -q -p ryo-v2-host -- bench --large <BASE> --repeat 1 --scope both > target/bench-m2/large-r1.log 2>&1
 # (b) T = sum of check_ms + revert_ms over all runs in large-r1.log; N = clamp(floor(300000 / T), 2, 10)
 #     this run's [load] is the "warm load (target built)" row
-cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat N --scope both > target/bench-m2/large.log 2>&1
+cargo run -q -p ryo-v2-host -- bench --large <BASE> --repeat N --scope both > target/bench-m2/large.log 2>&1
 # fallbacks if even N = 2 is too slow: add --no-assert-revert (keep b0 with assert on to confirm revert_ok true)
 # optional: load only plus repeat 2 without proc-macro
-cargo run -q -p ryo-v2-cli -- bench --large <BASE> --repeat 2 --scope both --no-proc-macro > target/bench-m2/large-nopm.log 2>&1
+cargo run -q -p ryo-v2-host -- bench --large <BASE> --repeat 2 --scope both --no-proc-macro > target/bench-m2/large-nopm.log 2>&1
 ```
 
 Before (b), check `pgrep -fa "cargo|rustc"` so that nothing else is building. Afterwards confirm the source repo is unchanged (`git -C <RYO_RS> status --short`).

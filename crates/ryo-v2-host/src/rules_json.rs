@@ -34,7 +34,7 @@ enum ScopeJson {
     Workspace,
 }
 
-/// Parses the rules JSON; every id is required (the cli does not invent a rule's identity).
+/// Parses the rules JSON; every id is required (the host does not invent a rule's identity).
 ///
 /// # Contract
 /// - C1: a rule for an intent that changes behaviour (extract-variable) is an error that names

@@ -7,7 +7,7 @@ use ryo_v2_core::domain::{
 };
 use serde::Deserialize;
 
-/// A parsed input: the set, and the ids the cli filled in.
+/// A parsed input: the set, and the ids the host filled in.
 #[derive(Debug)]
 pub(crate) struct ParsedBlueprints {
     pub(crate) set: BlueprintSet,

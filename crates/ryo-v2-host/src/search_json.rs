@@ -110,7 +110,7 @@ pub(crate) struct Request {
     pub(crate) targets: Vec<Target>,
     pub(crate) probes: Vec<ChangeProbe>,
     pub(crate) roots: Vec<Blueprint>,
-    /// Ids the cli filled in for roots without one.
+    /// Ids the host filled in for roots without one.
     pub(crate) generated: Vec<BlueprintId>,
     pub(crate) budget: SearchBudget,
     pub(crate) judge: JudgeSpec,

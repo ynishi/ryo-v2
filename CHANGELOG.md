@@ -41,3 +41,6 @@ and this project adheres to
   placeholders instead of a path.
 - `CONTRIBUTING.md`: where a review is recorded — a GitHub review or the PR body, or, with a local
   merge, the hand-over note and `Reviewed:` / `Verified:` lines in the merge commit's body.
+- The crate `ryo-v2-cli` is renamed `ryo-v2-host` (`cargo run -p ryo-v2-host`): it is the binary
+  that hosts the engine, and the command line is one front of it. The `ryo-v2` binary, its
+  subcommands and its output are unchanged.
