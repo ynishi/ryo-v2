@@ -226,8 +226,9 @@ pub enum Token {
     assert!(codes_of(&off, "E0204").is_empty(), "got {off:?}");
 }
 
-/// Types whose fields are all `Copy`, generic types, lifetime-only types, fieldless enums, a
-/// `Clone` derive alone and a field of unknown type are not reported.
+/// Types whose fields are all `Copy`, a generic type whose field is `Copy` under the derive's
+/// `T: Copy`, lifetime-only types, fieldless enums, a `Clone` derive alone and a field of unknown
+/// type are not reported.
 #[test]
 fn copy_impl_skips_copy_and_generic_types() {
     let text = r#"pub struct S;
@@ -682,6 +683,11 @@ where
 {
     pub n: Needs<T>,
 }
+
+#[derive(Clone, Debug)]
+pub struct Items<I: Iterator> {
+    pub first: Option<I::Item>,
+}
 "#;
     let p = Probe::new("field-generic-negative");
     let got = p.errors_of(true, text);
@@ -707,10 +713,21 @@ pub struct Unknown<T> {
     pub t: T,
     pub m: Missing,
 }
+
+#[derive(Clone)]
+pub struct CloneOnly;
+
+#[derive(Clone)]
+pub struct CArr<const N: usize> {
+    pub a: [CloneOnly; N],
+}
+impl<const N: usize> Copy for CArr<N> {}
 "#;
     let p = Probe::new("field-generic-skip");
     let got = p.errors_of(true, text);
     assert!(codes_of(&got, "E0277").is_empty(), "got {got:?}");
+    // A written `Copy` impl with a const parameter is not judged.
+    assert!(codes_of(&got, "E0204").is_empty(), "got {got:?}");
 }
 
 /// A written `Copy` impl of a generic type is checked in the impl's own env (D5): a field that
@@ -778,6 +795,34 @@ pub struct Lacks<'a, T> {
     assert_eq!(
         codes_of(&got, "E0277"),
         at("E0277", line_of(text, "pub raw: Raw")),
+        "got {got:?}"
+    );
+    assert!(codes_of(&got, "E0369").is_empty(), "got {got:?}");
+}
+
+/// `Eq` on a field of a generic type is skipped only when the field also fails `PartialEq` in the
+/// derived `PartialEq` impl's env: `Wrap<T>` is `PartialEq` under `T: PartialEq` and never `Eq`,
+/// so the derived `Eq` (under `T: Eq`) is reported at the field and the derived `PartialEq` is not.
+#[test]
+fn derive_field_generic_eq_beside_partialeq() {
+    let text = r#"pub struct Wrap<T>(pub T);
+
+impl<T: PartialEq> PartialEq for Wrap<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct HasWrap<T> {
+    pub w: Wrap<T>,
+}
+"#;
+    let p = Probe::new("field-generic-eq");
+    let got = p.errors_of(true, text);
+    assert_eq!(
+        codes_of(&got, "E0277"),
+        at("E0277", line_of(text, "pub w: Wrap<T>")),
         "got {got:?}"
     );
     assert!(codes_of(&got, "E0369").is_empty(), "got {got:?}");
