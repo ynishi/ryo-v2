@@ -28,9 +28,15 @@
 //!   text.
 //!   includes: Fresh, Stale, OutOfRange
 //! - Edit: the whole new text of one file, built by splicing; what the verifier consumes and a
-//!   writer writes once its candidate's basis has no drift.
+//!   writer writes once `prepare_write` has returned it as a `CheckedWrite`.
 //! - Basis: what a candidate's verdict rests on in the loaded text: the base fingerprint of every
-//!   file its path edits and the read ranges of the files it only reads.
+//!   file its path edits and the read ranges of the files it only reads. The files a check read
+//!   beyond it are covered by the re-check before a write.
+//! - CheckedWrite: the edits of a candidate that passed the check before a write, with the verdict
+//!   of the re-check and the unseen classes it names; only `prepare_write` makes one.
+//! - WriteRefusal: why the check before a write refused.
+//!   includes: NotACandidate, AmbiguousPick, Drift, Appeared, UnrecordedSession, StaleSession,
+//!   NewErrors, Check
 //! - Drift: one way the files no longer match a basis.
 //!   includes: File, Read, Missing
 //! - IntentKind: a typed action of the one-layer action space.

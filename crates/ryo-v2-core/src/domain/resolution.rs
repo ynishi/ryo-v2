@@ -53,6 +53,26 @@ pub fn unseen_classes(marks: &BTreeSet<RiskMark>) -> Option<UnseenClasses> {
     UnseenClasses::from_set(marks.iter().filter_map(|m| m.unseen_class()).collect())
 }
 
+/// The classes a result names: those of `marks` that are in `blind`, together with `observed`.
+///
+/// # Contract
+/// - C1: the classes are [`unseen_classes`] of `marks` that are in `blind`, together with all of
+///   `observed`; `None` when there are none. A blind class no mark names is not named, and an
+///   observed class is named whatever `blind` holds.
+///   tested: domain::resolution::tests::candidate_names_what_it_touches_and_what_was_observed
+///   tested: app::write::tests::recheck_names_the_unseen_it_observed
+pub(crate) fn named_unseen(
+    marks: &BTreeSet<RiskMark>,
+    blind: &BTreeSet<UnseenClass>,
+    observed: &BTreeSet<UnseenClass>,
+) -> Option<UnseenClasses> {
+    let mut named: BTreeSet<UnseenClass> = unseen_classes(marks)
+        .map(|u| u.classes().intersection(blind).copied().collect())
+        .unwrap_or_default();
+    named.extend(observed.iter().copied());
+    UnseenClasses::from_set(named)
+}
+
 /// The marks of a change made by `kinds` to files of `roles`.
 ///
 /// # Contract
@@ -98,10 +118,10 @@ pub(crate) fn mark_names(marks: &BTreeSet<RiskMark>) -> String {
 /// ```
 ///
 /// # Contract
-/// - C1 [invariant]: its `edits` are the texts of the state its basis was taken on; they may be
-///   written only when the basis has no drift against the files, and nothing splices them onto
-///   a changed text: a drifted candidate is decided again.
+/// - C1 [invariant]: its `edits` are the texts of the state its basis was taken on, and its basis
+///   is what `prepare_write` refuses a write on.
 ///   tested: app::apply::tests::candidate_basis_is_stale_after_outside_change
+///   tested: app::write::tests::drifted_candidate_is_refused_and_never_checked
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     path: NonEmpty<Blueprint>,
@@ -143,16 +163,12 @@ impl Candidate {
             path.iter().map(|b| b.intent().kind()),
             roles.iter().copied(),
         );
-        let mut named: BTreeSet<UnseenClass> = unseen_classes(&marks)
-            .map(|u| u.classes().intersection(blind).copied().collect())
-            .unwrap_or_default();
-        named.extend(verdict.unseen.iter().copied());
         Ok(Self {
             path,
             edits,
-            verdict,
             basis,
-            unseen_classes: UnseenClasses::from_set(named),
+            unseen_classes: named_unseen(&marks, blind, &verdict.unseen),
+            verdict,
             marks,
         })
     }
@@ -177,11 +193,8 @@ impl Candidate {
         &self.verdict
     }
 
-    /// What its verdict rests on; check it against the files before writing `edits`.
-    ///
-    /// The `edits` are the texts of the checked state. They may be written only when
-    /// `basis().check` of the files is empty, and nothing splices them onto a changed text: a
-    /// drifted candidate is decided again.
+    /// What its verdict rests on; `prepare_write` checks it against the files before `edits` are
+    /// written, and refuses the write when it has drifted.
     pub fn basis(&self) -> &Basis {
         &self.basis
     }
@@ -804,9 +817,9 @@ pub enum Resolution {
     /// At least one Blueprint passed, in input order.
     ///
     /// # Contract
-    /// - C1: the candidates are alternatives on the loaded state, not parts of one change; each
-    ///   one's basis is what to check before writing it, and writing one makes every other
-    ///   candidate on a shared file drift.
+    /// - C1: the candidates are alternatives on the loaded state, not parts of one change; before
+    ///   writing one, `prepare_write` checks its basis and re-checks its edits, and writing one
+    ///   makes every other candidate on a shared file drift.
     ///   tested: app::apply::tests::second_alternative_is_stale_after_first_is_written
     Decided {
         /// The candidates.

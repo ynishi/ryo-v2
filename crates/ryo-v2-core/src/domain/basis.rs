@@ -1,8 +1,8 @@
 //! What a verdict rests on in the loaded text, and how the files can drift from it.
 //!
 //! A [`Basis`] lists the base fingerprint of every file a change edits and the read ranges of
-//! the files it only reads. Checking it against the current files says whether the edits that
-//! were verified against the loaded text may still be written.
+//! the files it only reads. Checking it against the current files is the first thing the check
+//! before a write (`prepare_write`) looks at.
 
 use super::{BaseFp, Blueprint, Edit, Freshness, ReadRange, RelPath};
 use std::collections::BTreeSet;

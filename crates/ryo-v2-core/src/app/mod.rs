@@ -9,6 +9,30 @@ pub mod apply;
 pub mod ports;
 pub mod search;
 pub mod verify;
+pub mod write;
+
+use crate::app::ports::{CheckError, Verifier};
+use crate::domain::{Edit, Finding, Scope, Verdict};
+
+/// The verdict of `edits` at `scope` against `baseline`: what the decision and the check before
+/// a write both ask of the checker.
+///
+/// The caller takes `baseline` once per decision (`Verifier::baseline`) and passes it in.
+///
+/// # Contract
+/// - C1: the verdict is `Verdict::from_baseline(baseline, checked)` of the check's findings; a
+///   check failure is returned as is.
+///   tested: app::write::tests::decide_and_write_paths_give_the_same_verdict
+pub fn verdict_of<V: Verifier>(
+    verifier: &V,
+    session: &mut V::Session,
+    edits: &[Edit],
+    scope: Scope,
+    baseline: &[Finding],
+) -> Result<Verdict, CheckError> {
+    let checked = verifier.check(session, edits, scope)?;
+    Ok(Verdict::from_baseline(baseline, &checked))
+}
 
 /// The blind classes of the fake verifiers in the tests of this module: every class a mark names.
 #[cfg(test)]
