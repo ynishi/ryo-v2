@@ -32,7 +32,7 @@ pub enum RuleError {
     /// The intent can change behaviour: a review of the kind cannot cover every use.
     #[error("{0} can change behaviour and cannot be registered as a rule")]
     BehaviourChanging(IntentKind),
-    /// The conformance check of the intent is a text match only (CHECK_LEDGER M-1): no
+    /// The conformance check of the intent is a text match only: no
     /// review of the kind can cover every use until the engine generates its specs.
     #[error("{0} is checked by text match only and cannot be registered as a rule")]
     TextMatchOnly(IntentKind),

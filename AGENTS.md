@@ -23,8 +23,8 @@
 - Development flow ([CONTRIBUTING.md](CONTRIBUTING.md#development-flow)): one worktree and
   branch per implementer; until the code base is functionally complete the maintainer merges into
   `main` locally.
-- In that phase there is no issue tracker: open work lives in the "Open work" section of
-  [CHECK_LEDGER.md](CHECK_LEDGER.md) or in the task's contract.
+- In that phase there is no issue tracker and no list of work items: work is handed over in the
+  task's contract, and the ledgers hold only what was decided and measured.
 - A decision code or data must keep gets a test or a ceiling in the same change.
 - Files and commit messages never describe the execution environment (host, account, path); use
   placeholders such as `<BASE>` and `<OUT>`. Core count and memory beside a measurement stay.
