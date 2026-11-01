@@ -8,7 +8,7 @@ default:
     @just --list
 
 # Everything a change owes before it is handed over.
-check: rust-fmt-check rust-clippy rust-test deny
+check: base-check rust-fmt-check rust-clippy rust-test deny
 
 rust-fmt-check:
     cargo fmt --all -- --check
@@ -107,8 +107,8 @@ worktree-new type slug:
     git worktree add .worktrees/{{slug}} -b {{type}}/{{slug}} origin/main
     cd .worktrees/{{slug}} && just branch-check
 
-# Refuses main, and a branch that does not contain origin/main.
-branch-check:
+# Refuses main, and a branch that does not contain its base (`base-check`).
+branch-check: base-check
     #!/usr/bin/env bash
     set -euo pipefail
     branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -116,13 +116,84 @@ branch-check:
         echo "branch-check: on main; cut a branch with 'just worktree-new'" >&2
         exit 1
     fi
-    if git rev-parse --verify --quiet origin/main >/dev/null; then
-        git merge-base --is-ancestor origin/main HEAD || {
-            echo "branch-check: $branch does not contain origin/main; rebase or recut" >&2
-            exit 1
-        }
-    fi
     echo "branch-check: $branch ok"
+
+# Refuses a branch that does not contain `origin/main` (or the local `main` where there is no
+# `origin/main`): such a branch was cut from an older main and may collide with the current one
+# only after the merge. Passes on main. Says in one line that it skipped and passes outside a git
+# checkout of this tree, in a shallow clone, and where neither ref exists.
+base-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    here="$(cd "{{justfile_directory()}}" && pwd -P)"
+    top="$(git -C "$here" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -z "$top" ] || [ "$(cd "$top" && pwd -P)" != "$here" ]; then
+        echo "base-check: skipped (not a git checkout)"
+        exit 0
+    fi
+    cd "$here"
+    if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+        echo "base-check: skipped (shallow clone)"
+        exit 0
+    fi
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    if [ "$branch" = "main" ]; then
+        echo "base-check: on main"
+        exit 0
+    fi
+    if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+        base="origin/main"
+    elif git rev-parse --verify --quiet refs/heads/main >/dev/null; then
+        base="main"
+    else
+        echo "base-check: skipped (no main or origin/main)"
+        exit 0
+    fi
+    if ! git merge-base --is-ancestor "$base" HEAD; then
+        echo "base-check: $branch does not contain $base; merge $base into it and check again" >&2
+        exit 1
+    fi
+    echo "base-check: $branch contains $base"
+
+# Registers the ledger merge driver (`.gitattributes`, crates/ryo-v2-ledger-merge) in this
+# checkout's git config, which all its worktrees share: builds `ledger-merge`, copies it into the
+# git directory and points `merge.ledger.driver` at the copy. Where the copy is missing, or it
+# cannot merge (exit 2, the file untouched), the driver falls back to `git merge-file`, the line
+# merge, with its conflict markers: a failed run never leaves ours without markers. Re-run it after
+# the driver's code changes; the copy is not rebuilt by itself.
+ledger-merge-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    built="$(cargo build --release --locked -q -p ryo-v2-ledger-merge --bin ledger-merge --message-format=json \
+        | grep -o '"executable":"[^"]*"' | tail -n 1 | cut -d '"' -f 4)"
+    [ -x "$built" ] || { echo "ledger-merge-install: no binary built" >&2; exit 1; }
+    dest="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/ledger-merge"
+    install -m 755 "$built" "$dest"
+    git config merge.ledger.name "ledger rows and sections (crates/ryo-v2-ledger-merge)"
+    git config merge.ledger.driver "if [ -x '$dest' ]; then '$dest' %O %A %B %L %P; s=\$?; [ \$s -le 1 ] && exit \$s; fi; git merge-file --marker-size=%L %A %O %B"
+    echo "ledger-merge-install: merge.ledger.driver set"
+
+# Runs the ledger merge driver on three files as git would, on a copy of <ours>; prints the exit
+# status and the conflict marker lines, and the diff against <expected> when one is given.
+ledger-merge-try base ours theirs expected="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    out="$(mktemp)"
+    trap 'rm -f "$out"' EXIT
+    cp "{{ours}}" "$out"
+    cargo run -q --locked -p ryo-v2-ledger-merge --bin ledger-merge -- "{{base}}" "$out" "{{theirs}}" 7 "{{ours}}"
+    code=$?
+    markers=$'^((<{7,}|>{7,}|\\|{7,})( |\r?$)|={7,}\r?$)'
+    echo "ledger-merge-try: exit $code, $(grep -cE "$markers" "$out") marker lines"
+    grep -nE "$markers" "$out" || true
+    if [ -n "{{expected}}" ]; then
+        if d="$(diff "{{expected}}" "$out")"; then
+            echo "ledger-merge-try: equal to {{expected}}"
+        else
+            echo "ledger-merge-try: differs from {{expected}}"
+            printf '%s\n' "$d"
+        fi
+    fi
 
 # Commit messages on this branch carry no AI attribution (CONTRIBUTING.md).
 commit-msg-check:

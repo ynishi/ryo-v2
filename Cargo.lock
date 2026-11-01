@@ -2233,6 +2233,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryo-v2-ledger-merge"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "ryo-v2-oracle"
 version = "0.1.0"
 dependencies = [

@@ -29,6 +29,11 @@
 //!    both (comment lines in a recipe do not count). `rust-clippy` runs before `rust-test` in
 //!    `check`, so without its own `--locked` it would rewrite a stale `Cargo.lock` before
 //!    `rust-test` could refuse it.
+//! 8. The base and the ledgers in the `Justfile`: `check` and `branch-check` run `base-check`,
+//!    and `ledger-merge-install` has the `git config merge.ledger.driver "..."` line. What those
+//!    recipes do is checked by running them, not by their text: `tests/base_check.rs` runs
+//!    `base-check` in git repositories, and the driver tests of `ryo-v2-ledger-merge` run `git
+//!    merge` with the driver line read from this `Justfile`.
 //!
 //! Each rule is a function returning its problems; the `workspace_*` tests run them on the real
 //! manifests, the others show that each rule reports a broken manifest.
@@ -435,6 +440,29 @@ fn gate_recipe_problems(justfile: &str) -> Vec<String> {
     out
 }
 
+/// Rule 8.
+fn base_and_ledger_recipe_problems(justfile: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for runner in ["check", "branch-check"] {
+        let header = recipe(justfile, runner).first().copied().unwrap_or("");
+        let deps = header.split_once(':').map_or("", |(_, d)| d);
+        if !deps.split_whitespace().any(|d| d == "base-check") {
+            out.push(format!("Justfile: {runner} does not run base-check"));
+        }
+    }
+    if recipe(justfile, "base-check").is_empty() {
+        out.push("Justfile: no base-check recipe".to_owned());
+    }
+    let install = recipe(justfile, "ledger-merge-install");
+    if !install
+        .iter()
+        .any(|l| l.trim().starts_with("git config merge.ledger.driver \""))
+    {
+        out.push("Justfile: ledger-merge-install sets no merge.ledger.driver".to_owned());
+    }
+    out
+}
+
 fn assert_none(problems: Vec<String>) {
     assert!(
         problems.is_empty(),
@@ -509,6 +537,46 @@ fn workspace_rust_files_set_no_missing_docs_level() {
 fn workspace_gate_recipes_deny_warnings_and_lock() {
     let justfile = fs::read_to_string(root().join("Justfile")).expect("Justfile");
     assert_none(gate_recipe_problems(&justfile));
+}
+
+#[test]
+fn workspace_base_check_and_ledger_driver_recipes_are_in_place() {
+    let justfile = fs::read_to_string(root().join("Justfile")).expect("Justfile");
+    assert_none(base_and_ledger_recipe_problems(&justfile));
+}
+
+#[test]
+fn base_check_not_run_or_driver_not_set_is_a_problem() {
+    let justfile = fs::read_to_string(root().join("Justfile")).expect("Justfile");
+    let mutations: [(&str, &str, &str); 4] = [
+        ("check without base-check", "check: base-check ", "check: "),
+        (
+            "branch-check without it",
+            "branch-check: base-check",
+            "branch-check:",
+        ),
+        (
+            "base-check renamed",
+            "\nbase-check:\n",
+            "\nbase-check-old:\n",
+        ),
+        (
+            "driver line commented out",
+            "    git config merge.ledger.driver",
+            "    # git config merge.ledger.driver",
+        ),
+    ];
+    for (what, from, to) in mutations {
+        assert!(
+            justfile.contains(from),
+            "{what}: the Justfile has no {from:?}"
+        );
+        assert_eq!(
+            base_and_ledger_recipe_problems(&justfile.replacen(from, to, 1)).len(),
+            1,
+            "{what}"
+        );
+    }
 }
 
 #[test]
