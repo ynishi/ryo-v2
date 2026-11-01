@@ -12,6 +12,7 @@ use crate::app::apply::Acc;
 use crate::app::ports::{
     Assessor, CheckError, Clock, ExpandError, Expander, Judge, JudgeError, RevertAudit,
 };
+use crate::app::verdict_of;
 use crate::domain::search::{prune, rank_final, reward_score, score};
 use crate::domain::stage::{On, Refused, Staged, stage, view_of};
 use crate::domain::{
@@ -692,7 +693,7 @@ where
             run.trace[t].node = Some(id);
             let t_check = clock.now_ms();
             let result = match tree.node(id) {
-                Some(n) => v.check(s, n.edits(), input.scope),
+                Some(n) => verdict_of(v, s, n.edits(), input.scope, &baseline),
                 None => continue,
             };
             stats.check_ms = stats
@@ -700,11 +701,9 @@ where
                 .saturating_add(clock.now_ms().saturating_sub(t_check));
             stats.checked = stats.checked.saturating_add(1);
             match result {
-                Ok(found) => {
-                    let verdict = Verdict::from_baseline(&baseline, &found);
+                Ok(verdict) => {
                     run.acc.verdicts.push((bp_id, verdict.clone()));
-                    let errors =
-                        verdict.new_errors.errors.len() + verdict.new_errors.unmapped.len();
+                    let errors = verdict.new_errors.len();
                     run.acc.note(
                         bp_id,
                         Stage::Check,

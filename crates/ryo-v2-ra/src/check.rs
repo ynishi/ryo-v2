@@ -141,7 +141,10 @@ impl Verifier for RaAnalyzer {
     ///   plus the root `Cargo.toml`, each member's `Cargo.toml` and the root `Cargo.lock` as read
     ///   at load (one that could not be read is left out), so a manifest or lock change moves
     ///   the workspace fingerprint; the `gap_detectors` entry is the switch of every gap detector.
+    ///   A file's database text is its bytes on disk at load (line endings are not normalized),
+    ///   so `prepare_write` can compare the fingerprint with that of the file's current text.
     ///   tested: check::tests::analyzer_version_is_the_manifest_pin
+    ///   tested: tests/verifier.rs provenance_fingerprints_are_of_the_disk_text
     ///   tested: tests/verifier.rs provenance_records_the_gap_detector_switch
     ///   tested: tests/verifier.rs provenance_fingerprints_manifests_lock_and_toolchain
     ///   tested: tests/verifier.rs provenance_fingerprints_each_member_manifest

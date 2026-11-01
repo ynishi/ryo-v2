@@ -60,4 +60,9 @@ impl Diagnostics {
     pub fn is_empty(&self) -> bool {
         self.errors.is_empty() && self.unmapped.is_empty()
     }
+
+    /// The number of errors, with and without an E-code.
+    pub fn len(&self) -> usize {
+        self.errors.len() + self.unmapped.len()
+    }
 }

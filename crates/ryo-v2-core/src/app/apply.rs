@@ -5,6 +5,7 @@
 //! [`Candidate`] that carries the whole-file [`Edit`]s it would make.
 
 use crate::app::ports::{CheckError, Verifier};
+use crate::app::verdict_of;
 use crate::domain::resolution::DEFAULT_BUDGET;
 use crate::domain::stage::{On, Refused, Staged, stage};
 use crate::domain::{
@@ -245,8 +246,8 @@ fn decide<V: Verifier>(
     };
 
     // 6. check
-    let found = match v.check(s, staged.edits(), scope) {
-        Ok(found) => found,
+    let verdict = match verdict_of(v, s, staged.edits(), scope, baseline) {
+        Ok(verdict) => verdict,
         Err(e) => {
             let note = format!("check failed: {e}");
             return match e.into_blocking(id) {
@@ -264,9 +265,8 @@ fn decide<V: Verifier>(
             };
         }
     };
-    let verdict = Verdict::from_baseline(baseline, &found);
     acc.verdicts.push((id, verdict.clone()));
-    let errors = verdict.new_errors.errors.len() + verdict.new_errors.unmapped.len();
+    let errors = verdict.new_errors.len();
     acc.note(
         id,
         Stage::Check,

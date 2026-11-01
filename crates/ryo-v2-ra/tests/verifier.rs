@@ -1,7 +1,7 @@
 //! `Verifier` for `RaAnalyzer`, on throwaway workspaces (the corpus is never touched).
 
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, Event, Verifier};
-use ryo_v2_core::domain::{Edit, ErrorCode, FindingCode, RelPath, Scope};
+use ryo_v2_core::domain::{Edit, ErrorCode, FindingCode, Fingerprint, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{GapDetector, RaAnalyzer, RaConfig, RaSession};
@@ -378,6 +378,21 @@ fn provenance_fingerprints_manifests_lock_and_toolchain() {
     let lib = RelPath::parse("src/lib.rs").unwrap();
     assert_eq!(pa.files().get(&lib), pb.files().get(&lib));
     assert_ne!(pa.workspace(), pb.workspace());
+}
+
+#[test]
+fn provenance_fingerprints_are_of_the_disk_text() {
+    // The check before a write compares these with the fingerprint of the file's bytes, so a
+    // line ending must not be normalized on the way in.
+    let text = "pub fn a() {}\r\npub fn b() {}\r\n// lone\rcarriage return\n";
+    let f = Fixture::single("verifier_prov_disk_text", text);
+    let p = provenance_of(&f);
+    let on_disk = std::fs::read(f.dir.join("src/lib.rs")).unwrap();
+    assert_eq!(on_disk, text.as_bytes());
+    assert_eq!(
+        p.files().get(&rel("src/lib.rs")),
+        Some(&Fingerprint::of(&on_disk))
+    );
 }
 
 #[test]

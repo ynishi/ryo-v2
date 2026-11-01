@@ -175,8 +175,8 @@ fn join_paths(paths: &[RelPath]) -> String {
         .join(", ")
 }
 
-/// What `apply_blueprints` needs from the analyzer: the texts it holds, and a check of edits
-/// that leaves no trace.
+/// What `apply_blueprints` and `prepare_write` need from the analyzer: the texts it holds, and a
+/// check of edits that leaves no trace.
 pub trait Verifier {
     /// A loaded workspace.
     type Session;
