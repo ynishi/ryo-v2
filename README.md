@@ -2,6 +2,10 @@
 
 Speculative refactoring engine for Rust: Blueprints explored and verified in-process on rust-analyzer, built once after commit
 
+What it does and why, as the concept every design decision rests on: [CONCEPT.md](CONCEPT.md).
+How development is done: [DEVELOPMENT.md](DEVELOPMENT.md); basic conventions:
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Crates
 
 | crate | role |

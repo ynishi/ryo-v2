@@ -192,7 +192,7 @@ impl IntentKind {
 
     /// Whether [`IntentCall::conforms`] checks this intent by matching text only, so a
     /// Blueprint can pass it with a rename inside a string literal, a name capture, one side
-    /// of a shadowing pair or a struct-field rename (CHECK_LEDGER M-1).
+    /// of a shadowing pair or a struct-field rename.
     ///
     /// # Contract
     /// - C1: true for `RenameLocal` and `AddDerive`, false for every other kind.
