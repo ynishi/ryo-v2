@@ -196,10 +196,10 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     }
     match worst {
         Some((x, label)) => println!(
-            "principle-15: {} (worst warm median check_ms {x} at {label}, limit 5000)",
+            "core-4: {} (worst warm median check_ms {x} at {label}, limit 5000)",
             if x <= 5000 { "holds" } else { "exceeds" }
         ),
-        None => println!("principle-15: n/a (no runs)"),
+        None => println!("core-4: n/a (no runs)"),
     }
     if fail_infra > 0 {
         anyhow::bail!("{fail_infra} variant(s) failed revert assertion");
