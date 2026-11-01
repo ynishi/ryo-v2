@@ -1,12 +1,11 @@
 //! `ryo-v2 search`: the search of one decision as a dry run (nothing is written).
 
 use crate::resolution_json::exit_code;
-use crate::rules_json::parse_rules;
 use crate::search_json::{JudgeSpec, Request, parse_replay, parse_request, report_to_json};
 use anyhow::{Context, Result};
 use ryo_v2_core::app::ports::{Analyzer, Judge};
 use ryo_v2_core::app::search::{ASSERT_REVERT_EVERY, SearchInput, search_decision};
-use ryo_v2_core::domain::{DEFAULT_WEIGHTS, RuleCatalog, Scope};
+use ryo_v2_core::domain::{DEFAULT_WEIGHTS, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::judge::MetricJudge;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -20,7 +19,6 @@ use std::sync::Arc;
 pub(crate) struct SearchArgs {
     pub(crate) workspace: PathBuf,
     pub(crate) request: PathBuf,
-    pub(crate) rules: Option<PathBuf>,
     pub(crate) scope: Scope,
     pub(crate) proc_macro: bool,
 }
@@ -30,14 +28,6 @@ pub(crate) struct SearchArgs {
 /// included) is 1.
 pub(crate) fn run_search(args: &SearchArgs) -> Result<ExitCode> {
     // JSON errors surface before the (slow) load.
-    let rules = match &args.rules {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("read rules {}", path.display()))?;
-            parse_rules(&text)?
-        }
-        None => RuleCatalog::default(),
-    };
     let text = std::fs::read_to_string(&args.request)
         .with_context(|| format!("read request {}", args.request.display()))?;
     let request = parse_request(&text)?;
@@ -47,21 +37,16 @@ pub(crate) fn run_search(args: &SearchArgs) -> Result<ExitCode> {
         }
     }
     match &request.judge {
-        JudgeSpec::Metric => search_with(args, &request, &rules, &MetricJudge),
+        JudgeSpec::Metric => search_with(args, &request, &MetricJudge),
         JudgeSpec::Replay(file) => {
             let fixture = std::fs::read_to_string(file)
                 .with_context(|| format!("read replay fixture {file}"))?;
-            search_with(args, &request, &rules, &parse_replay(&fixture)?)
+            search_with(args, &request, &parse_replay(&fixture)?)
         }
     }
 }
 
-fn search_with<J: Judge>(
-    args: &SearchArgs,
-    request: &Request,
-    rules: &RuleCatalog,
-    judge: &J,
-) -> Result<ExitCode> {
+fn search_with<J: Judge>(args: &SearchArgs, request: &Request, judge: &J) -> Result<ExitCode> {
     let clock = Arc::new(MonotonicClock::new());
     let analyzer = RaAnalyzer::new(
         RaConfig {
@@ -84,7 +69,6 @@ fn search_with<J: Judge>(
         roots: &request.roots,
         targets: &request.targets,
         probes: &request.probes,
-        rules,
         scope: args.scope,
         budget: request.budget,
         weights: DEFAULT_WEIGHTS,

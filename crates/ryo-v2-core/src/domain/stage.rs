@@ -5,7 +5,7 @@
 
 use super::basis::View;
 use super::file_role::file_role;
-use super::resolution::risk_marks;
+use super::resolution::{mark_names, risk_marks};
 use super::search::compose;
 use super::text::splice;
 use super::{
@@ -269,8 +269,7 @@ pub(crate) fn stage(
 
     // 5. marks
     let marks = risk_marks([bp.intent().kind()], own_roles.iter().copied());
-    let names: Vec<String> = marks.iter().map(ToString::to_string).collect();
-    note(Stage::Marks, true, names.join(", "));
+    note(Stage::Marks, true, mark_names(&marks));
 
     let edits = compose(on_edits, &own, base);
     let mut roles = on_roles;

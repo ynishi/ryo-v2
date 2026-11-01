@@ -1,9 +1,8 @@
 //! The `Resolution` as the JSON the `apply` command prints, and its exit code.
 
 use ryo_v2_core::domain::{
-    BaseFp, Basis, Blocking, Candidate, CheckFailure, Diagnostics, Disposition, Drift, FileRole,
-    Freshness, LogEntry, ReadRange, Resolution, ReviewReason, RiskMark, Scope, Stage, UnseenClass,
-    Verdict,
+    BaseFp, Basis, Blocking, Candidate, CheckFailure, Diagnostics, Drift, FileRole, Freshness,
+    LogEntry, ReadRange, Resolution, RiskMark, Scope, Stage, UnseenClass, Verdict,
 };
 use serde_json::{Value, json};
 
@@ -46,21 +45,6 @@ fn stage_str(s: Stage) -> &'static str {
         Stage::Prune => "prune",
         Stage::Check => "check",
         Stage::Candidate => "candidate",
-    }
-}
-
-fn disposition_json(d: Disposition) -> (&'static str, Value) {
-    match d {
-        Disposition::AutoApplicable { rule } => ("auto_applicable", json!(rule.to_string())),
-        Disposition::NeedsReview { reason } => (
-            match reason {
-                ReviewReason::NoRule => "needs_review/no_rule",
-                ReviewReason::ProcMacroCrate => "needs_review/proc_macro_crate",
-                ReviewReason::Behaviour => "needs_review/behaviour",
-                ReviewReason::ScopeTooNarrow => "needs_review/scope_too_narrow",
-            },
-            Value::Null,
-        ),
     }
 }
 
@@ -121,7 +105,6 @@ fn drift_json(d: &Drift) -> Value {
 }
 
 fn candidate_json(c: &Candidate) -> Value {
-    let (disposition, rule) = disposition_json(c.disposition());
     let unseen_classes = match c.unseen_classes() {
         Some(u) => Value::Array(u.classes().iter().map(|k| json!(class_str(*k))).collect()),
         None => Value::Null,
@@ -148,8 +131,6 @@ fn candidate_json(c: &Candidate) -> Value {
     json!({
         "blueprint": c.blueprint().to_string(),
         "path": path,
-        "disposition": disposition,
-        "rule": rule,
         "unseen_classes": unseen_classes,
         "marks": marks,
         "edits": edits,
@@ -236,13 +217,14 @@ fn blocking_json(b: &Blocking) -> Value {
 /// The JSON document `apply` prints for a `Resolution`.
 ///
 /// # Contract
-/// - C1: a `Decided` resolution lists each candidate's disposition, rule id (or `null`),
-///   `unseen_classes` (a list of class names, or `null`), marks and edits, in that vocabulary and
-///   sorted order, and its `basis`: the `files` it edits (path, `fingerprint`) and the `reads` of
-///   files it only reads (path, `start`, `end`, `fingerprint`). The disposition is one of
-///   `auto_applicable` and the `needs_review/..` reasons.
+/// - C1: a `Decided` resolution lists each candidate with exactly the keys `blueprint`, `path`,
+///   `unseen_classes` (a list of class names, or `null`), `marks`, `edits` and `basis`, the
+///   classes, marks and edits in that vocabulary and sorted order; its `basis` has the `files` it
+///   edits (path, `fingerprint`) and the `reads` of files it only reads (path, `start`, `end`,
+///   `fingerprint`).
 ///   tested: resolution_json::tests::unseen_classes_lists_the_classes
-///   tested: resolution_json::tests::decided_lists_the_rule_id
+///   tested: resolution_json::tests::candidate_json_has_exactly_its_keys
+///   tested: tests/apply.rs apply_extract_variable_names_borrow_and_behaviour
 ///   tested: tests/apply.rs apply_rename_local_is_decided
 ///   tested: tests/apply.rs decided_candidate_lists_its_basis
 ///   tested: resolution_json::tests::decided_lists_the_reads_of_files_only_read
@@ -339,9 +321,8 @@ mod tests {
     use ryo_v2_core::app::ports::{CheckError, FileFacts, Verifier};
     use ryo_v2_core::domain::{
         BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, DecisionRecord, Edit,
-        ErrorCode, Finding, FindingCode, Fingerprint, Ident, Infeasible, IntentCall, IntentKind,
-        MutationSpec, Provenance, ReadRange, RelPath, ReviewRecord, Rule, RuleCatalog, RuleId,
-        ScopedFindings, SpecRef, TextRange,
+        ErrorCode, Finding, FindingCode, Fingerprint, Ident, Infeasible, IntentCall, MutationSpec,
+        Provenance, ReadRange, RelPath, ScopedFindings, SpecRef, TextRange,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -483,41 +464,31 @@ mod tests {
             &[],
         )
     }
-    fn decided(fake: &Fake, bps: Vec<Blueprint>, rules: &RuleCatalog) -> Resolution {
+    fn decided(fake: &Fake, bps: Vec<Blueprint>) -> Resolution {
         let set = BlueprintSet::new(bps).expect("a set");
-        let r = apply_blueprints(fake, &mut (), &set, rules, Scope::Affected).expect("a run");
+        let r = apply_blueprints(fake, &mut (), &set, Scope::Affected).expect("a run");
         assert!(matches!(r, Resolution::Decided { .. }), "{r:?}");
         r
     }
 
     #[test]
-    fn decided_lists_the_rule_id() {
-        let rule_id = RuleId::from_uuid(uuid::Uuid::now_v7()).expect("v7");
-        // The vocabulary, straight from the dispositions.
-        assert_eq!(
-            disposition_json(Disposition::AutoApplicable { rule: rule_id }),
-            ("auto_applicable", json!(rule_id.to_string()))
-        );
-        assert_eq!(
-            disposition_json(Disposition::NeedsReview {
-                reason: ReviewReason::ScopeTooNarrow
-            }),
-            ("needs_review/scope_too_narrow", Value::Null)
-        );
-        // And through a run: the move-item Rule covers a move, which names `visibility` unseen.
-        let review = ReviewRecord {
-            reviewer: "me".to_owned(),
-            reviewed_at_ms: 1,
-            note: "n".to_owned(),
-        };
-        let rule = Rule::register(rule_id, IntentKind::MoveItem, review, Scope::Affected)
-            .expect("move-item is registrable");
-        let rules = RuleCatalog::new(vec![rule]).expect("a catalog");
+    fn candidate_json_has_exactly_its_keys() {
+        // A move names `visibility` as a mark and an unseen class.
         let fake = Fake::with(&[("src/a.rs", "pub fn foo() {}\n"), ("src/b.rs", "")]);
-        let v = resolution_to_json(&decided(&fake, vec![move_foo()], &rules));
-        let c = &v["candidates"][0];
-        assert_eq!(c["disposition"], "auto_applicable");
-        assert_eq!(c["rule"], rule_id.to_string());
+        let v = resolution_to_json(&decided(&fake, vec![move_foo()]));
+        let c = v["candidates"][0].as_object().expect("a candidate object");
+        let keys: BTreeSet<&str> = c.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "blueprint",
+                "path",
+                "unseen_classes",
+                "marks",
+                "edits",
+                "basis"
+            ])
+        );
         assert_eq!(c["marks"], json!(["visibility"]));
         assert_eq!(c["unseen_classes"], json!(["visibility"]));
     }
@@ -525,26 +496,16 @@ mod tests {
     #[test]
     fn unseen_classes_lists_the_classes() {
         let fake = Fake::with(&[("build.rs", "f(1 + 2);")]).build_script("build.rs");
-        let v = resolution_to_json(&decided(
-            &fake,
-            vec![extract("build.rs")],
-            &RuleCatalog::default(),
-        ));
+        let v = resolution_to_json(&decided(&fake, vec![extract("build.rs")]));
         assert_eq!(v["resolution"], "decided");
         let c = &v["candidates"][0];
         assert_eq!(c["unseen_classes"], json!(["borrow", "build_script"]));
         assert_eq!(c["marks"], json!(["borrow", "build_script", "behaviour"]));
-        assert_eq!(c["disposition"], "needs_review/behaviour");
-        assert_eq!(c["rule"], Value::Null);
         assert_eq!(c["edits"][0]["path"], "build.rs");
         assert_eq!(c["edits"][0]["new_text"], "let t = 1 + 2;\nf(t);");
         assert_eq!(v["evidence"]["scope"], "affected");
         let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
-        let none = resolution_to_json(&decided(
-            &fake,
-            vec![rename("src/lib.rs")],
-            &RuleCatalog::default(),
-        ));
+        let none = resolution_to_json(&decided(&fake, vec![rename("src/lib.rs")]));
         assert_eq!(none["candidates"][0]["unseen_classes"], Value::Null);
         assert_eq!(none["candidates"][0]["marks"], json!([]));
     }
@@ -573,7 +534,7 @@ mod tests {
         })
         .expect("a blueprint");
         let fake = Fake::with(&[("src/lib.rs", text), ("src/o.rs", "abcdef")]);
-        let v = resolution_to_json(&decided(&fake, vec![bp], &RuleCatalog::default()));
+        let v = resolution_to_json(&decided(&fake, vec![bp]));
         assert_eq!(
             v["candidates"][0]["basis"],
             json!({
@@ -594,7 +555,7 @@ mod tests {
         let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
         let bp = rename("src/lib.rs");
         let bp_id = bp.id();
-        let v = resolution_to_json(&decided(&fake, vec![bp], &RuleCatalog::default()));
+        let v = resolution_to_json(&decided(&fake, vec![bp]));
         let path = &v["candidates"][0]["path"];
         assert_eq!(path.as_array().map(Vec::len), Some(1));
         assert_eq!(
@@ -730,7 +691,7 @@ mod tests {
     #[test]
     fn exit_codes_follow_the_resolution() {
         let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
-        let r = decided(&fake, vec![rename("src/lib.rs")], &RuleCatalog::default());
+        let r = decided(&fake, vec![rename("src/lib.rs")]);
         assert_eq!(exit_code(&r), 0);
         let inf = Infeasible::new(vec![], vec![], true).expect("budget exhausted");
         assert_eq!(exit_code(&Resolution::Failed(inf)), 2);
@@ -739,7 +700,7 @@ mod tests {
     #[test]
     fn decided_lists_the_blockings() {
         let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
-        let mut r = decided(&fake, vec![rename("src/lib.rs")], &RuleCatalog::default());
+        let mut r = decided(&fake, vec![rename("src/lib.rs")]);
         let b = id();
         let checked = ScopedFindings {
             files: vec![rel("src/lib.rs")],

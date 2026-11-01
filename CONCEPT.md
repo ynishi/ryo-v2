@@ -102,6 +102,10 @@ rust-analyzer's and ryo-v2's commands), or free text with a base mutation list. 
 the base list step by step and optimises it by the same Monte Carlo search, the Decision AI
 guarding each step against the text.
 
+Review before and after ryo-v2, by an AI or a person, converges on rules; a rule is expressed ahead
+as a command or a mutation list and applied by the search like any other command, instead of being
+checked on each result.
+
 rust-analyzer runs a command at a place; which commands, in which order and where, bring the code
 to the input, and whether the result compiles, is what ryo-v2 decides, and is otherwise manual.
 

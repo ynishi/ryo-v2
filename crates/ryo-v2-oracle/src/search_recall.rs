@@ -32,8 +32,8 @@ use ryo_v2_core::app::search::{
     TRIGGER_HARNESS_MS, TRIGGER_RSS_KB, TraceEntry, search_decision,
 };
 use ryo_v2_core::domain::{
-    ChangeProbe, DEFAULT_WEIGHTS, DomainError, Edit, Ident, PruneStage, RelPath, Resolution,
-    RuleCatalog, Scope, SearchBudget, Stage, Target, TextRange, Verdict,
+    ChangeProbe, DEFAULT_WEIGHTS, DomainError, Edit, Ident, PruneStage, RelPath, Resolution, Scope,
+    SearchBudget, Stage, Target, TextRange, Verdict,
 };
 use ryo_v2_core::infra::overlay::{OverlayError, overlay_edits};
 use ryo_v2_ra::{DetectorPanic, ExpanderPanic};
@@ -665,13 +665,11 @@ where
     }
     let mut budget = budget;
     budget.max_depth = case.depth.max(1);
-    let rules = RuleCatalog::default();
     let input = SearchInput {
         start: &edits,
         roots: &[],
         targets: &case.targets,
         probes: &case.probes,
-        rules: &rules,
         scope: Scope::Affected,
         budget,
         weights: DEFAULT_WEIGHTS,

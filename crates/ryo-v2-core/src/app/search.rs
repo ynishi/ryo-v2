@@ -17,8 +17,8 @@ use crate::domain::stage::{On, Refused, Staged, stage, view_of};
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, Infeasible, Inserted,
     IntentKind, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, Prior, Proposal,
-    ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, RuleCatalog, Scope, Scored,
-    SearchBudget, SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
+    ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, Scope, Scored, SearchBudget,
+    SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU16;
@@ -85,8 +85,6 @@ pub struct SearchInput<'a> {
     pub targets: &'a [Target],
     /// Shapes the assessor measures extensibility against.
     pub probes: &'a [ChangeProbe],
-    /// The registered rules.
-    pub rules: &'a RuleCatalog,
     /// The scope every check runs at.
     pub scope: Scope,
     /// The limits.
@@ -359,13 +357,12 @@ fn sat32(n: usize) -> u32 {
 ///   tested: app::search::tests::revert_audit_runs_once_at_end
 /// - C8: the ranking holds every node that passed, at any depth, by `rank_final`, each with
 ///   the Blueprints of its path and its prior. The resolution is `Decided` with every node of
-///   the ranking as a candidate, in the order of the ranking, each with the marks and
-///   the rule the domain derives from the Blueprints of its path and the file roles of its
-///   node; the rule is `None` unless every intent on the path has a rule, and then the one with
-///   the widest `min_scope`, the leaf's on a tie. With no node that passed the resolution is
-///   `Failed` with every blocking, and the budget flag, of the search.
+///   the ranking as a candidate, in the order of the ranking; the marks of each candidate are
+///   those of the Blueprints of its path and of the file roles its node edits. With no node
+///   that passed the resolution is `Failed` with every blocking, and the budget flag, of the
+///   search.
 ///   tested: app::search::tests::decided_lists_every_passing_node_by_reward
-///   tested: app::search::tests::path_rule_needs_a_rule_for_every_kind
+///   tested: app::search::tests::path_marks_are_the_union_of_the_path
 ///   tested: app::search::tests::hard_budget_with_nothing_verified_is_failed_exhausted
 /// - C9: a prior decides which children are kept and in which order they are checked, never
 ///   the final order: `rank_final` is given no prior, so a judge that reverses every prior
@@ -818,9 +815,8 @@ where
             continue;
         };
         let leaf = done.path().last().id();
-        if let Ok(c) = Candidate::new(done, verdict.clone(), input.rules, input.scope) {
-            run.acc
-                .note(leaf, Stage::Candidate, true, c.disposition().to_string());
+        if let Ok(c) = Candidate::new(done, verdict.clone()) {
+            run.acc.note(leaf, Stage::Candidate, true, c.marks_line());
             candidates.push(c);
         }
     }
@@ -863,9 +859,9 @@ mod tests {
     use crate::app::ports::{FileFacts, Verifier};
     use crate::domain::{
         BaseFp, BlueprintParts, CheckFailure, CleanDelta, Criterion, DEFAULT_BUDGET,
-        DEFAULT_WEIGHTS, DecisionRecord, DeriveName, Disposition, ErrorCode, Finding, FindingCode,
-        Ident, IntentCall, Judgement, MutationSpec, Provenance, ReadRange, ReviewReason,
-        ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings, SpecRef, TextRange,
+        DEFAULT_WEIGHTS, DecisionRecord, ErrorCode, Finding, FindingCode, Ident, IntentCall,
+        Judgement, MutationSpec, Provenance, ReadRange, RiskMark, ScopedFindings, SpecRef,
+        TextRange, UnseenClass,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -883,9 +879,6 @@ mod tests {
     }
     fn bid(n: u16) -> BlueprintId {
         BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a{n:04x}")).unwrap()
-    }
-    fn rid(n: u8) -> RuleId {
-        RuleId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap()
     }
     fn w(text: &str) -> Edit {
         Edit::write(rel(LIB), text)
@@ -930,13 +923,17 @@ mod tests {
             text,
         )
     }
-    fn derive_clone(n: u16, text: &str) -> Blueprint {
+    /// Binds the `1 + 2` of `f(1 + 2);` to `x`.
+    fn extract_x(n: u16, text: &str) -> Blueprint {
         make(
             n,
-            IntentCall::AddDerive {
-                derives: NonEmpty::new(vec![DeriveName::parse("Clone").unwrap()]).unwrap(),
+            IntentCall::ExtractVariable {
+                name: Ident::parse("x").unwrap(),
             },
-            vec![MutationSpec::insert(rel(LIB), 0, "#[derive(Clone)]\n").unwrap()],
+            vec![
+                MutationSpec::insert(rel(LIB), 0, "let x = 1 + 2;\n").unwrap(),
+                MutationSpec::replace(rel(LIB), tr(2, 7), "x").unwrap(),
+            ],
             text,
         )
     }
@@ -1147,7 +1144,6 @@ mod tests {
         j: FakeJ,
         clock: Ticker,
         roots: Vec<Blueprint>,
-        rules: RuleCatalog,
         budget: SearchBudget,
         scope: Scope,
         keep_edits: bool,
@@ -1166,7 +1162,6 @@ mod tests {
                 },
                 clock: Ticker::default(),
                 roots: vec![],
-                rules: RuleCatalog::default(),
                 budget: SearchBudget {
                     max_depth: 1,
                     ..DEFAULT_SEARCH_BUDGET
@@ -1189,7 +1184,6 @@ mod tests {
                     roots: &self.roots,
                     targets: &[],
                     probes: &[],
-                    rules: &self.rules,
                     scope: self.scope,
                     budget: self.budget,
                     weights: DEFAULT_WEIGHTS,
@@ -1908,104 +1902,52 @@ mod tests {
         assert_eq!(evidence.provenance().analyzer(), "fake");
     }
 
-    /// The disposition of the candidate whose Blueprint is `leaf`.
-    fn disposition_of(r: &SearchReport, leaf: u16) -> Disposition {
-        decided(r)
-            .iter()
-            .find(|c| c.blueprint() == bid(leaf))
-            .unwrap()
-            .disposition()
-    }
-    fn rule(n: u8, kind: IntentKind, scope: Scope) -> Rule {
-        // Production cannot register rename-local or add-derive, but these
-        // path-rule tests need two kinds with a Rule.
-        Rule::unchecked_for_tests(
-            rid(n),
-            kind,
-            ReviewRecord {
-                reviewer: "me".to_owned(),
-                reviewed_at_ms: 1,
-                note: String::new(),
-            },
-            scope,
-        )
-    }
-    /// Search over two depths: `first` then a rename of `S`/`b`; returns the report.
-    fn two_kind_path(rules: Vec<Rule>, scope: Scope) -> SearchReport {
-        let base = "struct S;";
-        let after = "#[derive(Clone)]\nstruct S;";
+    #[test]
+    fn path_marks_are_the_union_of_the_path() {
+        // The root extracts a variable (Borrow, Behaviour); the leaf renames it (no marks).
+        let base = "f(1 + 2);";
+        let after = "let x = 1 + 2;\nf(x);";
         let mut fx = Fx::new(base);
         fx.budget = SearchBudget {
             max_depth: 2,
             ..DEFAULT_SEARCH_BUDGET
         };
-        fx.rules = RuleCatalog::new(rules).unwrap();
-        fx.scope = scope;
-        fx.e.set(root_state(), vec![derive_clone(1, base)]);
-        fx.e.set(state(vec![w(after)]), vec![rename(2, "S", "T", after)]);
-        fx.run().unwrap()
-    }
+        fx.e.set(root_state(), vec![extract_x(1, base)]);
+        fx.e.set(state(vec![w(after)]), vec![rename(2, "x", "y", after)]);
+        let r = fx.run().unwrap();
+        let leaf = decided(&r)
+            .iter()
+            .find(|c| c.blueprint() == bid(2))
+            .unwrap();
+        assert_eq!(leaf.path().len(), 2);
+        assert_eq!(
+            leaf.marks(),
+            &BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
+        );
+        assert_eq!(
+            leaf.unseen_classes().unwrap().classes(),
+            &BTreeSet::from([UnseenClass::Borrow])
+        );
 
-    #[test]
-    fn path_rule_needs_a_rule_for_every_kind() {
-        // Same kind twice, one rule: the rule covers the whole path.
-        let mut fx = Fx::new(BASE);
+        // The other order: the root renames (no marks), the leaf extracts, so the leaf's own
+        // marks count as well as the root's.
+        let renamed = "g(1 + 2);";
+        let mut fx = Fx::new(base);
         fx.budget = SearchBudget {
             max_depth: 2,
             ..DEFAULT_SEARCH_BUDGET
         };
-        fx.rules =
-            RuleCatalog::new(vec![rule(1, IntentKind::RenameLocal, Scope::Affected)]).unwrap();
-        fx.e.set(root_state(), vec![rename(1, "a", "b", BASE)]);
-        fx.e.set(
-            state(vec![w("let b = 1;")]),
-            vec![rename(2, "b", "c", "let b = 1;")],
-        );
+        fx.e.set(root_state(), vec![rename(3, "f", "g", base)]);
+        fx.e.set(state(vec![w(renamed)]), vec![extract_x(4, renamed)]);
         let r = fx.run().unwrap();
+        let leaf = decided(&r)
+            .iter()
+            .find(|c| c.blueprint() == bid(4))
+            .unwrap();
+        assert_eq!(leaf.path().len(), 2);
         assert_eq!(
-            disposition_of(&r, 2),
-            Disposition::AutoApplicable { rule: rid(1) }
-        );
-
-        // Two kinds, a rule for the leaf's kind only: no rule for the path.
-        let r = two_kind_path(
-            vec![rule(1, IntentKind::RenameLocal, Scope::Affected)],
-            Scope::Workspace,
-        );
-        assert_eq!(
-            disposition_of(&r, 2),
-            Disposition::NeedsReview {
-                reason: ReviewReason::NoRule
-            }
-        );
-
-        // A rule for each kind: the widest min_scope wins, here the first kind's, which a
-        // check at the narrow scope does not cover; the leaf's own rule alone would pass.
-        let r = two_kind_path(
-            vec![
-                rule(1, IntentKind::RenameLocal, Scope::Affected),
-                rule(2, IntentKind::AddDerive, Scope::Workspace),
-            ],
-            Scope::Affected,
-        );
-        assert_eq!(
-            disposition_of(&r, 2),
-            Disposition::NeedsReview {
-                reason: ReviewReason::ScopeTooNarrow
-            }
-        );
-
-        // Equal min_scope: the leaf's rule.
-        let r = two_kind_path(
-            vec![
-                rule(1, IntentKind::RenameLocal, Scope::Affected),
-                rule(2, IntentKind::AddDerive, Scope::Affected),
-            ],
-            Scope::Affected,
-        );
-        assert_eq!(
-            disposition_of(&r, 2),
-            Disposition::AutoApplicable { rule: rid(1) }
+            leaf.marks(),
+            &BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
         );
     }
 
