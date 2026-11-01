@@ -23,6 +23,15 @@ fn class_str(c: UnseenClass) -> &'static str {
         UnseenClass::BuildScript => "build_script",
         UnseenClass::ProcMacroCrate => "proc_macro_crate",
         UnseenClass::Visibility => "visibility",
+        UnseenClass::ConstEval => "const_eval",
+        UnseenClass::StructLiteralPath => "struct_literal_path",
+        UnseenClass::UnusedTypeParam => "unused_type_param",
+        UnseenClass::DeriveWithoutServer => "derive_without_server",
+        UnseenClass::UnresolvedPath => "unresolved_path",
+        UnseenClass::DuplicateName => "duplicate_name",
+        UnseenClass::FieldBounds => "field_bounds",
+        UnseenClass::TestCode => "test_code",
+        UnseenClass::UnexpandedMacro => "unexpanded_macro",
     }
 }
 
@@ -194,17 +203,23 @@ fn blocking_json(b: &Blocking) -> Value {
             "kind": "budget_exhausted", "blueprint": blueprint, "limit_ms": limit_ms,
         }),
         Blocking::CheckFailed { failure, .. } => {
-            let (kind, path) = match failure {
-                CheckFailure::Edit { path, .. } => ("edit", Some(path.to_string())),
-                CheckFailure::Cancelled => ("cancelled", None),
-                CheckFailure::Panicked(_) => ("panicked", None),
+            let (kind, extra) = match failure {
+                CheckFailure::Edit { path, .. } => ("edit", vec![("path", path.to_string())]),
+                CheckFailure::Cancelled => ("cancelled", vec![]),
+                CheckFailure::Panicked(_) => ("panicked", vec![]),
+                CheckFailure::DetectorPanicked { detector, file } => (
+                    "detector_panicked",
+                    vec![("detector", detector.clone()), ("file", file.to_string())],
+                ),
             };
             let mut v = json!({
                 "kind": "check_failed", "blueprint": blueprint,
                 "failure": kind, "message": failure.to_string(),
             });
-            if let (Some(path), Some(o)) = (path, v.as_object_mut()) {
-                o.insert("path".to_owned(), json!(path));
+            if let Some(o) = v.as_object_mut() {
+                for (key, value) in extra {
+                    o.insert(key.to_owned(), json!(value));
+                }
             }
             v
         }
@@ -221,7 +236,9 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   `unseen_classes` (a list of class names, or `null`), `marks`, `edits` and `basis`, the
 ///   classes, marks and edits in that vocabulary and sorted order; its `basis` has the `files` it
 ///   edits (path, `fingerprint`) and the `reads` of files it only reads (path, `start`, `end`,
-///   `fingerprint`).
+///   `fingerprint`); the evidence lists the `blind_classes` of the checker, in the same
+///   vocabulary and order, empty when it has none.
+///   tested: resolution_json::tests::decided_lists_the_checkers_blind_classes
 ///   tested: resolution_json::tests::unseen_classes_lists_the_classes
 ///   tested: resolution_json::tests::candidate_json_has_exactly_its_keys
 ///   tested: tests/apply.rs apply_extract_variable_names_borrow_and_behaviour
@@ -239,14 +256,18 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   tested: resolution_json::tests::failed_lists_parent_failed
 /// - C3: a `Decided` resolution lists, per candidate, the Blueprints of its path with intent,
 ///   proposer, rationale and spec refs, and the evidence lists the provenance: analyzer,
-///   version, config and workspace fingerprint.
+///   version, config and workspace fingerprint; the evidence has exactly the keys `scope`,
+///   `fingerprints_checked`, `baseline_size`, `budget`, `provenance`, `verdicts` and
+///   `blind_classes`.
 ///   tested: resolution_json::tests::decided_lists_record_and_provenance
+///   tested: resolution_json::tests::decided_evidence_has_exactly_its_keys
 /// - C4: a `Decided` resolution lists, under `blocking`, the blockings
 ///   of the Blueprints that did not pass, in the vocabulary of C2; a `check_failed` blocking
-///   has the `failure` (`edit`, `cancelled` or `panicked`), the `path` for an edit, and the
-///   `message`.
+///   has the `failure` (`edit`, `cancelled`, `panicked` or `detector_panicked`), the `path` for
+///   an edit, the `detector` and the `file` for a detector panic, and the `message`.
 ///   tested: resolution_json::tests::decided_lists_the_blockings
 ///   tested: resolution_json::tests::check_failed_blocking_is_listed
+///   tested: resolution_json::tests::check_failed_names_the_panicked_detector
 pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
     match r {
         Resolution::Decided {
@@ -285,6 +306,11 @@ pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
                         "workspace": provenance.workspace().to_string(),
                     },
                     "verdicts": verdicts,
+                    "blind_classes": evidence
+                        .blind_classes()
+                        .iter()
+                        .map(|k| json!(class_str(*k)))
+                        .collect::<Vec<_>>(),
                 },
             })
         }
@@ -347,6 +373,14 @@ mod tests {
         .expect("a provenance")
     }
 
+    /// The blind classes of the `Fake`: every class a mark names.
+    const ALWAYS_BLIND: [UnseenClass; 4] = [
+        UnseenClass::Borrow,
+        UnseenClass::BuildScript,
+        UnseenClass::ProcMacroCrate,
+        UnseenClass::Visibility,
+    ];
+
     /// A verifier over fixed texts whose checks always pass.
     #[derive(Default)]
     struct Fake {
@@ -384,6 +418,9 @@ mod tests {
         }
         fn provenance(&self, _: &()) -> Provenance {
             prov()
+        }
+        fn blind_classes(&self) -> BTreeSet<UnseenClass> {
+            BTreeSet::from(ALWAYS_BLIND)
         }
         fn check(&self, _: &mut (), _: &[Edit], _: Scope) -> Result<ScopedFindings, CheckError> {
             Ok(ScopedFindings::default())
@@ -710,6 +747,7 @@ mod tests {
                 path: rel("src/lib.rs"),
                 line: 1,
             }],
+            ..Default::default()
         };
         let Resolution::Decided { blocking, .. } = &mut r else {
             panic!("expected Decided");
@@ -754,5 +792,88 @@ mod tests {
         assert_eq!(panicked["failure"], "panicked");
         assert_eq!(panicked["message"], "analyzer panicked: boom");
         assert!(panicked.get("path").is_none());
+    }
+
+    #[test]
+    fn check_failed_names_the_panicked_detector() {
+        let b = id();
+        let v = blocking_json(&Blocking::CheckFailed {
+            blueprint: b,
+            failure: CheckFailure::DetectorPanicked {
+                detector: "unresolved-path".to_owned(),
+                file: rel("src/lib.rs"),
+            },
+        });
+        assert_eq!(v["kind"], "check_failed");
+        assert_eq!(v["blueprint"], b.to_string());
+        assert_eq!(v["failure"], "detector_panicked");
+        assert_eq!(v["detector"], "unresolved-path");
+        assert_eq!(v["file"], "src/lib.rs");
+        assert_eq!(
+            v["message"],
+            "detector unresolved-path panicked on src/lib.rs"
+        );
+        assert!(v.get("path").is_none());
+    }
+
+    #[test]
+    fn decided_lists_the_checkers_blind_classes() {
+        let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
+        let v = resolution_to_json(&decided(&fake, vec![rename("src/lib.rs")]));
+        assert_eq!(
+            v["evidence"]["blind_classes"],
+            json!(["borrow", "build_script", "proc_macro_crate", "visibility"])
+        );
+        // The candidate has no mark, so it names none of them.
+        assert_eq!(v["candidates"][0]["unseen_classes"], Value::Null);
+        // The vocabulary is snake_case for every class.
+        let names: Vec<&str> = [
+            UnseenClass::ConstEval,
+            UnseenClass::StructLiteralPath,
+            UnseenClass::UnusedTypeParam,
+            UnseenClass::DeriveWithoutServer,
+            UnseenClass::UnresolvedPath,
+            UnseenClass::DuplicateName,
+            UnseenClass::FieldBounds,
+            UnseenClass::TestCode,
+            UnseenClass::UnexpandedMacro,
+        ]
+        .into_iter()
+        .map(class_str)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "const_eval",
+                "struct_literal_path",
+                "unused_type_param",
+                "derive_without_server",
+                "unresolved_path",
+                "duplicate_name",
+                "field_bounds",
+                "test_code",
+                "unexpanded_macro",
+            ]
+        );
+    }
+
+    #[test]
+    fn decided_evidence_has_exactly_its_keys() {
+        let fake = Fake::with(&[("src/lib.rs", "let a = 1;")]);
+        let v = resolution_to_json(&decided(&fake, vec![rename("src/lib.rs")]));
+        let evidence = v["evidence"].as_object().expect("an evidence object");
+        let keys: BTreeSet<&str> = evidence.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "scope",
+                "fingerprints_checked",
+                "baseline_size",
+                "budget",
+                "provenance",
+                "verdicts",
+                "blind_classes",
+            ])
+        );
     }
 }

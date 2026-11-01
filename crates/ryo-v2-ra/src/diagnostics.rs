@@ -14,7 +14,7 @@ use ra_ap_ide_db::imports::insert_use::{ImportGranularity, InsertUseConfig};
 use ra_ap_ide_db::{RootDatabase, SnippetCap};
 use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{AnalyzerError, Clock};
-use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath};
+use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath, UnseenClass};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -139,6 +139,9 @@ pub enum GapDetector {
     ///   all expand is not skipped.
     ///   tested: tests/unresolved.rs unresolved_names_outside_an_unexpanded_macro_file_are_still_reported
     ///   tested: tests/unresolved.rs a_file_whose_macros_expand_keeps_its_findings
+    /// - C3: a diagnostics run that skips a file by C1 names `UnexpandedMacro` in the `unseen` of
+    ///   its findings; a run that skips none, or that runs no gap detector, does not.
+    ///   tested: tests/unresolved.rs unexpanded_macro_file_names_the_class
     UnresolvedPath,
     /// A name an item and a `use` both define (E0255), `duplicate.rs`.
     DuplicateName,
@@ -173,6 +176,20 @@ impl GapDetector {
             GapDetector::UnresolvedPath => "unresolved-path",
             GapDetector::DuplicateName => "duplicate-name",
             GapDetector::FieldBounds => "field-bounds",
+        }
+    }
+
+    /// The class of error this detector reports, named as unseen where the detector cannot run.
+    ///
+    /// # Contract
+    /// - C1: `UnresolvedPath`, `DuplicateName` and `FieldBounds` give the `UnseenClass` of the
+    ///   same name.
+    ///   tested: diagnostics::tests::gap_detector_unseen_class_is_its_own
+    pub fn unseen_class(self) -> UnseenClass {
+        match self {
+            GapDetector::UnresolvedPath => UnseenClass::UnresolvedPath,
+            GapDetector::DuplicateName => UnseenClass::DuplicateName,
+            GapDetector::FieldBounds => UnseenClass::FieldBounds,
         }
     }
 }
@@ -303,6 +320,7 @@ fn collect_errors(
                 let line_of = |at: TextSize| index.line_col(at).line + 1;
                 for (which, run) in DETECTORS {
                     if unexpanded_macro && which.skips_files_with_unexpanded_macros() {
+                        found.unexpanded_macro = true;
                         continue;
                     }
                     // Each detector is contained on its own: a panic in one costs this file
@@ -329,6 +347,7 @@ fn collect_errors(
                                 path: rel.clone(),
                                 message,
                             });
+                        found.panics.push((which, rel.clone()));
                         Vec::new()
                     });
                     for (code, message, line) in hits {
@@ -359,16 +378,20 @@ fn collect_errors(
 struct Collected {
     native: Vec<Finding>,
     foreign: Vec<Finding>,
+    panics: Vec<(GapDetector, RelPath)>,
+    unexpanded_macro: bool,
 }
 
 impl Collected {
     fn extend(&mut self, other: Collected) {
         self.native.extend(other.native);
         self.foreign.extend(other.foreign);
+        self.panics.extend(other.panics);
+        self.unexpanded_macro |= other.unexpanded_macro;
     }
 
     /// Native findings and the foreign ones no native finding equals (once each), sorted.
-    fn into_findings(self) -> Vec<Finding> {
+    fn into_collect(self) -> Collect {
         let seen: HashSet<Finding> = self.native.iter().cloned().collect();
         let mut foreign: Vec<Finding> = self
             .foreign
@@ -380,8 +403,28 @@ impl Collected {
         let mut all = self.native;
         all.extend(foreign);
         all.sort();
-        all
+        let mut panics = self.panics;
+        panics.sort();
+        panics.dedup();
+        Collect {
+            findings: all,
+            panics,
+            unexpanded_macro: self.unexpanded_macro,
+        }
     }
+}
+
+/// What one collect found, and what it observed of its own run.
+pub(crate) struct Collect {
+    /// The errors, sorted.
+    pub(crate) findings: Vec<Finding>,
+    /// The detector and file of each detector panic contained in this collect, sorted, unique.
+    /// The session's record keeps a panic once however many collects hit it; this list is of this
+    /// collect only.
+    pub(crate) panics: Vec<(GapDetector, RelPath)>,
+    /// Whether the unresolved-path detector stayed silent on some file of this collect because a
+    /// macro call on it was not expanded.
+    pub(crate) unexpanded_macro: bool,
 }
 
 /// Parallel [`collect_errors`]: chunks the files and diagnoses each chunk on its own snapshot.
@@ -396,7 +439,7 @@ pub(crate) fn collect_errors_par(
     gap_detectors: bool,
     deadline: Option<&Deadline>,
     detector: Detector<'_>,
-) -> Result<Vec<Finding>, AnalyzerError> {
+) -> Result<Collect, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
         let db = gap_detectors.then(|| host.raw_database().clone());
         return collect_errors(
@@ -407,7 +450,7 @@ pub(crate) fn collect_errors_par(
             deadline,
             detector,
         )
-        .map(Collected::into_findings);
+        .map(Collected::into_collect);
     }
     let chunk_size = files.len().div_ceil(threads);
     let chunks: Vec<&[(FileId, RelPath)]> = files.chunks(chunk_size).collect();
@@ -438,7 +481,7 @@ pub(crate) fn collect_errors_par(
         }
         Ok(())
     })?;
-    Ok(errors.into_findings())
+    Ok(errors.into_collect())
 }
 
 #[cfg(test)]
@@ -464,6 +507,22 @@ mod tests {
         assert_eq!(
             classify(&DiagnosticCode::Ra("bad-rtn", Severity::Error)),
             FindingCode::Analyzer("bad-rtn".to_owned())
+        );
+    }
+
+    #[test]
+    fn gap_detector_unseen_class_is_its_own() {
+        assert_eq!(
+            GapDetector::UnresolvedPath.unseen_class(),
+            UnseenClass::UnresolvedPath
+        );
+        assert_eq!(
+            GapDetector::DuplicateName.unseen_class(),
+            UnseenClass::DuplicateName
+        );
+        assert_eq!(
+            GapDetector::FieldBounds.unseen_class(),
+            UnseenClass::FieldBounds
         );
     }
 

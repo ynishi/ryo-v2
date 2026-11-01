@@ -9,3 +9,12 @@ pub mod apply;
 pub mod ports;
 pub mod search;
 pub mod verify;
+
+/// The blind classes of the fake verifiers in the tests of this module: every class a mark names.
+#[cfg(test)]
+pub(crate) const ALWAYS_BLIND: [crate::domain::UnseenClass; 4] = [
+    crate::domain::UnseenClass::Borrow,
+    crate::domain::UnseenClass::BuildScript,
+    crate::domain::UnseenClass::ProcMacroCrate,
+    crate::domain::UnseenClass::Visibility,
+];

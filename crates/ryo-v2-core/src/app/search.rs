@@ -404,6 +404,7 @@ where
     let w = input.weights;
     let baseline = v.baseline(s);
     let provenance = v.provenance(s);
+    let blind = v.blind_classes();
     let mut tree = SearchTree::new(input.start.to_vec());
     let mut run = Run::default();
     let mut passing: Vec<NodeId> = Vec::new();
@@ -815,7 +816,7 @@ where
             continue;
         };
         let leaf = done.path().last().id();
-        if let Ok(c) = Candidate::new(done, verdict.clone()) {
+        if let Ok(c) = Candidate::new(done, verdict.clone(), &blind) {
             run.acc.note(leaf, Stage::Candidate, true, c.marks_line());
             candidates.push(c);
         }
@@ -832,6 +833,7 @@ where
                 run.acc.verdicts,
                 b.decision_budget(),
                 provenance,
+                blind,
             ),
         },
         None => Resolution::Failed(
@@ -948,6 +950,7 @@ mod tests {
                     line: 1,
                 })
                 .collect(),
+            ..Default::default()
         }
     }
     fn first_text(edits: &[Edit]) -> String {
@@ -998,6 +1001,9 @@ mod tests {
         }
         fn provenance(&self, _: &()) -> Provenance {
             Provenance::new("fake", "0", BTreeMap::new(), BTreeMap::new()).unwrap()
+        }
+        fn blind_classes(&self) -> BTreeSet<UnseenClass> {
+            BTreeSet::from(crate::app::ALWAYS_BLIND)
         }
         fn check(
             &self,
@@ -1900,6 +1906,10 @@ mod tests {
         assert_eq!(evidence.verdicts().len(), 5);
         assert_eq!(evidence.budget(), fx.budget.decision_budget());
         assert_eq!(evidence.provenance().analyzer(), "fake");
+        assert_eq!(
+            evidence.blind_classes(),
+            &BTreeSet::from(crate::app::ALWAYS_BLIND)
+        );
     }
 
     #[test]

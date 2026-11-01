@@ -167,6 +167,13 @@ impl RiskMark {
 
 /// A kind of error the in-process check does not see. A candidate names it in its result, and
 /// the build after the commit settles it.
+///
+/// # Contract
+/// - C1: the display name of each class is its kebab-case name, `borrow`, `build-script`,
+///   `proc-macro-crate`, `visibility`, `const-eval`, `struct-literal-path`, `unused-type-param`,
+///   `derive-without-server`, `unresolved-path`, `duplicate-name`, `field-bounds`, `test-code`
+///   and `unexpanded-macro`.
+///   tested: domain::intent::tests::unseen_class_names_are_stable
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnseenClass {
     /// Borrow checking is not run by the analyzer.
@@ -175,8 +182,27 @@ pub enum UnseenClass {
     BuildScript,
     /// A proc-macro crate changed.
     ProcMacroCrate,
-    /// An item moved: privacy and cfg-gated paths across crates are not judged by the analyzer.
+    /// Privacy and cfg-gated paths across crates are not judged by the analyzer: an item moved.
     Visibility,
+    /// Constant evaluation is not run by the analyzer (E0080).
+    ConstEval,
+    /// A struct literal that names a path that is not a struct is not judged (E0422).
+    StructLiteralPath,
+    /// A type parameter no field uses is not judged (E0392).
+    UnusedTypeParam,
+    /// The proc-macro server is off, so a derive is not expanded.
+    DeriveWithoutServer,
+    /// The gap detector of unresolved names and path prefixes is off (E0405, E0425, E0433).
+    UnresolvedPath,
+    /// The gap detector of names an item and a `use` both define is off (E0255).
+    DuplicateName,
+    /// The gap detector of the traits a field owes to a derived impl is off (E0204, E0277, E0369).
+    FieldBounds,
+    /// Code under `#[cfg(test)]` and in tests is not diagnosed.
+    TestCode,
+    /// A file has a macro call the analyzer could not expand, so the unresolved-path detector
+    /// stayed silent on it. Observed in a check, never declared.
+    UnexpandedMacro,
 }
 
 impl std::fmt::Display for UnseenClass {
@@ -186,6 +212,15 @@ impl std::fmt::Display for UnseenClass {
             UnseenClass::BuildScript => "build-script",
             UnseenClass::ProcMacroCrate => "proc-macro-crate",
             UnseenClass::Visibility => "visibility",
+            UnseenClass::ConstEval => "const-eval",
+            UnseenClass::StructLiteralPath => "struct-literal-path",
+            UnseenClass::UnusedTypeParam => "unused-type-param",
+            UnseenClass::DeriveWithoutServer => "derive-without-server",
+            UnseenClass::UnresolvedPath => "unresolved-path",
+            UnseenClass::DuplicateName => "duplicate-name",
+            UnseenClass::FieldBounds => "field-bounds",
+            UnseenClass::TestCode => "test-code",
+            UnseenClass::UnexpandedMacro => "unexpanded-macro",
         })
     }
 }
@@ -907,6 +942,31 @@ mod tests {
         assert_eq!(UnseenClass::BuildScript.to_string(), "build-script");
         assert_eq!(UnseenClass::ProcMacroCrate.to_string(), "proc-macro-crate");
         assert_eq!(UnseenClass::Visibility.to_string(), "visibility");
+    }
+
+    #[test]
+    fn unseen_class_names_are_stable() {
+        let names = [
+            (UnseenClass::Borrow, "borrow"),
+            (UnseenClass::BuildScript, "build-script"),
+            (UnseenClass::ProcMacroCrate, "proc-macro-crate"),
+            (UnseenClass::Visibility, "visibility"),
+            (UnseenClass::ConstEval, "const-eval"),
+            (UnseenClass::StructLiteralPath, "struct-literal-path"),
+            (UnseenClass::UnusedTypeParam, "unused-type-param"),
+            (UnseenClass::DeriveWithoutServer, "derive-without-server"),
+            (UnseenClass::UnresolvedPath, "unresolved-path"),
+            (UnseenClass::DuplicateName, "duplicate-name"),
+            (UnseenClass::FieldBounds, "field-bounds"),
+            (UnseenClass::TestCode, "test-code"),
+            (UnseenClass::UnexpandedMacro, "unexpanded-macro"),
+        ];
+        for (class, name) in names {
+            assert_eq!(class.to_string(), name);
+        }
+        let distinct: std::collections::BTreeSet<String> =
+            names.iter().map(|(c, _)| c.to_string()).collect();
+        assert_eq!(distinct.len(), names.len());
     }
 
     #[test]

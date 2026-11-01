@@ -1,7 +1,7 @@
 //! Forks: apply edits in place on the session, diagnose, revert.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{Detector, collect_errors_par, panic_message};
+use crate::diagnostics::{Detector, GapDetector, collect_errors_par, panic_message};
 use crate::rev_deps::scoped_files;
 use crate::session::RaSession;
 use ra_ap_base_db::salsa::Durability;
@@ -12,8 +12,8 @@ use ra_ap_vfs::file_set::FileSet;
 use ra_ap_vfs::{AbsPathBuf, FileExcluded, FileId, VfsPath};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
 use ryo_v2_core::domain::baseline::{restrict, same_findings};
-use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
-use std::collections::HashMap;
+use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings, UnseenClass};
+use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use triomphe::Arc as TriArc;
@@ -161,8 +161,23 @@ pub(crate) fn diagnostics(
     fork: &RaFork,
     scope: Scope,
 ) -> Result<ScopedFindings, AnalyzerError> {
+    diagnostics_with_panics(a, session, fork, scope).map(|(found, _)| found)
+}
+
+/// The findings of one diagnostics run, and the detector and file of each detector panic
+/// contained in it.
+pub(crate) type Diagnosed = (ScopedFindings, Vec<(GapDetector, RelPath)>);
+
+/// [`diagnostics`], and the detector panics of the run (the `Analyzer` port has no place for
+/// them).
+pub(crate) fn diagnostics_with_panics(
+    a: &RaAnalyzer,
+    session: &RaSession,
+    fork: &RaFork,
+    scope: Scope,
+) -> Result<Diagnosed, AnalyzerError> {
     if !fork.applied {
-        return Ok(ScopedFindings::default());
+        return Ok((ScopedFindings::default(), Vec::new()));
     }
     let live = |files: &[(FileId, RelPath)]| -> Vec<(FileId, RelPath)> {
         let mut out: Vec<(FileId, RelPath)> = files
@@ -179,7 +194,7 @@ pub(crate) fn diagnostics(
         Scope::Workspace => workspace.clone(),
     };
 
-    let findings = collect_errors_par(
+    let collected = collect_errors_par(
         &session.host,
         &diag_scope,
         &workspace,
@@ -199,7 +214,19 @@ pub(crate) fn diagnostics(
         total_files: session.files.len(),
         check_ms: a.clock.now_ms().saturating_sub(fork.apply_started_ms),
     });
-    Ok(ScopedFindings { files, findings })
+    let unseen = if collected.unexpanded_macro {
+        BTreeSet::from([UnseenClass::UnexpandedMacro])
+    } else {
+        BTreeSet::new()
+    };
+    Ok((
+        ScopedFindings {
+            files,
+            findings: collected.findings,
+            unseen,
+        },
+        collected.panics,
+    ))
 }
 
 pub(crate) fn discard(
@@ -259,7 +286,8 @@ fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), 
                 fault: a.detector_fault.as_ref(),
                 panics: &session.detector_panics,
             },
-        )?;
+        )?
+        .findings;
         Some(same_findings(&after, &want))
     } else {
         None

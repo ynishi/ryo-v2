@@ -11,8 +11,10 @@ use ryo_v2_core::app::ports::{
 };
 use ryo_v2_core::domain::baseline::{restrict, same_findings};
 use ryo_v2_core::domain::text::revert_intact;
-use ryo_v2_core::domain::{Edit, Finding, Fingerprint, Provenance, RelPath, Scope, ScopedFindings};
-use std::collections::BTreeMap;
+use ryo_v2_core::domain::{
+    Edit, Finding, Fingerprint, Provenance, RelPath, Scope, ScopedFindings, UnseenClass,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The rust-analyzer release the adapter is built on; equals the `=` pin of the `ra_ap_*` crates
@@ -92,6 +94,41 @@ impl Verifier for RaAnalyzer {
         s.baseline.clone()
     }
 
+    /// The classes of error this analyzer, as configured, does not see.
+    ///
+    /// # Contract
+    /// - C1: always `Borrow`, `BuildScript`, `ProcMacroCrate`, `Visibility`, `ConstEval`,
+    ///   `StructLiteralPath` and `UnusedTypeParam`; and `DeriveWithoutServer` when `proc_macro`
+    ///   is off, `UnresolvedPath`, `DuplicateName` and `FieldBounds` when `gap_detectors` is off,
+    ///   and `TestCode` when `cfg_test` is off. `UnexpandedMacro` is never declared: a check
+    ///   observes it.
+    ///   tested: check::tests::ra_blind_classes_follow_the_config
+    fn blind_classes(&self) -> BTreeSet<UnseenClass> {
+        let mut blind = BTreeSet::from([
+            UnseenClass::Borrow,
+            UnseenClass::BuildScript,
+            UnseenClass::ProcMacroCrate,
+            UnseenClass::Visibility,
+            UnseenClass::ConstEval,
+            UnseenClass::StructLiteralPath,
+            UnseenClass::UnusedTypeParam,
+        ]);
+        if !self.config.proc_macro {
+            blind.insert(UnseenClass::DeriveWithoutServer);
+        }
+        if !self.config.gap_detectors {
+            blind.extend([
+                UnseenClass::UnresolvedPath,
+                UnseenClass::DuplicateName,
+                UnseenClass::FieldBounds,
+            ]);
+        }
+        if !self.config.cfg_test {
+            blind.insert(UnseenClass::TestCode);
+        }
+        blind
+    }
+
     /// The analyzer, its configuration and the fingerprint of each workspace file's database
     /// text, of the manifests and of the lock file.
     ///
@@ -156,6 +193,15 @@ impl Verifier for RaAnalyzer {
     /// - C4: a diagnostic re-assert that differs from the baseline is `RevertMismatch` and
     ///   poisons the session; the next call is `Poisoned`.
     ///   tested: tests/verifier.rs reassert_mismatch_poisons_the_session
+    /// - C5: a gap detector that panicked on a file of the scope in this check's own diagnostics,
+    ///   where it did not panic at baseline, makes the result `CheckError::DetectorPanicked` (the
+    ///   first by detector and file), with the edits still reverted and the session usable; one
+    ///   that panicked on the same file at baseline too does not fail the check and names the
+    ///   detector's class (`GapDetector::unseen_class`) in the findings' `unseen`.
+    ///   tested: tests/unresolved.rs detector_panic_is_contained_per_file
+    ///   tested: tests/gap_detectors.rs each_detector_panic_is_contained_on_its_own
+    /// - C6: `RevertMismatch` and `Poisoned` win over `DetectorPanicked`.
+    ///   tested: tests/verifier.rs session_errors_win_over_a_detector_panic
     fn check(
         &self,
         s: &mut RaSession,
@@ -195,7 +241,27 @@ impl Verifier for RaAnalyzer {
             (Err(AnalyzerError::Cancelled), Some(limit_ms)) if timed_out => {
                 Err(CheckError::TimedOut { limit_ms })
             }
-            (outcome, _) => outcome.map_err(|e| map_error(e, &edited)),
+            (outcome, _) => {
+                // An error of the run, the session's included, wins over a detector panic.
+                let (mut found, panics) = outcome.map_err(|e| map_error(e, &edited))?;
+                // A panic the baseline had on the same file is a blind spot of the detector there
+                // before any edit: named, not a failure. A new one means the file cannot be judged.
+                let mut new_panic = None;
+                for (detector, file) in panics {
+                    if s.baseline_panics.contains(&(detector, file.clone())) {
+                        found.unseen.insert(detector.unseen_class());
+                    } else if new_panic.is_none() {
+                        new_panic = Some((detector, file));
+                    }
+                }
+                match new_panic {
+                    Some((detector, file)) => Err(CheckError::DetectorPanicked {
+                        detector: detector.name().to_owned(),
+                        file,
+                    }),
+                    None => Ok(found),
+                }
+            }
         }
     }
 }
@@ -235,7 +301,8 @@ impl RevertAudit for RaAnalyzer {
                 panics: &s.detector_panics,
             },
         )
-        .map_err(|e| map_error(e, &edited))?;
+        .map_err(|e| map_error(e, &edited))?
+        .findings;
         let paths: Vec<RelPath> = scope.iter().map(|(_, r)| r.clone()).collect();
         if same_findings(&found, &restrict(&s.baseline, &paths)) {
             Ok(())
@@ -248,13 +315,13 @@ impl RevertAudit for RaAnalyzer {
 
 /// fork, apply, diagnostics, discard; discard always runs. The `Err` that wins: apply, then
 /// diagnostics, then discard (the same as `app::verify`). The flag says that the cut-off ended
-/// the diagnostics.
+/// the diagnostics. The panics are those of the detectors in this run's diagnostics.
 fn run_fork(
     a: &RaAnalyzer,
     s: &mut RaSession,
     edits: &[Edit],
     scope: Scope,
-) -> (Result<ScopedFindings, AnalyzerError>, bool) {
+) -> (Result<fork::Diagnosed, AnalyzerError>, bool) {
     let mut f = match a.fork(s) {
         Ok(f) => f,
         Err(e) => return (Err(e), false),
@@ -266,7 +333,7 @@ fn run_fork(
             s.deadline = a
                 .check_timeout_ms
                 .map(|ms| Deadline::after(a.clock.clone(), ms));
-            let r = a.diagnostics(s, &f, scope);
+            let r = fork::diagnostics_with_panics(a, s, &f, scope);
             timed_out = s.deadline.take().is_some_and(|d| d.was_hit());
             Some(r)
         }
@@ -274,7 +341,7 @@ fn run_fork(
     };
     let discarded = a.discard(s, f);
     let outcome = applied.and_then(|()| {
-        let found = checked.unwrap_or_else(|| Ok(ScopedFindings::default()))?;
+        let found = checked.unwrap_or_else(|| Ok((ScopedFindings::default(), Vec::new())))?;
         discarded?;
         Ok(found)
     });
@@ -290,6 +357,54 @@ mod tests {
         let manifest = include_str!("../../../Cargo.toml");
         let pin = format!("ra_ap_ide = \"={ANALYZER_VERSION}\"");
         assert!(manifest.contains(&pin), "{pin}");
+    }
+
+    #[test]
+    fn ra_blind_classes_follow_the_config() {
+        use crate::RaConfig;
+        use ryo_v2_core::infra::clock::MonotonicClock;
+        use ryo_v2_core::infra::observer::RecordingObserver;
+        use std::sync::Arc;
+
+        let always = BTreeSet::from([
+            UnseenClass::Borrow,
+            UnseenClass::BuildScript,
+            UnseenClass::ProcMacroCrate,
+            UnseenClass::Visibility,
+            UnseenClass::ConstEval,
+            UnseenClass::StructLiteralPath,
+            UnseenClass::UnusedTypeParam,
+        ]);
+        for mask in 0..8u8 {
+            let (proc_macro, gap_detectors, cfg_test) =
+                (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+            let a = RaAnalyzer::new(
+                RaConfig {
+                    proc_macro,
+                    gap_detectors,
+                    cfg_test,
+                    ..RaConfig::default()
+                },
+                Arc::new(MonotonicClock::new()),
+                Arc::new(RecordingObserver::default()),
+            );
+            let mut want = always.clone();
+            if !proc_macro {
+                want.insert(UnseenClass::DeriveWithoutServer);
+            }
+            if !gap_detectors {
+                want.extend([
+                    UnseenClass::UnresolvedPath,
+                    UnseenClass::DuplicateName,
+                    UnseenClass::FieldBounds,
+                ]);
+            }
+            if !cfg_test {
+                want.insert(UnseenClass::TestCode);
+            }
+            assert_eq!(a.blind_classes(), want, "{mask:03b}");
+            assert!(!a.blind_classes().contains(&UnseenClass::UnexpandedMacro));
+        }
     }
 
     #[test]

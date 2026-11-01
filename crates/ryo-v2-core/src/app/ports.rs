@@ -2,8 +2,9 @@
 
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, ChangeProbe, CheckFailure, Edit, Finding, JudgeRequest,
-    Judgement, Provenance, RelPath, Scope, ScopedFindings, StaticMetrics, Target,
+    Judgement, Provenance, RelPath, Scope, ScopedFindings, StaticMetrics, Target, UnseenClass,
 };
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Failure of an [`Analyzer`] operation.
@@ -80,14 +81,23 @@ pub enum CheckError {
     /// The analyzer reported a load failure during a check.
     #[error("load failed: {0}")]
     Load(String),
+    /// A detector panicked on a file the check read, so the check cannot judge that file. The
+    /// session was restored.
+    #[error("detector {detector} panicked on {file}")]
+    DetectorPanicked {
+        /// The detector, by the adapter's name for it; the domain only shows it.
+        detector: String,
+        /// The file.
+        file: RelPath,
+    },
 }
 
 /// How far a [`CheckError`] reaches.
 ///
 /// The adapter reverts the edits and compares the text fingerprints of the edited files after
 /// every check, whatever its result, and a difference is `RevertMismatch`. So an `Edit`,
-/// `Cancelled` or `Panicked` that comes back says the session was restored and only this
-/// Blueprint's check did not finish.
+/// `Cancelled`, `Panicked` or `DetectorPanicked` that comes back says the session was restored
+/// and only this Blueprint's check did not finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckReach {
     /// Only the Blueprint being checked: it is blocked, and the decision goes on.
@@ -104,15 +114,16 @@ impl CheckError {
     /// itself failed. None of these can be pinned on the Blueprint.
     ///
     /// # Contract
-    /// - C1: `Edit`, `Cancelled`, `Panicked` and `TimedOut` reach the Blueprint; `RevertMismatch`,
-    ///   `Poisoned`, `ForkInUse`, `AlreadyApplied` and `Load` reach the session. The match is
-    ///   exhaustive, so a new variant must be classified to compile.
+    /// - C1: `Edit`, `Cancelled`, `Panicked`, `DetectorPanicked` and `TimedOut` reach the
+    ///   Blueprint; `RevertMismatch`, `Poisoned`, `ForkInUse`, `AlreadyApplied` and `Load` reach
+    ///   the session. The match is exhaustive, so a new variant must be classified to compile.
     ///   tested: app::ports::tests::check_error_reach_is_decided_per_variant
     pub fn reach(&self) -> CheckReach {
         match self {
             CheckError::Edit { .. }
             | CheckError::Cancelled
             | CheckError::Panicked(_)
+            | CheckError::DetectorPanicked { .. }
             | CheckError::TimedOut { .. } => CheckReach::Blueprint,
             CheckError::RevertMismatch { .. }
             | CheckError::Poisoned(_)
@@ -123,8 +134,8 @@ impl CheckError {
     }
 
     /// The blocking of `blueprint` for a failure of reach `Blueprint`; the failure itself for
-    /// one of reach `Session`. `TimedOut` is `Blocking::BudgetExhausted`; `Edit`, `Cancelled`
-    /// and `Panicked` are `Blocking::CheckFailed`.
+    /// one of reach `Session`. `TimedOut` is `Blocking::BudgetExhausted`; `Edit`, `Cancelled`,
+    /// `Panicked` and `DetectorPanicked` are `Blocking::CheckFailed`.
     pub fn into_blocking(self, blueprint: BlueprintId) -> Result<Blocking, CheckError> {
         match self {
             CheckError::TimedOut { limit_ms } => Ok(Blocking::BudgetExhausted {
@@ -142,6 +153,10 @@ impl CheckError {
             CheckError::Panicked(m) => Ok(Blocking::CheckFailed {
                 blueprint,
                 failure: CheckFailure::Panicked(m),
+            }),
+            CheckError::DetectorPanicked { detector, file } => Ok(Blocking::CheckFailed {
+                blueprint,
+                failure: CheckFailure::DetectorPanicked { detector, file },
             }),
             session @ (CheckError::RevertMismatch { .. }
             | CheckError::Poisoned(_)
@@ -174,6 +189,9 @@ pub trait Verifier {
     /// The analyzer, its configuration and the fingerprint of each file of the session's base
     /// workspace. The domain never reads these values; it carries them into the evidence.
     fn provenance(&self, s: &Self::Session) -> Provenance;
+    /// The classes of error this checker does not see, as it is configured. There is no default:
+    /// an empty set is a claim that it sees every class, so each checker states its own.
+    fn blind_classes(&self) -> BTreeSet<UnseenClass>;
     /// Applies `edits`, diagnoses the files of `scope`, and reverts. The observable state of
     /// the session afterwards is the state before.
     fn check(
@@ -340,6 +358,10 @@ mod tests {
             CheckError::Cancelled,
             CheckError::Panicked("p".to_owned()),
             CheckError::TimedOut { limit_ms: 7 },
+            CheckError::DetectorPanicked {
+                detector: "d".to_owned(),
+                file: rel("src/a.rs"),
+            },
         ];
         for e in blueprint_reach {
             assert_eq!(e.reach(), CheckReach::Blueprint, "{e:?}");
@@ -391,6 +413,20 @@ mod tests {
             Ok(Blocking::CheckFailed {
                 blueprint: id,
                 failure: CheckFailure::Panicked("p".to_owned())
+            })
+        );
+        assert_eq!(
+            CheckError::DetectorPanicked {
+                detector: "d".to_owned(),
+                file: rel("src/a.rs")
+            }
+            .into_blocking(id),
+            Ok(Blocking::CheckFailed {
+                blueprint: id,
+                failure: CheckFailure::DetectorPanicked {
+                    detector: "d".to_owned(),
+                    file: rel("src/a.rs")
+                }
             })
         );
     }

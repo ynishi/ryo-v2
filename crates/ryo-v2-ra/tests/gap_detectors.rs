@@ -469,7 +469,7 @@ pub struct Unknown {
 
 #[test]
 fn each_detector_panic_is_contained_on_its_own() {
-    use ryo_v2_core::app::ports::Verifier;
+    use ryo_v2_core::app::ports::{CheckError, Verifier};
     use ryo_v2_core::domain::FindingCode;
     let lib = "pub struct S;\n\
 pub fn g(s: S) {\n    s.missing();\n}\n\
@@ -537,9 +537,52 @@ pub struct Note {\n    pub text: String,\n}\n";
             panics[0].message.contains("fault injected"),
             "got {panics:?}"
         );
+        // The detector panicked on this file at baseline too: a check that reads it passes on and
+        // names the detector's class, again on a second check.
         let edit = Edit::write(lib_rel.clone(), format!("{lib}// edited\n"));
-        a.check(&mut s, &[edit], Scope::Affected)
-            .expect("check is not poisoned");
+        for _ in 0..2 {
+            let found = a
+                .check(&mut s, std::slice::from_ref(&edit), Scope::Affected)
+                .expect("a panic the baseline had is named, not a failure");
+            assert!(
+                found.unseen.contains(&d.unseen_class()),
+                "{d}: got {:?}",
+                found.unseen
+            );
+        }
+        // On a session whose baseline had no panic, the same panic means the file cannot be
+        // judged: the failure names the detector and the file, the session is usable, and the
+        // same check fails the same way again. The session is loaded without the fault and
+        // checked with it; the re-assert after the revert is off, as it would diagnose with the
+        // fault too and differ from that baseline.
+        let no_assert = || {
+            RaAnalyzer::new(
+                RaConfig {
+                    proc_macro: false,
+                    threads: Some(1),
+                    assert_revert: false,
+                    gap_detectors: true,
+                    assert_revert_every: None,
+                    cfg_test: false,
+                },
+                Arc::new(MonotonicClock::new()),
+                Arc::new(RecordingObserver::default()),
+            )
+        };
+        let mut s1 = no_assert().load(&p.dir).expect("load without fault");
+        let faulty = no_assert().with_detector_fault(Some((d, lib_rel.clone())));
+        for _ in 0..2 {
+            let err = faulty
+                .check(&mut s1, std::slice::from_ref(&edit), Scope::Affected)
+                .expect_err("a new detector panic is a failed check");
+            assert_eq!(
+                err,
+                CheckError::DetectorPanicked {
+                    detector: d.name().to_owned(),
+                    file: lib_rel.clone(),
+                }
+            );
+        }
     }
 }
 

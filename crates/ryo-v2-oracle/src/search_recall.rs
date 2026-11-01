@@ -652,9 +652,15 @@ where
         return Ok(skipped("the overlay makes no edit".into()));
     }
     let clean = case.clean_texts(&edits)?;
-    let checked = v
-        .check(s, &edits, Scope::Affected)
-        .map_err(RecallError::Check)?;
+    let checked = match v.check(s, &edits, Scope::Affected) {
+        Ok(checked) => checked,
+        // The planted state cannot be judged, and the session is intact: skip the case without
+        // the reload a search error makes.
+        Err(e @ CheckError::DetectorPanicked { .. }) => {
+            return Ok(skipped(format!("planted state cannot be checked: {e}")));
+        }
+        Err(e) => return Err(RecallError::Check(e)),
+    };
     let verdict = Verdict::from_baseline(&v.baseline(s), &checked);
     if !verdict.passed() {
         return Ok(skipped(format!(

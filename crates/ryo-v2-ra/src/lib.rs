@@ -49,9 +49,10 @@ pub struct RaConfig {
     /// `CargoConfig::set_test`: `#[cfg(test)]` code of workspace members is enabled, so it is diagnosed.
     ///
     /// # Contract
-    /// - C1: with `true` an error inside a `#[cfg(test)]` module is in the baseline; with the
-    ///   default `false` it is not.
+    /// - C1: with the default `true` an error inside a `#[cfg(test)]` module is in the baseline;
+    ///   with `false` it is not.
     ///   tested: tests/verifier.rs cfg_test_config_diagnoses_test_module
+    ///   tested: tests/verifier.rs ra_config_default_diagnoses_test_code
     pub cfg_test: bool,
 }
 
@@ -63,7 +64,7 @@ impl Default for RaConfig {
             assert_revert: false,
             gap_detectors: true,
             assert_revert_every: None,
-            cfg_test: false,
+            cfg_test: true,
         }
     }
 }

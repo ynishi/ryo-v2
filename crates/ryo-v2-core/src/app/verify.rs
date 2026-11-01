@@ -70,6 +70,7 @@ mod tests {
             Ok(ScopedFindings {
                 files: self.files.clone(),
                 findings: self.findings.clone(),
+                ..Default::default()
             })
         }
         fn discard(&self, _: &mut (), _: ()) -> Result<(), AnalyzerError> {
