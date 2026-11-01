@@ -1,8 +1,9 @@
 //! What came of a set of Blueprints: candidates that passed, or why none did.
 //!
 //! The central rule is [`disposition`]: whether a passing candidate may be applied without a
-//! human, needs a build first, or needs a review. It is a table, read top to bottom, and an
-//! outer check that is required is never skipped by an auto-apply.
+//! human or needs a review. It is a table of the Rule and the review, read top to bottom. The
+//! classes of error the in-process check cannot see are named in the candidate
+//! ([`unseen_classes`]); the build after the commit settles them.
 //!
 //! The marks and the Rule that feed the table are derived here, from the Blueprints of a path
 //! and the roles of the files it edits ([`risk_marks`], [`covering_rule`]); a caller never
@@ -12,49 +13,26 @@ use super::stage::Staged;
 use super::{
     Basis, Blueprint, BlueprintId, DomainError, Drift, Edit, FileRole, Fingerprint, IntentKind,
     NonEmpty, Nonconformance, RelPath, RiskMark, Rule, RuleCatalog, RuleId, Scope, SpliceError,
-    Verdict,
+    UnseenClass, Verdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Why a build or test must run before a candidate is applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum OuterCheckReason {
-    /// Borrow checking is not run by the analyzer.
-    Borrow,
-    /// A build script changed.
-    BuildScript,
-    /// A proc-macro crate changed.
-    ProcMacroCrate,
-    /// An item moved: privacy and cfg-gated paths across crates are not judged by the analyzer.
-    Visibility,
-}
-
-impl std::fmt::Display for OuterCheckReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            OuterCheckReason::Borrow => "borrow",
-            OuterCheckReason::BuildScript => "build-script",
-            OuterCheckReason::ProcMacroCrate => "proc-macro-crate",
-            OuterCheckReason::Visibility => "visibility",
-        })
-    }
-}
-
-/// The checks outside the analyzer that a candidate still needs. Never empty.
+/// The classes of error the in-process check does not see that a candidate carries, named in its
+/// result for the build after the commit to settle. Never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OuterCheck(BTreeSet<OuterCheckReason>);
+pub struct UnseenClasses(BTreeSet<UnseenClass>);
 
-impl OuterCheck {
-    /// Why the check is needed.
-    pub fn reasons(&self) -> &BTreeSet<OuterCheckReason> {
+impl UnseenClasses {
+    /// The classes.
+    pub fn classes(&self) -> &BTreeSet<UnseenClass> {
         &self.0
     }
 }
 
-impl std::fmt::Display for OuterCheck {
+impl std::fmt::Display for UnseenClasses {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<String> = self.0.iter().map(ToString::to_string).collect();
-        write!(f, "outer check ({})", names.join(", "))
+        write!(f, "unseen ({})", names.join(", "))
     }
 }
 
@@ -85,13 +63,8 @@ impl std::fmt::Display for ReviewReason {
 /// What may happen to a passing candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
-    /// A Rule covers it and nothing else is needed.
+    /// A Rule covers it. The unseen classes it names are settled by the build after the commit.
     AutoApplicable {
-        /// The Rule.
-        rule: RuleId,
-    },
-    /// A Rule covers it, once the outer check has passed.
-    AfterOuterCheck {
         /// The Rule.
         rule: RuleId,
     },
@@ -106,37 +79,24 @@ impl std::fmt::Display for Disposition {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Disposition::AutoApplicable { rule } => write!(f, "auto-applicable (rule {rule})"),
-            Disposition::AfterOuterCheck { rule } => {
-                write!(f, "applicable after the outer check (rule {rule})")
-            }
             Disposition::NeedsReview { reason } => write!(f, "needs review: {reason}"),
         }
     }
 }
 
-/// The checks outside the analyzer that `marks` call for, or `None` if there are none.
+/// The classes of unseen error that `marks` name, or `None` if there are none.
 ///
 /// # Contract
-/// - C1: the reasons are those of `Borrow`, `BuildScript`, `ProcMacroCrate` and `Visibility`
-///   among `marks`; `None` when there is none of them (`Behaviour` alone asks for a review, not
-///   a build).
-///   tested: domain::resolution::tests::outer_check_is_never_auto_applicable
-///   tested: domain::resolution::tests::visibility_owes_outer_check_not_review
-pub fn outer_check(marks: &BTreeSet<RiskMark>) -> Option<OuterCheck> {
-    let reasons: BTreeSet<OuterCheckReason> = marks
-        .iter()
-        .filter_map(|m| match m {
-            RiskMark::Borrow => Some(OuterCheckReason::Borrow),
-            RiskMark::BuildScript => Some(OuterCheckReason::BuildScript),
-            RiskMark::ProcMacroCrate => Some(OuterCheckReason::ProcMacroCrate),
-            RiskMark::Visibility => Some(OuterCheckReason::Visibility),
-            RiskMark::Behaviour => None,
-        })
-        .collect();
-    if reasons.is_empty() {
+/// - C1: the classes are those that [`RiskMark::unseen_class`] gives for `marks`; `None` when it
+///   gives none (`Behaviour` is not a kind of error, so it adds no class).
+///   tested: domain::resolution::tests::unseen_classes_follow_the_marks
+///   tested: domain::resolution::tests::visibility_is_named_not_reviewed
+pub fn unseen_classes(marks: &BTreeSet<RiskMark>) -> Option<UnseenClasses> {
+    let classes: BTreeSet<UnseenClass> = marks.iter().filter_map(|m| m.unseen_class()).collect();
+    if classes.is_empty() {
         None
     } else {
-        Some(OuterCheck(reasons))
+        Some(UnseenClasses(classes))
     }
 }
 
@@ -145,11 +105,13 @@ pub fn outer_check(marks: &BTreeSet<RiskMark>) -> Option<OuterCheck> {
 /// # Contract
 /// - C1: the first matching row wins: `Behaviour` gives `NeedsReview{Behaviour}`, then
 ///   `ProcMacroCrate` gives `NeedsReview{ProcMacroCrate}`, then no Rule gives `NoRule`, then
-///   a `scope` that does not cover the Rule's `min_scope` gives `ScopeTooNarrow`, then an
-///   outer check gives `AfterOuterCheck`, else `AutoApplicable`.
+///   a `scope` that does not cover the Rule's `min_scope` gives `ScopeTooNarrow`, else
+///   `AutoApplicable`.
 ///   tested: domain::resolution::tests::disposition_table_first_row_wins
-/// - C2: a candidate whose outer check is `Some` is never `AutoApplicable`.
-///   tested: domain::resolution::tests::outer_check_is_never_auto_applicable
+/// - C2: marks that only name an unseen class (`Borrow`, `BuildScript`, `Visibility`) do not
+///   change the disposition: adding or removing any of them from any set of marks gives the
+///   same disposition.
+///   tested: domain::resolution::tests::unseen_marks_never_change_disposition
 pub fn disposition(marks: &BTreeSet<RiskMark>, rule: Option<&Rule>, scope: Scope) -> Disposition {
     let review = |reason| Disposition::NeedsReview { reason };
     if marks.contains(&RiskMark::Behaviour) {
@@ -164,11 +126,7 @@ pub fn disposition(marks: &BTreeSet<RiskMark>, rule: Option<&Rule>, scope: Scope
     if !scope.covers(rule.min_scope()) {
         return review(ReviewReason::ScopeTooNarrow);
     }
-    if outer_check(marks).is_some() {
-        Disposition::AfterOuterCheck { rule: rule.id() }
-    } else {
-        Disposition::AutoApplicable { rule: rule.id() }
-    }
+    Disposition::AutoApplicable { rule: rule.id() }
 }
 
 /// The marks of a change made by `kinds` to files of `roles`.
@@ -240,7 +198,7 @@ pub struct Candidate {
     verdict: Verdict,
     basis: Basis,
     marks: BTreeSet<RiskMark>,
-    outer_check: Option<OuterCheck>,
+    unseen_classes: Option<UnseenClasses>,
     disposition: Disposition,
 }
 
@@ -254,8 +212,8 @@ impl Candidate {
     /// - C1: returns `Err(verdict)` unless `verdict.passed()`.
     ///   tested: domain::resolution::tests::candidate_refuses_failed_verdict
     /// - C2: the marks are [`risk_marks`] of the intent kinds of the path of `staged` and its
-    ///   roles, the Rule is [`covering_rule`] of those kinds, and `outer_check` and
-    ///   `disposition` follow from them with [`outer_check`] and [`disposition`]; a path with an
+    ///   roles, the Rule is [`covering_rule`] of those kinds, and `unseen_classes` and
+    ///   `disposition` follow from them with [`unseen_classes`] and [`disposition`]; a path with an
     ///   intent whose catalog risks hold `Behaviour` is `NeedsReview{Behaviour}` whatever the
     ///   catalog holds.
     ///   tested: domain::resolution::tests::candidate_derives_marks_and_rule
@@ -278,7 +236,7 @@ impl Candidate {
             edits,
             verdict,
             basis,
-            outer_check: outer_check(&marks),
+            unseen_classes: unseen_classes(&marks),
             disposition: disposition(&marks, rule, scope),
             marks,
         })
@@ -318,9 +276,9 @@ impl Candidate {
         &self.marks
     }
 
-    /// The checks still needed outside the analyzer.
-    pub fn outer_check(&self) -> Option<&OuterCheck> {
-        self.outer_check.as_ref()
+    /// The classes of error the analyzer does not see that it carries.
+    pub fn unseen_classes(&self) -> Option<&UnseenClasses> {
+        self.unseen_classes.as_ref()
     }
 
     /// What may happen to it.
@@ -500,8 +458,6 @@ impl std::fmt::Display for Blocking {
 
 /// At most this many new errors makes a failed Blueprint a near miss.
 pub const NEAR_MISS_MAX: usize = 2;
-/// At most this many outer checks are suggested at once.
-pub const OUTER_CHECK_MAX: usize = 3;
 
 /// A Blueprint that failed by only a few new errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1062,47 +1018,71 @@ mod tests {
     }
 
     #[test]
-    fn outer_check_is_never_auto_applicable() {
+    fn unseen_classes_follow_the_marks() {
+        for mask in 0..32u8 {
+            let m = marks(mask);
+            let expected: BTreeSet<UnseenClass> =
+                m.iter().filter_map(|k| k.unseen_class()).collect();
+            match unseen_classes(&m) {
+                Some(u) => {
+                    assert!(!expected.is_empty(), "{m:?}");
+                    assert_eq!(u.classes(), &expected, "{m:?}");
+                }
+                None => assert!(expected.is_empty(), "{m:?}"),
+            }
+        }
+        assert!(unseen_classes(&marks(0)).is_none());
+        assert!(unseen_classes(&BTreeSet::from([RiskMark::Behaviour])).is_none());
+        let both =
+            unseen_classes(&BTreeSet::from([RiskMark::Borrow, RiskMark::BuildScript])).unwrap();
+        assert_eq!(
+            both.classes(),
+            &BTreeSet::from([UnseenClass::Borrow, UnseenClass::BuildScript])
+        );
+        let named =
+            unseen_classes(&BTreeSet::from([RiskMark::Borrow, RiskMark::Visibility])).unwrap();
+        assert_eq!(named.to_string(), "unseen (borrow, visibility)");
+    }
+
+    #[test]
+    fn unseen_marks_never_change_disposition() {
         let rule = rule();
+        let only_unseen = [
+            RiskMark::Borrow,
+            RiskMark::BuildScript,
+            RiskMark::Visibility,
+        ];
         for mask in 0..32u8 {
             let m = marks(mask);
             for r in [None, Some(&rule)] {
                 for scope in [Scope::Affected, Scope::Workspace] {
-                    let d = disposition(&m, r, scope);
-                    let oc = outer_check(&m);
-                    if oc.is_some() {
-                        assert!(
-                            !matches!(d, Disposition::AutoApplicable { .. }),
-                            "{m:?} {r:?} {scope}"
+                    for u in only_unseen {
+                        let mut with = m.clone();
+                        with.insert(u);
+                        let mut without = m.clone();
+                        without.remove(&u);
+                        assert_eq!(
+                            disposition(&with, r, scope),
+                            disposition(&without, r, scope),
+                            "{m:?} {u} {r:?} {scope}"
                         );
-                    }
-                    if matches!(d, Disposition::AutoApplicable { .. }) {
-                        assert!(oc.is_none() && r.is_some() && !m.contains(&RiskMark::Behaviour));
                     }
                 }
             }
         }
-        assert!(outer_check(&marks(0)).is_none());
-        assert!(outer_check(&BTreeSet::from([RiskMark::Behaviour])).is_none());
-        let both = outer_check(&BTreeSet::from([RiskMark::Borrow, RiskMark::BuildScript])).unwrap();
-        assert_eq!(
-            both.reasons(),
-            &BTreeSet::from([OuterCheckReason::Borrow, OuterCheckReason::BuildScript])
-        );
     }
 
     #[test]
-    fn visibility_owes_outer_check_not_review() {
+    fn visibility_is_named_not_reviewed() {
         let rule = rule();
         let vis = BTreeSet::from([RiskMark::Visibility]);
         assert_eq!(
-            outer_check(&vis).unwrap().reasons(),
-            &BTreeSet::from([OuterCheckReason::Visibility])
+            unseen_classes(&vis).unwrap().classes(),
+            &BTreeSet::from([UnseenClass::Visibility])
         );
-        assert_eq!(OuterCheckReason::Visibility.to_string(), "visibility");
         assert_eq!(
             disposition(&vis, Some(&rule), Scope::Workspace),
-            Disposition::AfterOuterCheck { rule: rule.id() }
+            Disposition::AutoApplicable { rule: rule.id() }
         );
         assert_eq!(
             disposition(&vis, None, Scope::Workspace),
@@ -1168,7 +1148,7 @@ mod tests {
             disposition(&m(&[RiskMark::Behaviour]), None, Scope::Affected),
             review(ReviewReason::Behaviour)
         );
-        // ProcMacroCrate beats NoRule and an outer check
+        // ProcMacroCrate beats NoRule
         assert_eq!(
             disposition(
                 &m(&[RiskMark::ProcMacroCrate, RiskMark::Borrow]),
@@ -1177,12 +1157,12 @@ mod tests {
             ),
             review(ReviewReason::ProcMacroCrate)
         );
-        // NoRule beats the outer check
+        // NoRule beats a mark that names an unseen class
         assert_eq!(
             disposition(&m(&[RiskMark::Borrow]), None, Scope::Workspace),
             review(ReviewReason::NoRule)
         );
-        // ScopeTooNarrow beats the outer check
+        // ScopeTooNarrow beats a mark that names an unseen class
         assert_eq!(
             disposition(&m(&[RiskMark::Borrow]), Some(&rule), Scope::Affected),
             review(ReviewReason::ScopeTooNarrow)
@@ -1193,7 +1173,7 @@ mod tests {
         );
         assert_eq!(
             disposition(&m(&[RiskMark::BuildScript]), Some(&rule), Scope::Workspace),
-            Disposition::AfterOuterCheck { rule: id }
+            Disposition::AutoApplicable { rule: id }
         );
         assert_eq!(
             disposition(&m(&[]), Some(&rule), Scope::Workspace),
@@ -1205,7 +1185,20 @@ mod tests {
     fn crate_graph_edits_never_pass_silently() {
         // The pure half; `app::apply::tests` drives the same cases through `apply_blueprints`.
         let rules = RuleCatalog::new(vec![rule()]).unwrap();
-        for role in [FileRole::BuildScript, FileRole::ProcMacroSource] {
+        for (role, named, disposition) in [
+            (
+                FileRole::BuildScript,
+                UnseenClass::BuildScript,
+                Disposition::AutoApplicable { rule: rule().id() },
+            ),
+            (
+                FileRole::ProcMacroSource,
+                UnseenClass::ProcMacroCrate,
+                Disposition::NeedsReview {
+                    reason: ReviewReason::ProcMacroCrate,
+                },
+            ),
+        ] {
             let c = Candidate::new(
                 staged(&[IntentKind::MoveItem], BTreeSet::from([role]), vec![]),
                 passing(),
@@ -1213,11 +1206,11 @@ mod tests {
                 Scope::Workspace,
             )
             .unwrap();
-            assert!(c.outer_check().is_some(), "{role}");
-            assert!(!matches!(
-                c.disposition(),
-                Disposition::AutoApplicable { .. }
-            ));
+            assert!(
+                c.unseen_classes().unwrap().classes().contains(&named),
+                "{role}"
+            );
+            assert_eq!(c.disposition(), disposition, "{role}");
         }
     }
 
@@ -1293,7 +1286,7 @@ mod tests {
                         let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
                         let rule = covering_rule(kinds, rules);
                         assert_eq!(c.marks(), &marks);
-                        assert_eq!(c.outer_check(), outer_check(&marks).as_ref());
+                        assert_eq!(c.unseen_classes(), unseen_classes(&marks).as_ref());
                         assert_eq!(c.disposition(), disposition(&marks, rule, scope));
                         let kinds_of: Vec<_> = c.path().iter().map(|b| b.intent().kind()).collect();
                         assert_eq!(&kinds_of, kinds);

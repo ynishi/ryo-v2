@@ -16,9 +16,9 @@ use crate::domain::search::{prune, rank_final, reward_score, score};
 use crate::domain::stage::{On, Refused, Staged, stage, view_of};
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, Infeasible, Inserted,
-    IntentKind, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, OUTER_CHECK_MAX, Prior,
-    Proposal, ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, RuleCatalog, Scope,
-    Scored, SearchBudget, SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
+    IntentKind, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, Prior, Proposal,
+    ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, RuleCatalog, Scope, Scored,
+    SearchBudget, SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroU16;
@@ -358,13 +358,13 @@ fn sat32(n: usize) -> u32 {
 ///   `SearchError::RevertAudit`. A search that ends in an error is not audited.
 ///   tested: app::search::tests::revert_audit_runs_once_at_end
 /// - C8: the ranking holds every node that passed, at any depth, by `rank_final`, each with
-///   the Blueprints of its path and its prior. The resolution is `Decided` with the first
-///   `OUTER_CHECK_MAX` of the ranking as candidates in that order, each with the marks and
+///   the Blueprints of its path and its prior. The resolution is `Decided` with every node of
+///   the ranking as a candidate, in the order of the ranking, each with the marks and
 ///   the rule the domain derives from the Blueprints of its path and the file roles of its
 ///   node; the rule is `None` unless every intent on the path has a rule, and then the one with
 ///   the widest `min_scope`, the leaf's on a tie. With no node that passed the resolution is
 ///   `Failed` with every blocking, and the budget flag, of the search.
-///   tested: app::search::tests::decided_lists_top_outer_check_max_by_reward
+///   tested: app::search::tests::decided_lists_every_passing_node_by_reward
 ///   tested: app::search::tests::path_rule_needs_a_rule_for_every_kind
 ///   tested: app::search::tests::hard_budget_with_nothing_verified_is_failed_exhausted
 /// - C9: a prior decides which children are kept and in which order they are checked, never
@@ -812,7 +812,7 @@ where
         })
         .collect();
     let mut candidates = Vec::new();
-    for r in ranking.iter().take(OUTER_CHECK_MAX) {
+    for r in &ranking {
         let (Some(verdict), Some(done)) = (run.verdicts.get(&r.node), staged_of.remove(&r.node))
         else {
             continue;
@@ -1729,7 +1729,7 @@ mod tests {
             .unwrap();
         assert_eq!(child.path().len(), 2);
         assert!(child.marks().contains(&RiskMark::BuildScript));
-        assert!(child.outer_check().is_some());
+        assert!(child.unseen_classes().is_some());
         let parent = decided(&r)
             .iter()
             .find(|c| c.blueprint() == bid(1))
@@ -1882,7 +1882,7 @@ mod tests {
     }
 
     #[test]
-    fn decided_lists_top_outer_check_max_by_reward() {
+    fn decided_lists_every_passing_node_by_reward() {
         let mut fx = Fx::new(BASE);
         fx.rename_children(1, &["b", "c", "d", "e", "f"]);
         for (text, n) in [
@@ -1896,11 +1896,10 @@ mod tests {
         }
         let r = fx.run().unwrap();
 
-        assert_eq!(OUTER_CHECK_MAX, 3);
         let ids: Vec<BlueprintId> = decided(&r).iter().map(Candidate::blueprint).collect();
-        assert_eq!(ids, vec![bid(2), bid(4), bid(5)]);
+        assert_eq!(ids, vec![bid(2), bid(4), bid(5), bid(1), bid(3)]);
         let ranked: Vec<BlueprintId> = r.ranking.iter().map(|x| x.path[0]).collect();
-        assert_eq!(ranked, vec![bid(2), bid(4), bid(5), bid(1), bid(3)]);
+        assert_eq!(ranked, ids);
         let Resolution::Decided { evidence, .. } = &r.resolution else {
             panic!("expected Decided");
         };

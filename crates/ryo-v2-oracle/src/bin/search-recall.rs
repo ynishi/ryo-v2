@@ -7,7 +7,7 @@
 //!   directory (`ryo-rs`, a verification repository used as a large sample). Cases go to `--out`, by default `corpus/search/<ws>`; an `--out` with a
 //!   `target` component is refused.
 //! - `search-recall run <cases-dir> [--limit N] [--beam N] [--exhaustive] [--outer-check]
-//!   [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro]`
+//!   [--outer-sample N] [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro]`
 //!
 //! `run` loads one session per workspace, runs every case of it with the production assert
 //! sampling (a diagnostic re-assert every 50th check, decision D2 in SEARCH_LEDGER.md) and prints the recall table.
@@ -15,12 +15,13 @@
 //! so a narrow beam is how the ranking is stressed.
 //! `--exhaustive` checks up to 200 children per depth with no wall limit (the full-reward best is
 //! then ranked among everything); `--outer-check` runs `cargo check` on every decided candidate in
-//! a copy of the workspace (server only). The time of that outer check is reported apart and
-//! left out of trigger 4, which also judges only runs within the default budget (decision D4 in
-//! SEARCH_LEDGER.md).
+//! a copy of the workspace (server only), or with `--outer-sample N` (at least 1, for a large
+//! run; refused without `--outer-check`) on the top N of each decision's ranking; the report
+//! names the sample. The time of that outer check is reported apart and left out of trigger 4,
+//! which also judges only runs within the default budget (decision D4 in SEARCH_LEDGER.md).
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,11 +37,12 @@ use ryo_v2_oracle::cargo_check::{CheckOutput, cargo_check};
 use ryo_v2_oracle::materials::Materials;
 use ryo_v2_oracle::planted::{PlantKind, generate, generate_pair, read_clean, sites, write_case};
 use ryo_v2_oracle::search_recall::{
-    ContainedPanics, DecisionRow, PlantedCase, RunInfo, markdown, report_json, run_case, terminal,
+    ContainedPanics, DecisionRow, OuterSample, PlantedCase, RunInfo, markdown, outer_sample,
+    parse_outer_sample, report_json, run_case, terminal,
 };
 use ryo_v2_ra::{RaAnalyzer, RaConfig, SyntaxAssessor};
 
-const USAGE: &str = "usage: search-recall gen <ws> [--kinds a,b|all] [--seeds N] [--pairs N] [--base PATH] [--out DIR]\n       search-recall run <cases-dir> [--limit N] [--beam N] [--exhaustive] [--outer-check] [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro]";
+const USAGE: &str = "usage: search-recall gen <ws> [--kinds a,b|all] [--seeds N] [--pairs N] [--base PATH] [--out DIR]\n       search-recall run <cases-dir> [--limit N] [--beam N] [--exhaustive] [--outer-check] [--outer-sample N] [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro]";
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -206,9 +208,9 @@ struct Outer {
 }
 
 impl Outer {
-    fn summary(&self) -> String {
+    fn summary(&self, sample: OuterSample) -> String {
         format!(
-            "\nOuter cargo check: {} of {} decided candidates failed; {} of {} best candidates (first of each decision) failed\n",
+            "\nOuter cargo check (sample: {sample}): {} of {} checked candidates failed; {} of {} best candidates (first of each decision) failed\n",
             self.failed, self.checked, self.best_failed, self.best_checked
         )
     }
@@ -262,6 +264,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
     let mut exhaustive = false;
     let mut beam: Option<u16> = None;
     let mut outer = false;
+    let mut outer_sample_n: Option<NonZeroUsize> = None;
     let mut assert_every = NonZeroU32::new(ASSERT_REVERT_EVERY);
     let mut report: Option<PathBuf> = None;
     let mut md: Option<PathBuf> = None;
@@ -282,6 +285,10 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                 beam = Some(n);
             }
             "--outer-check" => outer = true,
+            "--outer-sample" => {
+                outer_sample_n =
+                    Some(parse_outer_sample(value("--outer-sample")?).map_err(anyhow::Error::msg)?);
+            }
             "--assert-every" => {
                 let n: u32 = value("--assert-every")?.parse().context("a number")?;
                 assert_every = NonZeroU32::new(n);
@@ -292,6 +299,12 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
             other => bail!("unknown argument {other:?}"),
         }
     }
+    let sample = match (outer, outer_sample_n) {
+        (false, None) => OuterSample::Off,
+        (false, Some(_)) => bail!("--outer-sample needs --outer-check"),
+        (true, None) => OuterSample::All,
+        (true, Some(n)) => OuterSample::Top(n),
+    };
     let mut cases = PlantedCase::load_all(Path::new(root), &m.corpus).context("load cases")?;
     if let Some(n) = limit {
         cases.truncate(n);
@@ -393,7 +406,8 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
             let mut row = match result {
                 Ok(run) => {
                     if outer {
-                        for (nth, edits) in run.decided_edits.iter().enumerate() {
+                        let checked = outer_sample(&run.decided_edits, sample);
+                        for (nth, edits) in checked.iter().enumerate() {
                             outer_counts.checked += 1;
                             outer_counts.best_checked += usize::from(nth == 0);
                             let t = Instant::now();
@@ -453,10 +467,10 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
-    let triggers = RunInfo::of_run(budget, started.elapsed(), outer_ms, rss_kb());
+    let triggers = RunInfo::of_run(budget, started.elapsed(), outer_ms, sample, rss_kb());
     let mut text = terminal(&rows, triggers);
     if outer {
-        text.push_str(&outer_counts.summary());
+        text.push_str(&outer_counts.summary(sample));
     }
     let panic_text = format!("\n{}\n", panics.lines().join("\n"));
     text.push_str(&panic_text);
@@ -470,7 +484,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
     if let Some(path) = md {
         let mut body = markdown(&rows, triggers);
         if outer {
-            body.push_str(&outer_counts.summary());
+            body.push_str(&outer_counts.summary(sample));
         }
         body.push_str(&panic_text);
         std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;

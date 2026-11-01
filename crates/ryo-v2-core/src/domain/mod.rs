@@ -36,8 +36,12 @@
 //! - IntentKind: a typed action of the one-layer action space.
 //!   includes: RenameLocal, ExtractVariable, AddDerive, ExtractFunction, MoveItem
 //! - IntentCall: one use of an intent in a blueprint: its kind and validated parameters.
-//! - RiskMark: a reason the engine's own verification is not enough.
+//! - RiskMark: a reason the engine's own verification is not enough. Borrow, BuildScript,
+//!   ProcMacroCrate and Visibility each name an unseen class (UnseenClass).
 //!   includes: Borrow, BuildScript, ProcMacroCrate, Behaviour, Visibility
+//! - UnseenClass: a kind of error the in-process check does not see; a candidate names it in its
+//!   result and the build after the commit settles it.
+//! - UnseenClasses: the non-empty set of unseen classes a candidate carries.
 //! - FileRole: what a touched file is to the crate graph.
 //!   includes: Source, BuildScript, ProcMacroSource, Manifest
 //! - Staged: a path of blueprints that passed every stage before the check, with the edits it
@@ -47,7 +51,7 @@
 //! - Resolution: the outcome of resolving a set of blueprints.
 //!   includes: Decided, Stopped, Failed
 //! - Disposition: what may happen to a passing candidate.
-//!   includes: AutoApplicable, AfterOuterCheck, NeedsReview
+//!   includes: AutoApplicable, NeedsReview
 //! - Blocking: why a blueprint was not made a candidate.
 //!   includes: Unverifiable, Stale, MissingFile, Nonconforming, Splice, NewErrors, BudgetExhausted,
 //!   CheckFailed, ParentFailed
@@ -138,7 +142,9 @@ pub use error_code::ErrorCode;
 pub use file_role::{FileFacts, FileRole};
 pub use finding::{Finding, FindingCode, ScopedFindings};
 pub use ids::{BlueprintId, RuleId};
-pub use intent::{DeriveName, Ident, IntentCall, IntentKind, IntentSpec, Nonconformance, RiskMark};
+pub use intent::{
+    DeriveName, Ident, IntentCall, IntentKind, IntentSpec, Nonconformance, RiskMark, UnseenClass,
+};
 pub use judge::{
     Criterion, JudgeRequest, Judgement, Noul, Prior, Proposal, ProposalId, ProviderTag,
 };
@@ -147,8 +153,8 @@ pub use non_empty::NonEmpty;
 pub use rel_path::RelPath;
 pub use resolution::{
     Blocking, Candidate, CheckFailure, DEFAULT_BUDGET, DecisionBudget, DecisionLog, Disposition,
-    Evidence, Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, OUTER_CHECK_MAX, OuterCheck,
-    OuterCheckReason, Provenance, Resolution, ReviewReason, SpecMismatch, Stage,
+    Evidence, Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, Provenance, Resolution, ReviewReason,
+    SpecMismatch, Stage, UnseenClasses,
 };
 pub use rule::{ReviewRecord, Rule, RuleCatalog, RuleError};
 pub use scope::Scope;
