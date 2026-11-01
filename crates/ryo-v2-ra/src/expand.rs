@@ -1657,9 +1657,8 @@ impl Expander for RaAnalyzer {
         paths.sort();
         paths.dedup();
         let before = fingerprints(s, &paths);
-        let mut f = self
-            .fork(s)
-            .map_err(|e| ExpandError::Session(map_error(e, &paths)))?;
+        let mut f =
+            Analyzer::fork(self, s).map_err(|e| ExpandError::Session(map_error(e, &paths)))?;
         let applied = self.apply(s, &mut f, state);
         let out = applied.is_ok().then(|| generate(s, state_fp, targets, max));
         let discarded = self.discard(s, f);

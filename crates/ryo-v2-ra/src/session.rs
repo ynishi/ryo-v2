@@ -93,7 +93,7 @@ fn capture_load_inputs(root: &Path, rev_deps: &RevDeps) -> LoadInputs {
 pub(crate) enum ForkPort {
     /// `Analyzer::fork`.
     Analyzer,
-    /// A fork opened inside the adapter for a `Verifier::check`.
+    /// `Stacked::fork`, or a fork opened inside the adapter for a `Verifier::check`.
     Stacked,
 }
 
@@ -137,10 +137,11 @@ pub struct RaSession {
     pub(crate) path_facts: PathFacts,
     /// Manifests, lock file and toolchain as of load.
     pub(crate) load_inputs: LoadInputs,
-    /// Number of `Verifier::check` writes so far (an `Analyzer::apply` is not counted); it paces
-    /// the sampled re-assert.
+    /// Number of writes so far, a refused one included: every `Verifier::check` and every
+    /// `Stacked::write` (an `Analyzer::apply` is not counted). It paces the sampled re-assert.
     pub(crate) write_count: u32,
-    /// Paths written by every `check` since the last revert audit, a refused one included.
+    /// Paths written by every `check` and `Stacked::write` since the last revert audit, a
+    /// refused one included.
     pub(crate) edited_since_audit: BTreeSet<RelPath>,
     /// Detector panics contained so far; collects run on several threads and take `&RaSession`.
     pub(crate) detector_panics: Mutex<BTreeSet<DetectorPanic>>,

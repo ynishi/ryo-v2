@@ -33,6 +33,11 @@ pub enum AnalyzerError {
     /// The analyzer panicked.
     #[error("rust-analyzer panicked: {0}")]
     Panicked(String),
+    /// The session can no longer be used: an earlier panic or a failed revert poisoned it, and
+    /// the operation was refused or the revert it ran could not be carried out or confirmed. The
+    /// text names the cause. This is about the session, never about the edits of the operation.
+    #[error("session poisoned: {0}")]
+    Poisoned(String),
     /// The revert did not restore the texts, or (assert on) the diagnostics.
     #[error("revert did not restore the base state")]
     RevertMismatch,
@@ -72,17 +77,18 @@ pub enum CheckError {
         /// The limit that was hit, in milliseconds.
         limit_ms: u64,
     },
-    /// A fork is live on the session: the operation needs the session at its base state.
-    #[error("a fork was already live on the session")]
+    /// A fork is live on the session: the operation needs the session at its base state, or the
+    /// ticket is not that of the live fork.
+    #[error("a fork is live on the session, or the ticket is not that of the live fork")]
     ForkInUse,
-    /// The adapter applied edits twice to one fork.
+    /// An `Analyzer` fork was written twice.
     #[error("edits were applied twice to one fork")]
     AlreadyApplied,
     /// The analyzer reported a load failure during a check.
     #[error("load failed: {0}")]
     Load(String),
-    /// A detector panicked on a file the check read, so the check cannot judge that file. The
-    /// session was restored.
+    /// A detector panicked on a file the check read, so the check cannot judge that file. A check
+    /// has restored the session; a diagnosis of a level leaves the levels as they were.
     #[error("detector {detector} panicked on {file}")]
     DetectorPanicked {
         /// The detector, by the adapter's name for it; the domain only shows it.
@@ -95,9 +101,10 @@ pub enum CheckError {
 /// How far a [`CheckError`] reaches.
 ///
 /// The adapter reverts the edits and compares the text fingerprints of the edited files after
-/// every check, whatever its result, and a difference is `RevertMismatch`. So an `Edit`,
-/// `Cancelled`, `Panicked` or `DetectorPanicked` that comes back says the session was restored
-/// and only this Blueprint's check did not finish.
+/// every check, whatever its result, and a difference is `RevertMismatch`. A failure of reach
+/// `Blueprint` leaves the session, and a fork's levels, as they were before the call: an `Edit`,
+/// `Cancelled`, `Panicked` or `DetectorPanicked` that comes back says only this Blueprint's check
+/// did not finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckReach {
     /// Only the Blueprint being checked: it is blocked, and the decision goes on.
@@ -109,9 +116,10 @@ pub enum CheckReach {
 impl CheckError {
     /// The reach of this failure.
     ///
-    /// `RevertMismatch` and `Poisoned` are the poison of the session; `ForkInUse` and
-    /// `AlreadyApplied` mean the adapter's fork bookkeeping is broken; `Load` means the session
-    /// itself failed. None of these can be pinned on the Blueprint.
+    /// `RevertMismatch` and `Poisoned` are the poison of the session; `ForkInUse`: the caller
+    /// holds a live fork while it asks the session for something else, or passes a ticket of
+    /// another fork; `AlreadyApplied`: an `Analyzer` fork was written twice; `Load` means the
+    /// session itself failed. None of these can be pinned on the Blueprint.
     ///
     /// # Contract
     /// - C1: `Edit`, `Cancelled`, `Panicked`, `DetectorPanicked` and `TimedOut` reach the
@@ -209,6 +217,199 @@ pub trait RevertAudit: Verifier {
     fn audit_revert(&self, s: &mut Self::Session) -> Result<(), CheckError>;
 }
 
+/// A [`Verifier`] whose forks take stacked writes: a child state is written on top of its
+/// parent's, never rebuilt from the base.
+///
+/// A fork is a stack of levels over the session's base state. `write` pushes a level whose edits
+/// are written on top of the level below and resolved against that level's state, as a load of
+/// that state would resolve them. `fork_text` and `diagnose` read the top level. `pop` reverts the
+/// top level. `release` reverts every level, top first, and ends the fork.
+///
+/// A level is diagnosed and reverted under the rules of a check:
+/// - the check time limit cuts a diagnosis off;
+/// - a detector panic is judged against the baseline;
+/// - a revert is compared with the level below, and a revert that does not restore it, or that
+///   cannot be carried out or confirmed, poisons the session.
+///
+/// The verdict of a level is against the baseline, like a check's. `diagnose` covers the scope of
+/// the top level's own edits, and a file outside it has the findings it has at the level below.
+/// So a caller that judges the state of a level keeps the findings of the levels below.
+///
+/// The reads of [`Verifier`] describe the base state, never a level: while a fork is live, and
+/// after a release that found the session poisoned.
+///
+/// An adapter whose forks write into the session's one database allows one live fork per
+/// session, and while it is live the session's other operations refuse with `ForkInUse`. An
+/// adapter whose forks are separate copies may keep several live.
+///
+/// # Contract
+/// - C1: on a poisoned session `fork`, and given the live fork's ticket `write`, `diagnose`,
+///   `fork_text` and `pop`, are `Poisoned`; `levels` still answers; `release` ends the fork and
+///   is `Poisoned`. A ticket that is not the live fork's is `ForkInUse` before the poison is
+///   looked at, and changes nothing.
+///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
+///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
+/// - C2: while a fork of an adapter with one live fork per session is live, `Verifier::check`,
+///   `RevertAudit::audit_revert`, `Expander::expand` (as `ExpandError::Session`) and a second
+///   `fork` are `ForkInUse`, or `Poisoned` on a poisoned session, before they change anything; an
+///   operation given a ticket that is not the live fork's is `ForkInUse`.
+///   tested: ryo-v2-ra tests/stack.rs session_operations_refuse_while_a_fork_is_live
+///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
+/// - C3: while a fork is live, and after a release that found the session poisoned,
+///   `Verifier::text`, `Verifier::provenance` and `Verifier::baseline` describe the base state,
+///   never a level.
+///   tested: ryo-v2-ra tests/stack.rs verifier_reads_describe_the_base_while_a_fork_is_live
+///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
+/// - C4: `Verifier::check` of edits at a scope gives what `fork`, one `write` of those edits,
+///   `diagnose` at that scope and `release` give; when more than one fails, the failure of
+///   `release` wins, then that of `write`, then that of `diagnose`.
+///   tested: ryo-v2-ra tests/stack.rs check_is_the_one_level_case
+///   tested: ryo-v2-ra tests/stack.rs a_session_error_of_the_release_wins_in_a_check
+pub trait Stacked: Verifier {
+    /// The ticket of a live fork of the session's base state; its levels live behind the
+    /// session.
+    type Fork;
+
+    /// Opens a fork of the session's base state, with no level.
+    ///
+    /// A poisoned session is `Poisoned`; a session on which a fork is live is `ForkInUse`.
+    fn fork(&self, s: &mut Self::Session) -> Result<Self::Fork, CheckError>;
+
+    /// Pushes a level that writes `edits` on top of the top level.
+    ///
+    /// A write that panics the database poisons the session and is `Poisoned`, not `Panicked`, so
+    /// that a failure of reach `Blueprint` always leaves the levels as they were.
+    ///
+    /// # Contract
+    /// - C1: pushes one level on top of the top level: `levels` grows by one, and `fork_text` and
+    ///   `diagnose` read the new level.
+    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
+    /// - C2: edits resolve against the state of the top level: a path that is not a file of that
+    ///   state is created, one a lower level deleted included; a path that is a file of it is
+    ///   modified or deleted; deleting a path that is not a file of it is `Edit`.
+    ///   tested: ryo-v2-ra tests/stack.rs a_level_writes_against_the_state_below
+    /// - C3: a stack diagnoses as its flat composition: at level k, `diagnose` at
+    ///   `Scope::Workspace` gives what `Verifier::check` at `Scope::Workspace` gives for the edits
+    ///   that take the base to the state of level k (the same files, findings and unseen classes,
+    ///   or the same failure of its diagnosis), and at `Scope::Affected` its files are the top
+    ///   level's scope and their findings are those that check gives on them.
+    ///   tested: ryo-v2-ra tests/stack.rs a_stack_diagnoses_as_its_flat_composition
+    /// - C4: a refused write (`Edit`, or a failure of the diagnosis it takes of the level below)
+    ///   pushes no level and leaves every text as it was.
+    ///   tested: ryo-v2-ra tests/stack.rs a_refused_write_pushes_no_level
+    /// - C5: a write with no edit pushes a level whose `Scope::Affected` diagnosis covers no file
+    ///   and names no unseen class.
+    ///   tested: ryo-v2-ra tests/stack.rs an_empty_write_diagnoses_nothing
+    /// - C6: a write the database cannot carry out (its write panics) is `Poisoned`, pushes no
+    ///   level and poisons the session; the reads of `Verifier` still describe the base.
+    ///   tested: ryo-v2-ra tests/stack.rs a_database_write_that_panics_poisons_the_session
+    fn write(
+        &self,
+        s: &mut Self::Session,
+        f: &mut Self::Fork,
+        edits: &[Edit],
+    ) -> Result<(), CheckError>;
+
+    /// The number of levels of the live fork.
+    ///
+    /// # Contract
+    /// - C1: the number of levels of the live fork, on a poisoned session too; a ticket that is
+    ///   not the live fork's is `ForkInUse`.
+    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
+    ///   tested: ryo-v2-ra tests/stack.rs pop_compares_texts_and_poisons_on_a_difference
+    ///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
+    fn levels(&self, s: &Self::Session, f: &Self::Fork) -> Result<usize, CheckError>;
+
+    /// The text of `path` at the top level.
+    ///
+    /// # Contract
+    /// - C1: the text of `path` at the top level (the base text with no level); `Ok(None)` when
+    ///   `path` is not a file of that state (not indexed, deleted by a level, never created); an
+    ///   error when the text could not be read.
+    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
+    ///   tested: ryo-v2-ra tests/stack.rs a_level_writes_against_the_state_below
+    fn fork_text(
+        &self,
+        s: &Self::Session,
+        f: &Self::Fork,
+        path: &RelPath,
+    ) -> Result<Option<String>, CheckError>;
+
+    /// Diagnoses the top level at `scope`.
+    ///
+    /// # Contract
+    /// - C1: `Scope::Affected` covers the files of the crates the top level's edits touch and of
+    ///   their dependents, at the top level's state (files it created included, files it deleted
+    ///   excluded); `Scope::Workspace` covers every file of that state.
+    ///   tested: ryo-v2-ra tests/stack.rs affected_scope_is_the_top_levels
+    /// - C2: with no level the result is `ScopedFindings::default()`.
+    ///   tested: ryo-v2-ra tests/stack.rs pop_without_a_level_is_false
+    /// - C3: a file outside the top level's `Scope::Affected` has, at the top level, the findings
+    ///   it has at the level below.
+    ///   tested: ryo-v2-ra tests/stack.rs files_outside_the_top_scope_keep_the_level_below
+    /// - C4: the adapter's check time limit cuts a diagnosis off with `TimedOut`; the levels stay
+    ///   and the fork stays usable.
+    ///   tested: ryo-v2-ra tests/stack.rs a_cut_off_diagnosis_keeps_the_levels
+    /// - C5: the unseen classes of the result are those this diagnosis observed at the top level;
+    ///   a class observed at a level below and not at the top is not among them.
+    ///   tested: ryo-v2-ra tests/stack.rs a_level_names_the_unseen_it_observes
+    /// - C6: a detector that panics on a file of the diagnosis, where it did not panic on that
+    ///   file at the baseline, makes the result `DetectorPanicked` (the first by detector and
+    ///   file), whatever the levels below had; one that panicked on that file at the baseline too
+    ///   names its class among the unseen classes, whatever the levels below had. Either way the
+    ///   levels stay and the fork stays usable.
+    ///   tested: ryo-v2-ra tests/stack.rs a_new_detector_panic_fails_the_diagnose_and_keeps_the_level
+    ///   tested: ryo-v2-ra tests/stack.rs a_baseline_panic_brought_back_above_is_named
+    ///   tested: ryo-v2-ra tests/stack.rs a_baseline_detector_panic_is_named_at_every_level
+    /// - C7: the `check_ms` of the `Event::Checked` of a diagnosis is the duration of the write of
+    ///   the top level plus the duration of this diagnosis: an earlier diagnosis of the level,
+    ///   the time between calls and the pop that made the level the top are not in it.
+    ///   tested: ryo-v2-ra tests/stack.rs the_diagnoses_of_a_level_do_not_add_up
+    fn diagnose(
+        &self,
+        s: &Self::Session,
+        f: &Self::Fork,
+        scope: Scope,
+    ) -> Result<ScopedFindings, CheckError>;
+
+    /// Reverts the top level.
+    ///
+    /// Given the live fork's ticket, every error of a pop poisons the session (`RevertMismatch`,
+    /// or `Poisoned`, which is also the answer when the session was poisoned already), so a pop
+    /// never fails with a `CheckError` of reach `Blueprint`. A ticket that is not the live fork's
+    /// is `ForkInUse`.
+    ///
+    /// # Contract
+    /// - C1: reverts the top level and returns `true`: afterwards every text is that of the level
+    ///   below and `levels` is one less.
+    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
+    /// - C2: a revert that does not restore the level below (its texts, or the adapter's
+    ///   diagnostic re-assert) is `RevertMismatch`, removes the level and poisons the session; a
+    ///   revert that cannot be carried out or confirmed (a database write panics, or the
+    ///   re-assert cannot run) is `Poisoned`, removes the level and poisons the session.
+    ///   tested: ryo-v2-ra tests/stack.rs pop_compares_texts_and_poisons_on_a_difference
+    ///   tested: ryo-v2-ra tests/stack.rs pop_reassert_compares_with_the_level_below
+    ///   tested: ryo-v2-ra tests/stack.rs a_revert_that_cannot_be_confirmed_poisons_the_session
+    ///   tested: ryo-v2-ra tests/stack.rs a_database_write_that_panics_poisons_the_session
+    /// - C3: with no level `pop` changes nothing and returns `Ok(false)`.
+    ///   tested: ryo-v2-ra tests/stack.rs pop_without_a_level_is_false
+    fn pop(&self, s: &mut Self::Session, f: &mut Self::Fork) -> Result<bool, CheckError>;
+
+    /// Reverts every level and ends the fork.
+    ///
+    /// # Contract
+    /// - C1: reverts every level, top first, under the rules of `pop`, and ends the fork: a later
+    ///   `fork` is not `ForkInUse`.
+    ///   tested: ryo-v2-ra tests/stack.rs release_reverts_every_level
+    /// - C2: every revert failure poisons the session, so from the first failure on, or on a
+    ///   session already poisoned, it writes nothing more: it drops the remaining levels, keeping
+    ///   their base texts for the reads of `Verifier`, ends the fork and returns that failure
+    ///   (`Poisoned` for a session already poisoned).
+    ///   tested: ryo-v2-ra tests/stack.rs release_stops_writing_after_a_failure
+    ///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
+    fn release(&self, s: &mut Self::Session, f: Self::Fork) -> Result<(), CheckError>;
+}
+
 /// Failure of an [`Expander`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExpandError {
@@ -271,20 +472,26 @@ pub enum Event {
         /// Errors at load.
         baseline_errors: usize,
     },
-    /// A scoped check finished.
+    /// A diagnosis of a scope ran to its end (a check's or a level's); a cut-off or a failed
+    /// collect records none.
     Checked {
         /// Files diagnosed.
         scope_files: usize,
         /// Local files at load.
         total_files: usize,
-        /// Check time.
+        /// Check time: the duration of the write of the diagnosed level plus the duration of this
+        /// diagnosis. The time between the write and the diagnosis, and between two diagnoses of
+        /// one level, is not counted, and neither is an earlier diagnosis.
         check_ms: u64,
     },
-    /// A fork was discarded.
+    /// A level of a fork was reverted (a discard, a pop, a level of a release, the one level of a
+    /// check); a refused write pushed no level and records none, and a release on a poisoned
+    /// session reverts nothing.
     Reverted {
         /// Revert time.
         revert_ms: u64,
-        /// Whether the post-revert diagnostics matched baseline (None = not asserted).
+        /// Whether the post-revert diagnostics matched those of the level below (the baseline
+        /// for the first level); None = not asserted.
         revert_ok: Option<bool>,
     },
     /// Resident set size of the process, sampled by the caller after a load or a discard

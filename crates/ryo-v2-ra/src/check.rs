@@ -37,6 +37,7 @@ pub(crate) fn map_error(e: AnalyzerError, edited: &[RelPath]) -> CheckError {
         AnalyzerError::Edit { path, reason } => CheckError::Edit { path, reason },
         AnalyzerError::Cancelled => CheckError::Cancelled,
         AnalyzerError::Panicked(m) => CheckError::Panicked(m),
+        AnalyzerError::Poisoned(m) => CheckError::Poisoned(m),
         AnalyzerError::RevertMismatch => CheckError::RevertMismatch {
             paths: edited.to_vec(),
         },
@@ -47,12 +48,11 @@ pub(crate) fn map_error(e: AnalyzerError, edited: &[RelPath]) -> CheckError {
 }
 
 /// How a failed revert is said to the caller of a check. A failure to revert is always about the
-/// session, never about the Blueprint being checked.
-fn revert_error(failed: RevertFailure) -> CheckError {
+/// session, never about the Blueprint being checked: it has poisoned the session.
+pub(crate) fn revert_error(failed: RevertFailure) -> CheckError {
     match failed {
         RevertFailure::Mismatch(paths) => CheckError::RevertMismatch { paths },
         RevertFailure::Poisoned(msg) => CheckError::Poisoned(msg),
-        RevertFailure::Failed(e) => map_error(e, &[]),
     }
 }
 
@@ -65,9 +65,10 @@ fn base_text(s: &RaSession, id: FileId) -> Option<String> {
     }
 }
 
-/// Diagnoses the top level for a check: under the check time limit, and with a detector that
-/// panicked where it did not at the baseline failing the diagnosis.
-fn diagnose_for_check(
+/// Diagnoses the top level as a check does, and as `Stacked::diagnose` does: under the check time
+/// limit, and with a detector that panicked where it did not at the baseline failing the
+/// diagnosis.
+pub(crate) fn diagnose_for_check(
     a: &RaAnalyzer,
     s: &RaSession,
     scope: Scope,
@@ -245,9 +246,10 @@ impl Verifier for RaAnalyzer {
     ///   difference poisons the session and is `RevertMismatch`.
     ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
     ///   tested: tests/stack.rs text_is_the_base_after_a_poisoned_check
-    /// - C2: the diagnostic re-assert runs on every n-th call when `assert_revert_every` is
-    ///   `Some(n)`.
+    /// - C2: the diagnostic re-assert runs on every n-th write when `assert_revert_every` is
+    ///   `Some(n)`, a check being one write.
     ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
+    ///   tested: tests/stack.rs writes_count_for_the_sampled_reassert
     /// - C3: with a cut-off set (`with_check_timeout`) a diagnostics step that is still running
     ///   when the limit is reached ends in `CheckError::TimedOut`; the edits are still reverted,
     ///   the text fingerprints still compared, and the session stays usable. The limit is
@@ -280,25 +282,12 @@ impl Verifier for RaAnalyzer {
         scope: Scope,
     ) -> Result<ScopedFindings, CheckError> {
         stack::require_free(s)?;
-        let mut edited: Vec<RelPath> = edits.iter().map(|e| e.path.clone()).collect();
-        edited.sort();
-        edited.dedup();
-        s.edited_since_audit.extend(edited.iter().cloned());
-
-        s.write_count = s.write_count.wrapping_add(1);
-        let sampled = s.assert_revert
-            || self
-                .config
-                .assert_revert_every
-                .is_some_and(|n| s.write_count.is_multiple_of(n.get()));
-
         // A check is the one-level case of a fork: write, diagnose, release. The release always
         // runs, and its failure, always about the session, wins; then the write's; then the
         // diagnosis's.
         stack::open_fork(s, ForkPort::Stacked);
-        let outcome = fork::push_level(self, s, edits, sampled)
-            .map_err(|e| map_error(e, &edited))
-            .and_then(|()| diagnose_for_check(self, s, scope));
+        let outcome =
+            stack::write_level(self, s, edits).and_then(|()| diagnose_for_check(self, s, scope));
         fork::release_levels(self, s).map_err(revert_error)?;
         outcome
     }
@@ -406,6 +395,18 @@ mod tests {
             assert_eq!(a.blind_classes(), want, "{mask:03b}");
             assert!(!a.blind_classes().contains(&UnseenClass::UnexpandedMacro));
         }
+    }
+
+    #[test]
+    fn map_error_keeps_the_poison_apart_from_a_panic() {
+        assert_eq!(
+            map_error(AnalyzerError::Poisoned("p".to_owned()), &[]),
+            CheckError::Poisoned("p".to_owned())
+        );
+        assert_eq!(
+            map_error(AnalyzerError::Panicked("p".to_owned()), &[]),
+            CheckError::Panicked("p".to_owned())
+        );
     }
 
     #[test]

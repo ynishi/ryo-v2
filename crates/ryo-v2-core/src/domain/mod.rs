@@ -117,6 +117,10 @@
 //!   classes of a loaded workspace, and a check of edits that leaves no trace.
 //! - Analyzer: the lower port of an analyzer adapter: load a workspace, one fork with one write,
 //!   its diagnostics and its discard; what the oracle's verify and the bench measure.
+//! - Stacked: a verifier whose forks take writes on top of earlier ones, each a level; read and
+//!   diagnosed at the top level, reverted level by level.
+//! - Level: one write of a stacked fork, on top of the level below; the base state is below the
+//!   first.
 //! - RevertAudit: a check that undoing a candidate's edits returns the files to the base.
 //! - ExpandError: why an expander could not propose.
 //! - JudgeError: why a judge could not answer.
