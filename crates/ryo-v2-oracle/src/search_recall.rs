@@ -22,6 +22,7 @@
 //! is at most 0.1 at 95 % (the rule of three).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit};
@@ -560,9 +561,59 @@ fn count32(n: usize) -> u32 {
 pub struct CaseRun {
     /// The decision.
     pub row: DecisionRow,
-    /// The edits of each `Decided` candidate (at most `OUTER_CHECK_MAX`), whole planted state
-    /// included; the outer `cargo check` of the harness reads them.
+    /// The edits of each `Decided` candidate in the order of the ranking, whole planted state
+    /// included; the outer `cargo check` of the harness reads them, all of them or the top of
+    /// them by [`outer_sample`].
     pub decided_edits: Vec<Vec<Edit>>,
+}
+
+/// Which candidates of each decision the outer `cargo check` of a run measures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OuterSample {
+    /// No outer check ran (no `--outer-check`).
+    #[default]
+    Off,
+    /// Every candidate (`--outer-check`).
+    All,
+    /// The top `n` of each decision's ranking (`--outer-check --outer-sample N`).
+    Top(NonZeroUsize),
+}
+
+impl std::fmt::Display for OuterSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OuterSample::Off => f.write_str("none (no outer check)"),
+            OuterSample::All => f.write_str("all"),
+            OuterSample::Top(n) => write!(f, "top {n} of each decision"),
+        }
+    }
+}
+
+/// The candidates the outer `cargo check` measures under `sample`.
+///
+/// # Contract
+/// - C1: `Off` gives none, `All` every candidate, and `Top(n)` the first
+///   `min(n, candidates.len())`, in the order given.
+///   tested: search_recall::tests::outer_sample_takes_the_top_of_the_ranking
+pub fn outer_sample<T>(candidates: &[T], sample: OuterSample) -> &[T] {
+    match sample {
+        OuterSample::Off => &[],
+        OuterSample::All => candidates,
+        OuterSample::Top(n) => &candidates[..n.get().min(candidates.len())],
+    }
+}
+
+/// The value of `--outer-sample`: a number of at least 1.
+///
+/// # Contract
+/// - C1: a decimal number of at least 1 is accepted; 0 and anything that is not a number are
+///   refused.
+///   tested: search_recall::tests::outer_sample_zero_is_refused
+pub fn parse_outer_sample(s: &str) -> Result<NonZeroUsize, String> {
+    match s.parse::<usize>() {
+        Ok(n) => NonZeroUsize::new(n).ok_or_else(|| "--outer-sample is at least 1".to_owned()),
+        Err(_) => Err("--outer-sample is a number".to_owned()),
+    }
 }
 
 /// Runs one planted case on a loaded session.
@@ -808,6 +859,9 @@ pub struct RunInfo {
     /// The part of `harness_ms` spent in the outer `cargo check`, in ms (0 without
     /// `--outer-check`).
     pub outer_check_ms: u64,
+    /// Which candidates of each decision the outer check measured: `Off` without
+    /// `--outer-check`. It is the denominator of the rejection rate.
+    pub outer_sample: OuterSample,
     /// The search budget the run used; `None` when unknown, which leaves trigger 4 not measured.
     pub budget: Option<SearchBudget>,
     /// Resident set size at the end of the run in kB, when known.
@@ -838,16 +892,18 @@ pub fn trigger_4_judges(budget: &SearchBudget) -> bool {
 
 impl RunInfo {
     /// The numbers of one finished `search-recall run`: the budget it searched with, its whole
-    /// wall time, the part of it spent in the outer `cargo check`, and the RSS.
+    /// wall time, the part of it spent in the outer `cargo check`, the sample the outer check
+    /// took, and the RSS.
     ///
     /// # Contract
-    /// - C1: `beam` is `budget.beam`, `budget` is `Some(budget)`, and both times are whole ms,
-    ///   saturating at `u64::MAX`.
+    /// - C1: `beam` is `budget.beam`, `budget` is `Some(budget)`, `outer_sample` is the one
+    ///   given, and both times are whole ms, saturating at `u64::MAX`.
     ///   tested: search_recall::tests::run_info_of_a_run_carries_budget_and_outer_time
     pub fn of_run(
         budget: SearchBudget,
         whole: std::time::Duration,
         outer_check: std::time::Duration,
+        outer_sample: OuterSample,
         rss_kb: Option<u64>,
     ) -> Self {
         let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
@@ -855,6 +911,7 @@ impl RunInfo {
             beam: budget.beam,
             harness_ms: ms(whole),
             outer_check_ms: ms(outer_check),
+            outer_sample,
             budget: Some(budget),
             rss_kb,
         }
@@ -1065,6 +1122,9 @@ pub fn markdown(rows: &[DecisionRow], t: RunInfo) -> String {
     for line in trigger_lines(rows, t) {
         out.push_str(&format!("- {line}\n"));
     }
+    if t.outer_sample != OuterSample::Off {
+        out.push_str(&format!("- outer sample: {}\n", t.outer_sample));
+    }
     out
 }
 
@@ -1172,6 +1232,11 @@ pub fn report_json(rows: &[DecisionRow], t: RunInfo) -> Value {
         "verdict": verdict(all.generated, all.recall()).id(),
         "harness_ms": t.harness_ms,
         "outer_check_ms": t.outer_check_ms,
+        "outer_sample": match t.outer_sample {
+            OuterSample::Off => Value::Null,
+            OuterSample::All => json!("all"),
+            OuterSample::Top(n) => json!(n.get()),
+        },
         "search_ms": t.search_ms(),
         "rss_kb": t.rss_kb,
         "triggers": trigger_lines(rows, t),
@@ -1616,6 +1681,7 @@ mod tests {
             b,
             Duration::from_micros(983_033_999),
             Duration::from_millis(634_965),
+            OuterSample::Top(NonZeroUsize::new(4).unwrap()),
             Some(7),
         );
         assert_eq!(
@@ -1624,15 +1690,58 @@ mod tests {
                 beam: 200,
                 harness_ms: 983_033,
                 outer_check_ms: 634_965,
+                outer_sample: OuterSample::Top(NonZeroUsize::new(4).unwrap()),
                 budget: Some(b),
                 rss_kb: Some(7),
             }
         );
         assert_eq!(t.search_ms(), 348_068);
         assert_eq!(
-            RunInfo::of_run(b, Duration::MAX, Duration::ZERO, None).harness_ms,
+            RunInfo::of_run(b, Duration::MAX, Duration::ZERO, OuterSample::Off, None).harness_ms,
             u64::MAX
         );
+    }
+
+    #[test]
+    fn report_names_the_outer_sample() {
+        let rows = [row("a", true, true)];
+        let off = RunInfo::default();
+        assert_eq!(report_json(&rows, off)["outer_sample"], Value::Null);
+        assert!(!markdown(&rows, off).contains("outer sample"));
+        let all = RunInfo {
+            outer_sample: OuterSample::All,
+            ..RunInfo::default()
+        };
+        assert_eq!(report_json(&rows, all)["outer_sample"], "all");
+        assert!(markdown(&rows, all).contains("- outer sample: all\n"));
+        let three = RunInfo {
+            outer_sample: OuterSample::Top(NonZeroUsize::new(3).unwrap()),
+            ..RunInfo::default()
+        };
+        assert_eq!(report_json(&rows, three)["outer_sample"], 3);
+        assert!(markdown(&rows, three).contains("- outer sample: top 3 of each decision\n"));
+    }
+
+    #[test]
+    fn outer_sample_takes_the_top_of_the_ranking() {
+        let top = |n| OuterSample::Top(NonZeroUsize::new(n).unwrap());
+        let ranked = [10, 20, 30, 40, 50];
+        assert!(outer_sample(&ranked, OuterSample::Off).is_empty());
+        assert_eq!(outer_sample(&ranked, OuterSample::All), &ranked);
+        assert_eq!(outer_sample(&ranked, top(2)), &[10, 20]);
+        assert_eq!(outer_sample(&ranked, top(5)), &ranked);
+        assert_eq!(outer_sample(&ranked, top(9)), &ranked);
+        let none: [u8; 0] = [];
+        assert!(outer_sample(&none, top(3)).is_empty());
+    }
+
+    #[test]
+    fn outer_sample_zero_is_refused() {
+        assert!(parse_outer_sample("0").is_err());
+        assert!(parse_outer_sample("-1").is_err());
+        assert!(parse_outer_sample("x").is_err());
+        assert_eq!(parse_outer_sample("1"), Ok(NonZeroUsize::MIN));
+        assert_eq!(parse_outer_sample("12"), Ok(NonZeroUsize::new(12).unwrap()));
     }
 
     #[test]

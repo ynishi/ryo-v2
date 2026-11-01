@@ -116,13 +116,14 @@ pub enum IntentKind {
 /// and guards are dropped at the new function's end instead of the old scope's: drop order is
 /// behaviour, the same reason extract-variable carries `Behaviour`. It can therefore never be a
 /// Rule. Move-item changes where an item lives and who can see it: the analyzer misses
-/// cross-crate privacy (E0603) and cfg-gated paths in another crate, so it owes an outer
-/// `cargo check` (`Visibility`). It does not reorder evaluation or drops and does not change
-/// borrows, so it carries no `Borrow` and no `Behaviour`, and stays registrable as a Rule.
+/// cross-crate privacy (E0603) and cfg-gated paths in another crate, so its candidate names
+/// `Visibility` as an unseen class, which the build after the commit settles. It does not
+/// reorder evaluation or drops and does not change borrows, so it carries no `Borrow` and no
+/// `Behaviour`, and stays registrable as a Rule.
 ///
 /// Known limit of move-item: a glob import (`use a::*`) that reached the item through its old
-/// file is not followed, so a name can stop resolving there; the outer check shows it, the
-/// conformance check does not.
+/// file is not followed, so a name can stop resolving there; the build after the commit shows
+/// it, the conformance check does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RiskMark {
     /// The edit can break borrow checking, which the analyzer does not run.
@@ -140,12 +141,52 @@ pub enum RiskMark {
 
 impl std::fmt::Display for RiskMark {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.unseen_class() {
+            Some(class) => class.fmt(f),
+            None => f.write_str("behaviour"),
+        }
+    }
+}
+
+impl RiskMark {
+    /// The class of errors the in-process check cannot see that this mark names, or `None`.
+    ///
+    /// # Contract
+    /// - C1: `Borrow`, `BuildScript`, `ProcMacroCrate` and `Visibility` give the class of the
+    ///   same name; `Behaviour` gives `None`, as it is not a kind of error.
+    ///   tested: domain::intent::tests::risk_mark_unseen_class_maps_each_mark
+    pub fn unseen_class(self) -> Option<UnseenClass> {
+        match self {
+            RiskMark::Borrow => Some(UnseenClass::Borrow),
+            RiskMark::BuildScript => Some(UnseenClass::BuildScript),
+            RiskMark::ProcMacroCrate => Some(UnseenClass::ProcMacroCrate),
+            RiskMark::Visibility => Some(UnseenClass::Visibility),
+            RiskMark::Behaviour => None,
+        }
+    }
+}
+
+/// A kind of error the in-process check does not see. A candidate names it in its result, and
+/// the build after the commit settles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UnseenClass {
+    /// Borrow checking is not run by the analyzer.
+    Borrow,
+    /// A build script changed.
+    BuildScript,
+    /// A proc-macro crate changed.
+    ProcMacroCrate,
+    /// An item moved: privacy and cfg-gated paths across crates are not judged by the analyzer.
+    Visibility,
+}
+
+impl std::fmt::Display for UnseenClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            RiskMark::Borrow => "borrow",
-            RiskMark::BuildScript => "build-script",
-            RiskMark::ProcMacroCrate => "proc-macro-crate",
-            RiskMark::Behaviour => "behaviour",
-            RiskMark::Visibility => "visibility",
+            UnseenClass::Borrow => "borrow",
+            UnseenClass::BuildScript => "build-script",
+            UnseenClass::ProcMacroCrate => "proc-macro-crate",
+            UnseenClass::Visibility => "visibility",
         })
     }
 }
@@ -177,7 +218,8 @@ impl IntentKind {
     ///   tested: domain::intent::tests::extract_variable_carries_borrow_and_behaviour
     /// - C2: `ExtractFunction` carries `Borrow` and `Behaviour` (parameters become borrows and
     ///   drop order changes), so it can never be registered as a Rule; `MoveItem` carries
-    ///   `Visibility` alone, so it owes an outer check and may be registered.
+    ///   `Visibility` alone, so its candidate names `Visibility` as an unseen class and may be
+    ///   registered.
     ///   tested: domain::intent::tests::new_intents_carry_their_risks
     pub fn spec(self) -> IntentSpec {
         let risks = match self {
@@ -852,6 +894,28 @@ mod tests {
         assert_eq!(mv.kind(), IntentKind::MoveItem);
         assert_eq!(ef.to_string(), "extract-function h");
         assert_eq!(mv.to_string(), "move-item foo -> b.rs");
+    }
+
+    #[test]
+    fn risk_mark_unseen_class_maps_each_mark() {
+        assert_eq!(RiskMark::Borrow.unseen_class(), Some(UnseenClass::Borrow));
+        assert_eq!(
+            RiskMark::BuildScript.unseen_class(),
+            Some(UnseenClass::BuildScript)
+        );
+        assert_eq!(
+            RiskMark::ProcMacroCrate.unseen_class(),
+            Some(UnseenClass::ProcMacroCrate)
+        );
+        assert_eq!(
+            RiskMark::Visibility.unseen_class(),
+            Some(UnseenClass::Visibility)
+        );
+        assert_eq!(RiskMark::Behaviour.unseen_class(), None);
+        assert_eq!(UnseenClass::Borrow.to_string(), "borrow");
+        assert_eq!(UnseenClass::BuildScript.to_string(), "build-script");
+        assert_eq!(UnseenClass::ProcMacroCrate.to_string(), "proc-macro-crate");
+        assert_eq!(UnseenClass::Visibility.to_string(), "visibility");
     }
 
     #[test]

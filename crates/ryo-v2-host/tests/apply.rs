@@ -161,7 +161,7 @@ fn apply_rename_local_is_decided() {
     assert_eq!(out["resolution"], "decided");
     let c = &out["candidates"][0];
     assert_eq!(c["disposition"], "needs_review/no_rule");
-    assert_eq!(c["outer_check"], Value::Null);
+    assert_eq!(c["unseen_classes"], Value::Null);
     let new_text = c["edits"][0]["new_text"].as_str().unwrap();
     assert!(
         !new_text.contains("acc") && new_text.contains("sum"),
@@ -352,7 +352,7 @@ fn apply_cargo_toml_edit_is_unverifiable() {
 }
 
 #[test]
-fn apply_build_rs_edit_needs_outer_check() {
+fn apply_build_rs_edit_names_build_script() {
     let build = "fn main() {\n    let x = 1;\n    let _ = x;\n}\n";
     let ws = Ws::new("apply_build_rs", &[("build.rs", build)]);
     let bp = blueprint(
@@ -367,7 +367,7 @@ fn apply_build_rs_edit_needs_outer_check() {
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(0), "{err}\n{out}");
     let c = &out["candidates"][0];
-    assert_eq!(c["outer_check"], json!(["build_script"]), "{out}");
+    assert_eq!(c["unseen_classes"], json!(["build_script"]), "{out}");
     assert_eq!(c["disposition"], "needs_review/no_rule");
 }
 
@@ -394,7 +394,7 @@ fn apply_extract_variable_needs_review_behaviour() {
     let (code, out, err) = apply(&ws, &bp, None);
     assert_eq!(code, Some(0), "{err}\n{out}");
     let c = &out["candidates"][0];
-    assert_eq!(c["outer_check"], json!(["borrow"]), "{out}");
+    assert_eq!(c["unseen_classes"], json!(["borrow"]), "{out}");
     assert_eq!(c["marks"], json!(["borrow", "behaviour"]), "{out}");
     assert_eq!(c["disposition"], "needs_review/behaviour");
 

@@ -2,8 +2,8 @@
 
 use ryo_v2_core::domain::{
     BaseFp, Basis, Blocking, Candidate, CheckFailure, Diagnostics, Disposition, Drift, FileRole,
-    Freshness, LogEntry, OuterCheckReason, ReadRange, Resolution, ReviewReason, RiskMark, Scope,
-    Stage, Verdict,
+    Freshness, LogEntry, ReadRange, Resolution, ReviewReason, RiskMark, Scope, Stage, UnseenClass,
+    Verdict,
 };
 use serde_json::{Value, json};
 
@@ -15,21 +15,15 @@ fn scope_str(s: Scope) -> &'static str {
 }
 
 fn mark_str(m: RiskMark) -> &'static str {
-    match m {
-        RiskMark::Borrow => "borrow",
-        RiskMark::BuildScript => "build_script",
-        RiskMark::ProcMacroCrate => "proc_macro_crate",
-        RiskMark::Behaviour => "behaviour",
-        RiskMark::Visibility => "visibility",
-    }
+    m.unseen_class().map_or("behaviour", class_str)
 }
 
-fn reason_str(r: OuterCheckReason) -> &'static str {
-    match r {
-        OuterCheckReason::Borrow => "borrow",
-        OuterCheckReason::BuildScript => "build_script",
-        OuterCheckReason::ProcMacroCrate => "proc_macro_crate",
-        OuterCheckReason::Visibility => "visibility",
+fn class_str(c: UnseenClass) -> &'static str {
+    match c {
+        UnseenClass::Borrow => "borrow",
+        UnseenClass::BuildScript => "build_script",
+        UnseenClass::ProcMacroCrate => "proc_macro_crate",
+        UnseenClass::Visibility => "visibility",
     }
 }
 
@@ -58,7 +52,6 @@ fn stage_str(s: Stage) -> &'static str {
 fn disposition_json(d: Disposition) -> (&'static str, Value) {
     match d {
         Disposition::AutoApplicable { rule } => ("auto_applicable", json!(rule.to_string())),
-        Disposition::AfterOuterCheck { rule } => ("after_outer_check", json!(rule.to_string())),
         Disposition::NeedsReview { reason } => (
             match reason {
                 ReviewReason::NoRule => "needs_review/no_rule",
@@ -129,8 +122,8 @@ fn drift_json(d: &Drift) -> Value {
 
 fn candidate_json(c: &Candidate) -> Value {
     let (disposition, rule) = disposition_json(c.disposition());
-    let outer_check = match c.outer_check() {
-        Some(o) => Value::Array(o.reasons().iter().map(|r| json!(reason_str(*r))).collect()),
+    let unseen_classes = match c.unseen_classes() {
+        Some(u) => Value::Array(u.classes().iter().map(|k| json!(class_str(*k))).collect()),
         None => Value::Null,
     };
     let marks: Vec<Value> = c.marks().iter().map(|m| json!(mark_str(*m))).collect();
@@ -157,7 +150,7 @@ fn candidate_json(c: &Candidate) -> Value {
         "path": path,
         "disposition": disposition,
         "rule": rule,
-        "outer_check": outer_check,
+        "unseen_classes": unseen_classes,
         "marks": marks,
         "edits": edits,
         "basis": basis_json(c.basis()),
@@ -244,10 +237,11 @@ fn blocking_json(b: &Blocking) -> Value {
 ///
 /// # Contract
 /// - C1: a `Decided` resolution lists each candidate's disposition, rule id (or `null`),
-///   `outer_check` reasons (or `null`), marks and edits, in that vocabulary and sorted order, and
-///   its `basis`: the `files` it edits (path, `fingerprint`) and the `reads` of files it only
-///   reads (path, `start`, `end`, `fingerprint`).
-///   tested: resolution_json::tests::outer_check_lists_reasons
+///   `unseen_classes` (a list of class names, or `null`), marks and edits, in that vocabulary and
+///   sorted order, and its `basis`: the `files` it edits (path, `fingerprint`) and the `reads` of
+///   files it only reads (path, `start`, `end`, `fingerprint`). The disposition is one of
+///   `auto_applicable` and the `needs_review/..` reasons.
+///   tested: resolution_json::tests::unseen_classes_lists_the_classes
 ///   tested: resolution_json::tests::decided_lists_the_rule_id
 ///   tested: tests/apply.rs apply_rename_local_is_decided
 ///   tested: tests/apply.rs decided_candidate_lists_its_basis
@@ -505,16 +499,12 @@ mod tests {
             ("auto_applicable", json!(rule_id.to_string()))
         );
         assert_eq!(
-            disposition_json(Disposition::AfterOuterCheck { rule: rule_id }),
-            ("after_outer_check", json!(rule_id.to_string()))
-        );
-        assert_eq!(
             disposition_json(Disposition::NeedsReview {
                 reason: ReviewReason::ScopeTooNarrow
             }),
             ("needs_review/scope_too_narrow", Value::Null)
         );
-        // And through a run: the move-item Rule covers a move, which owes an outer check.
+        // And through a run: the move-item Rule covers a move, which names `visibility` unseen.
         let review = ReviewRecord {
             reviewer: "me".to_owned(),
             reviewed_at_ms: 1,
@@ -526,14 +516,14 @@ mod tests {
         let fake = Fake::with(&[("src/a.rs", "pub fn foo() {}\n"), ("src/b.rs", "")]);
         let v = resolution_to_json(&decided(&fake, vec![move_foo()], &rules));
         let c = &v["candidates"][0];
-        assert_eq!(c["disposition"], "after_outer_check");
+        assert_eq!(c["disposition"], "auto_applicable");
         assert_eq!(c["rule"], rule_id.to_string());
         assert_eq!(c["marks"], json!(["visibility"]));
-        assert_eq!(c["outer_check"], json!(["visibility"]));
+        assert_eq!(c["unseen_classes"], json!(["visibility"]));
     }
 
     #[test]
-    fn outer_check_lists_reasons() {
+    fn unseen_classes_lists_the_classes() {
         let fake = Fake::with(&[("build.rs", "f(1 + 2);")]).build_script("build.rs");
         let v = resolution_to_json(&decided(
             &fake,
@@ -542,7 +532,7 @@ mod tests {
         ));
         assert_eq!(v["resolution"], "decided");
         let c = &v["candidates"][0];
-        assert_eq!(c["outer_check"], json!(["borrow", "build_script"]));
+        assert_eq!(c["unseen_classes"], json!(["borrow", "build_script"]));
         assert_eq!(c["marks"], json!(["borrow", "build_script", "behaviour"]));
         assert_eq!(c["disposition"], "needs_review/behaviour");
         assert_eq!(c["rule"], Value::Null);
@@ -555,7 +545,7 @@ mod tests {
             vec![rename("src/lib.rs")],
             &RuleCatalog::default(),
         ));
-        assert_eq!(none["candidates"][0]["outer_check"], Value::Null);
+        assert_eq!(none["candidates"][0]["unseen_classes"], Value::Null);
         assert_eq!(none["candidates"][0]["marks"], json!([]));
     }
 
@@ -734,7 +724,7 @@ mod tests {
         assert_eq!(first["limit_ms"], 6_000);
         assert_eq!(stage_str(Stage::Prune), "prune");
         assert_eq!(mark_str(RiskMark::Visibility), "visibility");
-        assert_eq!(reason_str(OuterCheckReason::Visibility), "visibility");
+        assert_eq!(class_str(UnseenClass::Visibility), "visibility");
     }
 
     #[test]

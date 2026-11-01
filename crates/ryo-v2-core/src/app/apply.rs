@@ -71,7 +71,7 @@ impl Acc {
 ///   tested: app::apply::tests::candidate_basis_is_stale_after_outside_change
 /// - C2: a spec in a file whose role is `Manifest` is blocked as `Unverifiable` before
 ///   anything is read, and the check is not called; a build script or proc-macro file gives
-///   a candidate whose `outer_check` is `Some`, which is never `AutoApplicable`.
+///   a candidate whose `unseen_classes` name `BuildScript` or `ProcMacroCrate`.
 ///   tested: app::apply::tests::crate_graph_edits_never_pass_silently
 /// - C3: a base fingerprint or a read of a file the analyzer does not have gives
 ///   `MissingFile`, also when other entries drifted, and the check is not called.
@@ -92,9 +92,9 @@ impl Acc {
 /// - C6: each stage logs one entry per Blueprint, `ok` false at the stage that blocked it and
 ///   no entry after that.
 ///   tested: app::apply::tests::decision_log_stops_at_blocking_stage
-/// - C7: the marks of an intent with `Borrow` and `Behaviour` risks give an outer check and
-///   `NeedsReview{Behaviour}`, with or without a Rule for another intent.
-///   tested: app::apply::tests::borrow_intent_reports_needs_outer_check
+/// - C7: the candidate of an intent with `Borrow` and `Behaviour` risks names `Borrow` in its
+///   `unseen_classes` and is `NeedsReview{Behaviour}`, with or without a Rule for another intent.
+///   tested: app::apply::tests::borrow_intent_names_borrow_unseen
 /// - C8: a passing Blueprint of rename-local or add-derive is `NeedsReview{NoRule}` under a
 ///   catalog that holds every Rule that can be registered.
 ///   tested: app::apply::tests::text_match_intents_need_review_under_every_rule
@@ -300,9 +300,9 @@ mod tests {
     use crate::domain::{
         BaseFp, BlueprintError, BlueprintParts, CheckFailure, DecisionRecord, DeriveName,
         Disposition, Drift, Edit, ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident,
-        IntentCall, IntentKind, MutationSpec, NonEmpty, Nonconformance, OuterCheckReason,
-        Provenance, ReadRange, RelPath, ReviewReason, ReviewRecord, RiskMark, Rule, RuleId,
-        ScopedFindings, SpecRef, TextRange,
+        IntentCall, IntentKind, MutationSpec, NonEmpty, Nonconformance, Provenance, ReadRange,
+        RelPath, ReviewReason, ReviewRecord, RiskMark, Rule, RuleId, ScopedFindings, SpecRef,
+        TextRange, UnseenClass,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -1080,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn borrow_intent_reports_needs_outer_check() {
+    fn borrow_intent_names_borrow_unseen() {
         let fake = Fake::with_text("src/lib.rs", "f(1 + 2);");
         for rules in [RuleCatalog::default(), every_rule()] {
             let r = run(&fake, vec![extract(1, "src/lib.rs")], &rules).unwrap();
@@ -1089,8 +1089,8 @@ mod tests {
             };
             let c = blueprints.first();
             assert_eq!(
-                c.outer_check().unwrap().reasons(),
-                &BTreeSet::from([OuterCheckReason::Borrow])
+                c.unseen_classes().unwrap().classes(),
+                &BTreeSet::from([UnseenClass::Borrow])
             );
             assert_eq!(
                 c.disposition(),
@@ -1200,7 +1200,7 @@ mod tests {
         );
         assert_eq!(
             cs[2].disposition(),
-            Disposition::AfterOuterCheck { rule: rule_id }
+            Disposition::AutoApplicable { rule: rule_id }
         );
         assert_eq!(cs[2].marks(), &BTreeSet::from([RiskMark::Visibility]));
         assert_eq!(cs[2].path().len(), 1);
@@ -1456,7 +1456,20 @@ mod tests {
         };
         let cs = blueprints.as_slice();
         assert_eq!(cs.len(), 2);
-        assert!(cs[0].outer_check().is_some() && cs[1].outer_check().is_some());
+        assert!(
+            cs[0]
+                .unseen_classes()
+                .unwrap()
+                .classes()
+                .contains(&UnseenClass::BuildScript)
+        );
+        assert!(
+            cs[1]
+                .unseen_classes()
+                .unwrap()
+                .classes()
+                .contains(&UnseenClass::ProcMacroCrate)
+        );
         assert_eq!(
             cs[0].disposition(),
             Disposition::NeedsReview {
