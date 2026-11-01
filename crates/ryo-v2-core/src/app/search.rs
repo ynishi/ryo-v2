@@ -1918,7 +1918,7 @@ mod tests {
             .disposition()
     }
     fn rule(n: u8, kind: IntentKind, scope: Scope) -> Rule {
-        // CHECK_LEDGER M-1: production cannot register rename-local or add-derive, but these
+        // Production cannot register rename-local or add-derive, but these
         // path-rule tests need two kinds with a Rule.
         Rule::unchecked_for_tests(
             rid(n),

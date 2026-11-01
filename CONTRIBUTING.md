@@ -110,9 +110,14 @@ release no input or output format carries a compatibility promise.
 - A decision that outlives a single change: a row of "Decisions in force" (`SEARCH_LEDGER.md` for
   the search), with the measurement that settled it, the guard that fails when it is broken, when
   to revisit it, and the options rejected.
-- Work a decision leaves open: a row of "Open work" in `CHECK_LEDGER.md`. Its direction is a
-  decision too; a change of direction says why in the row.
 - A promise a caller may rely on: a clause of a contract, below.
+- What a term means: the glossary in `crates/ryo-v2-core/src/domain/mod.rs`. How an adapter
+  realises a promise: that module's doc.
+- Measurements: the ledgers' tables, with the machine and the date beside each number.
+
+Nothing else is recorded: no list of work to do, of small gaps found on the way, or of ideas for
+later. Work that is decided is handed over in a task's contract; what it settles ends up in the
+places above.
 
 **Contracts.** A promise a caller may rely on is written as a clause under a `# Contract` heading in
 the rustdoc, with the tests that check it named beside it. The convention is stated in
@@ -135,7 +140,7 @@ cost. This is where the reasoning lives.>
 
 Verified: <the recipes actually run, and their outcome>
 
-Refs <issue: #<n>, or a ledger id such as S-2>
+Refs <issue: #<n>, a decision such as D4, or the contract clause it changes>
 ```
 
 - No AI attribution of any kind — no `Co-Authored-By`, no "Generated with", no
@@ -244,9 +249,10 @@ This is repository policy for every implementer, human or agent.
   complete, integration into `main` is a local merge done by the maintainer, conflicts included;
   pull requests are not required in this phase, and the hand-over ends as
   [Pull requests](#pull-requests) says.
-- In the same phase no issue tracker is used. Work to be done is written into the "Open work"
-  section of `CHECK_LEDGER.md` or into the task's contract, and handed over from there; what that
-  row stands for is defined in
+- In the same phase no issue tracker and no list of work items is kept. The phase is for validating
+  the engine's hypotheses fast; what a validation settles is fixed as a contract, and a contract
+  that proves wrong is changed. Work to be done is written into a task's contract and handed over
+  from there; what the contract stands for is defined in
   [PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md#role-of-each-public-artifact).
 - A decision that code or data must keep (a grouping, a denominator, a threshold) gets a test or a
   ceiling in the same change that makes the decision; prose alone does not keep it. Review asks
