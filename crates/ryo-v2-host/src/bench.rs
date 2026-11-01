@@ -73,11 +73,8 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     let analyzer = RaAnalyzer::new(
         RaConfig {
             proc_macro: args.proc_macro,
-            threads: None,
             assert_revert: args.assert_revert,
-            gap_detectors: true,
-            assert_revert_every: None,
-            cfg_test: false,
+            ..RaConfig::default()
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),

@@ -9,9 +9,9 @@ use crate::domain::resolution::DEFAULT_BUDGET;
 use crate::domain::stage::{On, Refused, Staged, stage};
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, BlueprintSet, Candidate, DecisionLog, Evidence, Infeasible,
-    LogEntry, NearMiss, NonEmpty, Resolution, Scope, Stage, Verdict,
+    LogEntry, NearMiss, NonEmpty, Resolution, Scope, Stage, UnseenClass, Verdict,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Why `apply_blueprints` could not finish.
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +71,8 @@ impl Acc {
 ///   tested: app::apply::tests::candidate_basis_is_stale_after_outside_change
 /// - C2: a spec in a file whose role is `Manifest` is blocked as `Unverifiable` before
 ///   anything is read, and the check is not called; a build script or proc-macro file gives
-///   a candidate whose `unseen_classes` name `BuildScript` or `ProcMacroCrate`.
+///   a candidate whose `unseen_classes` name `BuildScript` or `ProcMacroCrate` when the
+///   verifier is blind to them.
 ///   tested: app::apply::tests::crate_graph_edits_never_pass_silently
 /// - C3: a base fingerprint or a read of a file the analyzer does not have gives
 ///   `MissingFile`, also when other entries drifted, and the check is not called.
@@ -94,7 +95,7 @@ impl Acc {
 ///   tested: app::apply::tests::decision_log_stops_at_blocking_stage
 ///   tested: app::apply::tests::candidate_log_names_its_marks
 /// - C7: the candidate of an intent with `Borrow` and `Behaviour` risks has both in its marks
-///   and names `Borrow` in its `unseen_classes`.
+///   and, when the verifier is blind to borrows, names `Borrow` in its `unseen_classes`.
 ///   tested: app::apply::tests::borrow_intent_names_borrow_unseen
 /// - C9: the marks of a candidate are derived from its Blueprint's intent and the roles of the
 ///   files it edits.
@@ -115,6 +116,9 @@ impl Acc {
 ///   `Freshness` entry with `ok` false, and neither the stages nor the check run for it; a
 ///   chain below it fails the same way.
 ///   tested: app::apply::tests::child_of_failed_parent_is_never_checked
+/// - C14: a `Decided` resolution's evidence carries the verifier's blind classes, and each
+///   candidate is given them to name the ones its marks touch.
+///   tested: app::apply::tests::evidence_carries_the_checkers_blind_classes
 pub fn apply_blueprints<V: Verifier>(
     v: &V,
     s: &mut V::Session,
@@ -123,6 +127,7 @@ pub fn apply_blueprints<V: Verifier>(
 ) -> Result<Resolution, ApplyError> {
     let baseline = v.baseline(s);
     let provenance = v.provenance(s);
+    let blind = v.blind_classes();
     let mut acc = Acc::default();
     let mut candidates = Vec::new();
     let mut blocking = Vec::new();
@@ -156,6 +161,7 @@ pub fn apply_blueprints<V: Verifier>(
             &Decision {
                 baseline: &baseline,
                 scope,
+                blind: &blind,
             },
             &mut acc,
         )? {
@@ -184,6 +190,7 @@ pub fn apply_blueprints<V: Verifier>(
                 acc.verdicts,
                 DEFAULT_BUDGET,
                 provenance,
+                blind,
             ),
         });
     }
@@ -199,6 +206,7 @@ pub fn apply_blueprints<V: Verifier>(
 struct Decision<'a> {
     baseline: &'a [crate::domain::Finding],
     scope: Scope,
+    blind: &'a BTreeSet<UnseenClass>,
 }
 
 fn decide<V: Verifier>(
@@ -209,7 +217,11 @@ fn decide<V: Verifier>(
     ctx: &Decision<'_>,
     acc: &mut Acc,
 ) -> Result<Outcome, ApplyError> {
-    let Decision { baseline, scope } = *ctx;
+    let Decision {
+        baseline,
+        scope,
+        blind,
+    } = *ctx;
     let id = bp.id();
     let staged = {
         let session: &V::Session = s;
@@ -264,7 +276,7 @@ fn decide<V: Verifier>(
 
     // 7. candidate
     let kept = staged.clone();
-    match Candidate::new(staged, verdict) {
+    match Candidate::new(staged, verdict, blind) {
         Ok(c) => {
             acc.note(id, Stage::Candidate, true, c.marks_line());
             Ok(Outcome::Candidate(Box::new(c), Box::new(kept)))
@@ -322,6 +334,9 @@ mod tests {
         }
         fn provenance(&self, _: &()) -> Provenance {
             self.provenance.clone().unwrap_or_else(prov)
+        }
+        fn blind_classes(&self) -> BTreeSet<UnseenClass> {
+            BTreeSet::from(crate::app::ALWAYS_BLIND)
         }
         fn check(
             &self,
@@ -447,6 +462,7 @@ mod tests {
                     line: 1,
                 })
                 .collect(),
+            ..Default::default()
         }
     }
     fn run(fake: &Fake, bps: Vec<Blueprint>) -> Result<Resolution, ApplyError> {
@@ -1114,6 +1130,26 @@ mod tests {
             panic!("expected Decided");
         };
         assert_eq!(evidence.provenance(), &given);
+    }
+
+    #[test]
+    fn evidence_carries_the_checkers_blind_classes() {
+        let fake = Fake::with_text("src/lib.rs", BASE);
+        let r = run(&fake, vec![rename(1, "src/lib.rs")]).unwrap();
+        let Resolution::Decided {
+            evidence,
+            blueprints,
+            ..
+        } = r
+        else {
+            panic!("expected Decided");
+        };
+        assert_eq!(
+            evidence.blind_classes(),
+            &BTreeSet::from(crate::app::ALWAYS_BLIND)
+        );
+        // A blind class no mark of the candidate names is in the evidence only.
+        assert!(blueprints.as_slice()[0].unseen_classes().is_none());
     }
 
     #[test]

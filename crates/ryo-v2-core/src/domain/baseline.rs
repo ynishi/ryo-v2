@@ -171,6 +171,7 @@ mod tests {
         ScopedFindings {
             files: files(paths),
             findings,
+            ..Default::default()
         }
     }
 

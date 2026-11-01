@@ -119,6 +119,9 @@ pub struct RaSession {
     pub(crate) edited_since_audit: BTreeSet<RelPath>,
     /// Detector panics contained so far; collects run on several threads and take `&RaSession`.
     pub(crate) detector_panics: Mutex<BTreeSet<DetectorPanic>>,
+    /// The detector and file of each detector panic of the baseline: on these files the detector
+    /// was blind before any edit too.
+    pub(crate) baseline_panics: BTreeSet<(GapDetector, RelPath)>,
     /// Expander panics contained so far.
     pub(crate) expander_panics: Mutex<BTreeSet<ExpanderPanic>>,
     /// When set, every call of that edit kind in the expander panics; for the tests of the
@@ -244,7 +247,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
     let t1 = a.clock.now_ms();
     // The baseline is never cut off.
     let detector_panics = Mutex::new(BTreeSet::new());
-    let baseline = collect_errors_par(
+    let collected = collect_errors_par(
         &host,
         &files,
         &files,
@@ -256,6 +259,8 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
             panics: &detector_panics,
         },
     )?;
+    let baseline_panics: BTreeSet<(GapDetector, RelPath)> = collected.panics.into_iter().collect();
+    let baseline = collected.findings;
     let baseline_ms = a.clock.now_ms().saturating_sub(t1);
 
     a.observer.observe(Event::Loaded {
@@ -282,6 +287,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         deadline: None,
         edited_since_audit: BTreeSet::new(),
         detector_panics,
+        baseline_panics,
         expander_panics: Mutex::new(BTreeSet::new()),
         expander_fault: None,
     })

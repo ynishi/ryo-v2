@@ -180,9 +180,14 @@ fn cfg_test_config_diagnoses_test_module() {
     };
     assert!(
         !has_e0425(false),
-        "cfg(test) code is cfg-disabled by default"
+        "cfg(test) code is cfg-disabled with cfg_test off"
     );
     assert!(has_e0425(true), "set_test enables cfg(test) code");
+}
+
+#[test]
+fn ra_config_default_diagnoses_test_code() {
+    assert!(RaConfig::default().cfg_test);
 }
 
 const UNRESOLVED_LIB: &str =
@@ -230,6 +235,32 @@ fn reassert_mismatch_poisons_the_session() {
     );
     let second = healthy.check(&mut s, &[edit], Scope::Affected);
     assert!(matches!(second, Err(CheckError::Poisoned(_))), "{second:?}");
+}
+
+#[test]
+fn session_errors_win_over_a_detector_panic() {
+    let f = Fixture::single("verifier_session_wins", UNRESOLVED_LIB);
+    let healthy = assert_analyzer(false);
+    let faulty = assert_analyzer(true);
+    let edit = Edit::write(
+        rel("src/lib.rs"),
+        format!("{UNRESOLVED_LIB}pub fn h() {{}}\n"),
+    );
+    // The detector panics in the check's own diagnostics, and the re-assert after the revert
+    // lacks the finding the baseline has: the session error is the result.
+    let mut s = healthy.load(&f.dir).expect("load fixture");
+    let first = faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected);
+    assert!(
+        matches!(first, Err(CheckError::RevertMismatch { .. })),
+        "{first:?}"
+    );
+    // A poisoned session fails before the detector runs.
+    let second = faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected);
+    assert!(matches!(second, Err(CheckError::Poisoned(_))), "{second:?}");
+    let mut poisoned = healthy.load(&f.dir).expect("load fixture");
+    poisoned.poison("x");
+    let third = faulty.check(&mut poisoned, &[edit], Scope::Affected);
+    assert!(matches!(third, Err(CheckError::Poisoned(_))), "{third:?}");
 }
 
 #[test]

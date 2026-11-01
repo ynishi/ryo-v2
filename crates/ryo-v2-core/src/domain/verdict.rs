@@ -1,7 +1,8 @@
 //! The outcome of verifying edits.
 
 use super::baseline::new_findings;
-use super::{Diagnostics, Finding, ScopedFindings};
+use super::{Diagnostics, Finding, ScopedFindings, UnseenClass};
+use std::collections::BTreeSet;
 
 /// The errors the edits introduced.
 ///
@@ -11,12 +12,18 @@ use super::{Diagnostics, Finding, ScopedFindings};
 pub struct Verdict {
     /// Errors the baseline does not account for.
     pub new_errors: Diagnostics,
+    /// The classes of error the check did not see, as observed in it.
+    pub unseen: BTreeSet<UnseenClass>,
 }
 
 impl Verdict {
-    /// Builds a verdict from already-computed new errors (also used for "no edits").
+    /// Builds a verdict from already-computed new errors (also used for "no edits"); nothing was
+    /// observed.
     pub fn from_diagnostics(new_errors: Diagnostics) -> Self {
-        Self { new_errors }
+        Self {
+            new_errors,
+            unseen: BTreeSet::new(),
+        }
     }
 
     /// `Diagnostics::from_findings(&new_findings(baseline, checked))`.
@@ -24,8 +31,13 @@ impl Verdict {
     /// # Contract
     /// - C1: rustc codes land in `new_errors.errors`, analyzer codes in `new_errors.unmapped`.
     ///   tested: domain::verdict::tests::from_baseline_splits_codes
+    /// - C2: `unseen` is the `unseen` of `checked`.
+    ///   tested: domain::verdict::tests::from_baseline_carries_the_observed_unseen
     pub fn from_baseline(baseline: &[Finding], checked: &ScopedFindings) -> Self {
-        Self::from_diagnostics(Diagnostics::from_findings(&new_findings(baseline, checked)))
+        Self {
+            unseen: checked.unseen.clone(),
+            ..Self::from_diagnostics(Diagnostics::from_findings(&new_findings(baseline, checked)))
+        }
     }
 
     /// `new_errors.is_empty()`.
@@ -74,6 +86,7 @@ mod tests {
         let checked = ScopedFindings {
             files: vec![rel("a.rs")],
             findings: vec![e(rustc.clone(), 2), e(ra.clone(), 4)],
+            ..Default::default()
         };
         let v = Verdict::from_baseline(&[], &checked);
         assert!(!v.passed());
@@ -93,5 +106,18 @@ mod tests {
                 line: 4,
             }]
         );
+    }
+
+    #[test]
+    fn from_baseline_carries_the_observed_unseen() {
+        let none = ScopedFindings::default();
+        assert!(Verdict::from_baseline(&[], &none).unseen.is_empty());
+        let seen = ScopedFindings {
+            unseen: BTreeSet::from([UnseenClass::UnexpandedMacro]),
+            ..Default::default()
+        };
+        let v = Verdict::from_baseline(&[], &seen);
+        assert_eq!(v.unseen, BTreeSet::from([UnseenClass::UnexpandedMacro]));
+        assert!(v.passed());
     }
 }

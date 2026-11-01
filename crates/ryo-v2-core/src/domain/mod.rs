@@ -40,8 +40,15 @@
 //!   Borrow, BuildScript, ProcMacroCrate and Visibility each name an unseen class (UnseenClass).
 //!   includes: Borrow, BuildScript, ProcMacroCrate, Behaviour, Visibility
 //! - UnseenClass: a kind of error the in-process check does not see; a candidate names it in its
-//!   result and the build after the commit settles it.
-//! - UnseenClasses: the non-empty set of unseen classes a candidate carries.
+//!   result and the build after the commit settles it. A mark says what an edit can do and a blind
+//!   class what the checker does not see; a candidate names a class only when both hold, or when
+//!   the check observed it. A blind class no mark names is in the evidence only.
+//!   includes: Borrow, BuildScript, ProcMacroCrate, Visibility, ConstEval, StructLiteralPath,
+//!   UnusedTypeParam, DeriveWithoutServer, UnresolvedPath, DuplicateName, FieldBounds, TestCode,
+//!   UnexpandedMacro
+//! - UnseenClasses: the non-empty set of unseen classes a candidate names.
+//! - BlindClasses: the classes of error a checker does not see, declared on its port; the evidence
+//!   of a decision carries them.
 //! - FileRole: what a touched file is to the crate graph.
 //!   includes: Source, BuildScript, ProcMacroSource, Manifest
 //! - Staged: a path of blueprints that passed every stage before the check, with the edits it
@@ -52,13 +59,16 @@
 //!   includes: Unverifiable, Stale, MissingFile, Nonconforming, Splice, NewErrors, BudgetExhausted,
 //!   CheckFailed, ParentFailed
 //! - CheckError: failure of a verifier check.
-//!   includes: Edit, Cancelled, Panicked, RevertMismatch, Poisoned, TimedOut, ForkInUse,
-//!   AlreadyApplied, Load
+//!   includes: Edit, Cancelled, Panicked, DetectorPanicked, RevertMismatch, Poisoned, TimedOut,
+//!   ForkInUse, AlreadyApplied, Load
 //! - CheckReach: how far a check failure reaches: the one blueprint, or the session.
 //!   includes: Blueprint, Session
 //! - CheckFailure: why the check of a blueprint did not finish when the session survived it.
-//!   includes: Edit, Cancelled, Panicked
-//! - Verdict: the new errors relative to the baseline; passed if and only if there are none.
+//!   includes: Edit, Cancelled, Panicked, DetectorPanicked
+//! - Verdict: the new errors relative to the baseline and the unseen classes the check observed;
+//!   passed if and only if there are no new errors.
+//! - Evidence: what a decision rested on: the scope, the verdicts, the budget, the provenance and
+//!   the blind classes of the checker.
 //! - DecisionRecord: the proposer's identity and rationale, carried in the blueprint.
 //! - SpecRef: a reference `<doc>#<item>` to one item of a specification document.
 //! - Provenance: what a decision can be reproduced from: the analyzer, its version and

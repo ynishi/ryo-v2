@@ -27,6 +27,8 @@ fn analyzer() -> (RaAnalyzer, Arc<RecordingObserver>) {
     let a = RaAnalyzer::new(
         RaConfig {
             assert_revert: true,
+            // The fixtures' test modules still use the names their edits rename.
+            cfg_test: false,
             ..RaConfig::default()
         },
         Arc::new(MonotonicClock::new()),

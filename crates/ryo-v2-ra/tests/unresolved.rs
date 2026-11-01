@@ -2,7 +2,7 @@
 
 use ryo_v2_core::app::ports::Analyzer;
 use ryo_v2_core::app::verify::verify;
-use ryo_v2_core::domain::{Diagnostic, Edit, RelPath, Scope};
+use ryo_v2_core::domain::{Diagnostic, Edit, RelPath, Scope, UnseenClass, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{GapDetector, RaAnalyzer, RaConfig, RaSession};
@@ -67,12 +67,14 @@ impl Probe {
 
     /// New errors of writing `text` to src/lib.rs.
     fn errors_of(&self, gap_detectors: bool, text: &str) -> Vec<Diagnostic> {
+        self.verdict_of(gap_detectors, text).new_errors.errors
+    }
+
+    /// The verdict of writing `text` to src/lib.rs.
+    fn verdict_of(&self, gap_detectors: bool, text: &str) -> Verdict {
         let (a, mut s) = self.load(gap_detectors);
         let edit = Edit::write(RelPath::parse("src/lib.rs").unwrap(), text.to_owned());
-        verify(&a, &mut s, &[edit], Scope::Affected)
-            .expect("verify")
-            .new_errors
-            .errors
+        verify(&a, &mut s, &[edit], Scope::Affected).expect("verify")
     }
 }
 
@@ -292,7 +294,7 @@ fn cfg_disabled_statements_are_skipped() {
 
 #[test]
 fn detector_panic_is_contained_per_file() {
-    use ryo_v2_core::app::ports::Verifier;
+    use ryo_v2_core::app::ports::{CheckError, Verifier};
     use ryo_v2_core::domain::{Finding, FindingCode};
     let lib = "pub struct S;\npub fn g(s: S) {\n    s.missing();\n}\npub fn f(_x: Missing) {}\n";
     let p = Probe::new("contained");
@@ -338,10 +340,53 @@ fn detector_panic_is_contained_per_file() {
         "got {panics:?}"
     );
 
-    let edit = Edit::write(lib_rel, format!("{lib}// edited\n"));
-    a.check(&mut s, &[edit], Scope::Affected)
-        .expect("check is not poisoned");
+    // The detector panicked on this file at baseline too, so it was blind there before any edit:
+    // a check that reads the file passes on, names the detector's class, and the session's record
+    // keeps the panic once.
+    let edit = Edit::write(lib_rel.clone(), format!("{lib}// edited\n"));
+    for _ in 0..2 {
+        let found = a
+            .check(&mut s, std::slice::from_ref(&edit), Scope::Affected)
+            .expect("a panic the baseline had is named, not a failure");
+        assert!(
+            found.unseen.contains(&UnseenClass::UnresolvedPath),
+            "got {:?}",
+            found.unseen
+        );
+    }
     assert_eq!(s.detector_panics().len(), 1, "deduplicated");
+
+    // A panic the baseline did not have means the file cannot be judged: the check fails naming
+    // the detector and the file, and the session stays usable. The session is loaded without the
+    // fault and checked with it; the re-assert after the revert is off, as it would diagnose with
+    // the fault too and differ from that baseline.
+    let no_assert = || {
+        RaAnalyzer::new(
+            RaConfig {
+                proc_macro: false,
+                threads: Some(1),
+                assert_revert: false,
+                gap_detectors: true,
+                assert_revert_every: None,
+                cfg_test: false,
+            },
+            Arc::new(MonotonicClock::new()),
+            Arc::new(RecordingObserver::default()),
+        )
+    };
+    let mut s1 = no_assert().load(&p.dir).expect("load without fault");
+    let faulty =
+        no_assert().with_detector_fault(Some((GapDetector::UnresolvedPath, lib_rel.clone())));
+    let want = CheckError::DetectorPanicked {
+        detector: "unresolved-path".to_owned(),
+        file: lib_rel,
+    };
+    for _ in 0..2 {
+        let err = faulty
+            .check(&mut s1, std::slice::from_ref(&edit), Scope::Affected)
+            .expect_err("a new detector panic is a failed check");
+        assert_eq!(err, want);
+    }
 }
 
 const INCLUDE_GENERATED: &str = "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n\npub fn make() -> Generated {\n    Generated::new()\n}\n";
@@ -397,6 +442,27 @@ fn unresolved_names_outside_an_unexpanded_macro_file_are_still_reported() {
         "got {got:?}"
     );
     assert!(in_file("src/lib.rs").is_empty(), "got {got:?}");
+}
+
+#[test]
+fn unexpanded_macro_file_names_the_class() {
+    use std::collections::BTreeSet;
+    let p = Probe::new("names_class");
+    p.with_build_script();
+    // The detector skips the file, and the check says so.
+    let skipped = p.verdict_of(true, INCLUDE_GENERATED);
+    assert_eq!(
+        skipped.unseen,
+        BTreeSet::from([UnseenClass::UnexpandedMacro])
+    );
+    // The detector is off: nothing was skipped, so nothing is observed (the class is blind).
+    let off = p.verdict_of(false, INCLUDE_GENERATED);
+    assert!(off.unseen.is_empty(), "got {off:?}");
+    // A file whose macros expand is not skipped.
+    let q = Probe::new("names_class_expanding");
+    let expanding = "macro_rules! noop {\n    () => {};\n}\nnoop!();\n\npub fn f() {}\n";
+    let kept = q.verdict_of(true, expanding);
+    assert!(kept.unseen.is_empty(), "got {kept:?}");
 }
 
 #[test]

@@ -129,8 +129,10 @@ a 200,000-line workspace.
 3. **Verified as written.** A result is checked in exactly the text it would write. The truth of
    that check is `cargo check --workspace --all-targets`, and a result passes when it adds no error
    to the base. A file the check cannot judge makes a failure with its reason, never a result. A
-   class of error the in-process check cannot see is named on the result; the build after commit
-   settles it, and the rate at which it refuses a result is measured.
+   file the check reads but whose effect it does not see (a build script, a proc-macro crate) is
+   not unjudgeable: what it does is an unseen class. A class of error the in-process check cannot
+   see is named on the result; the build after commit settles it, and the rate at which it
+   refuses a result is measured.
 4. **Fast enough to search.** Verification runs in-process on a resident rust-analyzer, so a check
    takes seconds (the limit: 5 s or less per candidate on a warm session, a hypothesis) and many
    procedures can be compared. No `cargo`, `rustc` or test runs for a

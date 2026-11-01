@@ -1,6 +1,7 @@
 //! Error diagnostics as the analyzer reports them, before the baseline difference.
 
-use super::{ErrorCode, RelPath};
+use super::{ErrorCode, RelPath, UnseenClass};
+use std::collections::BTreeSet;
 
 /// The code of a [`Finding`]: a rustc E-code, or the analyzer's own name for an
 /// Error that has none ("unresolved-macro-call", "syntax-error", ...).
@@ -33,4 +34,7 @@ pub struct ScopedFindings {
     pub files: Vec<RelPath>,
     /// Every Error in those files, sorted (Ord), duplicates kept.
     pub findings: Vec<Finding>,
+    /// The classes of error this run did not see, though the checker would have looked: observed
+    /// in this run, not declared on the port.
+    pub unseen: BTreeSet<UnseenClass>,
 }

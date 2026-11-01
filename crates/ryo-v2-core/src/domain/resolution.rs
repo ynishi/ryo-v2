@@ -24,6 +24,15 @@ impl UnseenClasses {
     pub fn classes(&self) -> &BTreeSet<UnseenClass> {
         &self.0
     }
+
+    /// The classes of `set`, or `None` if it is empty.
+    ///
+    /// # Contract
+    /// - C1: `None` if and only if `set` is empty; otherwise the classes are `set`.
+    ///   tested: domain::resolution::tests::unseen_classes_from_an_empty_set_is_none
+    pub fn from_set(set: BTreeSet<UnseenClass>) -> Option<Self> {
+        (!set.is_empty()).then_some(Self(set))
+    }
 }
 
 impl std::fmt::Display for UnseenClasses {
@@ -41,12 +50,7 @@ impl std::fmt::Display for UnseenClasses {
 ///   tested: domain::resolution::tests::unseen_classes_follow_the_marks
 ///   tested: domain::resolution::tests::visibility_is_named_as_unseen
 pub fn unseen_classes(marks: &BTreeSet<RiskMark>) -> Option<UnseenClasses> {
-    let classes: BTreeSet<UnseenClass> = marks.iter().filter_map(|m| m.unseen_class()).collect();
-    if classes.is_empty() {
-        None
-    } else {
-        Some(UnseenClasses(classes))
-    }
+    UnseenClasses::from_set(marks.iter().filter_map(|m| m.unseen_class()).collect())
 }
 
 /// The marks of a change made by `kinds` to files of `roles`.
@@ -112,16 +116,25 @@ impl Candidate {
     /// Builds the candidate of a passing verdict.
     ///
     /// `staged` holds the Blueprints that lead to it, the root first and the leaf last (one for
-    /// an apply), the edits they make, the roles of every file they edit and their basis.
+    /// an apply), the edits they make, the roles of every file they edit and their basis. `blind`
+    /// is the classes its checker does not see.
     ///
     /// # Contract
     /// - C1: returns `Err(verdict)` unless `verdict.passed()`.
     ///   tested: domain::resolution::tests::candidate_refuses_failed_verdict
     /// - C2: the marks are [`risk_marks`] of the intent kinds of the path of `staged` and its
-    ///   roles, and `unseen_classes` follows from them with [`unseen_classes`].
+    ///   roles; `unseen_classes` is the classes of those marks ([`unseen_classes`]) that are in
+    ///   `blind`, together with the classes `verdict.unseen` observed, and `None` when there are
+    ///   none.
     ///   tested: domain::resolution::tests::candidate_names_its_marks
     ///   tested: domain::resolution::tests::crate_graph_edits_never_pass_silently
-    pub(crate) fn new(staged: Staged, verdict: Verdict) -> Result<Self, Verdict> {
+    ///   tested: domain::resolution::tests::candidate_names_what_it_touches_and_what_was_observed
+    ///   tested: domain::resolution::tests::empty_blind_names_nothing_from_marks
+    pub(crate) fn new(
+        staged: Staged,
+        verdict: Verdict,
+        blind: &BTreeSet<UnseenClass>,
+    ) -> Result<Self, Verdict> {
         if !verdict.passed() {
             return Err(verdict);
         }
@@ -130,12 +143,16 @@ impl Candidate {
             path.iter().map(|b| b.intent().kind()),
             roles.iter().copied(),
         );
+        let mut named: BTreeSet<UnseenClass> = unseen_classes(&marks)
+            .map(|u| u.classes().intersection(blind).copied().collect())
+            .unwrap_or_default();
+        named.extend(verdict.unseen.iter().copied());
         Ok(Self {
             path,
             edits,
             verdict,
             basis,
-            unseen_classes: unseen_classes(&marks),
+            unseen_classes: UnseenClasses::from_set(named),
             marks,
         })
     }
@@ -174,7 +191,9 @@ impl Candidate {
         &self.marks
     }
 
-    /// The classes of error the analyzer does not see that it carries.
+    /// The classes of error the checker does not see that it names: the blind classes its marks
+    /// name, and those observed in its check. A blind class that no mark names is in the
+    /// evidence only.
     pub fn unseen_classes(&self) -> Option<&UnseenClasses> {
         self.unseen_classes.as_ref()
     }
@@ -202,6 +221,13 @@ pub enum CheckFailure {
     Cancelled,
     /// The analyzer panicked.
     Panicked(String),
+    /// A detector panicked on a file the check read, so the check cannot judge that file.
+    DetectorPanicked {
+        /// The detector, by the adapter's name for it.
+        detector: String,
+        /// The file.
+        file: RelPath,
+    },
 }
 
 impl std::fmt::Display for CheckFailure {
@@ -210,6 +236,9 @@ impl std::fmt::Display for CheckFailure {
             CheckFailure::Edit { path, reason } => write!(f, "edit rejected: {path}: {reason}"),
             CheckFailure::Cancelled => write!(f, "check cancelled"),
             CheckFailure::Panicked(m) => write!(f, "analyzer panicked: {m}"),
+            CheckFailure::DetectorPanicked { detector, file } => {
+                write!(f, "detector {detector} panicked on {file}")
+            }
         }
     }
 }
@@ -699,6 +728,7 @@ pub struct Evidence {
     verdicts: Vec<(BlueprintId, Verdict)>,
     budget: DecisionBudget,
     provenance: Provenance,
+    blind_classes: BTreeSet<UnseenClass>,
 }
 
 impl Evidence {
@@ -710,6 +740,7 @@ impl Evidence {
         verdicts: Vec<(BlueprintId, Verdict)>,
         budget: DecisionBudget,
         provenance: Provenance,
+        blind_classes: BTreeSet<UnseenClass>,
     ) -> Self {
         Self {
             scope,
@@ -718,6 +749,7 @@ impl Evidence {
             verdicts,
             budget,
             provenance,
+            blind_classes,
         }
     }
 
@@ -751,6 +783,18 @@ impl Evidence {
     /// What the decision can be reproduced from.
     pub fn provenance(&self) -> &Provenance {
         &self.provenance
+    }
+
+    /// The classes of error the checker does not see, as it declared them for this decision.
+    /// Empty when it sees every class.
+    ///
+    /// # Contract
+    /// - C1: they are the classes the checker declares it does not see, whole, whatever the
+    ///   candidates name.
+    ///   tested: app::apply::tests::evidence_carries_the_checkers_blind_classes
+    ///   tested: app::search::tests::decided_lists_every_passing_node_by_reward
+    pub fn blind_classes(&self) -> &BTreeSet<UnseenClass> {
+        &self.blind_classes
     }
 }
 
@@ -893,6 +937,77 @@ mod tests {
     fn passing() -> Verdict {
         Verdict::from_diagnostics(Diagnostics::default())
     }
+    /// The classes the four marks name, all blind.
+    fn mark_blind() -> BTreeSet<UnseenClass> {
+        BTreeSet::from([
+            UnseenClass::Borrow,
+            UnseenClass::BuildScript,
+            UnseenClass::ProcMacroCrate,
+            UnseenClass::Visibility,
+        ])
+    }
+
+    #[test]
+    fn unseen_classes_from_an_empty_set_is_none() {
+        assert_eq!(UnseenClasses::from_set(BTreeSet::new()), None);
+        let one = BTreeSet::from([UnseenClass::ConstEval]);
+        assert_eq!(
+            UnseenClasses::from_set(one.clone()).unwrap().classes(),
+            &one
+        );
+    }
+
+    #[test]
+    fn empty_blind_names_nothing_from_marks() {
+        // Every mark that names a class, and a checker that is blind to none: nothing is named.
+        let c = Candidate::new(
+            staged(
+                &[IntentKind::ExtractFunction, IntentKind::MoveItem],
+                BTreeSet::from([FileRole::BuildScript, FileRole::ProcMacroSource]),
+                vec![],
+            ),
+            passing(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(c.marks().contains(&RiskMark::Borrow));
+        assert!(c.marks().contains(&RiskMark::Visibility));
+        assert!(c.marks().contains(&RiskMark::BuildScript));
+        assert!(c.marks().contains(&RiskMark::ProcMacroCrate));
+        assert_eq!(c.unseen_classes(), None);
+    }
+
+    #[test]
+    fn candidate_names_what_it_touches_and_what_was_observed() {
+        let borrow = || staged(&[IntentKind::ExtractVariable], BTreeSet::new(), vec![]);
+        let observed = Verdict {
+            unseen: BTreeSet::from([UnseenClass::UnexpandedMacro]),
+            ..passing()
+        };
+        // The mark names `Borrow` and the checker is blind to it: named.
+        let blind = BTreeSet::from([UnseenClass::Borrow, UnseenClass::ConstEval]);
+        let c = Candidate::new(borrow(), passing(), &blind).unwrap();
+        assert_eq!(
+            c.unseen_classes().unwrap().classes(),
+            &BTreeSet::from([UnseenClass::Borrow])
+        );
+        // The checker sees borrows: the mark names a class that is not blind, so nothing; a blind
+        // class no mark names (`ConstEval`) is not named either.
+        let other = BTreeSet::from([UnseenClass::ConstEval]);
+        let c = Candidate::new(borrow(), passing(), &other).unwrap();
+        assert_eq!(c.unseen_classes(), None);
+        // An observed class is named whatever the marks and the blind classes are.
+        let c = Candidate::new(borrow(), observed.clone(), &other).unwrap();
+        assert_eq!(
+            c.unseen_classes().unwrap().classes(),
+            &BTreeSet::from([UnseenClass::UnexpandedMacro])
+        );
+        let c = Candidate::new(borrow(), observed, &blind).unwrap();
+        assert_eq!(
+            c.unseen_classes().unwrap().classes(),
+            &BTreeSet::from([UnseenClass::Borrow, UnseenClass::UnexpandedMacro])
+        );
+    }
 
     #[test]
     fn unseen_classes_follow_the_marks() {
@@ -985,6 +1100,7 @@ mod tests {
             let c = Candidate::new(
                 staged(&[IntentKind::MoveItem], BTreeSet::from([role]), vec![]),
                 passing(),
+                &mark_blind(),
             )
             .unwrap();
             assert!(c.marks().contains(&mark), "{role}");
@@ -1010,6 +1126,7 @@ mod tests {
         let err = Candidate::new(
             staged(&[IntentKind::MoveItem], BTreeSet::new(), vec![]),
             v.clone(),
+            &mark_blind(),
         )
         .unwrap_err();
         assert_eq!(err, v);
@@ -1020,6 +1137,7 @@ mod tests {
                 vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
             ),
             passing(),
+            &mark_blind(),
         )
         .unwrap();
         assert_eq!(ok.blueprint(), ok.path()[1].id());
@@ -1039,7 +1157,12 @@ mod tests {
         }
         for kinds in &paths {
             for roles in role_subsets() {
-                let c = Candidate::new(staged(kinds, roles.clone(), vec![]), passing()).unwrap();
+                let c = Candidate::new(
+                    staged(kinds, roles.clone(), vec![]),
+                    passing(),
+                    &mark_blind(),
+                )
+                .unwrap();
                 let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
                 assert_eq!(c.marks(), &marks, "{kinds:?} {roles:?}");
                 assert_eq!(c.unseen_classes(), unseen_classes(&marks).as_ref());
