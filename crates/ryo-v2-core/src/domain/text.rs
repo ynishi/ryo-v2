@@ -379,7 +379,7 @@ pub enum SpliceError {
         offset: u32,
     },
     /// Two splices touch the same bytes.
-    #[error("two specs overlap")]
+    #[error("two splices overlap")]
     Overlap,
 }
 

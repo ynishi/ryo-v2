@@ -99,8 +99,8 @@ fn rename_acc(ws: &Ws, id: &str) -> Value {
     );
     json!({
         "id": id,
-        "intent": {"kind": "rename-local", "from": "acc", "to": "sum"},
-        "specs": [
+        "command": {"kind": "rename-local", "from": "acc", "to": "sum"},
+        "splices": [
             replace("src/lib.rs", at(LIB, "acc", 0, 0, 3), "sum"),
             replace("src/lib.rs", at(LIB, "acc", 1, 0, 3), "sum"),
             replace("src/lib.rs", at(LIB, "acc", 2, 0, 3), "sum"),

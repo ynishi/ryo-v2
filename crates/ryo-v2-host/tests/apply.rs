@@ -94,7 +94,7 @@ fn replace(path: &str, range: (usize, usize), text: &str) -> Value {
 
 fn blueprint(command: Value, splices: Vec<Value>, reads: Vec<Value>, bases: Vec<Value>) -> Value {
     json!({"blueprints": [{
-        "intent": command, "specs": splices, "reads": reads, "bases": bases,
+        "command": command, "splices": splices, "reads": reads, "bases": bases,
         "record": {"proposer": "test", "rationale": "test"},
     }]})
 }
@@ -182,8 +182,8 @@ fn builds_on_chain_is_decided() {
     let b = json!({
         "id": b_id,
         "builds_on": a_id,
-        "intent": {"kind": "rename-local", "from": "sum", "to": "total_sum"},
-        "specs": sites,
+        "command": {"kind": "rename-local", "from": "sum", "to": "total_sum"},
+        "splices": sites,
         "reads": [{
             "path": "src/lib.rs", "start": total.0, "end": total.1,
             "fingerprint": fp(&a_text[total.0..total.1]),

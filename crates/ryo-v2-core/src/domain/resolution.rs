@@ -374,10 +374,10 @@ impl std::fmt::Display for Blocking {
                 write!(f, "{blueprint}: {path} is not in the workspace")
             }
             Blocking::Nonconforming { blueprint, why } => {
-                write!(f, "{blueprint}: does not match its intent: {why}")
+                write!(f, "{blueprint}: does not match its command: {why}")
             }
             Blocking::Splice { blueprint, err } => {
-                write!(f, "{blueprint}: cannot apply the mutations: {err}")
+                write!(f, "{blueprint}: cannot apply the splices: {err}")
             }
             Blocking::NewErrors { blueprint, verdict } => write!(
                 f,
@@ -524,7 +524,7 @@ pub enum Stage {
     Freshness,
     /// The splices against the command.
     Conformance,
-    /// The splices spliced into the text.
+    /// The splices applied to the text.
     Splice,
     /// Risk marks.
     Marks,

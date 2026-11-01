@@ -130,7 +130,7 @@ fn candidate_json(c: &Candidate) -> Value {
         .map(|b| {
             json!({
                 "blueprint": b.id().to_string(),
-                "intent": b.command().to_string(),
+                "command": b.command().to_string(),
                 "proposer": b.record().proposer(),
                 "rationale": b.record().rationale(),
                 "spec_refs": b.spec_refs().iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -254,7 +254,7 @@ fn blocking_json(b: &Blocking) -> Value {
 ///   tested: tests/apply.rs apply_after_insert_above_is_failed_stale
 ///   tested: resolution_json::tests::budget_exhausted_blocking_is_listed
 ///   tested: resolution_json::tests::failed_lists_parent_failed
-/// - C3: a `Decided` resolution lists, per candidate, the Blueprints of its path with intent,
+/// - C3: a `Decided` resolution lists, per candidate, the Blueprints of its path with command,
 ///   proposer, rationale and spec refs, and the evidence lists the provenance: analyzer,
 ///   version, config and workspace fingerprint; the evidence has exactly the keys `scope`,
 ///   `fingerprints_checked`, `baseline_size`, `budget`, `provenance`, `verdicts` and
@@ -599,7 +599,7 @@ mod tests {
             path[0],
             json!({
                 "blueprint": bp_id.to_string(),
-                "intent": "rename-local a -> b",
+                "command": "rename-local a -> b",
                 "proposer": "agent",
                 "rationale": "because",
                 "spec_refs": ["docs/m3.md#4"],

@@ -126,7 +126,7 @@ pub struct TraceEntry {
     pub blueprint: BlueprintId,
     /// Its proposal, the identity a judge sees.
     pub proposal: ProposalId,
-    /// The command it calls.
+    /// The kind of the command it calls.
     pub command: CommandKind,
     /// The state it leads to; `None` when a stage refused it.
     pub state: Option<StateFp>,

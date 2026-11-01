@@ -105,16 +105,16 @@ impl DecisionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BlueprintError {
     /// A Blueprint without a splice.
-    #[error("a blueprint needs at least one mutation")]
+    #[error("a blueprint needs at least one splice")]
     NoSplices,
     /// Splice number `splice` lies outside every range the Blueprint read.
-    #[error("spec {splice} lies outside everything the blueprint read")]
+    #[error("splice {splice} lies outside everything the blueprint read")]
     Uncovered {
         /// Index of the splice.
         splice: usize,
     },
     /// Splices `a` and `b` touch the same bytes.
-    #[error("specs {a} and {b} overlap")]
+    #[error("splices {a} and {b} overlap")]
     Overlap {
         /// Lower index.
         a: usize,
@@ -122,7 +122,7 @@ pub enum BlueprintError {
         b: usize,
     },
     /// Splice number `splice` is in a file without a base fingerprint.
-    #[error("spec {splice} is in a file without a base fingerprint")]
+    #[error("splice {splice} is in a file without a base fingerprint")]
     NoBase {
         /// Index of the splice.
         splice: usize,

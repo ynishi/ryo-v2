@@ -331,7 +331,7 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Nonconformance {
     /// The splices touch more than one file (or none).
-    #[error("the specs do not touch exactly one file")]
+    #[error("the splices do not touch exactly one file")]
     ManyFiles,
     /// No base text was given for the file.
     #[error("no base text for {path}")]
@@ -340,7 +340,7 @@ pub enum Nonconformance {
         path: RelPath,
     },
     /// Splice number `splice` has a kind this command does not use.
-    #[error("spec {splice} is a {kind}, which this intent does not use")]
+    #[error("splice {splice} is a {kind}, which this command does not use")]
     WrongKind {
         /// Index of the splice.
         splice: usize,
@@ -348,13 +348,13 @@ pub enum Nonconformance {
         kind: SpliceKind,
     },
     /// The base text under splice number `splice` is not what the command names.
-    #[error("spec {splice} does not touch the name the intent renames")]
+    #[error("splice {splice} does not touch the name the command renames")]
     BaseTextMismatch {
         /// Index of the splice.
         splice: usize,
     },
     /// The new text of splice number `splice` is not what the command says.
-    #[error("spec {splice} writes text other than the intent's")]
+    #[error("splice {splice} writes text other than the command's")]
     NewTextMismatch {
         /// Index of the splice.
         splice: usize,
@@ -366,13 +366,13 @@ pub enum Nonconformance {
     #[error("no replace puts the new variable in place of an expression")]
     NoUseReplace,
     /// Splice number `splice` is not a derive attribute or a derive list tail.
-    #[error("spec {splice} is not a derive")]
+    #[error("splice {splice} is not a derive")]
     NotADerive {
         /// Index of the splice.
         splice: usize,
     },
     /// The derives written differ from the command's list.
-    #[error("the derives written differ from the intent's list")]
+    #[error("the derives written differ from the command's list")]
     DeriveListMismatch,
     /// No single insert declares the new function.
     #[error("no single insert declares the new function")]
@@ -387,16 +387,16 @@ pub enum Nonconformance {
         ident: String,
     },
     /// The splices of a move do not touch exactly the source file and the destination file.
-    #[error("the specs do not touch exactly the file moved from and the file moved to")]
+    #[error("the splices do not touch exactly the file moved from and the file moved to")]
     MoveFiles,
     /// The base text under splice number `splice` does not declare the item moved.
-    #[error("spec {splice} does not declare the item moved")]
+    #[error("splice {splice} does not declare the item moved")]
     NotAnItem {
         /// Index of the splice.
         splice: usize,
     },
     /// The new text of splice number `splice` is not a re-export of the item moved.
-    #[error("spec {splice} does not re-export the item moved")]
+    #[error("splice {splice} does not re-export the item moved")]
     NoReexport {
         /// Index of the splice.
         splice: usize,
@@ -405,7 +405,7 @@ pub enum Nonconformance {
     #[error("the destination does not receive the item's text")]
     NotMoved,
     /// Splice number `splice` replaces text by the same text.
-    #[error("spec {splice} writes the bytes it replaces: it changes nothing")]
+    #[error("splice {splice} writes the bytes it replaces: it changes nothing")]
     NoOp {
         /// Index of the splice.
         splice: usize,

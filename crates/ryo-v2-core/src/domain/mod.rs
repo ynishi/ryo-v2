@@ -18,7 +18,6 @@
 //! - BlueprintSet: the blueprints submitted together in one apply; those not on one chain are
 //!   alternatives, a blueprint with `builds_on` is against its parent's result.
 //! - Splice: one change of one text range of one file's base text.
-//!   includes: Replace, Insert, Delete
 //! - SpliceKind: what a splice does to its range.
 //!   includes: Replace, Insert, Delete
 //! - TextRange: a half-open UTF-8 byte range `[start, end)` of one file's base text.
@@ -43,7 +42,7 @@
 //!   includes: File, Read, Missing
 //! - CommandKind: a typed action of the one-layer action space.
 //!   includes: RenameLocal, ExtractVariable, AddDerive, ExtractFunction, MoveItem
-//! - Command: a blueprint's command: its CommandKind and validated parameters; what CONCEPT.md
+//! - Command: what a blueprint carries out: its CommandKind and validated parameters; what CONCEPT.md
 //!   calls a mutation of the code, and a mutation list is a chain of them.
 //! - CommandSpec: an entry of the catalog: a CommandKind and the risks it always carries.
 //! - RiskMark: a reason, named in the result, that the engine's own verification is not enough.
