@@ -16,6 +16,7 @@ use crate::check::{fingerprints, map_error};
 use crate::diagnostics::{diagnostics_config, panic_message};
 use crate::fork::db_text;
 use crate::session::{ExpanderPanic, RaSession};
+use crate::stack;
 use ra_ap_hir::{Crate, PrefixKind};
 use ra_ap_ide::TextRange as RaRange;
 use ra_ap_ide::{
@@ -1643,9 +1644,7 @@ impl Expander for RaAnalyzer {
         targets: &[Target],
         max: usize,
     ) -> Result<Vec<Blueprint>, ExpandError> {
-        if let Some(msg) = &s.poisoned {
-            return Err(ExpandError::Session(CheckError::Poisoned(msg.clone())));
-        }
+        stack::require_free(s).map_err(ExpandError::Session)?;
         if targets.is_empty() || max == 0 {
             return Ok(Vec::new());
         }

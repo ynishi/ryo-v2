@@ -14,6 +14,7 @@ mod field_bounds;
 mod fork;
 mod rev_deps;
 mod session;
+mod stack;
 mod unresolved;
 
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Clock, Observer};
@@ -79,6 +80,8 @@ pub struct RaAnalyzer {
     pub(crate) check_timeout_ms: Option<u64>,
     /// Detector and file on which it is made to panic; a test hook.
     pub(crate) detector_fault: Option<(GapDetector, RelPath)>,
+    /// File whose text a revert gets wrong; a test hook.
+    pub(crate) revert_fault: Option<RelPath>,
 }
 
 impl RaAnalyzer {
@@ -90,6 +93,7 @@ impl RaAnalyzer {
             observer,
             check_timeout_ms: None,
             detector_fault: None,
+            revert_fault: None,
         }
     }
 
@@ -98,6 +102,15 @@ impl RaAnalyzer {
     #[doc(hidden)]
     pub fn with_detector_fault(mut self, fault: Option<(GapDetector, RelPath)>) -> RaAnalyzer {
         self.detector_fault = fault;
+        self
+    }
+
+    /// Makes every revert of a write that modified or deleted `path` restore it with its stored
+    /// text plus one byte, so that the comparison of the texts must catch it.
+    /// For the tests of that comparison; nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_revert_fault(mut self, path: Option<RelPath>) -> RaAnalyzer {
+        self.revert_fault = path;
         self
     }
 
@@ -120,6 +133,18 @@ impl RaAnalyzer {
 /// - C1: a `discard` whose re-assert differs from the baseline is `RevertMismatch` and poisons
 ///   the session; a later `fork` is refused.
 ///   tested: tests/verifier.rs discard_reassert_mismatch_poisons_the_session
+/// - C2: a `discard` compares the texts of the files its write modified or deleted with their
+///   texts before; a difference is `RevertMismatch` and poisons the session.
+///   tested: tests/stack.rs analyzer_discard_compares_texts
+/// - C3: on a session poisoned while its fork is live, `apply` and `diagnostics` are refused and
+///   write nothing; `discard` ends the fork without writing.
+///   tested: tests/stack.rs a_poisoned_fork_is_not_written
+/// - C4: `apply`, `diagnostics` and `discard` with a fork that is not the session's live one
+///   (another session's, or one already discarded) are `ForkInUse` and change nothing.
+///   tested: tests/stack.rs an_analyzer_ticket_of_another_session_is_refused
+/// - C5: while a fork is live, `Verifier::check`, `Expander::expand` and
+///   `RevertAudit::audit_revert` are `ForkInUse`, and `Verifier::text` describes the base.
+///   tested: tests/stack.rs a_live_analyzer_fork_holds_the_session
 impl Analyzer for RaAnalyzer {
     type Session = RaSession;
     type Fork = RaFork;
@@ -155,6 +180,6 @@ impl Analyzer for RaAnalyzer {
     }
 
     fn discard(&self, session: &mut RaSession, fork: RaFork) -> Result<(), AnalyzerError> {
-        fork::discard(self, session, fork)
+        fork::discard(self, session, &fork)
     }
 }

@@ -3,14 +3,13 @@
 
 use crate::RaAnalyzer;
 use crate::diagnostics::{Deadline, Detector, collect_errors_par};
-use crate::fork;
+use crate::fork::{self, RevertFailure};
 use crate::rev_deps::scoped_files;
-use crate::session::RaSession;
-use ryo_v2_core::app::ports::{
-    Analyzer, AnalyzerError, CheckError, FileFacts, RevertAudit, Verifier,
-};
+use crate::session::{ForkPort, RaSession};
+use crate::stack;
+use ra_ap_vfs::FileId;
+use ryo_v2_core::app::ports::{AnalyzerError, CheckError, FileFacts, RevertAudit, Verifier};
 use ryo_v2_core::domain::baseline::{restrict, same_findings};
-use ryo_v2_core::domain::text::revert_intact;
 use ryo_v2_core::domain::{
     Edit, Finding, Fingerprint, Provenance, RelPath, Scope, ScopedFindings, UnseenClass,
 };
@@ -47,6 +46,66 @@ pub(crate) fn map_error(e: AnalyzerError, edited: &[RelPath]) -> CheckError {
     }
 }
 
+/// How a failed revert is said to the caller of a check. A failure to revert is always about the
+/// session, never about the Blueprint being checked.
+fn revert_error(failed: RevertFailure) -> CheckError {
+    match failed {
+        RevertFailure::Mismatch(paths) => CheckError::RevertMismatch { paths },
+        RevertFailure::Poisoned(msg) => CheckError::Poisoned(msg),
+        RevertFailure::Failed(e) => map_error(e, &[]),
+    }
+}
+
+/// The text of `id` in the base state: the record a level made before it wrote the file, or else
+/// what the database holds.
+fn base_text(s: &RaSession, id: FileId) -> Option<String> {
+    match s.base_texts.get(&id) {
+        Some(text) => Some(text.clone()),
+        None => fork::db_text(&s.host, id).ok(),
+    }
+}
+
+/// Diagnoses the top level for a check: under the check time limit, and with a detector that
+/// panicked where it did not at the baseline failing the diagnosis.
+fn diagnose_for_check(
+    a: &RaAnalyzer,
+    s: &RaSession,
+    scope: Scope,
+) -> Result<ScopedFindings, CheckError> {
+    let deadline = a
+        .check_timeout_ms
+        .map(|ms| Deadline::after(a.clock.clone(), ms));
+    let (mut found, panics) = match fork::diagnose_level(a, s, scope, deadline.as_ref()) {
+        Ok(diagnosed) => diagnosed,
+        Err(AnalyzerError::Cancelled) => {
+            return Err(match a.check_timeout_ms {
+                Some(limit_ms) if deadline.as_ref().is_some_and(Deadline::was_hit) => {
+                    CheckError::TimedOut { limit_ms }
+                }
+                _ => CheckError::Cancelled,
+            });
+        }
+        Err(e) => return Err(map_error(e, &[])),
+    };
+    // A panic the baseline had on the same file is a blind spot of the detector there before any
+    // edit: named, not a failure. A new one means the file cannot be judged.
+    let mut new_panic = None;
+    for (detector, file) in panics {
+        if s.baseline_panics.contains(&(detector, file.clone())) {
+            found.unseen.insert(detector.unseen_class());
+        } else if new_panic.is_none() {
+            new_panic = Some((detector, file));
+        }
+    }
+    match new_panic {
+        Some((detector, file)) => Err(CheckError::DetectorPanicked {
+            detector: detector.name().to_owned(),
+            file,
+        }),
+        None => Ok(found),
+    }
+}
+
 /// The adapter's `Verifier`.
 ///
 /// # Contract
@@ -69,7 +128,7 @@ impl Verifier for RaAnalyzer {
     ///   tested: tests/verifier.rs check_of_unindexed_existing_path_is_edit_error
     fn text(&self, s: &RaSession, path: &RelPath) -> Option<String> {
         let (id, _) = s.files.iter().find(|(_, r)| r == path)?;
-        fork::db_text(&s.host, *id).ok()
+        base_text(s, *id)
     }
 
     /// Facts of `path` from the one `cargo metadata` call at load.
@@ -153,7 +212,7 @@ impl Verifier for RaAnalyzer {
             .files
             .iter()
             .filter_map(|(id, path)| {
-                let text = fork::db_text(&s.host, *id).ok()?;
+                let text = base_text(s, *id)?;
                 Some((path.clone(), Fingerprint::of(text.as_bytes())))
             })
             .collect();
@@ -185,6 +244,7 @@ impl Verifier for RaAnalyzer {
     /// - C1: the text fingerprints of the edited files are compared before and after; a
     ///   difference poisons the session and is `RevertMismatch`.
     ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
+    ///   tested: tests/stack.rs text_is_the_base_after_a_poisoned_check
     /// - C2: the diagnostic re-assert runs on every n-th call when `assert_revert_every` is
     ///   `Some(n)`.
     ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
@@ -203,69 +263,44 @@ impl Verifier for RaAnalyzer {
     ///   detector's class (`GapDetector::unseen_class`) in the findings' `unseen`.
     ///   tested: tests/unresolved.rs detector_panic_is_contained_per_file
     ///   tested: tests/gap_detectors.rs each_detector_panic_is_contained_on_its_own
-    /// - C6: `RevertMismatch` and `Poisoned` win over `DetectorPanicked`.
+    /// - C6: `RevertMismatch` and `Poisoned` win over every other error of the check: an `Edit`,
+    ///   a `TimedOut`, a `Panicked` and a `DetectorPanicked`.
     ///   tested: tests/verifier.rs session_errors_win_over_a_detector_panic
+    ///   tested: tests/stack.rs a_session_error_of_the_release_wins_in_a_check
+    /// - C7: with no edit the check diagnoses no file at `Scope::Affected` and names no unseen
+    ///   class.
+    ///   tested: tests/stack.rs an_empty_check_diagnoses_nothing
+    /// - C8: a check whose edits are refused records no check or revert event and pushes no
+    ///   level.
+    ///   tested: tests/stack.rs a_refused_check_reverts_nothing
     fn check(
         &self,
         s: &mut RaSession,
         edits: &[Edit],
         scope: Scope,
     ) -> Result<ScopedFindings, CheckError> {
-        if let Some(msg) = &s.poisoned {
-            return Err(CheckError::Poisoned(msg.clone()));
-        }
+        stack::require_free(s)?;
         let mut edited: Vec<RelPath> = edits.iter().map(|e| e.path.clone()).collect();
         edited.sort();
         edited.dedup();
         s.edited_since_audit.extend(edited.iter().cloned());
-        let before = fingerprints(s, &edited);
 
-        s.check_count = s.check_count.wrapping_add(1);
-        let sampled = self
-            .config
-            .assert_revert_every
-            .is_some_and(|n| s.check_count.is_multiple_of(n.get()));
-        let saved_assert = s.assert_revert;
-        if sampled {
-            s.assert_revert = true;
-        }
-        let (outcome, timed_out) = run_fork(self, s, edits, scope);
-        s.assert_revert = saved_assert;
+        s.write_count = s.write_count.wrapping_add(1);
+        let sampled = s.assert_revert
+            || self
+                .config
+                .assert_revert_every
+                .is_some_and(|n| s.write_count.is_multiple_of(n.get()));
 
-        let after = fingerprints(s, &edited);
-        if let Err(paths) = revert_intact(&before, &after) {
-            s.poisoned = Some(format!(
-                "text of {} file(s) differs after revert",
-                paths.len()
-            ));
-            return Err(CheckError::RevertMismatch { paths });
-        }
-        match (outcome, self.check_timeout_ms) {
-            (Err(AnalyzerError::Cancelled), Some(limit_ms)) if timed_out => {
-                Err(CheckError::TimedOut { limit_ms })
-            }
-            (outcome, _) => {
-                // An error of the run, the session's included, wins over a detector panic.
-                let (mut found, panics) = outcome.map_err(|e| map_error(e, &edited))?;
-                // A panic the baseline had on the same file is a blind spot of the detector there
-                // before any edit: named, not a failure. A new one means the file cannot be judged.
-                let mut new_panic = None;
-                for (detector, file) in panics {
-                    if s.baseline_panics.contains(&(detector, file.clone())) {
-                        found.unseen.insert(detector.unseen_class());
-                    } else if new_panic.is_none() {
-                        new_panic = Some((detector, file));
-                    }
-                }
-                match new_panic {
-                    Some((detector, file)) => Err(CheckError::DetectorPanicked {
-                        detector: detector.name().to_owned(),
-                        file,
-                    }),
-                    None => Ok(found),
-                }
-            }
-        }
+        // A check is the one-level case of a fork: write, diagnose, release. The release always
+        // runs, and its failure, always about the session, wins; then the write's; then the
+        // diagnosis's.
+        stack::open_fork(s, ForkPort::Stacked);
+        let outcome = fork::push_level(self, s, edits, sampled)
+            .map_err(|e| map_error(e, &edited))
+            .and_then(|()| diagnose_for_check(self, s, scope));
+        fork::release_levels(self, s).map_err(revert_error)?;
+        outcome
     }
 }
 
@@ -280,9 +315,7 @@ impl Verifier for RaAnalyzer {
 ///   tested: tests/timeout.rs audit_revert_is_ok_after_checks_and_refuses_poisoned
 impl RevertAudit for RaAnalyzer {
     fn audit_revert(&self, s: &mut RaSession) -> Result<(), CheckError> {
-        if let Some(msg) = &s.poisoned {
-            return Err(CheckError::Poisoned(msg.clone()));
-        }
+        stack::require_free(s)?;
         if s.edited_since_audit.is_empty() {
             return Ok(());
         }
@@ -314,41 +347,6 @@ impl RevertAudit for RaAnalyzer {
             Err(CheckError::RevertMismatch { paths: edited })
         }
     }
-}
-
-/// fork, apply, diagnostics, discard; discard always runs. The `Err` that wins: apply, then
-/// diagnostics, then discard (the same as `app::verify`). The flag says that the cut-off ended
-/// the diagnostics. The panics are those of the detectors in this run's diagnostics.
-fn run_fork(
-    a: &RaAnalyzer,
-    s: &mut RaSession,
-    edits: &[Edit],
-    scope: Scope,
-) -> (Result<fork::Diagnosed, AnalyzerError>, bool) {
-    let mut f = match a.fork(s) {
-        Ok(f) => f,
-        Err(e) => return (Err(e), false),
-    };
-    let applied = a.apply(s, &mut f, edits);
-    let mut timed_out = false;
-    let checked = match applied {
-        Ok(()) => {
-            s.deadline = a
-                .check_timeout_ms
-                .map(|ms| Deadline::after(a.clock.clone(), ms));
-            let r = fork::diagnostics_with_panics(a, s, &f, scope);
-            timed_out = s.deadline.take().is_some_and(|d| d.was_hit());
-            Some(r)
-        }
-        Err(_) => None,
-    };
-    let discarded = a.discard(s, f);
-    let outcome = applied.and_then(|()| {
-        let found = checked.unwrap_or_else(|| Ok((ScopedFindings::default(), Vec::new())))?;
-        discarded?;
-        Ok(found)
-    });
-    (outcome, timed_out)
 }
 
 #[cfg(test)]

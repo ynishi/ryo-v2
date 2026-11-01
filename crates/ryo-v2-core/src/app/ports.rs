@@ -33,8 +33,8 @@ pub enum AnalyzerError {
     /// The analyzer panicked.
     #[error("rust-analyzer panicked: {0}")]
     Panicked(String),
-    /// Diagnostics after revert differ from the baseline.
-    #[error("revert did not restore the baseline")]
+    /// The revert did not restore the texts, or (assert on) the diagnostics.
+    #[error("revert did not restore the base state")]
     RevertMismatch,
 }
 
@@ -72,7 +72,7 @@ pub enum CheckError {
         /// The limit that was hit, in milliseconds.
         limit_ms: u64,
     },
-    /// A fork was already live on the session when the check began.
+    /// A fork is live on the session: the operation needs the session at its base state.
     #[error("a fork was already live on the session")]
     ForkInUse,
     /// The adapter applied edits twice to one fork.
@@ -335,7 +335,7 @@ pub trait Analyzer {
         fork: &Self::Fork,
         scope: Scope,
     ) -> Result<ScopedFindings, AnalyzerError>;
-    /// 適用を巻き戻して Fork を捨てる。assert_revert 有効時、巻き戻し後の診断が baseline と違えば Err(RevertMismatch)。
+    /// 適用を巻き戻して Fork を捨てる。巻き戻しが text を戻さなかった時、または (assert_revert 有効時) 巻き戻し後の診断が baseline と違う時は Err(RevertMismatch)。
     fn discard(&self, session: &mut Self::Session, fork: Self::Fork) -> Result<(), AnalyzerError>;
 }
 
