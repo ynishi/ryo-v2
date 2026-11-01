@@ -4,7 +4,7 @@
 //!
 //! The check reads sources with `syn` only: no rustdoc JSON, no rust-analyzer, no build of other
 //! targets. It checks that a named test *exists*; that it really checks the promise is a review
-//! question (see `CONTRIBUTING.md`).
+//! question (see `DEVELOPMENT.md`).
 //!
 //! Example (the fence keeps this example out of the check, see rule 1):
 //!
@@ -103,7 +103,7 @@
 //!    problem, whichever owners they have. `[free]` clauses take part. The problem is reported
 //!    on every member after the first of the group sorted by (package, file, owner, id).
 //!
-//! Not checked, and left to review (see `CONTRIBUTING.md`): which change request touches which
+//! Not checked, and left to review (see `DEVELOPMENT.md`): which change request touches which
 //! clause; a clause that is vacuous or contradicts another with different words; whether a
 //! glossary term names a real item; whether a change of an `includes:` list was intended.
 //!

@@ -264,7 +264,7 @@ contributors use the same context without repeatedly reclassifying it.
   examples, compatibility notes, and migration path.
 
 While the repository uses no issue tracker
-([CONTRIBUTING.md](CONTRIBUTING.md#development-flow) says when), the task's
+([DEVELOPMENT.md](DEVELOPMENT.md#development-flow) says when), the task's
 contract is the issue as a unit of work: what this document says of an issue
 applies to it, an umbrella is split into tasks rather than child issues, and the
 hand-over note ([CONTRIBUTING.md](CONTRIBUTING.md#pull-requests)) does the work

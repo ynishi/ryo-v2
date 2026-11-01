@@ -1,13 +1,15 @@
 # ryo-v2 — pointers for coding agents
 
 - What the project is and promises, and the crate layout: [README.md](README.md)
+- The concept every design decision rests on — a change is checked against it:
+  [CONCEPT.md](CONCEPT.md)
 - Disclosure policy — read before anything ships:
   [PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md)
 - Issue, branch, commit and PR conventions:
   [CONTRIBUTING.md](CONTRIBUTING.md)
 - Security reports: [SECURITY.md](SECURITY.md)
 - How decisions are made and recorded, and how contracts change:
-  [CONTRIBUTING.md](CONTRIBUTING.md#decisions-and-contracts)
+  [DEVELOPMENT.md](DEVELOPMENT.md#decisions-and-contracts)
 - API detail lives in RustDoc (`cargo doc`); code documentation outranks stale
   issue text.
 - Never work on `main`; one branch per issue, cut from `origin/main` after a
@@ -18,9 +20,9 @@
 - Review a change locally before it goes up — by a person or an AI agent — and
   record who or what reviewed it: a GitHub review or the PR body, or, with a
   local merge, the hand-over note and the merge commit's `Reviewed:` line.
-  [CONTRIBUTING.md](CONTRIBUTING.md#working-with-coding-agents--the-recommended-pattern)
+  [DEVELOPMENT.md](DEVELOPMENT.md#working-with-coding-agents--the-recommended-pattern)
   lists the questions a review answers.
-- Development flow ([CONTRIBUTING.md](CONTRIBUTING.md#development-flow)): one worktree and
+- Development flow ([DEVELOPMENT.md](DEVELOPMENT.md#development-flow)): one worktree and
   branch per implementer; until the code base is functionally complete the maintainer merges into
   `main` locally.
 - In that phase there is no issue tracker and no list of work items: work is handed over in the
