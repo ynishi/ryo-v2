@@ -1,12 +1,12 @@
 //! A Blueprint: one proposed change, with what it read and why.
 //!
-//! A Blueprint is never trusted as written. It cannot be built with a spec outside what it
-//! read, with a spec in a file that has no [`BaseFp`], or with two specs on the same bytes; the
-//! intent check, freshness and the analyzer run later, in `app::apply`.
+//! A Blueprint is never trusted as written. It cannot be built with a splice outside what it
+//! read, with a splice in a file that has no [`BaseFp`], or with two splices on the same bytes; the
+//! command check, freshness and the analyzer run later, in `app::apply`.
 
 use super::{
-    BaseFp, Basis, BlueprintId, DomainError, IntentCall, MutationSpec, NonEmpty, ReadRange,
-    RelPath, TextRange,
+    BaseFp, Basis, BlueprintId, Command, DomainError, NonEmpty, ReadRange, RelPath, Splice,
+    TextRange,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -104,28 +104,28 @@ impl DecisionRecord {
 /// Why a Blueprint or a set of them cannot be built.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BlueprintError {
-    /// A Blueprint without a mutation.
-    #[error("a blueprint needs at least one mutation")]
-    NoSpecs,
-    /// Spec number `spec` lies outside every range the Blueprint read.
-    #[error("spec {spec} lies outside everything the blueprint read")]
+    /// A Blueprint without a splice.
+    #[error("a blueprint needs at least one splice")]
+    NoSplices,
+    /// Splice number `splice` lies outside every range the Blueprint read.
+    #[error("splice {splice} lies outside everything the blueprint read")]
     Uncovered {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
-    /// Specs `a` and `b` touch the same bytes.
-    #[error("specs {a} and {b} overlap")]
+    /// Splices `a` and `b` touch the same bytes.
+    #[error("splices {a} and {b} overlap")]
     Overlap {
         /// Lower index.
         a: usize,
         /// Higher index.
         b: usize,
     },
-    /// Spec number `spec` is in a file without a base fingerprint.
-    #[error("spec {spec} is in a file without a base fingerprint")]
+    /// Splice number `splice` is in a file without a base fingerprint.
+    #[error("splice {splice} is in a file without a base fingerprint")]
     NoBase {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
     /// Two base fingerprints name one path.
     #[error("two base fingerprints name {0}")]
@@ -154,10 +154,10 @@ pub enum BlueprintError {
 pub struct BlueprintParts {
     /// The id.
     pub id: BlueprintId,
-    /// The intent and its arguments.
-    pub intent: IntentCall,
-    /// The mutations.
-    pub specs: Vec<MutationSpec>,
+    /// The command and its arguments.
+    pub command: Command,
+    /// The splices.
+    pub splices: Vec<Splice>,
     /// What was read.
     pub reads: Vec<ReadRange>,
     /// The fingerprint of the whole base text of each file.
@@ -166,7 +166,7 @@ pub struct BlueprintParts {
     pub spec_refs: Vec<SpecRef>,
     /// Who proposed it and why.
     pub record: DecisionRecord,
-    /// The Blueprint of the set whose result this one's bases, reads and specs are against.
+    /// The Blueprint of the set whose result this one's bases, reads and splices are against.
     pub builds_on: Option<BlueprintId>,
 }
 
@@ -174,8 +174,8 @@ pub struct BlueprintParts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blueprint {
     id: BlueprintId,
-    intent: IntentCall,
-    specs: NonEmpty<MutationSpec>,
+    command: Command,
+    splices: NonEmpty<Splice>,
     reads: Vec<ReadRange>,
     bases: Vec<BaseFp>,
     spec_refs: Vec<SpecRef>,
@@ -187,32 +187,32 @@ impl Blueprint {
     /// Builds a Blueprint, checking the parts against each other.
     ///
     /// # Contract
-    /// - C1: no specs gives `NoSpecs`; then two reads of one path and range give
+    /// - C1: no splices gives `NoSplices`; then two reads of one path and range give
     ///   `DuplicateRead`; then two base fingerprints of one path give `DuplicateBase`; then a
-    ///   spec in a file without a base fingerprint gives `NoBase` with the lowest such index;
-    ///   then a spec not `contains`-ed by a read of its path gives `Uncovered` (an insert at
-    ///   `p` needs a read with `start <= p <= end`); then specs of one file that overlap give
+    ///   splice in a file without a base fingerprint gives `NoBase` with the lowest such index;
+    ///   then a splice not `contains`-ed by a read of its path gives `Uncovered` (an insert at
+    ///   `p` needs a read with `start <= p <= end`); then splices of one file that overlap give
     ///   `Overlap` with the lowest indices.
-    ///   tested: domain::blueprint::tests::uncovered_spec_rejected
+    ///   tested: domain::blueprint::tests::uncovered_splice_rejected
     ///   tested: domain::blueprint::tests::edited_file_needs_one_base
-    /// - C2: overlapping specs of one file are refused; specs of different files never
+    /// - C2: overlapping splices of one file are refused; splices of different files never
     ///   overlap.
-    ///   tested: domain::blueprint::tests::overlapping_specs_rejected
-    /// - C3: every file with a spec has exactly one base fingerprint; a base fingerprint of a
-    ///   file without a spec is allowed, and the bases are kept in path order.
+    ///   tested: domain::blueprint::tests::overlapping_splices_rejected
+    /// - C3: every file with a splice has exactly one base fingerprint; a base fingerprint of a
+    ///   file without a splice is allowed, and the bases are kept in path order.
     ///   tested: domain::blueprint::tests::edited_file_needs_one_base
     pub fn new(parts: BlueprintParts) -> Result<Self, BlueprintError> {
         let BlueprintParts {
             id,
-            intent,
-            specs,
+            command,
+            splices,
             reads,
             mut bases,
             spec_refs,
             record,
             builds_on,
         } = parts;
-        let specs = NonEmpty::new(specs).ok_or(BlueprintError::NoSpecs)?;
+        let splices = NonEmpty::new(splices).ok_or(BlueprintError::NoSplices)?;
         let mut seen: BTreeSet<(&RelPath, TextRange)> = BTreeSet::new();
         for r in &reads {
             if !seen.insert((r.path(), r.range())) {
@@ -225,20 +225,20 @@ impl Blueprint {
                 return Err(BlueprintError::DuplicateBase(b.path().clone()));
             }
         }
-        for (i, s) in specs.iter().enumerate() {
+        for (i, s) in splices.iter().enumerate() {
             if !base_paths.contains(s.path()) {
-                return Err(BlueprintError::NoBase { spec: i });
+                return Err(BlueprintError::NoBase { splice: i });
             }
         }
-        for (i, s) in specs.iter().enumerate() {
+        for (i, s) in splices.iter().enumerate() {
             let covered = reads
                 .iter()
                 .any(|r| r.path() == s.path() && r.range().contains(&s.range()));
             if !covered {
-                return Err(BlueprintError::Uncovered { spec: i });
+                return Err(BlueprintError::Uncovered { splice: i });
             }
         }
-        let all = specs.as_slice();
+        let all = splices.as_slice();
         for (a, sa) in all.iter().enumerate() {
             for (b, sb) in all.iter().enumerate().skip(a + 1) {
                 if sa.path() == sb.path() && sa.range().overlaps(&sb.range()) {
@@ -249,8 +249,8 @@ impl Blueprint {
         bases.sort_by(|x, y| x.path().cmp(y.path()));
         Ok(Self {
             id,
-            intent,
-            specs,
+            command,
+            splices,
             reads,
             bases,
             spec_refs,
@@ -264,14 +264,14 @@ impl Blueprint {
         self.id
     }
 
-    /// The intent and its arguments.
-    pub fn intent(&self) -> &IntentCall {
-        &self.intent
+    /// The command and its arguments.
+    pub fn command(&self) -> &Command {
+        &self.command
     }
 
-    /// The mutations, in the order given.
-    pub fn specs(&self) -> &[MutationSpec] {
-        self.specs.as_slice()
+    /// The splices, in the order given.
+    pub fn splices(&self) -> &[Splice] {
+        self.splices.as_slice()
     }
 
     /// What was read.
@@ -309,10 +309,10 @@ impl Blueprint {
         Basis::new(self.bases().to_vec(), self.reads().to_vec())
     }
 
-    /// The specs grouped by file, files in path order, specs in the order given.
-    pub fn edits_by_file(&self) -> BTreeMap<&RelPath, Vec<&MutationSpec>> {
-        let mut out: BTreeMap<&RelPath, Vec<&MutationSpec>> = BTreeMap::new();
-        for s in self.specs.iter() {
+    /// The splices grouped by file, files in path order, splices in the order given.
+    pub fn edits_by_file(&self) -> BTreeMap<&RelPath, Vec<&Splice>> {
+        let mut out: BTreeMap<&RelPath, Vec<&Splice>> = BTreeMap::new();
+        for s in self.splices.iter() {
             out.entry(s.path()).or_default().push(s);
         }
         out
@@ -392,8 +392,8 @@ mod tests {
         let text = "x".repeat(64);
         ReadRange::capture(rel(path), &text, tr(a, b)).unwrap()
     }
-    fn call() -> IntentCall {
-        IntentCall::RenameLocal {
+    fn call() -> Command {
+        Command::RenameLocal {
             from: Ident::parse("a").unwrap(),
             to: Ident::parse("b").unwrap(),
         }
@@ -401,26 +401,26 @@ mod tests {
     fn base(path: &str) -> BaseFp {
         BaseFp::capture(rel(path), &"x".repeat(64))
     }
-    /// Builds a Blueprint with one base per file that has a spec.
+    /// Builds a Blueprint with one base per file that has a splice.
     fn make(
         id: BlueprintId,
-        specs: Vec<MutationSpec>,
+        splices: Vec<Splice>,
         reads: Vec<ReadRange>,
     ) -> Result<Blueprint, BlueprintError> {
-        let paths: BTreeSet<&RelPath> = specs.iter().map(MutationSpec::path).collect();
+        let paths: BTreeSet<&RelPath> = splices.iter().map(Splice::path).collect();
         let bases = paths.into_iter().map(|p| base(p.as_str())).collect();
-        make_with(id, specs, reads, bases)
+        make_with(id, splices, reads, bases)
     }
     fn make_with(
         id: BlueprintId,
-        specs: Vec<MutationSpec>,
+        splices: Vec<Splice>,
         reads: Vec<ReadRange>,
         bases: Vec<BaseFp>,
     ) -> Result<Blueprint, BlueprintError> {
         Blueprint::new(BlueprintParts {
             id,
-            intent: call(),
-            specs,
+            command: call(),
+            splices,
             reads,
             bases,
             spec_refs: vec![SpecRef::parse("spec#1").unwrap()],
@@ -428,8 +428,8 @@ mod tests {
             builds_on: None,
         })
     }
-    fn rep(path: &str, a: u32, b: u32) -> MutationSpec {
-        MutationSpec::replace(rel(path), tr(a, b), "b").unwrap()
+    fn rep(path: &str, a: u32, b: u32) -> Splice {
+        Splice::replace(rel(path), tr(a, b), "b").unwrap()
     }
 
     #[test]
@@ -461,19 +461,19 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_spec_rejected() {
+    fn uncovered_splice_rejected() {
         assert_eq!(
             make(bid(1), vec![], vec![read("a.rs", 0, 10)]),
-            Err(BlueprintError::NoSpecs)
+            Err(BlueprintError::NoSplices)
         );
         assert_eq!(
             make(bid(1), vec![rep("a.rs", 2, 3)], vec![]),
-            Err(BlueprintError::Uncovered { spec: 0 })
+            Err(BlueprintError::Uncovered { splice: 0 })
         );
         // read of another file, and a range past the read
         assert_eq!(
             make(bid(1), vec![rep("a.rs", 2, 3)], vec![read("b.rs", 0, 10)]),
-            Err(BlueprintError::Uncovered { spec: 0 })
+            Err(BlueprintError::Uncovered { splice: 0 })
         );
         assert_eq!(
             make(
@@ -481,14 +481,14 @@ mod tests {
                 vec![rep("a.rs", 2, 3), rep("a.rs", 9, 12)],
                 vec![read("a.rs", 0, 10)]
             ),
-            Err(BlueprintError::Uncovered { spec: 1 })
+            Err(BlueprintError::Uncovered { splice: 1 })
         );
         // an insert at the end of a read is covered, one past it is not
-        let at = |p| MutationSpec::insert(rel("a.rs"), p, "z").unwrap();
+        let at = |p| Splice::insert(rel("a.rs"), p, "z").unwrap();
         assert!(make(bid(1), vec![at(10)], vec![read("a.rs", 0, 10)]).is_ok());
         assert_eq!(
             make(bid(1), vec![at(11)], vec![read("a.rs", 0, 10)]),
-            Err(BlueprintError::Uncovered { spec: 0 })
+            Err(BlueprintError::Uncovered { splice: 0 })
         );
         assert_eq!(
             make(
@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_specs_rejected() {
+    fn overlapping_splices_rejected() {
         let reads = || vec![read("a.rs", 0, 20), read("b.rs", 0, 20)];
         assert_eq!(
             make(
@@ -516,39 +516,39 @@ mod tests {
         let by_file = b.edits_by_file();
         assert_eq!(by_file.len(), 2);
         assert_eq!(by_file[&rel("a.rs")].len(), 1);
-        assert_eq!(b.specs().len(), 2);
+        assert_eq!(b.splices().len(), 2);
         assert_eq!(b.reads().len(), 2);
         assert_eq!(b.spec_refs().len(), 1);
         assert_eq!(b.record().proposer(), "agent");
         assert_eq!(b.id(), bid(1));
-        assert_eq!(b.intent(), &call());
+        assert_eq!(b.command(), &call());
     }
 
     #[test]
     fn edited_file_needs_one_base() {
-        let specs = || vec![rep("a.rs", 0, 3), rep("b.rs", 0, 3)];
+        let splices = || vec![rep("a.rs", 0, 3), rep("b.rs", 0, 3)];
         let reads = || vec![read("a.rs", 0, 10), read("b.rs", 0, 10)];
         assert_eq!(
-            make_with(bid(1), specs(), reads(), vec![base("a.rs")]),
-            Err(BlueprintError::NoBase { spec: 1 })
+            make_with(bid(1), splices(), reads(), vec![base("a.rs")]),
+            Err(BlueprintError::NoBase { splice: 1 })
         );
         assert_eq!(
-            make_with(bid(1), specs(), reads(), vec![base("b.rs")]),
-            Err(BlueprintError::NoBase { spec: 0 })
+            make_with(bid(1), splices(), reads(), vec![base("b.rs")]),
+            Err(BlueprintError::NoBase { splice: 0 })
         );
-        // both lack a base: the lowest spec index is reported
+        // both lack a base: the lowest splice index is reported
         assert_eq!(
-            make_with(bid(1), specs(), reads(), vec![]),
-            Err(BlueprintError::NoBase { spec: 0 })
+            make_with(bid(1), splices(), reads(), vec![]),
+            Err(BlueprintError::NoBase { splice: 0 })
         );
         assert_eq!(
-            make_with(bid(1), specs(), reads(), vec![base("z.rs")]),
-            Err(BlueprintError::NoBase { spec: 0 })
+            make_with(bid(1), splices(), reads(), vec![base("z.rs")]),
+            Err(BlueprintError::NoBase { splice: 0 })
         );
         assert_eq!(
             make_with(
                 bid(1),
-                specs(),
+                splices(),
                 reads(),
                 vec![base("a.rs"), base("b.rs"), base("a.rs")]
             ),
@@ -557,7 +557,7 @@ mod tests {
         // a base of a file that is only read is allowed; bases come back in path order
         let ok = make_with(
             bid(1),
-            specs(),
+            splices(),
             reads(),
             vec![base("z.rs"), base("b.rs"), base("a.rs")],
         )
@@ -576,12 +576,12 @@ mod tests {
             Err(BlueprintError::DuplicateRead)
         );
         assert_eq!(
-            make_with(bid(1), specs(), reads(), vec![base("a.rs"), base("a.rs")]),
+            make_with(bid(1), splices(), reads(), vec![base("a.rs"), base("a.rs")]),
             Err(BlueprintError::DuplicateBase(rel("a.rs")))
         );
         assert_eq!(
             make_with(bid(1), vec![rep("a.rs", 2, 3)], vec![], vec![]),
-            Err(BlueprintError::NoBase { spec: 0 })
+            Err(BlueprintError::NoBase { splice: 0 })
         );
     }
 
@@ -606,8 +606,8 @@ mod tests {
             let b = make(bid(n), vec![rep("a.rs", 0, 3)], vec![read("a.rs", 0, 10)]).unwrap();
             let mut parts = BlueprintParts {
                 id: b.id(),
-                intent: b.intent().clone(),
-                specs: b.specs().to_vec(),
+                command: b.command().clone(),
+                splices: b.splices().to_vec(),
                 reads: b.reads().to_vec(),
                 bases: b.bases().to_vec(),
                 spec_refs: b.spec_refs().to_vec(),

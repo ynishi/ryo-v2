@@ -92,9 +92,9 @@ fn replace(path: &str, range: (usize, usize), text: &str) -> Value {
     json!({"op": "replace", "path": path, "start": range.0, "end": range.1, "text": text})
 }
 
-fn blueprint(intent: Value, specs: Vec<Value>, reads: Vec<Value>, bases: Vec<Value>) -> Value {
+fn blueprint(command: Value, splices: Vec<Value>, reads: Vec<Value>, bases: Vec<Value>) -> Value {
     json!({"blueprints": [{
-        "intent": intent, "specs": specs, "reads": reads, "bases": bases,
+        "command": command, "splices": splices, "reads": reads, "bases": bases,
         "record": {"proposer": "test", "rationale": "test"},
     }]})
 }
@@ -120,14 +120,14 @@ fn rename_acc(ws: &Ws) -> Value {
         0,
         LIB.find("\n\npub fn twice").unwrap(),
     );
-    let specs = vec![
+    let splices = vec![
         replace("src/lib.rs", at(LIB, "acc", 0, 0, 3), "sum"),
         replace("src/lib.rs", at(LIB, "acc", 1, 0, 3), "sum"),
         replace("src/lib.rs", at(LIB, "acc", 2, 0, 3), "sum"),
     ];
     blueprint(
         json!({"kind": "rename-local", "from": "acc", "to": "sum"}),
-        specs,
+        splices,
         vec![read(ws, "src/lib.rs", total)],
         vec![base(ws, "src/lib.rs")],
     )
@@ -182,8 +182,8 @@ fn builds_on_chain_is_decided() {
     let b = json!({
         "id": b_id,
         "builds_on": a_id,
-        "intent": {"kind": "rename-local", "from": "sum", "to": "total_sum"},
-        "specs": sites,
+        "command": {"kind": "rename-local", "from": "sum", "to": "total_sum"},
+        "splices": sites,
         "reads": [{
             "path": "src/lib.rs", "start": total.0, "end": total.1,
             "fingerprint": fp(&a_text[total.0..total.1]),
@@ -287,7 +287,7 @@ fn apply_after_disk_change_is_failed_stale() {
 #[test]
 fn apply_after_insert_above_is_failed_stale() {
     let ws = Ws::new("apply_insert_above", &[]);
-    // The read covers exactly the line `    let mut acc = 0;\n`; the spec renames its `acc`.
+    // The read covers exactly the line `    let mut acc = 0;\n`; the splice renames its `acc`.
     let line = "    let mut acc = 0;\n";
     let line_at = at(LIB, line, 0, 0, line.len());
     let bp = blueprint(

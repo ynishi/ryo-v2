@@ -9,7 +9,7 @@
 //! # Glossary
 //! Format and checking: crates/ryo-v2-core/tests/doc_contract.rs.
 //!
-//! - Blueprint: one proposed change: an intent call, mutation specs against base text, the
+//! - Blueprint: one proposed change: a command, splices against base text, the
 //!   read ranges it rests on, the base fingerprint of each file it edits, spec refs, a
 //!   decision record and, optionally, the blueprint it builds on.
 //! - BlueprintParts: the parts of a blueprint before they are checked against each other.
@@ -17,7 +17,8 @@
 //!   fresh only while its whole text is unchanged.
 //! - BlueprintSet: the blueprints submitted together in one apply; those not on one chain are
 //!   alternatives, a blueprint with `builds_on` is against its parent's result.
-//! - MutationSpec: one splice on one file of a text range of the base text.
+//! - Splice: one change of one text range of one file's base text.
+//! - SpliceKind: what a splice does to its range.
 //!   includes: Replace, Insert, Delete
 //! - TextRange: a half-open UTF-8 byte range `[start, end)` of one file's base text.
 //! - ReadRange: a path, a text range and its fingerprint: the text the proposer read, checked
@@ -39,9 +40,11 @@
 //!   NewErrors, Check
 //! - Drift: one way the files no longer match a basis.
 //!   includes: File, Read, Missing
-//! - IntentKind: a typed action of the one-layer action space.
+//! - CommandKind: a typed action of the one-layer action space.
 //!   includes: RenameLocal, ExtractVariable, AddDerive, ExtractFunction, MoveItem
-//! - IntentCall: one use of an intent in a blueprint: its kind and validated parameters.
+//! - Command: what a blueprint carries out: its CommandKind and validated parameters; what CONCEPT.md
+//!   calls a mutation of the code, and a mutation list is a chain of them.
+//! - CommandSpec: an entry of the catalog: a CommandKind and the risks it always carries.
 //! - RiskMark: a reason, named in the result, that the engine's own verification is not enough.
 //!   Borrow, BuildScript, ProcMacroCrate and Visibility each name an unseen class (UnseenClass).
 //!   includes: Borrow, BuildScript, ProcMacroCrate, Behaviour, Visibility
@@ -102,7 +105,7 @@
 //! - Criterion: a kind of flaw a judge looks for in a proposal.
 //!   includes: LayerViolation, LeakyAbstraction, NamingMismatch, BehaviourChange, SpecConflict
 //! - Noul: a flaw a judge found in a proposal: the criterion, the file and the range.
-//! - Proposal: what a judge is shown of one blueprint: intent, specs and static metrics.
+//! - Proposal: what a judge is shown of one blueprint: command, splices and static metrics.
 //! - ProposalId: the identity of a proposal by what it does, not by its blueprint's id.
 //! - JudgeRequest: the proposals put to a judge and the criteria to judge them by.
 //! - Judgement: a judge's answer to a request: priors and flaws, and who answered.
@@ -124,6 +127,7 @@
 pub mod baseline;
 pub mod basis;
 pub mod blueprint;
+pub mod command;
 pub mod diagnostic;
 pub mod edit;
 pub mod error;
@@ -131,20 +135,22 @@ pub mod error_code;
 pub mod file_role;
 pub mod finding;
 pub mod ids;
-pub mod intent;
 pub mod judge;
-pub mod mutation;
 pub mod non_empty;
 pub mod rel_path;
 pub mod resolution;
 pub mod scope;
 pub mod search;
+pub mod splice;
 pub(crate) mod stage;
 pub mod text;
 pub mod verdict;
 pub use basis::{Basis, Drift};
 pub use blueprint::{
     Blueprint, BlueprintError, BlueprintParts, BlueprintSet, DecisionRecord, SpecRef,
+};
+pub use command::{
+    Command, CommandKind, CommandSpec, DeriveName, Ident, Nonconformance, RiskMark, UnseenClass,
 };
 pub use diagnostic::{Diagnostic, Diagnostics, UnmappedDiagnostic};
 pub use edit::Edit;
@@ -153,13 +159,9 @@ pub use error_code::ErrorCode;
 pub use file_role::{FileFacts, FileRole};
 pub use finding::{Finding, FindingCode, ScopedFindings};
 pub use ids::BlueprintId;
-pub use intent::{
-    DeriveName, Ident, IntentCall, IntentKind, IntentSpec, Nonconformance, RiskMark, UnseenClass,
-};
 pub use judge::{
     Criterion, JudgeRequest, Judgement, Noul, Prior, Proposal, ProposalId, ProviderTag,
 };
-pub use mutation::{MutationSpec, SpecKind};
 pub use non_empty::NonEmpty;
 pub use rel_path::RelPath;
 pub use resolution::{
@@ -173,5 +175,6 @@ pub use search::{
     Pruned, Reward, Scored, SearchBudget, SearchNode, SearchTree, StateFp, StaticMetrics, Target,
     Weights,
 };
+pub use splice::{Splice, SpliceKind};
 pub use text::{BaseFp, Fingerprint, FpAlgo, Freshness, ReadRange, SpliceError, TextRange};
 pub use verdict::Verdict;

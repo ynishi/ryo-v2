@@ -4,9 +4,9 @@
 //! remembers the fingerprint of those bytes, so a later change of the same bytes is noticed
 //! ([`Freshness::Stale`]) instead of being edited blindly. A [`BaseFp`] fingerprints the whole
 //! text of a file the Blueprint edits, so a change anywhere in it is noticed too, including one
-//! that moves the offsets of the specs while leaving the bytes of every read unchanged.
+//! that moves the offsets of the splices while leaving the bytes of every read unchanged.
 
-use super::{DomainError, MutationSpec, RelPath};
+use super::{DomainError, RelPath, Splice};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A half-open byte range `[start, end)` of a text. `start <= end` always holds.
@@ -284,7 +284,7 @@ impl ReadRange {
     }
 }
 
-/// The fingerprint of the whole base text of one file: the text a Blueprint's specs and read
+/// The fingerprint of the whole base text of one file: the text a Blueprint's splices and read
 /// ranges in that file are offsets into.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BaseFp {
@@ -378,12 +378,12 @@ pub enum SpliceError {
         /// The offset.
         offset: u32,
     },
-    /// Two specs touch the same bytes.
-    #[error("two specs overlap")]
+    /// Two splices touch the same bytes.
+    #[error("two splices overlap")]
     Overlap,
 }
 
-/// Applies all specs of one file to `base`.
+/// Applies all splices of one file to `base`.
 ///
 /// # Contract
 /// - C1: any overlapping pair of ranges gives `Overlap` (inserting at the start of a replaced
@@ -392,12 +392,12 @@ pub enum SpliceError {
 /// - C2: a range past the end of `base` gives `OutOfRange`, an offset inside a char gives
 ///   `NotCharBoundary`.
 ///   tested: domain::text::tests::splice_rejects_non_char_boundary
-/// - C3: otherwise the specs are applied in descending `start` order, so every offset refers
+/// - C3: otherwise the splices are applied in descending `start` order, so every offset refers
 ///   to `base`.
 ///   tested: domain::text::tests::splice_applies_from_end
-pub fn splice(base: &str, specs: &[&MutationSpec]) -> Result<String, SpliceError> {
+pub fn splice(base: &str, splices: &[&Splice]) -> Result<String, SpliceError> {
     let len = text_len(base);
-    for s in specs {
+    for s in splices {
         let r = s.range();
         if r.end() > len {
             return Err(SpliceError::OutOfRange { range: r, len });
@@ -408,15 +408,15 @@ pub fn splice(base: &str, specs: &[&MutationSpec]) -> Result<String, SpliceError
             }
         }
     }
-    for (i, a) in specs.iter().enumerate() {
-        if specs[i + 1..]
+    for (i, a) in splices.iter().enumerate() {
+        if splices[i + 1..]
             .iter()
             .any(|b| a.range().overlaps(&b.range()))
         {
             return Err(SpliceError::Overlap);
         }
     }
-    let mut order: Vec<&&MutationSpec> = specs.iter().collect();
+    let mut order: Vec<&&Splice> = splices.iter().collect();
     order.sort_by_key(|s| std::cmp::Reverse(s.range().start()));
     let mut out = base.to_owned();
     for s in order {
@@ -436,11 +436,11 @@ mod tests {
     fn tr(a: u32, b: u32) -> TextRange {
         TextRange::new(a, b).unwrap()
     }
-    fn rep(a: u32, b: u32, t: &str) -> MutationSpec {
-        MutationSpec::replace(rel("a.rs"), tr(a, b), t).unwrap()
+    fn rep(a: u32, b: u32, t: &str) -> Splice {
+        Splice::replace(rel("a.rs"), tr(a, b), t).unwrap()
     }
-    fn ins(at: u32, t: &str) -> MutationSpec {
-        MutationSpec::insert(rel("a.rs"), at, t).unwrap()
+    fn ins(at: u32, t: &str) -> Splice {
+        Splice::insert(rel("a.rs"), at, t).unwrap()
     }
 
     #[test]
@@ -574,7 +574,7 @@ mod tests {
         let a = rep(4, 5, "bb");
         let b = ins(0, "// c\n");
         let c = ins(10, " // end");
-        let d = MutationSpec::delete(rel("a.rs"), tr(6, 8)).unwrap();
+        let d = Splice::delete(rel("a.rs"), tr(6, 8)).unwrap();
         let out = splice(base, &[&a, &b, &c, &d]).unwrap();
         assert_eq!(out, "// c\nlet bb 1; // end");
         // insert at the end of a replaced range is allowed

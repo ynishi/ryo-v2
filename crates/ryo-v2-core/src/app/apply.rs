@@ -68,9 +68,9 @@ impl Acc {
 ///   tested: app::apply::tests::identical_line_inserted_above_is_stale
 ///   tested: app::apply::tests::read_of_file_without_base_is_checked
 ///   tested: app::apply::tests::stale_lists_every_base_and_read
-///   tested: app::apply::tests::read_of_file_with_base_but_no_spec_is_covered_by_its_base
+///   tested: app::apply::tests::read_of_file_with_base_but_no_splice_is_covered_by_its_base
 ///   tested: app::apply::tests::candidate_basis_is_stale_after_outside_change
-/// - C2: a spec in a file whose role is `Manifest` is blocked as `Unverifiable` before
+/// - C2: a splice in a file whose role is `Manifest` is blocked as `Unverifiable` before
 ///   anything is read, and the check is not called; a build script or proc-macro file gives
 ///   a candidate whose `unseen_classes` name `BuildScript` or `ProcMacroCrate` when the
 ///   verifier is blind to them.
@@ -95,20 +95,20 @@ impl Acc {
 ///   no entry after that; the note of the `Candidate` entry is the candidate's `marks_line`.
 ///   tested: app::apply::tests::decision_log_stops_at_blocking_stage
 ///   tested: app::apply::tests::candidate_log_names_its_marks
-/// - C7: the candidate of an intent with `Borrow` and `Behaviour` risks has both in its marks
+/// - C7: the candidate of a command with `Borrow` and `Behaviour` risks has both in its marks
 ///   and, when the verifier is blind to borrows, names `Borrow` in its `unseen_classes`.
-///   tested: app::apply::tests::borrow_intent_names_borrow_unseen
-/// - C9: the marks of a candidate are derived from its Blueprint's intent and the roles of the
+///   tested: app::apply::tests::borrow_command_names_borrow_unseen
+/// - C9: the marks of a candidate are derived from its Blueprint's command and the roles of the
 ///   files it edits.
 ///   tested: app::apply::tests::candidate_marks_follow_its_blueprint
-/// - C10: a Blueprint with a spec that writes the bytes it replaces is blocked at the
+/// - C10: a Blueprint with a splice that writes the bytes it replaces is blocked at the
 ///   conformance stage as `Nonconforming` with `Nonconformance::NoOp`, and the check is not
 ///   called.
 ///   tested: app::apply::tests::no_op_rename_is_refused_and_never_checked
 /// - C11: a `Decided` resolution's evidence carries the verifier's provenance unchanged.
 ///   tested: app::apply::tests::evidence_carries_the_provenance
 /// - C12: a Blueprint with `builds_on` is staged on its parent's staged path (`On::Parent`):
-///   its reads, bases and specs are against the parent candidate's result, the check is given
+///   its reads, bases and splices are against the parent candidate's result, the check is given
 ///   the composed edits of the chain, its candidate's path is the chain (root first) and its
 ///   basis is the loaded text's (`Basis::of_chain`).
 ///   tested: app::apply::tests::child_builds_on_parent_result
@@ -301,10 +301,9 @@ mod tests {
     use crate::domain::resolution::NEAR_MISS_MAX;
     use crate::domain::search::compose;
     use crate::domain::{
-        BaseFp, BlueprintError, BlueprintParts, CheckFailure, DecisionRecord, Drift, Edit,
-        ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident, IntentCall, MutationSpec,
-        Nonconformance, Provenance, ReadRange, RelPath, RiskMark, ScopedFindings, SpecRef,
-        TextRange, UnseenClass,
+        BaseFp, BlueprintError, BlueprintParts, CheckFailure, Command, DecisionRecord, Drift, Edit,
+        ErrorCode, FileRole, Finding, FindingCode, Freshness, Ident, Nonconformance, Provenance,
+        ReadRange, RelPath, RiskMark, ScopedFindings, SpecRef, Splice, TextRange, UnseenClass,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -387,16 +386,16 @@ mod tests {
     }
     fn make(
         n: u8,
-        intent: IntentCall,
-        specs: Vec<MutationSpec>,
+        command: Command,
+        splices: Vec<Splice>,
         path: &str,
         text: &str,
     ) -> Result<Blueprint, BlueprintError> {
         let end = u32::try_from(text.len()).unwrap();
         Blueprint::new(BlueprintParts {
             id: bid(n),
-            intent,
-            specs,
+            command,
+            splices,
             reads: vec![ReadRange::capture(rel(path), text, tr(0, end)).unwrap()],
             bases: vec![BaseFp::capture(rel(path), text)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
@@ -408,11 +407,11 @@ mod tests {
     fn rename(n: u8, path: &str) -> Blueprint {
         make(
             n,
-            IntentCall::RenameLocal {
+            Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            vec![MutationSpec::replace(rel(path), tr(4, 5), "b").unwrap()],
+            vec![Splice::replace(rel(path), tr(4, 5), "b").unwrap()],
             path,
             BASE,
         )
@@ -422,12 +421,12 @@ mod tests {
         let text = "f(1 + 2);";
         make(
             n,
-            IntentCall::ExtractVariable {
+            Command::ExtractVariable {
                 name: Ident::parse("t").unwrap(),
             },
             vec![
-                MutationSpec::insert(rel(path), 0, "let t = 1 + 2;\n").unwrap(),
-                MutationSpec::replace(rel(path), tr(2, 7), "t").unwrap(),
+                Splice::insert(rel(path), 0, "let t = 1 + 2;\n").unwrap(),
+                Splice::replace(rel(path), tr(2, 7), "t").unwrap(),
             ],
             path,
             text,
@@ -438,8 +437,8 @@ mod tests {
     fn chained(bp: &Blueprint, parent: BlueprintId) -> Blueprint {
         Blueprint::new(BlueprintParts {
             id: bp.id(),
-            intent: bp.intent().clone(),
-            specs: bp.specs().to_vec(),
+            command: bp.command().clone(),
+            splices: bp.splices().to_vec(),
             reads: bp.reads().to_vec(),
             bases: bp.bases().to_vec(),
             spec_refs: bp.spec_refs().to_vec(),
@@ -484,13 +483,13 @@ mod tests {
         // B's offsets and fingerprints are those of A's result, not of the loaded text.
         let b = make(
             2,
-            IntentCall::RenameLocal {
+            Command::RenameLocal {
                 from: Ident::parse("t").unwrap(),
                 to: Ident::parse("u").unwrap(),
             },
             vec![
-                MutationSpec::replace(rel(path), tr(4, 5), "u").unwrap(),
-                MutationSpec::replace(rel(path), tr(17, 18), "u").unwrap(),
+                Splice::replace(rel(path), tr(4, 5), "u").unwrap(),
+                Splice::replace(rel(path), tr(17, 18), "u").unwrap(),
             ],
             path,
             a_text,
@@ -534,11 +533,11 @@ mod tests {
             vec![
                 make(
                     2,
-                    IntentCall::RenameLocal {
+                    Command::RenameLocal {
                         from: Ident::parse("t").unwrap(),
                         to: Ident::parse("u").unwrap(),
                     },
-                    vec![MutationSpec::replace(rel(path), tr(4, 5), "u").unwrap()],
+                    vec![Splice::replace(rel(path), tr(4, 5), "u").unwrap()],
                     path,
                     a_text,
                 )
@@ -641,11 +640,11 @@ mod tests {
         let fake = Fake::with_text("src/lib.rs", BASE);
         let same = make(
             1,
-            IntentCall::RenameLocal {
+            Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("a").unwrap(),
             },
-            vec![MutationSpec::replace(rel("src/lib.rs"), tr(4, 5), "a").unwrap()],
+            vec![Splice::replace(rel("src/lib.rs"), tr(4, 5), "a").unwrap()],
             "src/lib.rs",
             BASE,
         )
@@ -655,7 +654,7 @@ mod tests {
         assert!(
             matches!(
                 &i.blocking()[0],
-                Blocking::Nonconforming { blueprint, why: Nonconformance::NoOp { spec: 0 } }
+                Blocking::Nonconforming { blueprint, why: Nonconformance::NoOp { splice: 0 } }
                     if *blueprint == bid(1)
             ),
             "{:?}",
@@ -689,14 +688,14 @@ mod tests {
     fn identical_line_inserted_above_is_stale() {
         let base = "fn f() {\n    let a = 1;\n}\n";
         let path = rel("src/lib.rs");
-        // line 2 is bytes 9..24; the spec renames the `a` at 17..18
+        // line 2 is bytes 9..24; the splice renames the `a` at 17..18
         let bp = Blueprint::new(BlueprintParts {
             id: bid(1),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            specs: vec![MutationSpec::replace(path.clone(), tr(17, 18), "b").unwrap()],
+            splices: vec![Splice::replace(path.clone(), tr(17, 18), "b").unwrap()],
             reads: vec![ReadRange::capture(path.clone(), base, tr(9, 24)).unwrap()],
             bases: vec![BaseFp::capture(path.clone(), base)],
             spec_refs: vec![],
@@ -729,11 +728,11 @@ mod tests {
         let other = rel("src/o.rs");
         let bp = Blueprint::new(BlueprintParts {
             id: bid(1),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            specs: vec![MutationSpec::replace(path.clone(), tr(4, 5), "b").unwrap()],
+            splices: vec![Splice::replace(path.clone(), tr(4, 5), "b").unwrap()],
             reads: vec![
                 ReadRange::capture(path.clone(), BASE, tr(0, 10)).unwrap(),
                 ReadRange::capture(other.clone(), "abc", tr(0, 3)).unwrap(),
@@ -796,13 +795,13 @@ mod tests {
         let bp = |n: u8| {
             Blueprint::new(BlueprintParts {
                 id: bid(n),
-                intent: IntentCall::RenameLocal {
+                command: Command::RenameLocal {
                     from: Ident::parse("a").unwrap(),
                     to: Ident::parse("b").unwrap(),
                 },
-                specs: vec![
-                    MutationSpec::replace(a.clone(), tr(4, 5), "b").unwrap(),
-                    MutationSpec::replace(b.clone(), tr(4, 5), "b").unwrap(),
+                splices: vec![
+                    Splice::replace(a.clone(), tr(4, 5), "b").unwrap(),
+                    Splice::replace(b.clone(), tr(4, 5), "b").unwrap(),
                 ],
                 reads: vec![
                     ReadRange::capture(a.clone(), BASE, tr(0, 10)).unwrap(),
@@ -888,11 +887,11 @@ mod tests {
         let lib = rel("src/lib.rs");
         let second = make(
             2,
-            IntentCall::RenameLocal {
+            Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("c").unwrap(),
             },
-            vec![MutationSpec::replace(lib.clone(), tr(4, 5), "c").unwrap()],
+            vec![Splice::replace(lib.clone(), tr(4, 5), "c").unwrap()],
             "src/lib.rs",
             BASE,
         )
@@ -914,15 +913,15 @@ mod tests {
     }
 
     #[test]
-    fn read_of_file_with_base_but_no_spec_is_covered_by_its_base() {
+    fn read_of_file_with_base_but_no_splice_is_covered_by_its_base() {
         let (a, c) = (rel("src/a.rs"), rel("src/c.rs"));
         let bp = Blueprint::new(BlueprintParts {
             id: bid(1),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            specs: vec![MutationSpec::replace(a.clone(), tr(4, 5), "b").unwrap()],
+            splices: vec![Splice::replace(a.clone(), tr(4, 5), "b").unwrap()],
             reads: vec![
                 ReadRange::capture(a.clone(), BASE, tr(0, 10)).unwrap(),
                 // wrong on purpose: were it checked, it would be stale
@@ -1011,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn borrow_intent_names_borrow_unseen() {
+    fn borrow_command_names_borrow_unseen() {
         let fake = Fake::with_text("src/lib.rs", "f(1 + 2);");
         let r = run(&fake, vec![extract(1, "src/lib.rs")]).unwrap();
         let Resolution::Decided { blueprints, .. } = r else {
@@ -1050,19 +1049,18 @@ mod tests {
         assert_eq!(note(bid(2)), "marks: borrow, behaviour");
     }
 
-    /// A move of `foo` from `src/a.rs` to `src/b.rs`, which conforms to its intent.
+    /// A move of `foo` from `src/a.rs` to `src/b.rs`, which conforms to its command.
     fn move_foo(n: u8) -> Blueprint {
         let a = "pub fn foo() {}\n";
         Blueprint::new(BlueprintParts {
             id: bid(n),
-            intent: IntentCall::MoveItem {
+            command: Command::MoveItem {
                 item: Ident::parse("foo").unwrap(),
                 to: rel("src/b.rs"),
             },
-            specs: vec![
-                MutationSpec::replace(rel("src/a.rs"), tr(0, 15), "pub use crate::b::foo;")
-                    .unwrap(),
-                MutationSpec::insert(rel("src/b.rs"), 0, a).unwrap(),
+            splices: vec![
+                Splice::replace(rel("src/a.rs"), tr(0, 15), "pub use crate::b::foo;").unwrap(),
+                Splice::insert(rel("src/b.rs"), 0, a).unwrap(),
             ],
             reads: vec![
                 ReadRange::capture(rel("src/a.rs"), a, tr(0, 16)).unwrap(),

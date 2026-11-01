@@ -9,7 +9,7 @@ mod common;
 use common::{Fixture, rel};
 use ryo_v2_core::app::ports::{Analyzer, Expander, Verifier};
 use ryo_v2_core::domain::text::splice;
-use ryo_v2_core::domain::{Blueprint, Edit, IntentCall, MutationSpec, RelPath, SpecKind, Target};
+use ryo_v2_core::domain::{Blueprint, Command, Edit, RelPath, Splice, SpliceKind, Target};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
@@ -91,13 +91,13 @@ fn plan() -> RelPath {
     rel("src/plan.rs")
 }
 
-/// Applies the specs of a Blueprint to `texts`, per file.
+/// Applies the splices of a Blueprint to `texts`, per file.
 fn apply(bp: &Blueprint, texts: &BTreeMap<RelPath, String>) -> BTreeMap<RelPath, String> {
     let mut out = texts.clone();
-    for (path, specs) in bp.edits_by_file() {
-        let specs: Vec<&MutationSpec> = specs.into_iter().collect();
+    for (path, splices) in bp.edits_by_file() {
+        let splices: Vec<&Splice> = splices.into_iter().collect();
         let base = texts.get(path).expect("text of the file");
-        out.insert(path.clone(), splice(base, &specs).expect("splice"));
+        out.insert(path.clone(), splice(base, &splices).expect("splice"));
     }
     out
 }
@@ -143,7 +143,7 @@ fn expand_planted_in(
     (bps, texts)
 }
 
-/// The Blueprints among `bps` whose specs turn `texts` into the clean texts.
+/// The Blueprints among `bps` whose splices turn `texts` into the clean texts.
 fn restores(bps: &[Blueprint], texts: &BTreeMap<RelPath, String>) -> Vec<String> {
     restores_to(bps, texts, (LIB, PLAN))
 }
@@ -158,12 +158,12 @@ fn restores_to(
         [(lib(), clean.0.to_owned()), (plan(), clean.1.to_owned())].into();
     bps.iter()
         .filter(|bp| apply(bp, texts) == clean)
-        .map(|bp| bp.intent().to_string())
+        .map(|bp| bp.command().to_string())
         .collect()
 }
 
 fn names(bps: &[Blueprint]) -> Vec<String> {
-    bps.iter().map(|bp| bp.intent().to_string()).collect()
+    bps.iter().map(|bp| bp.command().to_string()).collect()
 }
 
 /// Cause 1 (SEARCH_LEDGER "Generation"): a call folded into the initializer of a `let`.
@@ -266,9 +266,9 @@ fn extract_variable_refuses_a_name_the_block_still_reads() {
     let (bps, texts) = expand_planted("gen-shadow", &[(lib(), planted)]);
     let rewritten: Vec<String> = bps
         .iter()
-        .filter(|bp| matches!(bp.intent(), IntentCall::ExtractVariable { .. }))
+        .filter(|bp| matches!(bp.command(), Command::ExtractVariable { .. }))
         .filter(|bp| !apply(bp, &texts)[&lib()].contains("Slot { width: needed(v), count: width }"))
-        .map(|bp| bp.intent().to_string())
+        .map(|bp| bp.command().to_string())
         .collect();
     assert_eq!(
         rewritten,
@@ -326,7 +326,7 @@ fn move_item_forward_keeps_the_doc_above_the_visibility() {
     let (bps, texts) = expand_planted_in("gen-doc-forward", (DOC_LIB, PLAN), &[]);
     let moved: Vec<String> = bps
         .iter()
-        .filter(|bp| bp.intent().to_string() == "move-item helper -> src/plan.rs")
+        .filter(|bp| bp.command().to_string() == "move-item helper -> src/plan.rs")
         .map(|bp| apply(bp, &texts)[&plan()].clone())
         .collect();
     assert_eq!(moved.len(), 1, "one forward move: {:?}", names(&bps));
@@ -422,18 +422,18 @@ fn extract_variable_offers_no_path_argument() {
     let base = &texts[&lib()];
     let on_x: Vec<String> = bps
         .iter()
-        .filter(|bp| matches!(bp.intent(), IntentCall::ExtractVariable { .. }))
+        .filter(|bp| matches!(bp.command(), Command::ExtractVariable { .. }))
         .filter(|bp| {
-            bp.edits_by_file().into_iter().any(|(path, specs)| {
+            bp.edits_by_file().into_iter().any(|(path, splices)| {
                 *path == lib()
-                    && specs.into_iter().any(|s| {
-                        matches!(s.kind(), SpecKind::Replace)
+                    && splices.into_iter().any(|s| {
+                        matches!(s.kind(), SpliceKind::Replace)
                             && base.get(s.range().start() as usize..s.range().end() as usize)
                                 == Some("x")
                     })
             })
         })
-        .map(|bp| bp.intent().to_string())
+        .map(|bp| bp.command().to_string())
         .collect();
     assert_eq!(on_x, Vec::<String>::new(), "no extraction of `x`");
 }

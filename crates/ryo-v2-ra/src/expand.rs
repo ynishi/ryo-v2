@@ -1,9 +1,9 @@
 //! The `Expander` of the rust-analyzer adapter: from the code of a search state it proposes
-//! Blueprints for the five intents (rename-local, extract-variable, add-derive,
+//! Blueprints for the five commands (rename-local, extract-variable, add-derive,
 //! extract-function, move-item).
 //!
 //! rust-analyzer does the semantic work (rename, extract assists, names, module paths); this
-//! file reads its text edits as mutation specs and keeps only the Blueprints that the intent's
+//! file reads its text edits as splices and keeps only the Blueprints that the command's
 //! conformance check accepts, so a shape that rust-analyzer produces differently is dropped, not
 //! forced. Candidates are produced lazily, round-robin over the targets and then the kinds, so a
 //! small `max` costs few analyzer calls.
@@ -31,9 +31,9 @@ use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, ExpandError, Expander};
 use ryo_v2_core::domain::text::revert_intact;
 use ryo_v2_core::domain::{
-    BaseFp, Blueprint, BlueprintId, BlueprintParts, DecisionRecord, DeriveName, Edit, Fingerprint,
-    Ident, IntentCall, IntentKind, MutationSpec, NonEmpty, ReadRange, RelPath, SpecKind, StateFp,
-    Target, TextRange,
+    BaseFp, Blueprint, BlueprintId, BlueprintParts, Command, CommandKind, DecisionRecord,
+    DeriveName, Edit, Fingerprint, Ident, NonEmpty, ReadRange, RelPath, Splice, SpliceKind,
+    StateFp, Target, TextRange,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -109,8 +109,8 @@ fn rename_config() -> RenameConfig {
 
 /// A candidate before it is checked and turned into a Blueprint.
 struct Cand {
-    intent: IntentCall,
-    specs: Vec<MutationSpec>,
+    command: Command,
+    splices: Vec<Splice>,
     rationale: String,
 }
 
@@ -325,14 +325,10 @@ fn visibility_of(node: &SyntaxNode) -> Option<ast::Visibility> {
 }
 
 /// The deterministic UUID version 7 of a Blueprint: 80 bits folded from the state and the
-/// content (intent and specs), under timestamp 0.
-fn blueprint_id(
-    state: StateFp,
-    intent: &IntentCall,
-    specs: &[MutationSpec],
-) -> Option<BlueprintId> {
-    let mut key = intent.to_string();
-    for s in specs {
+/// content (command and splices), under timestamp 0.
+fn blueprint_id(state: StateFp, command: &Command, splices: &[Splice]) -> Option<BlueprintId> {
+    let mut key = command.to_string();
+    for s in splices {
         key.push('\n');
         key.push_str(&s.to_string());
         key.push('\0');
@@ -504,19 +500,19 @@ impl<'a> Env<'a> {
             .unwrap_or(whole)
     }
 
-    /// Checks a candidate against its intent and builds the Blueprint.
+    /// Checks a candidate against its command and builds the Blueprint.
     fn finish(&self, c: Cand) -> Option<Blueprint> {
         let mut base: BTreeMap<RelPath, String> = BTreeMap::new();
-        for s in &c.specs {
+        for s in &c.splices {
             if !base.contains_key(s.path()) {
                 base.insert(s.path().clone(), self.text_of_path(s.path())?.to_string());
             }
         }
-        c.intent.conforms(&c.specs, &base).ok()?;
+        c.command.conforms(&c.splices, &base).ok()?;
         let mut reads = Vec::new();
         for (path, text) in &base {
             let (lo, hi) = c
-                .specs
+                .splices
                 .iter()
                 .filter(|s| s.path() == path)
                 .fold((u32::MAX, 0u32), |(lo, hi), s| {
@@ -526,7 +522,7 @@ impl<'a> Env<'a> {
             let range = self.read_range(id, text, lo, hi);
             reads.push(ReadRange::capture(path.clone(), text, range).ok()?);
         }
-        let id = blueprint_id(self.state_fp, &c.intent, &c.specs)?;
+        let id = blueprint_id(self.state_fp, &c.command, &c.splices)?;
         let record = DecisionRecord::new(PROPOSER, &c.rationale).ok()?;
         let bases = base
             .iter()
@@ -534,8 +530,8 @@ impl<'a> Env<'a> {
             .collect();
         Blueprint::new(BlueprintParts {
             id,
-            intent: c.intent,
-            specs: c.specs,
+            command: c.command,
+            splices: c.splices,
             reads,
             bases,
             spec_refs: Vec::new(),
@@ -545,12 +541,12 @@ impl<'a> Env<'a> {
         .ok()
     }
 
-    /// The indels of a change that touches one file, as mutation specs.
-    fn single_file_specs(
+    /// The indels of a change that touches one file, as splices.
+    fn single_file_splices(
         &self,
         change: &SourceChange,
         refuse_annotations: bool,
-    ) -> Option<Vec<MutationSpec>> {
+    ) -> Option<Vec<Splice>> {
         if !change.file_system_edits.is_empty()
             || change.is_snippet
             || change.source_file_edits.len() != 1
@@ -563,23 +559,23 @@ impl<'a> Env<'a> {
             return None;
         }
         let path = self.by_file.get(fid)?.clone();
-        let mut specs = Vec::new();
+        let mut splices = Vec::new();
         for ind in edit.iter() {
             let (s, e) = (u32::from(ind.delete.start()), u32::from(ind.delete.end()));
-            let spec = if s == e {
+            let splice = if s == e {
                 if ind.insert.is_empty() {
                     continue;
                 }
-                MutationSpec::insert(path.clone(), s, ind.insert.clone()).ok()?
+                Splice::insert(path.clone(), s, ind.insert.clone()).ok()?
             } else if ind.insert.is_empty() {
-                MutationSpec::delete(path.clone(), TextRange::new(s, e).ok()?).ok()?
+                Splice::delete(path.clone(), TextRange::new(s, e).ok()?).ok()?
             } else {
-                MutationSpec::replace(path.clone(), TextRange::new(s, e).ok()?, ind.insert.clone())
+                Splice::replace(path.clone(), TextRange::new(s, e).ok()?, ind.insert.clone())
                     .ok()?
             };
-            specs.push(spec);
+            splices.push(splice);
         }
-        (!specs.is_empty()).then_some(specs)
+        (!splices.is_empty()).then_some(splices)
     }
 
     /// The resolved assist `id` on `range`, if rust-analyzer offers it there.
@@ -716,18 +712,18 @@ impl<'a> Env<'a> {
                 }
             };
             let Ok(change) = res else { continue };
-            let Some(specs) = self.single_file_specs(&change, true) else {
+            let Some(splices) = self.single_file_splices(&change, true) else {
                 continue;
             };
             let Ok(to_id) = Ident::parse(to) else {
                 continue;
             };
             out.push(Cand {
-                intent: IntentCall::RenameLocal {
+                command: Command::RenameLocal {
                     from: from.clone(),
                     to: to_id,
                 },
-                specs,
+                splices,
                 rationale: (*why).to_owned(),
             });
         }
@@ -794,7 +790,7 @@ impl<'a> Env<'a> {
     }
 
     /// rust-analyzer decides whether the expression can be extracted and names it; its edit is a
-    /// text diff of unpredictable shape, so the specs are built here: `let <name> = <expr>;` before
+    /// text diff of unpredictable shape, so the splices are built here: `let <name> = <expr>;` before
     /// the statement and the expression replaced by the name. The name is the one of the
     /// `let <name> = <expr>;` that applying rust-analyzer's own edit adds ([`added_let_name`]); a
     /// candidate is kept only when there is exactly one. The value of a record-literal field
@@ -840,18 +836,18 @@ impl<'a> Env<'a> {
             return Vec::new();
         };
         let (Ok(ins), Ok(rep)) = (
-            MutationSpec::insert(
+            Splice::insert(
                 path.clone(),
                 seed.at,
                 format!("{}let {name} = {init};\n", seed.indent),
             ),
-            MutationSpec::replace(path.clone(), range, name),
+            Splice::replace(path.clone(), range, name),
         ) else {
             return Vec::new();
         };
         vec![Cand {
-            intent: IntentCall::ExtractVariable { name: ident },
-            specs: vec![ins, rep],
+            command: Command::ExtractVariable { name: ident },
+            splices: vec![ins, rep],
             rationale: "name from the expression".to_owned(),
         }]
     }
@@ -930,35 +926,35 @@ impl<'a> Env<'a> {
         let Some(change) = assist.source_change else {
             return Vec::new();
         };
-        let Some(specs) = self.single_file_specs(&change, false) else {
+        let Some(splices) = self.single_file_splices(&change, false) else {
             return Vec::new();
         };
         let Ok(name) = Ident::parse(&seed.name) else {
             return Vec::new();
         };
         let mut renamed = Vec::new();
-        for s in &specs {
-            let spec = match s.kind() {
-                SpecKind::Insert => MutationSpec::insert(
+        for s in &splices {
+            let splice = match s.kind() {
+                SpliceKind::Insert => Splice::insert(
                     s.path().clone(),
                     s.range().start(),
                     replace_word(s.text(), FUN_NAME, &seed.name),
                 ),
-                SpecKind::Replace => MutationSpec::replace(
+                SpliceKind::Replace => Splice::replace(
                     s.path().clone(),
                     s.range(),
                     replace_word(s.text(), FUN_NAME, &seed.name),
                 ),
-                SpecKind::Delete => Ok(s.clone()),
+                SpliceKind::Delete => Ok(s.clone()),
             };
-            match spec {
+            match splice {
                 Ok(s) => renamed.push(s),
                 Err(_) => return Vec::new(),
             }
         }
         vec![Cand {
-            intent: IntentCall::ExtractFunction { name },
-            specs: renamed,
+            command: Command::ExtractFunction { name },
+            splices: renamed,
             rationale: "name of the last call in the extracted range".to_owned(),
         }]
     }
@@ -1017,25 +1013,23 @@ impl<'a> Env<'a> {
                 {
                     continue;
                 }
-                let spec = match close {
+                let splice = match close {
                     Some((_, true)) => continue,
-                    Some((at, false)) => MutationSpec::insert(path.clone(), at, format!(", {d}")),
-                    None if indent_ok => MutationSpec::insert(
-                        path.clone(),
-                        start,
-                        format!("#[derive({d})]\n{indent}"),
-                    ),
+                    Some((at, false)) => Splice::insert(path.clone(), at, format!(", {d}")),
+                    None if indent_ok => {
+                        Splice::insert(path.clone(), start, format!("#[derive({d})]\n{indent}"))
+                    }
                     None => continue,
                 };
-                let (Ok(spec), Ok(name)) = (spec, DeriveName::parse(d)) else {
+                let (Ok(splice), Ok(name)) = (splice, DeriveName::parse(d)) else {
                     continue;
                 };
                 let Some(derives) = NonEmpty::new(vec![name]) else {
                     continue;
                 };
                 out.push(Cand {
-                    intent: IntentCall::AddDerive { derives },
-                    specs: vec![spec],
+                    command: Command::AddDerive { derives },
+                    splices: vec![splice],
                     rationale: "derive missing on the type".to_owned(),
                 });
             }
@@ -1136,22 +1130,18 @@ impl<'a> Env<'a> {
                 let Ok(len) = u32::try_from(dest_text.len()) else {
                     continue;
                 };
-                let (Ok(use_spec), Ok(add_spec)) = (
-                    MutationSpec::replace(
-                        src_path.clone(),
-                        range,
-                        format!("{vis_text}use {target};"),
-                    ),
-                    MutationSpec::insert((*dest_path).clone(), len, format!("{prefix}{moved}\n")),
+                let (Ok(use_splice), Ok(add_splice)) = (
+                    Splice::replace(src_path.clone(), range, format!("{vis_text}use {target};")),
+                    Splice::insert((*dest_path).clone(), len, format!("{prefix}{moved}\n")),
                 ) else {
                     continue;
                 };
                 out.push(Cand {
-                    intent: IntentCall::MoveItem {
+                    command: Command::MoveItem {
                         item: item_id.clone(),
                         to: (*dest_path).clone(),
                     },
-                    specs: vec![use_spec, add_spec],
+                    splices: vec![use_splice, add_splice],
                     rationale: "move to a sibling module and re-export".to_owned(),
                 });
             }
@@ -1225,17 +1215,17 @@ impl<'a> Env<'a> {
                 continue;
             };
             let (Ok(rep), Ok(del)) = (
-                MutationSpec::replace(src_path.clone(), use_range, restored),
-                MutationSpec::delete(m_path.clone(), del_range),
+                Splice::replace(src_path.clone(), use_range, restored),
+                Splice::delete(m_path.clone(), del_range),
             ) else {
                 continue;
             };
             out.push(Cand {
-                intent: IntentCall::MoveItem {
+                command: Command::MoveItem {
                     item: item_id,
                     to: src_path.clone(),
                 },
-                specs: vec![rep, del],
+                splices: vec![rep, del],
                 rationale: "move back into the module that re-exports it".to_owned(),
             });
         }
@@ -1251,7 +1241,7 @@ impl<'a> Env<'a> {
     /// The injected test fault fires only in `call` units.
     fn contained<T: Default>(
         &self,
-        kind: IntentKind,
+        kind: CommandKind,
         file: FileId,
         call: bool,
         f: impl FnOnce() -> T,
@@ -1278,10 +1268,14 @@ impl<'a> Env<'a> {
         }
     }
 
-    fn lazy<'e>(&'e self, kind: IntentKind, t: &TInfo) -> Box<dyn Iterator<Item = Blueprint> + 'e> {
+    fn lazy<'e>(
+        &'e self,
+        kind: CommandKind,
+        t: &TInfo,
+    ) -> Box<dyn Iterator<Item = Blueprint> + 'e> {
         let file = t.file;
         match kind {
-            IntentKind::RenameLocal => Box::new(
+            CommandKind::RenameLocal => Box::new(
                 self.contained(kind, file, false, || self.rename_seeds(t))
                     .into_iter()
                     .flat_map(move |s| {
@@ -1289,7 +1283,7 @@ impl<'a> Env<'a> {
                     })
                     .filter_map(move |c| self.finish(c)),
             ),
-            IntentKind::ExtractVariable => Box::new(
+            CommandKind::ExtractVariable => Box::new(
                 self.contained(kind, file, false, || self.extract_var_seeds(t))
                     .into_iter()
                     .flat_map(move |s| {
@@ -1297,12 +1291,12 @@ impl<'a> Env<'a> {
                     })
                     .filter_map(move |c| self.finish(c)),
             ),
-            IntentKind::AddDerive => Box::new(
+            CommandKind::AddDerive => Box::new(
                 self.contained(kind, file, true, || self.add_derive_cands(t))
                     .into_iter()
                     .filter_map(move |c| self.finish(c)),
             ),
-            IntentKind::ExtractFunction => Box::new(
+            CommandKind::ExtractFunction => Box::new(
                 self.contained(kind, file, false, || self.extract_fn_seeds(t))
                     .into_iter()
                     .flat_map(move |s| {
@@ -1310,7 +1304,7 @@ impl<'a> Env<'a> {
                     })
                     .filter_map(move |c| self.finish(c)),
             ),
-            IntentKind::MoveItem => Box::new(
+            CommandKind::MoveItem => Box::new(
                 self.contained(kind, file, true, || self.move_item_cands(t))
                     .into_iter()
                     .filter_map(move |c| self.finish(c)),
@@ -1323,7 +1317,7 @@ impl<'a> Env<'a> {
         let mut gens: Vec<Vec<std::iter::Fuse<Box<dyn Iterator<Item = Blueprint> + '_>>>> = infos
             .iter()
             .map(|t| {
-                IntentKind::ALL
+                CommandKind::ALL
                     .iter()
                     .map(|k| self.lazy(*k, t).fuse())
                     .collect()
@@ -1572,11 +1566,11 @@ fn generate(
     }
 }
 
-/// Blueprints for the five intents, from the code of a search state.
+/// Blueprints for the five commands, from the code of a search state.
 ///
 /// # Contract
-/// - C1: every returned Blueprint passes the conformance check of its intent against the
-///   texts of the state, for all five intents.
+/// - C1: every returned Blueprint passes the conformance check of its command against the
+///   texts of the state, for all five commands.
 ///   tested: tests/expand.rs every_expansion_conforms
 /// - C2: rename-local proposes a rename of a local binding that replaces its definition and
 ///   every use, and no other change.
@@ -1584,7 +1578,7 @@ fn generate(
 /// - C3: after `expand`, whatever the state, the text and baseline of the session are what
 ///   they were before, and a following `check` works.
 ///   tested: tests/expand.rs expansion_leaves_session_at_base
-/// - C4: the specs, ranges and reads are those of the text of the state, not of the base.
+/// - C4: the splices, ranges and reads are those of the text of the state, not of the base.
 ///   tested: tests/expand.rs expansion_reads_the_given_state
 /// - C5: at most `max` Blueprints come back, only within the given targets; no target gives
 ///   nothing.

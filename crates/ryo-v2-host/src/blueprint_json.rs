@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use ryo_v2_core::domain::{
-    BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, DecisionRecord, DeriveName,
-    Fingerprint, Ident, IntentCall, MutationSpec, NonEmpty, ReadRange, RelPath, SpecRef, TextRange,
+    BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, Command, DecisionRecord,
+    DeriveName, Fingerprint, Ident, NonEmpty, ReadRange, RelPath, SpecRef, Splice, TextRange,
 };
 use serde::Deserialize;
 
@@ -24,8 +24,8 @@ struct Input {
 #[serde(deny_unknown_fields)]
 struct BlueprintJson {
     id: Option<String>,
-    intent: IntentJson,
-    specs: Vec<SpecJson>,
+    command: CommandJson,
+    splices: Vec<SpliceJson>,
     reads: Vec<ReadJson>,
     bases: Vec<BaseJson>,
     #[serde(default)]
@@ -37,7 +37,7 @@ struct BlueprintJson {
 
 #[derive(Deserialize)]
 #[serde(tag = "kind")]
-enum IntentJson {
+enum CommandJson {
     #[serde(rename = "rename-local")]
     RenameLocal(RenameLocalJson),
     #[serde(rename = "extract-variable")]
@@ -84,7 +84,7 @@ struct AddDeriveJson {
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
-enum SpecJson {
+enum SpliceJson {
     Replace(ReplaceJson),
     Insert(InsertJson),
     Delete(DeleteJson),
@@ -150,50 +150,50 @@ fn rel(index: usize, name: &str, path: &str) -> Result<RelPath> {
     field(index, name, RelPath::parse(path))
 }
 
-fn intent(index: usize, j: IntentJson) -> Result<IntentCall> {
+fn command(index: usize, j: CommandJson) -> Result<Command> {
     Ok(match j {
-        IntentJson::RenameLocal(r) => IntentCall::RenameLocal {
-            from: field(index, "intent.from", Ident::parse(&r.from))?,
-            to: field(index, "intent.to", Ident::parse(&r.to))?,
+        CommandJson::RenameLocal(r) => Command::RenameLocal {
+            from: field(index, "command.from", Ident::parse(&r.from))?,
+            to: field(index, "command.to", Ident::parse(&r.to))?,
         },
-        IntentJson::ExtractVariable(e) => IntentCall::ExtractVariable {
-            name: field(index, "intent.name", Ident::parse(&e.name))?,
+        CommandJson::ExtractVariable(e) => Command::ExtractVariable {
+            name: field(index, "command.name", Ident::parse(&e.name))?,
         },
-        IntentJson::AddDerive(a) => {
+        CommandJson::AddDerive(a) => {
             let names = a
                 .derives
                 .iter()
-                .map(|d| field(index, "intent.derives", DeriveName::parse(d)))
+                .map(|d| field(index, "command.derives", DeriveName::parse(d)))
                 .collect::<Result<Vec<_>>>()?;
             let derives = NonEmpty::new(names)
-                .ok_or_else(|| anyhow!("blueprint {index}: intent.derives: must not be empty"))?;
-            IntentCall::AddDerive { derives }
+                .ok_or_else(|| anyhow!("blueprint {index}: command.derives: must not be empty"))?;
+            Command::AddDerive { derives }
         }
-        IntentJson::ExtractFunction(e) => IntentCall::ExtractFunction {
-            name: field(index, "intent.name", Ident::parse(&e.name))?,
+        CommandJson::ExtractFunction(e) => Command::ExtractFunction {
+            name: field(index, "command.name", Ident::parse(&e.name))?,
         },
-        IntentJson::MoveItem(m) => IntentCall::MoveItem {
-            item: field(index, "intent.item", Ident::parse(&m.item))?,
-            to: rel(index, "intent.to", &m.to)?,
+        CommandJson::MoveItem(m) => Command::MoveItem {
+            item: field(index, "command.item", Ident::parse(&m.item))?,
+            to: rel(index, "command.to", &m.to)?,
         },
     })
 }
 
-fn spec(index: usize, j: SpecJson) -> Result<MutationSpec> {
+fn splice(index: usize, j: SpliceJson) -> Result<Splice> {
     match j {
-        SpecJson::Replace(r) => {
-            let path = rel(index, "specs.path", &r.path)?;
-            let range = field(index, "specs.range", TextRange::new(r.start, r.end))?;
-            field(index, "specs", MutationSpec::replace(path, range, r.text))
+        SpliceJson::Replace(r) => {
+            let path = rel(index, "splices.path", &r.path)?;
+            let range = field(index, "splices.range", TextRange::new(r.start, r.end))?;
+            field(index, "splices", Splice::replace(path, range, r.text))
         }
-        SpecJson::Insert(i) => {
-            let path = rel(index, "specs.path", &i.path)?;
-            field(index, "specs", MutationSpec::insert(path, i.at, i.text))
+        SpliceJson::Insert(i) => {
+            let path = rel(index, "splices.path", &i.path)?;
+            field(index, "splices", Splice::insert(path, i.at, i.text))
         }
-        SpecJson::Delete(d) => {
-            let path = rel(index, "specs.path", &d.path)?;
-            let range = field(index, "specs.range", TextRange::new(d.start, d.end))?;
-            field(index, "specs", MutationSpec::delete(path, range))
+        SpliceJson::Delete(d) => {
+            let path = rel(index, "splices.path", &d.path)?;
+            let range = field(index, "splices.range", TextRange::new(d.start, d.end))?;
+            field(index, "splices", Splice::delete(path, range))
         }
     }
 }
@@ -225,20 +225,23 @@ fn base(index: usize, j: BaseJson) -> Result<BaseFp> {
 /// `generated`); no other part of the program generates ids.
 ///
 /// # Contract
-/// - C1: an unknown `intent.kind` (or any unknown field) is an error, and the JSON is not
+/// - C1: an unknown `command.kind` (or any unknown field) is an error, and the JSON is not
 ///   guessed at.
-///   tested: blueprint_json::tests::unknown_intent_kind_rejected
+///   tested: blueprint_json::tests::unknown_command_kind_rejected
 /// - C2: a blueprint without `id` gets a UUID v7 and is listed in `generated`.
 ///   tested: blueprint_json::tests::missing_id_is_filled_with_v7
-/// - C3: a domain constructor error (a spec no read covers) is an error naming the blueprint
+/// - C3: a domain constructor error (a splice no read covers) is an error naming the blueprint
 ///   index; nothing is loaded for it.
-///   tested: blueprint_json::tests::uncovered_spec_is_a_parse_error
-/// - C4: `bases` is required, and a blueprint whose spec is in a file without a base, or with
-///   two bases of one path, is an error naming the blueprint index (and the spec).
+///   tested: blueprint_json::tests::uncovered_splice_is_a_parse_error
+/// - C4: `bases` is required, and a blueprint whose splice is in a file without a base, or with
+///   two bases of one path, is an error naming the blueprint index (and the splice).
 ///   tested: blueprint_json::tests::missing_base_is_a_parse_error
 /// - C5: `builds_on` is optional; a parent not listed before the blueprint is an error naming
 ///   both ids.
 ///   tested: blueprint_json::tests::builds_on_must_name_an_earlier_blueprint
+/// - C6: the keys `command` and `splices` are the blueprint's; the former keys `intent` and
+///   `specs` are unknown fields and refused.
+///   tested: blueprint_json::tests::old_blueprint_keys_are_refused
 pub(crate) fn parse_blueprints(json: &str) -> Result<ParsedBlueprints> {
     let input: Input = serde_json::from_str(json).context("blueprint JSON")?;
     build(input.blueprints)
@@ -269,10 +272,10 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
                 id
             }
         };
-        let specs = bp
-            .specs
+        let splices = bp
+            .splices
             .into_iter()
-            .map(|s| spec(index, s))
+            .map(|s| splice(index, s))
             .collect::<Result<Vec<_>>>()?;
         let reads = bp
             .reads
@@ -303,8 +306,8 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
             "blueprint",
             Blueprint::new(BlueprintParts {
                 id,
-                intent: intent(index, bp.intent)?,
-                specs,
+                command: command(index, bp.command)?,
+                splices,
                 reads,
                 bases,
                 spec_refs,
@@ -327,12 +330,12 @@ mod tests {
         format!("{{\"path\":\"src/lib.rs\",\"fingerprint\":\"{fp}\"}}")
     }
 
-    fn json(intent: &str, with_id: bool, with_read: bool) -> String {
-        json_with(intent, with_id, with_read, Some(&base_json()))
+    fn json(command: &str, with_id: bool, with_read: bool) -> String {
+        json_with(command, with_id, with_read, Some(&base_json()))
     }
 
     /// The input document; `bases` is the content of the `bases` array, or the key is left out.
-    fn json_with(intent: &str, with_id: bool, with_read: bool, bases: Option<&str>) -> String {
+    fn json_with(command: &str, with_id: bool, with_read: bool, bases: Option<&str>) -> String {
         let fp = Fingerprint::of(b"a = 1");
         let bases = bases.map_or(String::new(), |b| format!("\"bases\":[{b}],"));
         let id = if with_id {
@@ -346,7 +349,7 @@ mod tests {
             String::new()
         };
         format!(
-            "{{\"blueprints\":[{{{id}\"intent\":{intent},\"specs\":[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"start\":0,\"end\":1,\"text\":\"b\"}}],\"reads\":[{reads}],{bases}\"record\":{{\"proposer\":\"p\",\"rationale\":\"r\"}}}}]}}"
+            "{{\"blueprints\":[{{{id}\"command\":{command},\"splices\":[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"start\":0,\"end\":1,\"text\":\"b\"}}],\"reads\":[{reads}],{bases}\"record\":{{\"proposer\":\"p\",\"rationale\":\"r\"}}}}]}}"
         )
     }
 
@@ -359,7 +362,7 @@ mod tests {
         let one = |id: uuid::Uuid, builds_on: Option<&str>| {
             let builds_on = builds_on.map_or(String::new(), |p| format!("\"builds_on\":\"{p}\","));
             format!(
-                "{{\"id\":\"{id}\",{builds_on}\"intent\":{RENAME},\"specs\":[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"start\":0,\"end\":1,\"text\":\"b\"}}],\"reads\":[{{\"path\":\"src/lib.rs\",\"start\":0,\"end\":5,\"fingerprint\":\"{fp}\"}}],\"bases\":[{}],\"record\":{{\"proposer\":\"p\",\"rationale\":\"r\"}}}}",
+                "{{\"id\":\"{id}\",{builds_on}\"command\":{RENAME},\"splices\":[{{\"op\":\"replace\",\"path\":\"src/lib.rs\",\"start\":0,\"end\":1,\"text\":\"b\"}}],\"reads\":[{{\"path\":\"src/lib.rs\",\"start\":0,\"end\":5,\"fingerprint\":\"{fp}\"}}],\"bases\":[{}],\"record\":{{\"proposer\":\"p\",\"rationale\":\"r\"}}}}",
                 base_json()
             )
         };
@@ -387,12 +390,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_intent_kind_rejected() {
+    fn unknown_command_kind_rejected() {
         let err = parse_blueprints(&json("{\"kind\":\"inline-all\"}", true, true))
             .expect_err("unknown kind");
         assert!(format!("{err:#}").contains("inline-all"), "{err:#}");
         let extra = RENAME.replace('}', ",\"extra\":1}");
         assert!(parse_blueprints(&json(&extra, true, true)).is_err());
+    }
+
+    #[test]
+    fn old_blueprint_keys_are_refused() {
+        let good = json(RENAME, true, true);
+        parse_blueprints(&good).expect("the current keys parse");
+        // The former keys are unknown fields, in a document and in a search request's roots.
+        let old_command = good.replace("\"command\":", "\"intent\":");
+        let err = parse_blueprints(&old_command).expect_err("old command key");
+        assert!(format!("{err:#}").contains("intent"), "{err:#}");
+        let old_splices = good.replace("\"splices\":", "\"specs\":");
+        let err = parse_blueprints(&old_splices).expect_err("old splices key");
+        assert!(format!("{err:#}").contains("specs"), "{err:#}");
+        for old in [old_command, old_splices] {
+            let doc: serde_json::Value = serde_json::from_str(&old).expect("json");
+            let list = doc["blueprints"].as_array().cloned().expect("array");
+            assert!(parse_blueprint_values(list).is_err(), "{old}");
+        }
     }
 
     #[test]
@@ -407,16 +428,16 @@ mod tests {
     }
 
     #[test]
-    fn new_intent_kinds_parse() {
+    fn new_command_kinds_parse() {
         let extract = "{\"kind\":\"extract-function\",\"name\":\"helper\"}";
         let parsed = parse_blueprints(&json(extract, true, true)).expect("extract-function");
         let bp = parsed.set.iter().next().expect("one");
-        assert_eq!(bp.intent().to_string(), "extract-function helper");
+        assert_eq!(bp.command().to_string(), "extract-function helper");
         let mv = "{\"kind\":\"move-item\",\"item\":\"Shape\",\"to\":\"geo/src/shapes.rs\"}";
         let parsed = parse_blueprints(&json(mv, true, true)).expect("move-item");
         let bp = parsed.set.iter().next().expect("one");
         assert_eq!(
-            bp.intent().to_string(),
+            bp.command().to_string(),
             "move-item Shape -> geo/src/shapes.rs"
         );
         // An unknown field and a bad path are refused.
@@ -433,9 +454,9 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_spec_is_a_parse_error() {
+    fn uncovered_splice_is_a_parse_error() {
         let err =
-            parse_blueprints(&json(RENAME, true, false)).expect_err("no read covers the spec");
+            parse_blueprints(&json(RENAME, true, false)).expect_err("no read covers the splice");
         assert!(format!("{err:#}").contains("blueprint 0"), "{err:#}");
     }
 
@@ -444,14 +465,14 @@ mod tests {
         // (a) no `bases` key
         let err = parse_blueprints(&json_with(RENAME, true, true, None)).expect_err("required");
         assert!(format!("{err:#}").contains("bases"), "{err:#}");
-        // (b) an empty list with a spec
+        // (b) an empty list with a splice
         let err = parse_blueprints(&json_with(RENAME, true, true, Some(""))).expect_err("no base");
         let text = format!("{err:#}");
         assert!(
-            text.contains("blueprint 0") && text.contains("spec 0"),
+            text.contains("blueprint 0") && text.contains("splice 0"),
             "{text}"
         );
-        // (c) a base of the spec's file
+        // (c) a base of the splice's file
         let parsed = parse_blueprints(&json(RENAME, true, true)).expect("parse");
         let bp = parsed.set.iter().next().expect("one");
         assert_eq!(bp.bases().len(), 1);

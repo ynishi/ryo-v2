@@ -7,8 +7,7 @@ use common::{Fixture, rel};
 use ryo_v2_core::app::ports::{Analyzer, Expander, Verifier};
 use ryo_v2_core::domain::text::splice;
 use ryo_v2_core::domain::{
-    Blueprint, Edit, Freshness, IntentCall, IntentKind, MutationSpec, RelPath, Scope, Target,
-    TextRange,
+    Blueprint, Command, CommandKind, Edit, Freshness, RelPath, Scope, Splice, Target, TextRange,
 };
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -133,13 +132,13 @@ fn shapes_path() -> RelPath {
     rel("geo/src/shapes.rs")
 }
 
-/// Applies the specs of a Blueprint to `texts`, per file.
+/// Applies the splices of a Blueprint to `texts`, per file.
 fn apply(bp: &Blueprint, texts: &BTreeMap<RelPath, String>) -> BTreeMap<RelPath, String> {
     let mut out = texts.clone();
-    for (path, specs) in bp.edits_by_file() {
-        let specs: Vec<&MutationSpec> = specs.into_iter().collect();
+    for (path, splices) in bp.edits_by_file() {
+        let splices: Vec<&Splice> = splices.into_iter().collect();
         let base = texts.get(path).expect("text of the file");
-        out.insert(path.clone(), splice(base, &specs).expect("splice"));
+        out.insert(path.clone(), splice(base, &splices).expect("splice"));
     }
     out
 }
@@ -151,10 +150,10 @@ fn texts_of(a: &RaAnalyzer, s: &RaSession) -> BTreeMap<RelPath, String> {
         .collect()
 }
 
-fn kinds(bps: &[Blueprint]) -> BTreeMap<IntentKind, usize> {
+fn kinds(bps: &[Blueprint]) -> BTreeMap<CommandKind, usize> {
     let mut m = BTreeMap::new();
     for b in bps {
-        *m.entry(b.intent().kind()).or_insert(0) += 1;
+        *m.entry(b.command().kind()).or_insert(0) += 1;
     }
     m
 }
@@ -175,7 +174,7 @@ fn every_expansion_conforms() {
     println!("expand: {} blueprints in {:?}", bps.len(), t0.elapsed());
     let counts = kinds(&bps);
     println!("candidates per kind: {counts:?}");
-    for k in IntentKind::ALL {
+    for k in CommandKind::ALL {
         assert!(
             counts.get(&k).copied().unwrap_or(0) > 0,
             "no {k}: {counts:?}"
@@ -184,23 +183,23 @@ fn every_expansion_conforms() {
     let texts = texts_of(&a, &s);
     for b in &bps {
         let base: BTreeMap<RelPath, String> = b
-            .specs()
+            .splices()
             .iter()
             .map(|sp| (sp.path().clone(), texts[sp.path()].clone()))
             .collect();
-        b.intent()
-            .conforms(b.specs(), &base)
-            .unwrap_or_else(|e| panic!("{} does not conform: {e}", b.intent()));
+        b.command()
+            .conforms(b.splices(), &base)
+            .unwrap_or_else(|e| panic!("{} does not conform: {e}", b.command()));
         for r in b.reads() {
             assert_eq!(r.check(&texts[r.path()]), Freshness::Fresh);
         }
-        assert!(!b.bases().is_empty(), "{}", b.intent());
+        assert!(!b.bases().is_empty(), "{}", b.command());
         let edited: std::collections::BTreeSet<&RelPath> =
-            b.specs().iter().map(|sp| sp.path()).collect();
+            b.splices().iter().map(|sp| sp.path()).collect();
         let based: Vec<&RelPath> = b.bases().iter().map(|x| x.path()).collect();
-        assert_eq!(based.len(), edited.len(), "{}", b.intent());
+        assert_eq!(based.len(), edited.len(), "{}", b.command());
         for bf in b.bases() {
-            assert!(edited.contains(bf.path()), "{}", b.intent());
+            assert!(edited.contains(bf.path()), "{}", b.command());
             assert_eq!(bf.check(&texts[bf.path()]), Freshness::Fresh);
         }
         assert_eq!(b.record().proposer(), "ryo-v2-ra/expand");
@@ -216,23 +215,25 @@ fn rename_local_expansion_covers_all_uses() {
         .expect("expand");
     let renames: Vec<&Blueprint> = bps
         .iter()
-        .filter(|b| matches!(b.intent(), IntentCall::RenameLocal { .. }))
+        .filter(|b| matches!(b.command(), Command::RenameLocal { .. }))
         .collect();
     assert!(!renames.is_empty());
     // `size` is bound once and used once, inside a format string.
     let size = renames
         .iter()
-        .find(|b| matches!(b.intent(), IntentCall::RenameLocal { from, .. } if from.as_str() == "size"))
+        .find(
+            |b| matches!(b.command(), Command::RenameLocal { from, .. } if from.as_str() == "size"),
+        )
         .expect("a rename of `size`");
     assert_eq!(
-        size.specs().len(),
+        size.splices().len(),
         2,
         "definition and the use in the format string"
     );
     // Applying it leaves no `size` binding or use in `describe`.
     let texts = texts_of(&a, &s);
     let after = apply(size, &texts);
-    let IntentCall::RenameLocal { to, .. } = size.intent() else {
+    let Command::RenameLocal { to, .. } = size.command() else {
         unreachable!()
     };
     let new = &after[&shapes_path()];
@@ -280,35 +281,35 @@ fn expansion_reads_the_given_state() {
     let mut on_new_code = 0;
     for b in &bps {
         for r in b.reads().iter().filter(|r| r.path() == &shapes_path()) {
-            assert_eq!(r.check(&state_text), Freshness::Fresh, "{}", b.intent());
+            assert_eq!(r.check(&state_text), Freshness::Fresh, "{}", b.command());
         }
-        let in_extra = b.specs().iter().any(|sp| {
+        let in_extra = b.splices().iter().any(|sp| {
             sp.path() == &shapes_path() && sp.range().start() as usize > texts[&shapes_path()].len()
         });
         if in_extra {
             on_new_code += 1;
         }
-        assert!(!b.bases().is_empty(), "{}", b.intent());
+        assert!(!b.bases().is_empty(), "{}", b.command());
         let edited: std::collections::BTreeSet<&RelPath> =
-            b.specs().iter().map(|sp| sp.path()).collect();
-        assert_eq!(b.bases().len(), edited.len(), "{}", b.intent());
+            b.splices().iter().map(|sp| sp.path()).collect();
+        assert_eq!(b.bases().len(), edited.len(), "{}", b.command());
         for bf in b.bases() {
-            assert!(edited.contains(bf.path()), "{}", b.intent());
+            assert!(edited.contains(bf.path()), "{}", b.command());
             if bf.path() == &shapes_path() {
-                assert_eq!(bf.check(&state_text), Freshness::Fresh, "{}", b.intent());
+                assert_eq!(bf.check(&state_text), Freshness::Fresh, "{}", b.command());
                 // the loaded text is not the given state
                 assert_ne!(
                     bf.check(&texts[&shapes_path()]),
                     Freshness::Fresh,
                     "{}",
-                    b.intent()
+                    b.command()
                 );
             } else {
                 assert_eq!(bf.check(&texts[bf.path()]), Freshness::Fresh);
             }
         }
         let base: BTreeMap<RelPath, String> = b
-            .specs()
+            .splices()
             .iter()
             .map(|sp| {
                 let t = if sp.path() == &shapes_path() {
@@ -319,7 +320,7 @@ fn expansion_reads_the_given_state() {
                 (sp.path().clone(), t)
             })
             .collect();
-        assert!(b.intent().conforms(b.specs(), &base).is_ok());
+        assert!(b.command().conforms(b.splices(), &base).is_ok());
     }
     assert!(
         on_new_code > 0,
@@ -349,11 +350,11 @@ fn expansion_respects_max_and_targets() {
     assert!(!only.is_empty());
     for b in &only {
         assert!(
-            b.specs()
+            b.splices()
                 .iter()
                 .any(|sp| sp.path() == &rel("geo/src/report.rs")),
             "{}",
-            b.intent()
+            b.command()
         );
     }
 
@@ -374,14 +375,14 @@ fn expansion_respects_max_and_targets() {
         .expect("expand");
     assert!(!ranged.is_empty());
     for b in &ranged {
-        if matches!(b.intent(), IntentCall::MoveItem { .. }) {
+        if matches!(b.command(), Command::MoveItem { .. }) {
             continue;
         }
-        let first = &b.specs()[0];
+        let first = &b.splices()[0];
         assert!(
             first.range().start() >= lo && first.range().start() <= hi,
             "{} at {}",
-            b.intent(),
+            b.command(),
             first.range()
         );
     }
@@ -397,14 +398,14 @@ fn move_item_forward_then_collapse_restores_the_text() {
         .expect("expand");
     let moves: Vec<&Blueprint> = bps
         .iter()
-        .filter(|b| matches!(b.intent(), IntentCall::MoveItem { .. }))
+        .filter(|b| matches!(b.command(), Command::MoveItem { .. }))
         .collect();
     assert!(!moves.is_empty(), "no move-item: {:?}", kinds(&bps));
     // Forward: `scale` moves to report.rs and leaves a use.
     let fwd = moves
         .iter()
         .find(|b| {
-            matches!(b.intent(), IntentCall::MoveItem { item, to }
+            matches!(b.command(), Command::MoveItem { item, to }
                 if item.as_str() == "scale" && to == &rel("geo/src/report.rs"))
         })
         .expect("scale -> report.rs");
@@ -427,7 +428,7 @@ fn move_item_forward_then_collapse_restores_the_text() {
     let collapse = back
         .iter()
         .find(|b| {
-            matches!(b.intent(), IntentCall::MoveItem { item, to }
+            matches!(b.command(), Command::MoveItem { item, to }
                 if item.as_str() == "scale" && to == &shapes_path())
         })
         .expect("the collapse");
@@ -453,25 +454,25 @@ fn extract_function_names_are_not_fun_name() {
         .expect("expand");
     let fns: Vec<&Blueprint> = bps
         .iter()
-        .filter(|b| matches!(b.intent(), IntentCall::ExtractFunction { .. }))
+        .filter(|b| matches!(b.command(), Command::ExtractFunction { .. }))
         .collect();
     assert!(!fns.is_empty(), "no extract-function: {:?}", kinds(&bps));
     for b in fns {
-        let IntentCall::ExtractFunction { name } = b.intent() else {
+        let Command::ExtractFunction { name } = b.command() else {
             unreachable!()
         };
         assert_ne!(name.as_str(), "fun_name");
         assert!(
-            b.specs().iter().all(|sp| !sp.text().contains("fun_name")),
+            b.splices().iter().all(|sp| !sp.text().contains("fun_name")),
             "{}",
-            b.intent()
+            b.command()
         );
         assert!(
-            b.specs()
+            b.splices()
                 .iter()
                 .any(|sp| sp.text().contains(&format!("fn {name}"))),
             "{}",
-            b.intent()
+            b.command()
         );
     }
 }

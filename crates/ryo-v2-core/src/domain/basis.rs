@@ -77,7 +77,7 @@ impl Basis {
     ///
     /// # Contract
     /// - C1: holds `BaseFp::capture` of the text of `base` for every path on which a Blueprint
-    ///   of the chain has a spec or a base fingerprint and for every path of `edits`; never a
+    ///   of the chain has a splice or a base fingerprint and for every path of `edits`; never a
     ///   fingerprint of an intermediate state or of a Blueprint's own base.
     ///   tested: domain::basis::tests::of_chain_takes_every_base_from_the_loaded_text
     ///   tested: app::search::tests::search_candidate_basis_is_against_the_loaded_text
@@ -90,7 +90,7 @@ impl Basis {
     pub(crate) fn of_chain(chain: &[&Blueprint], edits: &[Edit], base: &View<'_>) -> Self {
         let mut paths: BTreeSet<RelPath> = edits.iter().map(|e| e.path.clone()).collect();
         for bp in chain {
-            paths.extend(bp.specs().iter().map(|s| s.path().clone()));
+            paths.extend(bp.splices().iter().map(|s| s.path().clone()));
             paths.extend(bp.bases().iter().map(|b| b.path().clone()));
         }
         let files: Vec<BaseFp> = paths
@@ -155,8 +155,7 @@ impl Basis {
 mod tests {
     use super::*;
     use crate::domain::{
-        BlueprintId, BlueprintParts, DecisionRecord, Ident, IntentCall, MutationSpec, SpecRef,
-        TextRange,
+        BlueprintId, BlueprintParts, Command, DecisionRecord, Ident, SpecRef, Splice, TextRange,
     };
     use std::collections::BTreeMap;
 
@@ -180,17 +179,17 @@ mod tests {
     }
     fn blueprint(
         n: u8,
-        specs: Vec<MutationSpec>,
+        splices: Vec<Splice>,
         reads: Vec<ReadRange>,
         bases: Vec<BaseFp>,
     ) -> Blueprint {
         Blueprint::new(BlueprintParts {
             id: bid(n),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            specs,
+            splices,
             reads,
             bases,
             spec_refs: vec![SpecRef::parse("spec#1").unwrap()],
@@ -230,7 +229,7 @@ mod tests {
         let a_len = u32::try_from(A.len()).unwrap();
         let bp = blueprint(
             1,
-            vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
+            vec![Splice::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
             vec![
                 ReadRange::capture(rel("a.rs"), A, tr(0, a_len)).unwrap(),
                 ReadRange::capture(rel("b.rs"), B, tr(0, 3)).unwrap(),
@@ -274,13 +273,13 @@ mod tests {
         let loaded = texts(&[("a.rs", "let a = 1;"), ("b.rs", B), ("s.rs", "start")]);
         let parent = blueprint(
             1,
-            vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
+            vec![Splice::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
             vec![ReadRange::capture(rel("a.rs"), "let a = 1;", tr(0, 10)).unwrap()],
             vec![BaseFp::capture(rel("a.rs"), "let a = 1;")],
         );
         let child = blueprint(
             2,
-            vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), "c").unwrap()],
+            vec![Splice::replace(rel("a.rs"), tr(4, 5), "c").unwrap()],
             vec![
                 ReadRange::capture(rel("a.rs"), parent_state, tr(0, 10)).unwrap(),
                 ReadRange::capture(rel("b.rs"), B, tr(0, 3)).unwrap(),
@@ -311,7 +310,7 @@ mod tests {
         let loaded = texts(&[("a.rs", A)]);
         let bp = blueprint(
             1,
-            vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
+            vec![Splice::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
             vec![ReadRange::capture(rel("a.rs"), A, tr(0, 10)).unwrap()],
             vec![BaseFp::capture(rel("a.rs"), A)],
         );
