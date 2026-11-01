@@ -1253,7 +1253,7 @@ mod tests {
     use super::*;
     use ryo_v2_core::app::search::{DepthStats, RankedNode};
     use ryo_v2_core::domain::{
-        BlueprintId, Fingerprint, Infeasible, IntentKind, Prior, ProposalId, Reward, SearchTree,
+        BlueprintId, CommandKind, Fingerprint, Infeasible, Prior, ProposalId, Reward, SearchTree,
         StateFp,
     };
     use ryo_v2_ra::GapDetector;
@@ -1269,7 +1269,7 @@ mod tests {
             message: "boom\nmore".to_owned(),
         }];
         let e = [ExpanderPanic {
-            kind: Some(IntentKind::ExtractVariable),
+            kind: Some(CommandKind::ExtractVariable),
             path: None,
             message: "bang".to_owned(),
         }];
@@ -1285,7 +1285,7 @@ mod tests {
             lines[2],
             format!(
                 "expander panic ws1 {} -: bang",
-                IntentKind::ExtractVariable.id()
+                CommandKind::ExtractVariable.id()
             )
         );
         assert_eq!(p.to_json()["expander"][0]["ws"], "ws1");
@@ -1335,7 +1335,7 @@ mod tests {
             parent: root,
             blueprint: BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap(),
             proposal: ProposalId::parse(&Fingerprint::of(&[tag]).to_string()).unwrap(),
-            intent: IntentKind::RenameLocal,
+            command: CommandKind::RenameLocal,
             state: edits.as_deref().map(StateFp::of),
             score: None,
             rank,

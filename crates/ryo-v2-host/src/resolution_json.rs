@@ -130,7 +130,7 @@ fn candidate_json(c: &Candidate) -> Value {
         .map(|b| {
             json!({
                 "blueprint": b.id().to_string(),
-                "intent": b.intent().to_string(),
+                "intent": b.command().to_string(),
                 "proposer": b.record().proposer(),
                 "rationale": b.record().rationale(),
                 "spec_refs": b.spec_refs().iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -346,9 +346,9 @@ mod tests {
     use ryo_v2_core::app::apply::apply_blueprints;
     use ryo_v2_core::app::ports::{CheckError, FileFacts, Verifier};
     use ryo_v2_core::domain::{
-        BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, DecisionRecord, Edit,
-        ErrorCode, Finding, FindingCode, Fingerprint, Ident, Infeasible, IntentCall, MutationSpec,
-        Provenance, ReadRange, RelPath, ScopedFindings, SpecRef, TextRange,
+        BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, Command, DecisionRecord,
+        Edit, ErrorCode, Finding, FindingCode, Fingerprint, Ident, Infeasible, Provenance,
+        ReadRange, RelPath, ScopedFindings, SpecRef, Splice, TextRange,
     };
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -429,8 +429,8 @@ mod tests {
 
     /// Every read here covers the whole file, so its fingerprint is the base of the file.
     fn blueprint(
-        intent: IntentCall,
-        specs: Vec<MutationSpec>,
+        command: Command,
+        splices: Vec<Splice>,
         reads: Vec<ReadRange>,
         refs: &[&str],
     ) -> Blueprint {
@@ -440,8 +440,8 @@ mod tests {
             .collect();
         Blueprint::new(BlueprintParts {
             id: id(),
-            intent,
-            specs,
+            command,
+            splices,
             reads,
             bases,
             spec_refs: refs
@@ -457,11 +457,11 @@ mod tests {
     fn rename(path: &str) -> Blueprint {
         let text = "let a = 1;";
         blueprint(
-            IntentCall::RenameLocal {
+            Command::RenameLocal {
                 from: Ident::parse("a").expect("ident"),
                 to: Ident::parse("b").expect("ident"),
             },
-            vec![MutationSpec::replace(rel(path), tr(4, 5), "b").expect("a spec")],
+            vec![Splice::replace(rel(path), tr(4, 5), "b").expect("a splice")],
             vec![ReadRange::capture(rel(path), text, tr(0, 10)).expect("a read")],
             &["docs/m3.md#4"],
         )
@@ -470,12 +470,12 @@ mod tests {
     fn extract(path: &str) -> Blueprint {
         let text = "f(1 + 2);";
         blueprint(
-            IntentCall::ExtractVariable {
+            Command::ExtractVariable {
                 name: Ident::parse("t").expect("ident"),
             },
             vec![
-                MutationSpec::insert(rel(path), 0, "let t = 1 + 2;\n").expect("a spec"),
-                MutationSpec::replace(rel(path), tr(2, 7), "t").expect("a spec"),
+                Splice::insert(rel(path), 0, "let t = 1 + 2;\n").expect("a splice"),
+                Splice::replace(rel(path), tr(2, 7), "t").expect("a splice"),
             ],
             vec![ReadRange::capture(rel(path), text, tr(0, 9)).expect("a read")],
             &[],
@@ -485,14 +485,14 @@ mod tests {
     fn move_foo() -> Blueprint {
         let a = "pub fn foo() {}\n";
         blueprint(
-            IntentCall::MoveItem {
+            Command::MoveItem {
                 item: Ident::parse("foo").expect("ident"),
                 to: rel("src/b.rs"),
             },
             vec![
-                MutationSpec::replace(rel("src/a.rs"), tr(0, 15), "pub use crate::b::foo;")
-                    .expect("a spec"),
-                MutationSpec::insert(rel("src/b.rs"), 0, a).expect("a spec"),
+                Splice::replace(rel("src/a.rs"), tr(0, 15), "pub use crate::b::foo;")
+                    .expect("a splice"),
+                Splice::insert(rel("src/b.rs"), 0, a).expect("a splice"),
             ],
             vec![
                 ReadRange::capture(rel("src/a.rs"), a, tr(0, 16)).expect("a read"),
@@ -554,11 +554,11 @@ mod tests {
         let read = ReadRange::capture(other.clone(), "abcdef", tr(1, 4)).expect("a read");
         let bp = Blueprint::new(BlueprintParts {
             id: id(),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").expect("ident"),
                 to: Ident::parse("b").expect("ident"),
             },
-            specs: vec![MutationSpec::replace(lib.clone(), tr(4, 5), "b").expect("a spec")],
+            splices: vec![Splice::replace(lib.clone(), tr(4, 5), "b").expect("a splice")],
             // the read of the edited file is covered by its base and is not in the basis
             reads: vec![
                 ReadRange::capture(lib.clone(), text, tr(0, 10)).expect("a read"),

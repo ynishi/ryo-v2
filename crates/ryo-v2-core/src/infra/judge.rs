@@ -94,8 +94,8 @@ impl Judge for ReplayJudge {
 mod tests {
     use super::*;
     use crate::domain::{
-        BaseFp, Blueprint, BlueprintId, BlueprintParts, CleanDelta, Criterion, DecisionRecord,
-        ExtDelta, Ident, IntentCall, MutationSpec, Proposal, ReadRange, RelPath, SpecRef,
+        BaseFp, Blueprint, BlueprintId, BlueprintParts, CleanDelta, Command, Criterion,
+        DecisionRecord, ExtDelta, Ident, Proposal, ReadRange, RelPath, SpecRef, Splice,
         StaticMetrics, TextRange,
     };
 
@@ -111,11 +111,11 @@ mod tests {
     fn rename(n: u16, to: &str) -> Blueprint {
         Blueprint::new(BlueprintParts {
             id: BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a{n:04x}")).unwrap(),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse(to).unwrap(),
             },
-            specs: vec![MutationSpec::replace(rel(), tr(4, 5), to).unwrap()],
+            splices: vec![Splice::replace(rel(), tr(4, 5), to).unwrap()],
             reads: vec![ReadRange::capture(rel(), TEXT, tr(0, 10)).unwrap()],
             bases: vec![BaseFp::capture(rel(), TEXT)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],

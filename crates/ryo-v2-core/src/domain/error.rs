@@ -24,9 +24,9 @@ pub enum DomainError {
     /// Not a UUID version 7.
     #[error("not a version 7 uuid: {0:?}")]
     Uuid(String),
-    /// A mutation spec that changes nothing or is malformed.
+    /// A splice that changes nothing or is malformed.
     #[error("invalid mutation: {0}")]
-    Mutation(String),
+    InvalidSplice(String),
     /// Not `<doc>#<item>`.
     #[error("not a spec reference (<doc>#<item>): {0:?}")]
     SpecRef(String),

@@ -9,7 +9,7 @@
 
 use super::stage::Staged;
 use super::{
-    Basis, Blueprint, BlueprintId, DomainError, Drift, Edit, FileRole, Fingerprint, IntentKind,
+    Basis, Blueprint, BlueprintId, CommandKind, DomainError, Drift, Edit, FileRole, Fingerprint,
     NonEmpty, Nonconformance, RelPath, RiskMark, Scope, SpliceError, UnseenClass, Verdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -79,9 +79,9 @@ pub(crate) fn named_unseen(
 /// - C1: the marks are the union of the catalog risks of `kinds` and, for the roles, `BuildScript`
 ///   for `FileRole::BuildScript` and `ProcMacroCrate` for `FileRole::ProcMacroSource`; `Source`
 ///   and `Manifest` add nothing.
-///   tested: domain::resolution::tests::risk_marks_are_intent_risks_plus_roles
+///   tested: domain::resolution::tests::risk_marks_are_command_risks_plus_roles
 pub fn risk_marks(
-    kinds: impl IntoIterator<Item = IntentKind>,
+    kinds: impl IntoIterator<Item = CommandKind>,
     roles: impl IntoIterator<Item = FileRole>,
 ) -> BTreeSet<RiskMark> {
     let mut marks = BTreeSet::new();
@@ -142,7 +142,7 @@ impl Candidate {
     /// # Contract
     /// - C1: returns `Err(verdict)` unless `verdict.passed()`.
     ///   tested: domain::resolution::tests::candidate_refuses_failed_verdict
-    /// - C2: the marks are [`risk_marks`] of the intent kinds of the path of `staged` and its
+    /// - C2: the marks are [`risk_marks`] of the command kinds of the path of `staged` and its
     ///   roles; `unseen_classes` is the classes of those marks ([`unseen_classes`]) that are in
     ///   `blind`, together with the classes `verdict.unseen` observed, and `None` when there are
     ///   none.
@@ -160,7 +160,7 @@ impl Candidate {
         }
         let (path, edits, roles, basis) = staged.into_parts();
         let marks = risk_marks(
-            path.iter().map(|b| b.intent().kind()),
+            path.iter().map(|b| b.command().kind()),
             roles.iter().copied(),
         );
         Ok(Self {
@@ -259,7 +259,7 @@ impl std::fmt::Display for CheckFailure {
 /// Why a Blueprint was not made a candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocking {
-    /// A spec is in a file the analyzer cannot judge.
+    /// A splice is in a file the analyzer cannot judge.
     Unverifiable {
         /// The Blueprint.
         blueprint: BlueprintId,
@@ -282,14 +282,14 @@ pub enum Blocking {
         /// The file.
         path: RelPath,
     },
-    /// The mutations are not what the intent says.
+    /// The splices are not what the command says.
     Nonconforming {
         /// The Blueprint.
         blueprint: BlueprintId,
         /// What differs.
         why: Nonconformance,
     },
-    /// The mutations could not be applied to the text.
+    /// The splices could not be applied to the text.
     Splice {
         /// The Blueprint.
         blueprint: BlueprintId,
@@ -522,9 +522,9 @@ pub enum Stage {
     FileRole,
     /// Freshness of the reads.
     Freshness,
-    /// The mutations against the intent.
+    /// The splices against the command.
     Conformance,
-    /// The mutations spliced into the text.
+    /// The splices spliced into the text.
     Splice,
     /// Risk marks.
     Marks,
@@ -842,8 +842,8 @@ mod tests {
     use super::*;
     use crate::domain::DeriveName;
     use crate::domain::{
-        BaseFp, BlueprintParts, DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident,
-        IntentCall, MutationSpec, ReadRange, TextRange,
+        BaseFp, BlueprintParts, Command, DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident,
+        ReadRange, Splice, TextRange,
     };
 
     fn empty_basis() -> Basis {
@@ -869,35 +869,35 @@ mod tests {
     fn bid() -> BlueprintId {
         BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap()
     }
-    fn call(kind: IntentKind) -> IntentCall {
+    fn call(kind: CommandKind) -> Command {
         match kind {
-            IntentKind::RenameLocal => IntentCall::RenameLocal {
+            CommandKind::RenameLocal => Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            IntentKind::ExtractVariable => IntentCall::ExtractVariable {
+            CommandKind::ExtractVariable => Command::ExtractVariable {
                 name: Ident::parse("t").unwrap(),
             },
-            IntentKind::AddDerive => IntentCall::AddDerive {
+            CommandKind::AddDerive => Command::AddDerive {
                 derives: NonEmpty::one(DeriveName::parse("Clone").unwrap()),
             },
-            IntentKind::ExtractFunction => IntentCall::ExtractFunction {
+            CommandKind::ExtractFunction => Command::ExtractFunction {
                 name: Ident::parse("h").unwrap(),
             },
-            IntentKind::MoveItem => IntentCall::MoveItem {
+            CommandKind::MoveItem => Command::MoveItem {
                 item: Ident::parse("i").unwrap(),
                 to: RelPath::parse("b.rs").unwrap(),
             },
         }
     }
-    /// A Blueprint of `kind`; the intent is not checked against its specs when it is built.
-    fn blueprint(n: u8, kind: IntentKind) -> Blueprint {
+    /// A Blueprint of `kind`; the command is not checked against its splices when it is built.
+    fn blueprint(n: u8, kind: CommandKind) -> Blueprint {
         let path = RelPath::parse("a.rs").unwrap();
         let range = TextRange::new(0, 1).unwrap();
         Blueprint::new(BlueprintParts {
             id: BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap(),
-            intent: call(kind),
-            specs: vec![MutationSpec::replace(path.clone(), range, "y").unwrap()],
+            command: call(kind),
+            splices: vec![Splice::replace(path.clone(), range, "y").unwrap()],
             reads: vec![ReadRange::capture(path.clone(), "x", range).unwrap()],
             bases: vec![BaseFp::capture(path, "x")],
             spec_refs: vec![],
@@ -906,7 +906,7 @@ mod tests {
         })
         .unwrap()
     }
-    fn path_of(kinds: &[IntentKind]) -> NonEmpty<Blueprint> {
+    fn path_of(kinds: &[CommandKind]) -> NonEmpty<Blueprint> {
         NonEmpty::new(
             kinds
                 .iter()
@@ -916,7 +916,7 @@ mod tests {
         )
         .unwrap()
     }
-    fn staged(kinds: &[IntentKind], roles: BTreeSet<FileRole>, edits: Vec<Edit>) -> Staged {
+    fn staged(kinds: &[CommandKind], roles: BTreeSet<FileRole>, edits: Vec<Edit>) -> Staged {
         Staged::for_tests(path_of(kinds), roles, edits, empty_basis())
     }
     const ALL_ROLES: [FileRole; 4] = [
@@ -975,7 +975,7 @@ mod tests {
         // Every mark that names a class, and a checker that is blind to none: nothing is named.
         let c = Candidate::new(
             staged(
-                &[IntentKind::ExtractFunction, IntentKind::MoveItem],
+                &[CommandKind::ExtractFunction, CommandKind::MoveItem],
                 BTreeSet::from([FileRole::BuildScript, FileRole::ProcMacroSource]),
                 vec![],
             ),
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn candidate_names_what_it_touches_and_what_was_observed() {
-        let borrow = || staged(&[IntentKind::ExtractVariable], BTreeSet::new(), vec![]);
+        let borrow = || staged(&[CommandKind::ExtractVariable], BTreeSet::new(), vec![]);
         let observed = Verdict {
             unseen: BTreeSet::from([UnseenClass::UnexpandedMacro]),
             ..passing()
@@ -1111,7 +1111,7 @@ mod tests {
             ),
         ] {
             let c = Candidate::new(
-                staged(&[IntentKind::MoveItem], BTreeSet::from([role]), vec![]),
+                staged(&[CommandKind::MoveItem], BTreeSet::from([role]), vec![]),
                 passing(),
                 &mark_blind(),
             )
@@ -1137,7 +1137,7 @@ mod tests {
     fn candidate_refuses_failed_verdict() {
         let v = failing();
         let err = Candidate::new(
-            staged(&[IntentKind::MoveItem], BTreeSet::new(), vec![]),
+            staged(&[CommandKind::MoveItem], BTreeSet::new(), vec![]),
             v.clone(),
             &mark_blind(),
         )
@@ -1145,7 +1145,7 @@ mod tests {
         assert_eq!(err, v);
         let ok = Candidate::new(
             staged(
-                &[IntentKind::RenameLocal, IntentKind::MoveItem],
+                &[CommandKind::RenameLocal, CommandKind::MoveItem],
                 BTreeSet::new(),
                 vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
             ),
@@ -1162,9 +1162,9 @@ mod tests {
 
     #[test]
     fn candidate_names_its_marks() {
-        let mut paths: Vec<Vec<IntentKind>> = IntentKind::ALL.iter().map(|k| vec![*k]).collect();
-        for a in IntentKind::ALL {
-            for b in IntentKind::ALL {
+        let mut paths: Vec<Vec<CommandKind>> = CommandKind::ALL.iter().map(|k| vec![*k]).collect();
+        for a in CommandKind::ALL {
+            for b in CommandKind::ALL {
                 paths.push(vec![a, b]);
             }
         }
@@ -1179,16 +1179,16 @@ mod tests {
                 let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
                 assert_eq!(c.marks(), &marks, "{kinds:?} {roles:?}");
                 assert_eq!(c.unseen_classes(), unseen_classes(&marks).as_ref());
-                let kinds_of: Vec<_> = c.path().iter().map(|b| b.intent().kind()).collect();
+                let kinds_of: Vec<_> = c.path().iter().map(|b| b.command().kind()).collect();
                 assert_eq!(&kinds_of, kinds);
             }
         }
     }
 
     #[test]
-    fn risk_marks_are_intent_risks_plus_roles() {
+    fn risk_marks_are_command_risks_plus_roles() {
         assert!(risk_marks([], []).is_empty());
-        for kind in IntentKind::ALL {
+        for kind in CommandKind::ALL {
             assert_eq!(risk_marks([kind], []), kind.spec().risks, "{kind}");
         }
         for role in ALL_ROLES {
@@ -1198,7 +1198,7 @@ mod tests {
                 FileRole::Source | FileRole::Manifest => BTreeSet::new(),
             };
             assert_eq!(risk_marks([], [role]), expected, "{role}");
-            for kind in IntentKind::ALL {
+            for kind in CommandKind::ALL {
                 let mut all = kind.spec().risks;
                 all.extend(expected.iter().copied());
                 assert_eq!(risk_marks([kind], [role]), all, "{kind} {role}");
@@ -1206,7 +1206,7 @@ mod tests {
         }
         assert_eq!(
             risk_marks(
-                [IntentKind::MoveItem, IntentKind::ExtractVariable],
+                [CommandKind::MoveItem, CommandKind::ExtractVariable],
                 [FileRole::Source, FileRole::BuildScript]
             ),
             BTreeSet::from([

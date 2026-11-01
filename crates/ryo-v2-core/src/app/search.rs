@@ -16,8 +16,8 @@ use crate::app::verdict_of;
 use crate::domain::search::{prune, rank_final, reward_score, score};
 use crate::domain::stage::{On, Refused, Staged, stage, view_of};
 use crate::domain::{
-    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, Edit, Evidence, Infeasible, Inserted,
-    IntentKind, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, Prior, Proposal,
+    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, CommandKind, Edit, Evidence,
+    Infeasible, Inserted, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, Prior, Proposal,
     ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, Scope, Scored, SearchBudget,
     SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
 };
@@ -126,8 +126,8 @@ pub struct TraceEntry {
     pub blueprint: BlueprintId,
     /// Its proposal, the identity a judge sees.
     pub proposal: ProposalId,
-    /// The intent it calls.
-    pub intent: IntentKind,
+    /// The command it calls.
+    pub command: CommandKind,
     /// The state it leads to; `None` when a stage refused it.
     pub state: Option<StateFp>,
     /// Its score for pruning; `None` when a stage refused it.
@@ -493,7 +493,7 @@ where
                 parent: child.parent,
                 blueprint: bp.id(),
                 proposal,
-                intent: bp.intent().kind(),
+                command: bp.command().kind(),
                 state: None,
                 score: None,
                 rank: None,
@@ -859,10 +859,9 @@ mod tests {
     use super::*;
     use crate::app::ports::{FileFacts, Verifier};
     use crate::domain::{
-        BaseFp, BlueprintParts, CheckFailure, CleanDelta, Criterion, DEFAULT_BUDGET,
-        DEFAULT_WEIGHTS, DecisionRecord, ErrorCode, Finding, FindingCode, Ident, IntentCall,
-        Judgement, MutationSpec, Provenance, ReadRange, RiskMark, ScopedFindings, SpecRef,
-        TextRange, UnseenClass,
+        BaseFp, BlueprintParts, CheckFailure, CleanDelta, Command, Criterion, DEFAULT_BUDGET,
+        DEFAULT_WEIGHTS, DecisionRecord, ErrorCode, Finding, FindingCode, Ident, Judgement,
+        Provenance, ReadRange, RiskMark, ScopedFindings, SpecRef, Splice, TextRange, UnseenClass,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -896,12 +895,12 @@ mod tests {
             ..StaticMetrics::default()
         }
     }
-    fn make(n: u16, intent: IntentCall, specs: Vec<MutationSpec>, text: &str) -> Blueprint {
+    fn make(n: u16, command: Command, splices: Vec<Splice>, text: &str) -> Blueprint {
         let end = u32::try_from(text.len()).unwrap();
         Blueprint::new(BlueprintParts {
             id: bid(n),
-            intent,
-            specs,
+            command,
+            splices,
             reads: vec![ReadRange::capture(rel(LIB), text, tr(0, end)).unwrap()],
             bases: vec![BaseFp::capture(rel(LIB), text)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
@@ -916,11 +915,11 @@ mod tests {
         let end = at + u32::try_from(from.len()).unwrap();
         make(
             n,
-            IntentCall::RenameLocal {
+            Command::RenameLocal {
                 from: Ident::parse(from).unwrap(),
                 to: Ident::parse(to).unwrap(),
             },
-            vec![MutationSpec::replace(rel(LIB), tr(at, end), to).unwrap()],
+            vec![Splice::replace(rel(LIB), tr(at, end), to).unwrap()],
             text,
         )
     }
@@ -928,12 +927,12 @@ mod tests {
     fn extract_x(n: u16, text: &str) -> Blueprint {
         make(
             n,
-            IntentCall::ExtractVariable {
+            Command::ExtractVariable {
                 name: Ident::parse("x").unwrap(),
             },
             vec![
-                MutationSpec::insert(rel(LIB), 0, "let x = 1 + 2;\n").unwrap(),
-                MutationSpec::replace(rel(LIB), tr(2, 7), "x").unwrap(),
+                Splice::insert(rel(LIB), 0, "let x = 1 + 2;\n").unwrap(),
+                Splice::replace(rel(LIB), tr(2, 7), "x").unwrap(),
             ],
             text,
         )
@@ -1491,11 +1490,11 @@ mod tests {
         let end = u32::try_from(at_b.len()).unwrap();
         let child = Blueprint::new(BlueprintParts {
             id: bid(10),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("b").unwrap(),
                 to: Ident::parse("c").unwrap(),
             },
-            specs: vec![MutationSpec::replace(rel(LIB), tr(4, 5), "c").unwrap()],
+            splices: vec![Splice::replace(rel(LIB), tr(4, 5), "c").unwrap()],
             reads: vec![
                 ReadRange::capture(rel(LIB), at_b, tr(0, end)).unwrap(),
                 ReadRange::capture(other.clone(), "abc", tr(0, 3)).unwrap(),
@@ -1703,11 +1702,11 @@ mod tests {
         // The parent renames in the build script, the child in an ordinary source file.
         let parent = Blueprint::new(BlueprintParts {
             id: bid(1),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            specs: vec![MutationSpec::replace(rel("build.rs"), tr(4, 5), "b").unwrap()],
+            splices: vec![Splice::replace(rel("build.rs"), tr(4, 5), "b").unwrap()],
             reads: vec![ReadRange::capture(rel("build.rs"), BASE, tr(0, 10)).unwrap()],
             bases: vec![BaseFp::capture(rel("build.rs"), BASE)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
@@ -1809,8 +1808,8 @@ mod tests {
         let other = rename(2, "a", "c", BASE);
         let chained = Blueprint::new(BlueprintParts {
             id: other.id(),
-            intent: other.intent().clone(),
-            specs: other.specs().to_vec(),
+            command: other.command().clone(),
+            splices: other.splices().to_vec(),
             reads: other.reads().to_vec(),
             bases: other.bases().to_vec(),
             spec_refs: other.spec_refs().to_vec(),
@@ -1821,8 +1820,8 @@ mod tests {
         let later = rename(4, "a", "e", BASE);
         let later = Blueprint::new(BlueprintParts {
             id: later.id(),
-            intent: later.intent().clone(),
-            specs: later.specs().to_vec(),
+            command: later.command().clone(),
+            splices: later.splices().to_vec(),
             reads: later.reads().to_vec(),
             bases: later.bases().to_vec(),
             spec_refs: later.spec_refs().to_vec(),
@@ -2001,7 +2000,7 @@ mod tests {
         let (r, _) = build(false);
         assert_eq!(r.trace.len(), 2);
         assert!(r.trace.iter().all(|t| t.edits.is_none() && t.depth == 1));
-        assert_eq!(r.trace[0].intent, IntentKind::RenameLocal);
+        assert_eq!(r.trace[0].command, CommandKind::RenameLocal);
         assert_eq!(r.trace[0].state, Some(state(vec![w("let b = 1;")])));
         assert_eq!(r.trace[1].fate, Fate::Blocked(Stage::Freshness));
         assert_eq!(r.trace[1].state, None);

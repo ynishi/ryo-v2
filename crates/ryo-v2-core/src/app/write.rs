@@ -226,9 +226,9 @@ mod tests {
     use crate::domain::resolution::DEFAULT_BUDGET;
     use crate::domain::stage::Staged;
     use crate::domain::{
-        BaseFp, Blueprint, BlueprintParts, BlueprintSet, Candidate, DecisionLog, DecisionRecord,
-        Diagnostics, ErrorCode, Evidence, Finding, FindingCode, Freshness, Ident, Infeasible,
-        IntentCall, MutationSpec, NonEmpty, Provenance, ReadRange, Scope, ScopedFindings, SpecRef,
+        BaseFp, Blueprint, BlueprintParts, BlueprintSet, Candidate, Command, DecisionLog,
+        DecisionRecord, Diagnostics, ErrorCode, Evidence, Finding, FindingCode, Freshness, Ident,
+        Infeasible, NonEmpty, Provenance, ReadRange, Scope, ScopedFindings, SpecRef, Splice,
         TextRange, UnseenClass,
     };
     use std::cell::{Cell, RefCell};
@@ -318,12 +318,12 @@ mod tests {
     fn view(texts: &BTreeMap<RelPath, String>) -> impl Fn(&RelPath) -> Option<String> + '_ {
         move |p| texts.get(p).cloned()
     }
-    fn make(n: u8, intent: IntentCall, specs: Vec<MutationSpec>, text: &str) -> Blueprint {
+    fn make(n: u8, command: Command, splices: Vec<Splice>, text: &str) -> Blueprint {
         let end = u32::try_from(text.len()).unwrap();
         Blueprint::new(BlueprintParts {
             id: bid(n),
-            intent,
-            specs,
+            command,
+            splices,
             reads: vec![ReadRange::capture(rel(LIB), text, tr(0, end)).unwrap()],
             bases: vec![BaseFp::capture(rel(LIB), text)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
@@ -336,11 +336,11 @@ mod tests {
     fn rename(n: u8) -> Blueprint {
         make(
             n,
-            IntentCall::RenameLocal {
+            Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            vec![MutationSpec::replace(rel(LIB), tr(4, 5), "b").unwrap()],
+            vec![Splice::replace(rel(LIB), tr(4, 5), "b").unwrap()],
             BASE,
         )
     }
@@ -348,12 +348,12 @@ mod tests {
     fn extract(n: u8) -> Blueprint {
         make(
             n,
-            IntentCall::ExtractVariable {
+            Command::ExtractVariable {
                 name: Ident::parse("t").unwrap(),
             },
             vec![
-                MutationSpec::insert(rel(LIB), 0, "let t = 1 + 2;\n").unwrap(),
-                MutationSpec::replace(rel(LIB), tr(2, 7), "t").unwrap(),
+                Splice::insert(rel(LIB), 0, "let t = 1 + 2;\n").unwrap(),
+                Splice::replace(rel(LIB), tr(2, 7), "t").unwrap(),
             ],
             "f(1 + 2);",
         )

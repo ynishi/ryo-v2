@@ -6,7 +6,7 @@ mod common;
 
 use common::{Fixture, rel};
 use ryo_v2_core::app::ports::{Analyzer, Expander, Verifier};
-use ryo_v2_core::domain::{Blueprint, IntentCall, IntentKind, Scope, Target};
+use ryo_v2_core::domain::{Blueprint, Command, CommandKind, Scope, Target};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
@@ -84,8 +84,8 @@ fn extract_variable_skips_the_value_of_an_attributed_record_field() {
         .expect("expansion of a struct literal with a cfg-gated field");
     let extracted: Vec<String> = bps
         .iter()
-        .filter_map(|bp| match bp.intent() {
-            IntentCall::ExtractVariable { name } => Some(name.as_str().to_owned()),
+        .filter_map(|bp| match bp.command() {
+            Command::ExtractVariable { name } => Some(name.as_str().to_owned()),
             _ => None,
         })
         .collect();
@@ -108,8 +108,8 @@ fn extract_variable_skips_the_value_of_an_attributed_record_field() {
 }
 
 /// The edit kinds among `bps`.
-fn kinds(bps: &[Blueprint]) -> BTreeSet<IntentKind> {
-    bps.iter().map(|bp| bp.intent().kind()).collect()
+fn kinds(bps: &[Blueprint]) -> BTreeSet<CommandKind> {
+    bps.iter().map(|bp| bp.command().kind()).collect()
 }
 
 /// A panic in a call of one edit kind that reaches rust-analyzer (realizing a seed, or the
@@ -126,10 +126,10 @@ fn an_expander_panic_is_contained_and_recorded() {
     );
     assert_eq!(
         all,
-        IntentKind::ALL.iter().copied().collect(),
+        CommandKind::ALL.iter().copied().collect(),
         "the fixture gives every kind, so each fault below removes something"
     );
-    for kind in IntentKind::ALL {
+    for kind in CommandKind::ALL {
         s.inject_expander_fault(Some(kind));
         let got = kinds(
             &a.expand(&mut s, &[], std::slice::from_ref(&target), 500)

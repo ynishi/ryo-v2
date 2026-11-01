@@ -1,7 +1,7 @@
 //! A deterministic, line-based generator that plants the inverse of a refactor into clean code,
 //! and the corpus cases built from its output.
 //!
-//! Each kind injects the inverse of one Intent, so the best Blueprint of the planted state (the
+//! Each kind injects the inverse of one command, so the best Blueprint of the planted state (the
 //! one that restores the clean text) is known by construction, independent of every metric:
 //!
 //! | kind | injection | best restores with |
@@ -64,8 +64,8 @@ impl PlantKind {
         PlantKind::ALL.into_iter().find(|k| k.id() == s)
     }
 
-    /// The id of the Intent whose call restores the clean text.
-    pub fn best_intent(self) -> &'static str {
+    /// The id of the command whose call restores the clean text.
+    pub fn best_command(self) -> &'static str {
         match self {
             PlantKind::ObscureName => "rename-local",
             PlantKind::InlineVariable => "extract-variable",
@@ -123,7 +123,7 @@ impl Plant {
 
 /// One edit of a run of lines of one file (0-based, half open).
 #[derive(Debug, Clone)]
-struct Splice {
+struct LineSplice {
     path: RelPath,
     start: usize,
     end: usize,
@@ -147,7 +147,7 @@ enum RegionKind {
 #[derive(Debug, Clone)]
 struct Raw {
     site: Site,
-    splices: Vec<Splice>,
+    splices: Vec<LineSplice>,
     original_fn: Option<String>,
     note: String,
 }
@@ -428,7 +428,7 @@ fn line_count(text: &str) -> usize {
 
 /// `raw`'s splices over `files`: the new files and the touched regions in them.
 fn apply(files: &[SourceFile], raw: &Raw) -> Option<Applied> {
-    let mut by_path: BTreeMap<&RelPath, Vec<&Splice>> = BTreeMap::new();
+    let mut by_path: BTreeMap<&RelPath, Vec<&LineSplice>> = BTreeMap::new();
     for s in &raw.splices {
         by_path.entry(&s.path).or_default().push(s);
     }
@@ -1341,7 +1341,7 @@ fn obscure_at(p: &Parsed, f: &FnBlock, l: usize, files: &[SourceFile]) -> Option
             path: p.path.clone(),
             line: l as u32 + 1,
         },
-        splices: vec![Splice {
+        splices: vec![LineSplice {
             path: p.path.clone(),
             start: l,
             end: m,
@@ -1430,7 +1430,7 @@ fn inline_variable_at(p: &Parsed, f: &FnBlock, l: usize, index: &FnIndex) -> Opt
             path: p.path.clone(),
             line: l as u32 + 1,
         },
-        splices: vec![Splice {
+        splices: vec![LineSplice {
             path: p.path.clone(),
             start: l,
             end: l + 2,
@@ -1541,14 +1541,14 @@ fn inline_function_at(all: &[Parsed], p: &Parsed, h: &FnBlock) -> Option<Raw> {
             line: l as u32 + 1,
         },
         splices: vec![
-            Splice {
+            LineSplice {
                 path: p.path.clone(),
                 start: l,
                 end: l + 1,
                 replacement: new_line,
                 region: RegionKind::EnclosingFn,
             },
-            Splice {
+            LineSplice {
                 path: p.path.clone(),
                 start: caller.end + 1,
                 end: h.end + 1,
@@ -1867,14 +1867,14 @@ fn misplace_at(
             line: item.header as u32 + 1,
         },
         splices: vec![
-            Splice {
+            LineSplice {
                 path: p.path.clone(),
                 start: item.start,
                 end: item.end + 1,
                 replacement: reexport,
                 region: RegionKind::Exact { skip: 0 },
             },
-            Splice {
+            LineSplice {
                 path: dest.path.clone(),
                 start: dest_len,
                 end: dest_len,

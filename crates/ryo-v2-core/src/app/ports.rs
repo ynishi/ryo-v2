@@ -220,13 +220,13 @@ pub enum ExpandError {
     Session(CheckError),
 }
 
-/// Proposes the children of a search state: Blueprints whose reads and specs are against the
+/// Proposes the children of a search state: Blueprints whose reads and splices are against the
 /// text of that state.
 pub trait Expander {
     /// A loaded workspace.
     type Session;
     /// Children of the state `state` (edits over the session base), at most `max`, within
-    /// `targets`. Observable session state afterwards = before. Reads and specs are against
+    /// `targets`. Observable session state afterwards = before. Reads and splices are against
     /// the state's text.
     fn expand(
         &self,

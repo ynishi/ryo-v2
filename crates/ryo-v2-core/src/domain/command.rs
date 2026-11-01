@@ -1,10 +1,10 @@
-//! The catalog of refactoring intents, and the check that a set of mutations carries one out.
+//! The catalog of refactoring commands, and the check that a set of splices carries one out.
 //!
-//! A Blueprint names an intent (`IntentCall`) and gives the mutations. Nothing here trusts the
-//! pairing: [`IntentCall::conforms`] reads the mutations against the base text and refuses a
-//! Blueprint whose edits are not what its intent says.
+//! A Blueprint names a command (`Command`) and gives the splices. Nothing here trusts the
+//! pairing: [`Command::conforms`] reads the splices against the base text and refuses a
+//! Blueprint whose edits are not what its command says.
 
-use super::{DomainError, NonEmpty, RelPath, SpecKind};
+use super::{DomainError, NonEmpty, RelPath, SpliceKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Strict and reserved keywords of edition 2024. They cannot be a bare identifier.
@@ -39,7 +39,7 @@ impl Ident {
     /// # Contract
     /// - C1: accepts `[A-Za-z_][A-Za-z0-9_]*` except `_` alone and every strict or reserved
     ///   keyword of edition 2024; accepts `r#name` except `r#self r#Self r#super r#crate r#_`.
-    ///   tested: domain::intent::tests::ident_rejects_keywords
+    ///   tested: domain::command::tests::ident_rejects_keywords
     pub fn parse(s: &str) -> Result<Self, DomainError> {
         let bad = || DomainError::Ident(s.to_owned());
         if let Some(name) = s.strip_prefix("r#") {
@@ -73,7 +73,7 @@ impl DeriveName {
     ///
     /// # Contract
     /// - C1: accepts one or more [`Ident`]s separated by `::`, refuses anything else.
-    ///   tested: domain::intent::tests::add_derive_checks_list
+    ///   tested: domain::command::tests::add_derive_checks_list
     pub fn parse(s: &str) -> Result<Self, DomainError> {
         if !s.is_empty() && s.split("::").all(|p| Ident::parse(p).is_ok()) {
             Ok(Self(s.to_owned()))
@@ -94,9 +94,9 @@ impl std::fmt::Display for DeriveName {
     }
 }
 
-/// The closed set of intents.
+/// The closed set of commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum IntentKind {
+pub enum CommandKind {
     /// Rename a local binding and its uses.
     RenameLocal,
     /// Bind an expression to a new `let` and use the name.
@@ -109,9 +109,9 @@ pub enum IntentKind {
     MoveItem,
 }
 
-/// What can go wrong with an intent that the verifier alone does not show.
+/// What can go wrong with a command that the verifier alone does not show.
 ///
-/// Why each intent carries the marks it does. Extract-function moves statements into a new body,
+/// Why each command carries the marks it does. Extract-function moves statements into a new body,
 /// so parameters become borrows or moves (the analyzer runs no borrow check), and temporaries
 /// and guards are dropped at the new function's end instead of the old scope's: drop order is
 /// behaviour, the same reason extract-variable carries `Behaviour`. Move-item changes where an
@@ -153,7 +153,7 @@ impl RiskMark {
     /// # Contract
     /// - C1: `Borrow`, `BuildScript`, `ProcMacroCrate` and `Visibility` give the class of the
     ///   same name; `Behaviour` gives `None`, as it is not a kind of error.
-    ///   tested: domain::intent::tests::risk_mark_unseen_class_maps_each_mark
+    ///   tested: domain::command::tests::risk_mark_unseen_class_maps_each_mark
     pub fn unseen_class(self) -> Option<UnseenClass> {
         match self {
             RiskMark::Borrow => Some(UnseenClass::Borrow),
@@ -173,7 +173,7 @@ impl RiskMark {
 ///   `proc-macro-crate`, `visibility`, `const-eval`, `struct-literal-path`, `unused-type-param`,
 ///   `derive-without-server`, `unresolved-path`, `duplicate-name`, `field-bounds`, `test-code`
 ///   and `unexpanded-macro`.
-///   tested: domain::intent::tests::unseen_class_names_are_stable
+///   tested: domain::command::tests::unseen_class_names_are_stable
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnseenClass {
     /// Borrow checking is not run by the analyzer.
@@ -225,23 +225,23 @@ impl std::fmt::Display for UnseenClass {
     }
 }
 
-/// An entry of the catalog: an intent and the risks it always carries.
+/// An entry of the catalog: a command kind and the risks it always carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntentSpec {
-    /// The intent.
-    pub kind: IntentKind,
+pub struct CommandSpec {
+    /// The command kind.
+    pub kind: CommandKind,
     /// The risks every use of it carries.
     pub risks: BTreeSet<RiskMark>,
 }
 
-impl IntentKind {
-    /// Every intent.
-    pub const ALL: [IntentKind; 5] = [
-        IntentKind::RenameLocal,
-        IntentKind::ExtractVariable,
-        IntentKind::AddDerive,
-        IntentKind::ExtractFunction,
-        IntentKind::MoveItem,
+impl CommandKind {
+    /// Every command kind.
+    pub const ALL: [CommandKind; 5] = [
+        CommandKind::RenameLocal,
+        CommandKind::ExtractVariable,
+        CommandKind::AddDerive,
+        CommandKind::ExtractFunction,
+        CommandKind::MoveItem,
     ];
 
     /// The catalog entry.
@@ -249,53 +249,53 @@ impl IntentKind {
     /// # Contract
     /// - C1: `RenameLocal` and `AddDerive` carry no risk; `ExtractVariable` carries `Borrow`
     ///   and `Behaviour`.
-    ///   tested: domain::intent::tests::extract_variable_carries_borrow_and_behaviour
+    ///   tested: domain::command::tests::extract_variable_carries_borrow_and_behaviour
     /// - C2: `ExtractFunction` carries `Borrow` and `Behaviour` (parameters become borrows and
     ///   drop order changes); `MoveItem` carries `Visibility` alone, so its candidate names
     ///   `Visibility` as an unseen class.
-    ///   tested: domain::intent::tests::new_intents_carry_their_risks
-    pub fn spec(self) -> IntentSpec {
+    ///   tested: domain::command::tests::new_commands_carry_their_risks
+    pub fn spec(self) -> CommandSpec {
         let risks = match self {
-            IntentKind::RenameLocal | IntentKind::AddDerive => BTreeSet::new(),
-            IntentKind::ExtractVariable | IntentKind::ExtractFunction => {
+            CommandKind::RenameLocal | CommandKind::AddDerive => BTreeSet::new(),
+            CommandKind::ExtractVariable | CommandKind::ExtractFunction => {
                 BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
             }
-            IntentKind::MoveItem => BTreeSet::from([RiskMark::Visibility]),
+            CommandKind::MoveItem => BTreeSet::from([RiskMark::Visibility]),
         };
-        IntentSpec { kind: self, risks }
+        CommandSpec { kind: self, risks }
     }
 
     /// The stable name: `rename-local`, `extract-variable`, `add-derive`, `extract-function` or
     /// `move-item`.
     pub fn id(self) -> &'static str {
         match self {
-            IntentKind::RenameLocal => "rename-local",
-            IntentKind::ExtractVariable => "extract-variable",
-            IntentKind::AddDerive => "add-derive",
-            IntentKind::ExtractFunction => "extract-function",
-            IntentKind::MoveItem => "move-item",
+            CommandKind::RenameLocal => "rename-local",
+            CommandKind::ExtractVariable => "extract-variable",
+            CommandKind::AddDerive => "add-derive",
+            CommandKind::ExtractFunction => "extract-function",
+            CommandKind::MoveItem => "move-item",
         }
     }
 
-    /// The intent whose [`id`](IntentKind::id) is `s`.
+    /// The command kind whose [`id`](CommandKind::id) is `s`.
     ///
     /// # Contract
     /// - C1: `parse(k.id()) == Some(k)` for every kind, and `None` for any other text.
-    ///   tested: domain::intent::tests::intent_ids_round_trip
+    ///   tested: domain::command::tests::command_ids_round_trip
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.id() == s)
     }
 }
 
-impl std::fmt::Display for IntentKind {
+impl std::fmt::Display for CommandKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.id())
     }
 }
 
-/// An intent with its arguments.
+/// A command with its arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntentCall {
+pub enum Command {
     /// Rename `from` to `to`.
     RenameLocal {
         /// The old name.
@@ -327,10 +327,10 @@ pub enum IntentCall {
     },
 }
 
-/// Why mutations do not carry out their intent.
+/// Why splices do not carry out their command.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Nonconformance {
-    /// The specs touch more than one file (or none).
+    /// The splices touch more than one file (or none).
     #[error("the specs do not touch exactly one file")]
     ManyFiles,
     /// No base text was given for the file.
@@ -339,25 +339,25 @@ pub enum Nonconformance {
         /// The file.
         path: RelPath,
     },
-    /// Spec number `spec` has a kind this intent does not use.
-    #[error("spec {spec} is a {kind}, which this intent does not use")]
+    /// Splice number `splice` has a kind this command does not use.
+    #[error("spec {splice} is a {kind}, which this intent does not use")]
     WrongKind {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
         /// Its kind.
-        kind: SpecKind,
+        kind: SpliceKind,
     },
-    /// The base text under spec number `spec` is not what the intent names.
-    #[error("spec {spec} does not touch the name the intent renames")]
+    /// The base text under splice number `splice` is not what the command names.
+    #[error("spec {splice} does not touch the name the intent renames")]
     BaseTextMismatch {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
-    /// The new text of spec number `spec` is not what the intent says.
-    #[error("spec {spec} writes text other than the intent's")]
+    /// The new text of splice number `splice` is not what the command says.
+    #[error("spec {splice} writes text other than the intent's")]
     NewTextMismatch {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
     /// No insert binds the new variable with `let`.
     #[error("no single insert binds the new variable with let")]
@@ -365,13 +365,13 @@ pub enum Nonconformance {
     /// Nothing replaces an expression with the new variable.
     #[error("no replace puts the new variable in place of an expression")]
     NoUseReplace,
-    /// Spec number `spec` is not a derive attribute or a derive list tail.
-    #[error("spec {spec} is not a derive")]
+    /// Splice number `splice` is not a derive attribute or a derive list tail.
+    #[error("spec {splice} is not a derive")]
     NotADerive {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
-    /// The derives written differ from the intent's list.
+    /// The derives written differ from the command's list.
     #[error("the derives written differ from the intent's list")]
     DeriveListMismatch,
     /// No single insert declares the new function.
@@ -386,29 +386,29 @@ pub enum Nonconformance {
         /// The name.
         ident: String,
     },
-    /// The specs of a move do not touch exactly the source file and the destination file.
+    /// The splices of a move do not touch exactly the source file and the destination file.
     #[error("the specs do not touch exactly the file moved from and the file moved to")]
     MoveFiles,
-    /// The base text under spec number `spec` does not declare the item moved.
-    #[error("spec {spec} does not declare the item moved")]
+    /// The base text under splice number `splice` does not declare the item moved.
+    #[error("spec {splice} does not declare the item moved")]
     NotAnItem {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
-    /// The new text of spec number `spec` is not a re-export of the item moved.
-    #[error("spec {spec} does not re-export the item moved")]
+    /// The new text of splice number `splice` is not a re-export of the item moved.
+    #[error("spec {splice} does not re-export the item moved")]
     NoReexport {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
     /// The destination does not receive the text of the item.
     #[error("the destination does not receive the item's text")]
     NotMoved,
-    /// Spec number `spec` replaces text by the same text.
-    #[error("spec {spec} writes the bytes it replaces: it changes nothing")]
+    /// Splice number `splice` replaces text by the same text.
+    #[error("spec {splice} writes the bytes it replaces: it changes nothing")]
     NoOp {
-        /// Index of the spec.
-        spec: usize,
+        /// Index of the splice.
+        splice: usize,
     },
 }
 
@@ -535,8 +535,8 @@ fn without_vis(text: &str) -> String {
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn base_slice<'a>(base: &'a str, spec: &super::MutationSpec) -> Option<&'a str> {
-    base.get(spec.range().start() as usize..spec.range().end() as usize)
+fn base_slice<'a>(base: &'a str, splice: &super::Splice) -> Option<&'a str> {
+    base.get(splice.range().start() as usize..splice.range().end() as usize)
 }
 
 /// Whether `text` contains `let <name>` followed by a non-ident char or the end.
@@ -557,7 +557,7 @@ fn derive_list(s: &str) -> Option<Vec<DeriveName>> {
         .collect()
 }
 
-/// The names a derive spec text adds: `#[derive(L)]` or `, L`.
+/// The names a derive splice text adds: `#[derive(L)]` or `, L`.
 fn derive_text(text: &str) -> Option<Vec<DeriveName>> {
     let t = text.trim();
     if let Some(inner) = t
@@ -570,81 +570,81 @@ fn derive_text(text: &str) -> Option<Vec<DeriveName>> {
     }
 }
 
-impl IntentCall {
-    /// The intent being called.
-    pub fn kind(&self) -> IntentKind {
+impl Command {
+    /// The command kind being called.
+    pub fn kind(&self) -> CommandKind {
         match self {
-            IntentCall::RenameLocal { .. } => IntentKind::RenameLocal,
-            IntentCall::ExtractVariable { .. } => IntentKind::ExtractVariable,
-            IntentCall::AddDerive { .. } => IntentKind::AddDerive,
-            IntentCall::ExtractFunction { .. } => IntentKind::ExtractFunction,
-            IntentCall::MoveItem { .. } => IntentKind::MoveItem,
+            Command::RenameLocal { .. } => CommandKind::RenameLocal,
+            Command::ExtractVariable { .. } => CommandKind::ExtractVariable,
+            Command::AddDerive { .. } => CommandKind::AddDerive,
+            Command::ExtractFunction { .. } => CommandKind::ExtractFunction,
+            Command::MoveItem { .. } => CommandKind::MoveItem,
         }
     }
 
-    /// Checks that `specs` carry out this call against the `base` texts.
+    /// Checks that `splices` carry out this call against the `base` texts.
     ///
     /// Known limit of rename-local and add-derive: they are checked by matching text only, so a
     /// Blueprint can pass with a rename inside a string literal, a name capture, one side of a
     /// shadowing pair or a struct-field rename.
     ///
     /// # Contract
-    /// - C7: checked before every other clause and for every intent, `MoveItem` included: the
-    ///   first spec that is a `Replace` writing the bytes of the base text it replaces (when
+    /// - C7: checked before every other clause and for every command, `MoveItem` included: the
+    ///   first splice that is a `Replace` writing the bytes of the base text it replaces (when
     ///   `base` has its path and the range lies inside it) gives `NoOp`; inserts and deletes
     ///   are never no-ops.
-    ///   tested: domain::intent::tests::no_op_replace_is_refused
-    /// - C1: for every intent except `MoveItem`, all specs are on one path and `base` has a
+    ///   tested: domain::command::tests::no_op_replace_is_refused
+    /// - C1: for every command except `MoveItem`, all splices are on one path and `base` has a
     ///   text for it, else `ManyFiles` or `MissingBase`.
-    ///   tested: domain::intent::tests::conforms_needs_one_file_and_its_base
-    /// - C2: `RenameLocal`: every spec is a `Replace` of the text `from` by the text `to`.
-    ///   tested: domain::intent::tests::rename_local_rejects_replace_of_other_text
+    ///   tested: domain::command::tests::conforms_needs_one_file_and_its_base
+    /// - C2: `RenameLocal`: every splice is a `Replace` of the text `from` by the text `to`.
+    ///   tested: domain::command::tests::rename_local_rejects_replace_of_other_text
     /// - C3: `ExtractVariable`: no `Delete`; exactly one `Insert`, containing `let <name>`
     ///   not followed by an identifier char; at least one `Replace` whose text is `name`.
-    ///   tested: domain::intent::tests::extract_variable_needs_let_and_use
-    /// - C4: `AddDerive`: every spec is an `Insert` of `#[derive(L)]` or `, L`, and the
+    ///   tested: domain::command::tests::extract_variable_needs_let_and_use
+    /// - C4: `AddDerive`: every splice is an `Insert` of `#[derive(L)]` or `, L`, and the
     ///   concatenated lists equal `derives` in order.
-    ///   tested: domain::intent::tests::add_derive_checks_list
+    ///   tested: domain::command::tests::add_derive_checks_list
     /// - C5: `ExtractFunction`: no `Delete` (`WrongKind`); exactly one `Insert` whose text has
     ///   `fn`, whitespace, the name, optional whitespace and `(` or `<` (`NoFnInsert`); exactly
     ///   one `Replace` whose new text contains `name(` not preceded by an identifier char
     ///   (`NoCallReplace`); every identifier token of that `Replace`'s base text that is not a
     ///   keyword occurs among the tokens of the `Insert` text or of the `Replace` text, the
     ///   first missing one giving `LostIdent`.
-    ///   tested: domain::intent::tests::extract_function_needs_fn_insert_and_call
-    ///   tested: domain::intent::tests::extract_function_rejects_lost_identifiers
-    /// - C6: `MoveItem`: the specs touch exactly two paths, one of them `to`, both with a base
-    ///   text (`MoveFiles`, `MissingBase`). The other path, the source, has exactly one spec, a
+    ///   tested: domain::command::tests::extract_function_needs_fn_insert_and_call
+    ///   tested: domain::command::tests::extract_function_rejects_lost_identifiers
+    /// - C6: `MoveItem`: the splices touch exactly two paths, one of them `to`, both with a base
+    ///   text (`MoveFiles`, `MissingBase`). The other path, the source, has exactly one splice, a
     ///   `Replace` or a `Delete` (`WrongKind`, else `NotMoved`), whose base text declares the
     ///   item as `<kw> <item>` with `kw` one of `fn struct enum trait type const static union`
     ///   (`NotAnItem`); a `Replace` there writes `[<vis> ]use <path>::<item>;` with `vis` one of
     ///   `pub`, `pub(crate)` or `pub(super)` (`NoReexport`). The destination `to` has exactly one
-    ///   spec, an `Insert`, or a `Replace` of such a `use` line (`WrongKind`, `NotMoved`,
+    ///   splice, an `Insert`, or a `Replace` of such a `use` line (`WrongKind`, `NotMoved`,
     ///   `BaseTextMismatch`), and its new text, with whitespace collapsed and every visibility
     ///   token removed, contains the source's base text treated the same way (`NotMoved`).
-    ///   tested: domain::intent::tests::move_item_needs_two_files_and_the_item
-    ///   tested: domain::intent::tests::move_item_accepts_reexport_and_collapse
+    ///   tested: domain::command::tests::move_item_needs_two_files_and_the_item
+    ///   tested: domain::command::tests::move_item_accepts_reexport_and_collapse
     pub fn conforms(
         &self,
-        specs: &[super::MutationSpec],
+        splices: &[super::Splice],
         base: &BTreeMap<RelPath, String>,
     ) -> Result<(), Nonconformance> {
-        if let Some(spec) = specs.iter().position(|s| {
-            s.kind() == SpecKind::Replace
+        if let Some(splice) = splices.iter().position(|s| {
+            s.kind() == SpliceKind::Replace
                 && base
                     .get(s.path())
                     .and_then(|text| base_slice(text, s))
                     .is_some_and(|old| old == s.text())
         }) {
-            return Err(Nonconformance::NoOp { spec });
+            return Err(Nonconformance::NoOp { splice });
         }
-        if let IntentCall::MoveItem { item, to } = self {
-            return conforms_move(item, to, specs, base);
+        if let Command::MoveItem { item, to } = self {
+            return conforms_move(item, to, splices, base);
         }
-        let Some(first) = specs.first() else {
+        let Some(first) = splices.first() else {
             return Err(Nonconformance::ManyFiles);
         };
-        if specs.iter().any(|s| s.path() != first.path()) {
+        if splices.iter().any(|s| s.path() != first.path()) {
             return Err(Nonconformance::ManyFiles);
         }
         let Some(text) = base.get(first.path()) else {
@@ -653,58 +653,58 @@ impl IntentCall {
             });
         };
         match self {
-            IntentCall::RenameLocal { from, to } => {
-                for (i, s) in specs.iter().enumerate() {
-                    if s.kind() != SpecKind::Replace {
+            Command::RenameLocal { from, to } => {
+                for (i, s) in splices.iter().enumerate() {
+                    if s.kind() != SpliceKind::Replace {
                         return Err(Nonconformance::WrongKind {
-                            spec: i,
+                            splice: i,
                             kind: s.kind(),
                         });
                     }
                     if base_slice(text, s) != Some(from.as_str()) {
-                        return Err(Nonconformance::BaseTextMismatch { spec: i });
+                        return Err(Nonconformance::BaseTextMismatch { splice: i });
                     }
                     if s.text() != to.as_str() {
-                        return Err(Nonconformance::NewTextMismatch { spec: i });
+                        return Err(Nonconformance::NewTextMismatch { splice: i });
                     }
                 }
                 Ok(())
             }
-            IntentCall::ExtractVariable { name } => {
-                if let Some((i, s)) = specs
+            Command::ExtractVariable { name } => {
+                if let Some((i, s)) = splices
                     .iter()
                     .enumerate()
-                    .find(|(_, s)| s.kind() == SpecKind::Delete)
+                    .find(|(_, s)| s.kind() == SpliceKind::Delete)
                 {
                     return Err(Nonconformance::WrongKind {
-                        spec: i,
+                        splice: i,
                         kind: s.kind(),
                     });
                 }
-                let mut inserts = specs.iter().filter(|s| s.kind() == SpecKind::Insert);
+                let mut inserts = splices.iter().filter(|s| s.kind() == SpliceKind::Insert);
                 match (inserts.next(), inserts.next()) {
                     (Some(ins), None) if binds_with_let(ins.text(), name.as_str()) => {}
                     _ => return Err(Nonconformance::NoLetInsert),
                 }
-                if !specs
+                if !splices
                     .iter()
-                    .any(|s| s.kind() == SpecKind::Replace && s.text() == name.as_str())
+                    .any(|s| s.kind() == SpliceKind::Replace && s.text() == name.as_str())
                 {
                     return Err(Nonconformance::NoUseReplace);
                 }
                 Ok(())
             }
-            IntentCall::AddDerive { derives } => {
+            Command::AddDerive { derives } => {
                 let mut written = Vec::new();
-                for (i, s) in specs.iter().enumerate() {
-                    if s.kind() != SpecKind::Insert {
+                for (i, s) in splices.iter().enumerate() {
+                    if s.kind() != SpliceKind::Insert {
                         return Err(Nonconformance::WrongKind {
-                            spec: i,
+                            splice: i,
                             kind: s.kind(),
                         });
                     }
                     let Some(names) = derive_text(s.text()) else {
-                        return Err(Nonconformance::NotADerive { spec: i });
+                        return Err(Nonconformance::NotADerive { splice: i });
                     };
                     written.extend(names);
                 }
@@ -714,39 +714,39 @@ impl IntentCall {
                     Err(Nonconformance::DeriveListMismatch)
                 }
             }
-            IntentCall::ExtractFunction { name } => {
-                if let Some((i, s)) = specs
+            Command::ExtractFunction { name } => {
+                if let Some((i, s)) = splices
                     .iter()
                     .enumerate()
-                    .find(|(_, s)| s.kind() == SpecKind::Delete)
+                    .find(|(_, s)| s.kind() == SpliceKind::Delete)
                 {
                     return Err(Nonconformance::WrongKind {
-                        spec: i,
+                        splice: i,
                         kind: s.kind(),
                     });
                 }
-                let mut inserts = specs.iter().filter(|s| s.kind() == SpecKind::Insert);
+                let mut inserts = splices.iter().filter(|s| s.kind() == SpliceKind::Insert);
                 let ins = match (inserts.next(), inserts.next()) {
                     (Some(ins), None) if declares_fn(ins.text(), name.as_str()) => ins,
                     _ => return Err(Nonconformance::NoFnInsert),
                 };
-                let mut replaces = specs
+                let mut replaces = splices
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| s.kind() == SpecKind::Replace);
+                    .filter(|(_, s)| s.kind() == SpliceKind::Replace);
                 let (ri, rep) = match (replaces.next(), replaces.next()) {
                     (Some((i, r)), None) if calls_fn(r.text(), name.as_str()) => (i, r),
                     _ => return Err(Nonconformance::NoCallReplace),
                 };
                 let Some(replaced) = base_slice(text, rep) else {
-                    return Err(Nonconformance::BaseTextMismatch { spec: ri });
+                    return Err(Nonconformance::BaseTextMismatch { splice: ri });
                 };
                 match first_lost_ident(replaced, [ins.text(), rep.text()]) {
                     Some(ident) => Err(Nonconformance::LostIdent { ident }),
                     None => Ok(()),
                 }
             }
-            IntentCall::MoveItem { item, to } => conforms_move(item, to, specs, base),
+            Command::MoveItem { item, to } => conforms_move(item, to, splices, base),
         }
     }
 }
@@ -755,10 +755,10 @@ impl IntentCall {
 fn conforms_move(
     item: &Ident,
     to: &RelPath,
-    specs: &[super::MutationSpec],
+    splices: &[super::Splice],
     base: &BTreeMap<RelPath, String>,
 ) -> Result<(), Nonconformance> {
-    let paths: BTreeSet<&RelPath> = specs.iter().map(|s| s.path()).collect();
+    let paths: BTreeSet<&RelPath> = splices.iter().map(|s| s.path()).collect();
     if paths.len() != 2 || !paths.contains(to) {
         return Err(Nonconformance::MoveFiles);
     }
@@ -772,8 +772,8 @@ fn conforms_move(
         .find(|p| **p != to)
         .copied()
         .ok_or(Nonconformance::MoveFiles)?;
-    let on = |p: &RelPath| -> Vec<(usize, &super::MutationSpec)> {
-        specs
+    let on = |p: &RelPath| -> Vec<(usize, &super::Splice)> {
+        splices
             .iter()
             .enumerate()
             .filter(|(_, s)| s.path() == p)
@@ -783,34 +783,34 @@ fn conforms_move(
     let [(si, s)] = on(src)[..] else {
         return Err(Nonconformance::NotMoved);
     };
-    if s.kind() == SpecKind::Insert {
+    if s.kind() == SpliceKind::Insert {
         return Err(Nonconformance::WrongKind {
-            spec: si,
+            splice: si,
             kind: s.kind(),
         });
     }
     let Some(declared) = base_slice(&base[src], s).filter(|d| declares_item(d, item)) else {
-        return Err(Nonconformance::NotAnItem { spec: si });
+        return Err(Nonconformance::NotAnItem { splice: si });
     };
-    if s.kind() == SpecKind::Replace && !is_use_of(s.text(), item) {
-        return Err(Nonconformance::NoReexport { spec: si });
+    if s.kind() == SpliceKind::Replace && !is_use_of(s.text(), item) {
+        return Err(Nonconformance::NoReexport { splice: si });
     }
     let [(di, d)] = on(to)[..] else {
         return Err(Nonconformance::NotMoved);
     };
     match d.kind() {
-        SpecKind::Delete => {
+        SpliceKind::Delete => {
             return Err(Nonconformance::WrongKind {
-                spec: di,
+                splice: di,
                 kind: d.kind(),
             });
         }
-        SpecKind::Replace => {
+        SpliceKind::Replace => {
             if !base_slice(&base[to], d).is_some_and(|b| is_use_of(b, item)) {
-                return Err(Nonconformance::BaseTextMismatch { spec: di });
+                return Err(Nonconformance::BaseTextMismatch { splice: di });
             }
         }
-        SpecKind::Insert => {}
+        SpliceKind::Insert => {}
     }
     if without_vis(d.text()).contains(&without_vis(declared)) {
         Ok(())
@@ -819,17 +819,17 @@ fn conforms_move(
     }
 }
 
-impl std::fmt::Display for IntentCall {
+impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IntentCall::RenameLocal { from, to } => write!(f, "rename-local {from} -> {to}"),
-            IntentCall::ExtractVariable { name } => write!(f, "extract-variable {name}"),
-            IntentCall::AddDerive { derives } => {
+            Command::RenameLocal { from, to } => write!(f, "rename-local {from} -> {to}"),
+            Command::ExtractVariable { name } => write!(f, "extract-variable {name}"),
+            Command::AddDerive { derives } => {
                 let names: Vec<&str> = derives.iter().map(DeriveName::as_str).collect();
                 write!(f, "add-derive {}", names.join(", "))
             }
-            IntentCall::ExtractFunction { name } => write!(f, "extract-function {name}"),
-            IntentCall::MoveItem { item, to } => write!(f, "move-item {item} -> {to}"),
+            Command::ExtractFunction { name } => write!(f, "extract-function {name}"),
+            Command::MoveItem { item, to } => write!(f, "move-item {item} -> {to}"),
         }
     }
 }
@@ -837,7 +837,7 @@ impl std::fmt::Display for IntentCall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{MutationSpec, TextRange};
+    use crate::domain::{Splice, TextRange};
 
     fn rel() -> RelPath {
         RelPath::parse("a.rs").unwrap()
@@ -845,11 +845,11 @@ mod tests {
     fn id(s: &str) -> Ident {
         Ident::parse(s).unwrap()
     }
-    fn rep(a: u32, b: u32, t: &str) -> MutationSpec {
-        MutationSpec::replace(rel(), TextRange::new(a, b).unwrap(), t).unwrap()
+    fn rep(a: u32, b: u32, t: &str) -> Splice {
+        Splice::replace(rel(), TextRange::new(a, b).unwrap(), t).unwrap()
     }
-    fn ins(at: u32, t: &str) -> MutationSpec {
-        MutationSpec::insert(rel(), at, t).unwrap()
+    fn ins(at: u32, t: &str) -> Splice {
+        Splice::insert(rel(), at, t).unwrap()
     }
     fn base(text: &str) -> BTreeMap<RelPath, String> {
         BTreeMap::from([(rel(), text.to_owned())])
@@ -884,40 +884,40 @@ mod tests {
     }
 
     #[test]
-    fn intent_ids_round_trip() {
-        for k in IntentKind::ALL {
-            assert_eq!(IntentKind::parse(k.id()), Some(k));
+    fn command_ids_round_trip() {
+        for k in CommandKind::ALL {
+            assert_eq!(CommandKind::parse(k.id()), Some(k));
             assert_eq!(k.spec().kind, k);
         }
-        assert_eq!(IntentKind::parse("rename"), None);
-        assert_eq!(IntentKind::AddDerive.to_string(), "add-derive");
-        assert_eq!(IntentKind::ALL.len(), 5);
+        assert_eq!(CommandKind::parse("rename"), None);
+        assert_eq!(CommandKind::AddDerive.to_string(), "add-derive");
+        assert_eq!(CommandKind::ALL.len(), 5);
         assert_eq!(
-            IntentKind::parse("extract-function"),
-            Some(IntentKind::ExtractFunction)
+            CommandKind::parse("extract-function"),
+            Some(CommandKind::ExtractFunction)
         );
-        assert_eq!(IntentKind::parse("move-item"), Some(IntentKind::MoveItem));
-        assert_eq!(IntentKind::MoveItem.to_string(), "move-item");
+        assert_eq!(CommandKind::parse("move-item"), Some(CommandKind::MoveItem));
+        assert_eq!(CommandKind::MoveItem.to_string(), "move-item");
         assert_eq!(RiskMark::Visibility.to_string(), "visibility");
     }
 
     #[test]
-    fn new_intents_carry_their_risks() {
+    fn new_commands_carry_their_risks() {
         assert_eq!(
-            IntentKind::ExtractFunction.spec().risks,
+            CommandKind::ExtractFunction.spec().risks,
             BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
         );
         assert_eq!(
-            IntentKind::MoveItem.spec().risks,
+            CommandKind::MoveItem.spec().risks,
             BTreeSet::from([RiskMark::Visibility])
         );
-        let ef = IntentCall::ExtractFunction { name: id("h") };
-        let mv = IntentCall::MoveItem {
+        let ef = Command::ExtractFunction { name: id("h") };
+        let mv = Command::MoveItem {
             item: id("foo"),
             to: RelPath::parse("b.rs").unwrap(),
         };
-        assert_eq!(ef.kind(), IntentKind::ExtractFunction);
-        assert_eq!(mv.kind(), IntentKind::MoveItem);
+        assert_eq!(ef.kind(), CommandKind::ExtractFunction);
+        assert_eq!(mv.kind(), CommandKind::MoveItem);
         assert_eq!(ef.to_string(), "extract-function h");
         assert_eq!(mv.to_string(), "move-item foo -> b.rs");
     }
@@ -971,21 +971,21 @@ mod tests {
 
     #[test]
     fn extract_variable_carries_borrow_and_behaviour() {
-        assert!(IntentKind::RenameLocal.spec().risks.is_empty());
-        assert!(IntentKind::AddDerive.spec().risks.is_empty());
+        assert!(CommandKind::RenameLocal.spec().risks.is_empty());
+        assert!(CommandKind::AddDerive.spec().risks.is_empty());
         assert_eq!(
-            IntentKind::ExtractVariable.spec().risks,
+            CommandKind::ExtractVariable.spec().risks,
             BTreeSet::from([RiskMark::Borrow, RiskMark::Behaviour])
         );
     }
 
     #[test]
     fn conforms_needs_one_file_and_its_base() {
-        let call = IntentCall::RenameLocal {
+        let call = Command::RenameLocal {
             from: id("a"),
             to: id("b"),
         };
-        let other = MutationSpec::replace(
+        let other = Splice::replace(
             RelPath::parse("b.rs").unwrap(),
             TextRange::new(0, 1).unwrap(),
             "b",
@@ -1003,40 +1003,40 @@ mod tests {
             call.conforms(&[], &base("a")),
             Err(Nonconformance::ManyFiles)
         );
-        assert_eq!(call.kind(), IntentKind::RenameLocal);
+        assert_eq!(call.kind(), CommandKind::RenameLocal);
         assert_eq!(call.to_string(), "rename-local a -> b");
     }
 
     #[test]
     fn no_op_replace_is_refused() {
-        let same = IntentCall::RenameLocal {
+        let same = Command::RenameLocal {
             from: id("a"),
             to: id("a"),
         };
         assert_eq!(
             same.conforms(&[rep(4, 5, "a")], &base("let a = 1;")),
-            Err(Nonconformance::NoOp { spec: 0 })
+            Err(Nonconformance::NoOp { splice: 0 })
         );
         // the lowest index wins, before every other check
-        let call = IntentCall::RenameLocal {
+        let call = Command::RenameLocal {
             from: id("a"),
             to: id("bb"),
         };
         assert_eq!(
             call.conforms(&[rep(4, 5, "bb"), rep(8, 9, "a")], &base("let a = a + c;")),
-            Err(Nonconformance::NoOp { spec: 1 })
+            Err(Nonconformance::NoOp { splice: 1 })
         );
         // an insert or a delete is never a no-op; a range outside the base is not judged here
         assert_ne!(
             call.conforms(&[ins(0, "z")], &base("a")),
-            Err(Nonconformance::NoOp { spec: 0 })
+            Err(Nonconformance::NoOp { splice: 0 })
         );
         assert_ne!(
             call.conforms(&[rep(40, 41, "a")], &base("a")),
-            Err(Nonconformance::NoOp { spec: 0 })
+            Err(Nonconformance::NoOp { splice: 0 })
         );
         // a no-op is found before the file count and the missing base are
-        let other = MutationSpec::replace(
+        let other = Splice::replace(
             RelPath::parse("b.rs").unwrap(),
             TextRange::new(0, 1).unwrap(),
             "z",
@@ -1044,11 +1044,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             same.conforms(&[rep(4, 5, "a"), other.clone()], &base("let a = 1;")),
-            Err(Nonconformance::NoOp { spec: 0 })
+            Err(Nonconformance::NoOp { splice: 0 })
         );
         assert_eq!(
             same.conforms(&[other, rep(4, 5, "a")], &base("let a = 1;")),
-            Err(Nonconformance::NoOp { spec: 1 })
+            Err(Nonconformance::NoOp { splice: 1 })
         );
         // a move whose source Replace writes back its own text
         let b = two("pub fn foo() {}\n", "");
@@ -1058,13 +1058,13 @@ mod tests {
         ];
         assert_eq!(
             mv("foo", "b.rs").conforms(&back, &b),
-            Err(Nonconformance::NoOp { spec: 0 })
+            Err(Nonconformance::NoOp { splice: 0 })
         );
     }
 
     #[test]
     fn rename_local_rejects_replace_of_other_text() {
-        let call = IntentCall::RenameLocal {
+        let call = Command::RenameLocal {
             from: id("a"),
             to: id("bb"),
         };
@@ -1075,29 +1075,29 @@ mod tests {
         );
         assert_eq!(
             call.conforms(&[rep(4, 5, "bb"), rep(12, 13, "bb")], &base(text)),
-            Err(Nonconformance::BaseTextMismatch { spec: 1 })
+            Err(Nonconformance::BaseTextMismatch { splice: 1 })
         );
         assert_eq!(
             call.conforms(&[rep(4, 5, "cc")], &base(text)),
-            Err(Nonconformance::NewTextMismatch { spec: 0 })
+            Err(Nonconformance::NewTextMismatch { splice: 0 })
         );
         assert_eq!(
             call.conforms(&[ins(4, "bb")], &base(text)),
             Err(Nonconformance::WrongKind {
-                spec: 0,
-                kind: SpecKind::Insert
+                splice: 0,
+                kind: SpliceKind::Insert
             })
         );
         // out of range or off a char boundary is a mismatch, not a panic
         assert_eq!(
             call.conforms(&[rep(40, 41, "bb")], &base(text)),
-            Err(Nonconformance::BaseTextMismatch { spec: 0 })
+            Err(Nonconformance::BaseTextMismatch { splice: 0 })
         );
     }
 
     #[test]
     fn extract_variable_needs_let_and_use() {
-        let call = IntentCall::ExtractVariable { name: id("t") };
+        let call = Command::ExtractVariable { name: id("t") };
         let text = "f(1 + 2);";
         let ok = [ins(0, "let t = 1 + 2;\n"), rep(2, 7, "t")];
         assert_eq!(call.conforms(&ok, &base(text)), Ok(()));
@@ -1116,12 +1116,12 @@ mod tests {
             call.conforms(&[ins(0, "let t")], &base(text)),
             Err(Nonconformance::NoUseReplace)
         );
-        let del = MutationSpec::delete(rel(), TextRange::new(0, 1).unwrap()).unwrap();
+        let del = Splice::delete(rel(), TextRange::new(0, 1).unwrap()).unwrap();
         assert_eq!(
             call.conforms(&[ok[0].clone(), del], &base(text)),
             Err(Nonconformance::WrongKind {
-                spec: 1,
-                kind: SpecKind::Delete
+                splice: 1,
+                kind: SpliceKind::Delete
             })
         );
     }
@@ -1132,7 +1132,7 @@ mod tests {
         for bad in ["", "::A", "A::", "A:B", "a b", "fn", "A,B"] {
             assert!(DeriveName::parse(bad).is_err(), "{bad}");
         }
-        let call = IntentCall::AddDerive {
+        let call = Command::AddDerive {
             derives: derives(&["Clone", "Debug", "serde::Serialize"]),
         };
         let text = "struct S;";
@@ -1167,22 +1167,22 @@ mod tests {
         ] {
             assert_eq!(
                 call.conforms(&[ins(0, bad)], &base(text)),
-                Err(Nonconformance::NotADerive { spec: 0 }),
+                Err(Nonconformance::NotADerive { splice: 0 }),
                 "{bad}"
             );
         }
         assert_eq!(
             call.conforms(&[rep(0, 1, "#[derive(Clone)]")], &base(text)),
             Err(Nonconformance::WrongKind {
-                spec: 0,
-                kind: SpecKind::Replace
+                splice: 0,
+                kind: SpliceKind::Replace
             })
         );
     }
 
     #[test]
     fn extract_function_needs_fn_insert_and_call() {
-        let call = IntentCall::ExtractFunction { name: id("h") };
+        let call = Command::ExtractFunction { name: id("h") };
         let text = "fn f(x: i32) { g(x + 1); }";
         let decl = "fn h(x: i32) { g(x + 1); }\n";
         assert_eq!(
@@ -1197,12 +1197,12 @@ mod tests {
             ),
             Ok(())
         );
-        let del = MutationSpec::delete(rel(), TextRange::new(0, 2).unwrap()).unwrap();
+        let del = Splice::delete(rel(), TextRange::new(0, 2).unwrap()).unwrap();
         assert_eq!(
             call.conforms(&[ins(0, decl), rep(15, 24, "h(x);"), del], &base(text)),
             Err(Nonconformance::WrongKind {
-                spec: 2,
-                kind: SpecKind::Delete
+                splice: 2,
+                kind: SpliceKind::Delete
             })
         );
         for bad in [
@@ -1248,13 +1248,13 @@ mod tests {
         // a replace outside the base text is a mismatch, not a panic
         assert_eq!(
             call.conforms(&[ins(0, decl), rep(60, 70, "h(x);")], &base(text)),
-            Err(Nonconformance::BaseTextMismatch { spec: 1 })
+            Err(Nonconformance::BaseTextMismatch { splice: 1 })
         );
     }
 
     #[test]
     fn extract_function_rejects_lost_identifiers() {
-        let call = IntentCall::ExtractFunction { name: id("h") };
+        let call = Command::ExtractFunction { name: id("h") };
         let text = "fn f(x: i32) { g(x + 1); }";
         // `g` is neither in the new function nor in the call
         assert_eq!(
@@ -1295,20 +1295,20 @@ mod tests {
     fn rp(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
     }
-    fn rep_at(p: &str, a: u32, b: u32, t: &str) -> MutationSpec {
-        MutationSpec::replace(rp(p), TextRange::new(a, b).unwrap(), t).unwrap()
+    fn rep_at(p: &str, a: u32, b: u32, t: &str) -> Splice {
+        Splice::replace(rp(p), TextRange::new(a, b).unwrap(), t).unwrap()
     }
-    fn ins_at(p: &str, at: u32, t: &str) -> MutationSpec {
-        MutationSpec::insert(rp(p), at, t).unwrap()
+    fn ins_at(p: &str, at: u32, t: &str) -> Splice {
+        Splice::insert(rp(p), at, t).unwrap()
     }
-    fn del_at(p: &str, a: u32, b: u32) -> MutationSpec {
-        MutationSpec::delete(rp(p), TextRange::new(a, b).unwrap()).unwrap()
+    fn del_at(p: &str, a: u32, b: u32) -> Splice {
+        Splice::delete(rp(p), TextRange::new(a, b).unwrap()).unwrap()
     }
     fn two(a: &str, b: &str) -> BTreeMap<RelPath, String> {
         BTreeMap::from([(rp("a.rs"), a.to_owned()), (rp("b.rs"), b.to_owned())])
     }
-    fn mv(item: &str, to: &str) -> IntentCall {
-        IntentCall::MoveItem {
+    fn mv(item: &str, to: &str) -> Command {
+        Command::MoveItem {
             item: id(item),
             to: rp(to),
         }
@@ -1322,7 +1322,7 @@ mod tests {
         let item = "pub fn foo() {}\n";
         let ok = [rep_at("a.rs", 0, 15, reexport), ins_at("b.rs", 0, item)];
         assert_eq!(call.conforms(&ok, &b), Ok(()));
-        // one file, a third file, or `to` missing from the specs
+        // one file, a third file, or `to` missing from the splices
         assert_eq!(call.conforms(&ok[..1], &b), Err(Nonconformance::MoveFiles));
         assert_eq!(call.conforms(&[], &b), Err(Nonconformance::MoveFiles));
         let c = ins_at("c.rs", 0, "x");
@@ -1343,16 +1343,16 @@ mod tests {
         // the source must declare exactly the item
         assert_eq!(
             call.conforms(&[rep_at("a.rs", 16, 27, reexport), ok[1].clone()], &b),
-            Err(Nonconformance::NotAnItem { spec: 0 })
+            Err(Nonconformance::NotAnItem { splice: 0 })
         );
         assert_eq!(
             mv("fo", "b.rs").conforms(&ok, &b),
-            Err(Nonconformance::NotAnItem { spec: 0 })
+            Err(Nonconformance::NotAnItem { splice: 0 })
         );
-        // an index counts in `specs`, whichever file comes first
+        // an index counts in `splices`, whichever file comes first
         assert_eq!(
             call.conforms(&[ok[1].clone(), rep_at("a.rs", 16, 27, reexport)], &b),
-            Err(Nonconformance::NotAnItem { spec: 1 })
+            Err(Nonconformance::NotAnItem { splice: 1 })
         );
         // a replace of the source must leave a re-export of the item
         for bad in [
@@ -1364,7 +1364,7 @@ mod tests {
         ] {
             assert_eq!(
                 call.conforms(&[rep_at("a.rs", 0, 15, bad), ok[1].clone()], &b),
-                Err(Nonconformance::NoReexport { spec: 0 }),
+                Err(Nonconformance::NoReexport { splice: 0 }),
                 "{bad}"
             );
         }
@@ -1374,7 +1374,7 @@ mod tests {
                 &[rep_at("a.rs", 0, 15, "pub fn foo() {}"), ok[1].clone()],
                 &b
             ),
-            Err(Nonconformance::NoOp { spec: 0 })
+            Err(Nonconformance::NoOp { splice: 0 })
         );
         for good in [
             "use crate::b::foo;",
@@ -1387,12 +1387,12 @@ mod tests {
                 "{good}"
             );
         }
-        // the source has one spec, a replace or a delete
+        // the source has one splice, a replace or a delete
         assert_eq!(
             call.conforms(&[ins_at("a.rs", 0, "x"), ok[1].clone()], &b),
             Err(Nonconformance::WrongKind {
-                spec: 0,
-                kind: SpecKind::Insert
+                splice: 0,
+                kind: SpliceKind::Insert
             })
         );
         assert_eq!(
@@ -1415,13 +1415,13 @@ mod tests {
         assert_eq!(
             call.conforms(&[ok[0].clone(), del_at("b.rs", 0, 5)], &b2),
             Err(Nonconformance::WrongKind {
-                spec: 1,
-                kind: SpecKind::Delete
+                splice: 1,
+                kind: SpliceKind::Delete
             })
         );
         assert_eq!(
             call.conforms(&[ok[0].clone(), rep_at("b.rs", 0, 9, item)], &b2),
-            Err(Nonconformance::BaseTextMismatch { spec: 1 })
+            Err(Nonconformance::BaseTextMismatch { splice: 1 })
         );
     }
 

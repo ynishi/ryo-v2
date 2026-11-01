@@ -651,8 +651,8 @@ impl SearchTree {
 mod tests {
     use super::*;
     use crate::domain::{
-        BaseFp, BlueprintId, BlueprintParts, DEFAULT_BUDGET, DecisionRecord, IntentCall,
-        MutationSpec, ReadRange,
+        BaseFp, BlueprintId, BlueprintParts, Command, DEFAULT_BUDGET, DecisionRecord, ReadRange,
+        Splice,
     };
 
     fn rel(s: &str) -> RelPath {
@@ -668,11 +668,11 @@ mod tests {
         let read = ReadRange::capture(rel("a.rs"), "let a = a;", tr(0, 10)).unwrap();
         Blueprint::new(BlueprintParts {
             id: BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap(),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse("b").unwrap(),
             },
-            specs: vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
+            splices: vec![Splice::replace(rel("a.rs"), tr(4, 5), "b").unwrap()],
             reads: vec![read],
             bases: vec![BaseFp::capture(rel("a.rs"), "let a = a;")],
             spec_refs: vec![],

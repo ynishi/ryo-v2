@@ -1,12 +1,12 @@
 //! The typed judgement of proposals before they are checked (System 1).
 //!
-//! A judge sees only what a proposal says it will do: the intent, the specs and the static
+//! A judge sees only what a proposal says it will do: the command, the splices and the static
 //! metrics. It answers with a [`Prior`] per proposal and a [`Noul`] for each one it finds a flaw
 //! in. Nothing verified reaches it: a [`JudgeRequest`] holds [`Proposal`]s, and a [`Proposal`]
 //! is built from a [`Blueprint`] alone.
 
 use super::search::StaticMetrics;
-use super::{Blueprint, DomainError, Fingerprint, IntentCall, MutationSpec, RelPath, TextRange};
+use super::{Blueprint, Command, DomainError, Fingerprint, RelPath, Splice, TextRange};
 use std::collections::BTreeSet;
 
 /// How likely a proposal is to be worth checking, in thousandths. At most 1000.
@@ -126,15 +126,15 @@ impl ProposalId {
     /// The id of the proposal `bp` makes.
     ///
     /// # Contract
-    /// - C1: the fingerprint of the intent's text, a newline, then each spec's text and a
-    ///   newline; so two Blueprints with different ids and the same intent and specs get the
-    ///   same id, and a different intent gives a different one.
+    /// - C1: the fingerprint of the command's text, a newline, then each splice's text and a
+    ///   newline; so two Blueprints with different ids and the same command and splices get the
+    ///   same id, and a different command gives a different one.
     ///   tested: domain::judge::tests::proposal_id_is_content_not_id
     pub fn of(bp: &Blueprint) -> ProposalId {
-        let mut s = bp.intent().to_string();
+        let mut s = bp.command().to_string();
         s.push('\n');
-        for spec in bp.specs() {
-            s.push_str(&spec.to_string());
+        for splice in bp.splices() {
+            s.push_str(&splice.to_string());
             s.push('\n');
         }
         ProposalId(Fingerprint::of(s.as_bytes()))
@@ -161,13 +161,13 @@ impl std::fmt::Display for ProposalId {
     }
 }
 
-/// What a judge is shown of one Blueprint: its intent, its specs and its static metrics.
+/// What a judge is shown of one Blueprint: its command, its splices and its static metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
     id: ProposalId,
     depth: u8,
-    intent: IntentCall,
-    specs: Vec<MutationSpec>,
+    command: Command,
+    splices: Vec<Splice>,
     metrics: StaticMetrics,
 }
 
@@ -177,8 +177,8 @@ impl Proposal {
         Proposal {
             id: ProposalId::of(bp),
             depth,
-            intent: bp.intent().clone(),
-            specs: bp.specs().to_vec(),
+            command: bp.command().clone(),
+            splices: bp.splices().to_vec(),
             metrics,
         }
     }
@@ -193,14 +193,14 @@ impl Proposal {
         self.depth
     }
 
-    /// The intent and its arguments.
-    pub fn intent(&self) -> &IntentCall {
-        &self.intent
+    /// The command and its arguments.
+    pub fn command(&self) -> &Command {
+        &self.command
     }
 
-    /// The mutations.
-    pub fn specs(&self) -> &[MutationSpec] {
-        &self.specs
+    /// The splices.
+    pub fn splices(&self) -> &[Splice] {
+        &self.splices
     }
 
     /// The static metrics of its edits.
@@ -350,11 +350,11 @@ mod tests {
         let read = ReadRange::capture(rel("a.rs"), "let a = a;", tr(0, 10)).unwrap();
         Blueprint::new(BlueprintParts {
             id: bid(n),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse("a").unwrap(),
                 to: Ident::parse(to).unwrap(),
             },
-            specs: vec![MutationSpec::replace(rel("a.rs"), tr(4, 5), to).unwrap()],
+            splices: vec![Splice::replace(rel("a.rs"), tr(4, 5), to).unwrap()],
             reads: vec![read],
             bases: vec![BaseFp::capture(rel("a.rs"), "let a = a;")],
             spec_refs: vec![],
@@ -421,8 +421,8 @@ mod tests {
     fn judge_request_holds_proposals_and_all_criteria() {
         let p = prop(1, "b");
         assert_eq!(p.depth(), 1);
-        assert_eq!(p.intent().to_string(), "rename-local a -> b");
-        assert_eq!(p.specs().len(), 1);
+        assert_eq!(p.command().to_string(), "rename-local a -> b");
+        assert_eq!(p.splices().len(), 1);
         assert_eq!(p.metrics(), &StaticMetrics::default());
         let req = JudgeRequest::new(vec![p.clone(), prop(1, "c")]);
         assert_eq!(req.proposals()[0], p);

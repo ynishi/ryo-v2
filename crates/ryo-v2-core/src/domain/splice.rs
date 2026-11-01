@@ -2,9 +2,9 @@
 
 use super::{DomainError, RelPath, TextRange};
 
-/// What a [`MutationSpec`] does to its range.
+/// What a [`Splice`] does to its range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SpecKind {
+pub enum SpliceKind {
     /// Replace a non-empty range with text.
     Replace,
     /// Insert text at an offset.
@@ -13,12 +13,12 @@ pub enum SpecKind {
     Delete,
 }
 
-impl std::fmt::Display for SpecKind {
+impl std::fmt::Display for SpliceKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            SpecKind::Replace => "replace",
-            SpecKind::Insert => "insert",
-            SpecKind::Delete => "delete",
+            SpliceKind::Replace => "replace",
+            SpliceKind::Insert => "insert",
+            SpliceKind::Delete => "delete",
         })
     }
 }
@@ -28,19 +28,19 @@ impl std::fmt::Display for SpecKind {
 /// The fields are private: every value is a change that does something.
 ///
 /// # Contract
-/// - C1 [invariant]: no spec is a no-op: a `Replace` or `Delete` has a non-empty `range` and an
+/// - C1 [invariant]: no splice is a no-op: a `Replace` or `Delete` has a non-empty `range` and an
 ///   `Insert` a non-empty `text`; the constructors refuse anything else with
-///   [`DomainError::Mutation`].
-///   tested: domain::mutation::tests::no_op_specs_rejected
+///   [`DomainError::InvalidSplice`].
+///   tested: domain::splice::tests::no_op_splices_rejected
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MutationSpec {
+pub struct Splice {
     path: RelPath,
-    kind: SpecKind,
+    kind: SpliceKind,
     range: TextRange,
     text: String,
 }
 
-impl MutationSpec {
+impl Splice {
     /// Replaces `range` with `text`.
     pub fn replace(
         path: RelPath,
@@ -48,13 +48,13 @@ impl MutationSpec {
         text: impl Into<String>,
     ) -> Result<Self, DomainError> {
         if range.is_empty() {
-            return Err(DomainError::Mutation(format!(
+            return Err(DomainError::InvalidSplice(format!(
                 "replace of an empty range in {path}"
             )));
         }
         Ok(Self {
             path,
-            kind: SpecKind::Replace,
+            kind: SpliceKind::Replace,
             range,
             text: text.into(),
         })
@@ -64,13 +64,13 @@ impl MutationSpec {
     pub fn insert(path: RelPath, at: u32, text: impl Into<String>) -> Result<Self, DomainError> {
         let text = text.into();
         if text.is_empty() {
-            return Err(DomainError::Mutation(format!(
+            return Err(DomainError::InvalidSplice(format!(
                 "insert of empty text in {path}"
             )));
         }
         Ok(Self {
             path,
-            kind: SpecKind::Insert,
+            kind: SpliceKind::Insert,
             range: TextRange::empty_at(at),
             text,
         })
@@ -79,13 +79,13 @@ impl MutationSpec {
     /// Deletes `range`.
     pub fn delete(path: RelPath, range: TextRange) -> Result<Self, DomainError> {
         if range.is_empty() {
-            return Err(DomainError::Mutation(format!(
+            return Err(DomainError::InvalidSplice(format!(
                 "delete of an empty range in {path}"
             )));
         }
         Ok(Self {
             path,
-            kind: SpecKind::Delete,
+            kind: SpliceKind::Delete,
             range,
             text: String::new(),
         })
@@ -97,7 +97,7 @@ impl MutationSpec {
     }
 
     /// What it does.
-    pub fn kind(&self) -> SpecKind {
+    pub fn kind(&self) -> SpliceKind {
         self.kind
     }
 
@@ -112,7 +112,7 @@ impl MutationSpec {
     }
 }
 
-impl std::fmt::Display for MutationSpec {
+impl std::fmt::Display for Splice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}:{}", self.kind, self.path, self.range)
     }
@@ -127,24 +127,24 @@ mod tests {
     }
 
     #[test]
-    fn no_op_specs_rejected() {
+    fn no_op_splices_rejected() {
         let empty = TextRange::empty_at(3);
-        assert!(MutationSpec::replace(rel(), empty, "x").is_err());
-        assert!(MutationSpec::delete(rel(), empty).is_err());
-        assert!(MutationSpec::insert(rel(), 3, "").is_err());
+        assert!(Splice::replace(rel(), empty, "x").is_err());
+        assert!(Splice::delete(rel(), empty).is_err());
+        assert!(Splice::insert(rel(), 3, "").is_err());
 
         let r = TextRange::new(1, 4).unwrap();
-        let rep = MutationSpec::replace(rel(), r, "z").unwrap();
+        let rep = Splice::replace(rel(), r, "z").unwrap();
         assert_eq!(
             (rep.kind(), rep.range(), rep.text()),
-            (SpecKind::Replace, r, "z")
+            (SpliceKind::Replace, r, "z")
         );
-        let del = MutationSpec::delete(rel(), r).unwrap();
-        assert_eq!((del.kind(), del.text()), (SpecKind::Delete, ""));
-        let ins = MutationSpec::insert(rel(), 3, "q").unwrap();
+        let del = Splice::delete(rel(), r).unwrap();
+        assert_eq!((del.kind(), del.text()), (SpliceKind::Delete, ""));
+        let ins = Splice::insert(rel(), 3, "q").unwrap();
         assert_eq!(
             (ins.kind(), ins.range(), ins.text()),
-            (SpecKind::Insert, empty, "q")
+            (SpliceKind::Insert, empty, "q")
         );
         assert_eq!(ins.path(), &rel());
         assert_eq!(ins.to_string(), "insert a.rs:3..3");

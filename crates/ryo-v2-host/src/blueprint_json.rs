@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use ryo_v2_core::domain::{
-    BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, DecisionRecord, DeriveName,
-    Fingerprint, Ident, IntentCall, MutationSpec, NonEmpty, ReadRange, RelPath, SpecRef, TextRange,
+    BaseFp, Blueprint, BlueprintId, BlueprintParts, BlueprintSet, Command, DecisionRecord,
+    DeriveName, Fingerprint, Ident, NonEmpty, ReadRange, RelPath, SpecRef, Splice, TextRange,
 };
 use serde::Deserialize;
 
@@ -150,13 +150,13 @@ fn rel(index: usize, name: &str, path: &str) -> Result<RelPath> {
     field(index, name, RelPath::parse(path))
 }
 
-fn intent(index: usize, j: IntentJson) -> Result<IntentCall> {
+fn intent(index: usize, j: IntentJson) -> Result<Command> {
     Ok(match j {
-        IntentJson::RenameLocal(r) => IntentCall::RenameLocal {
+        IntentJson::RenameLocal(r) => Command::RenameLocal {
             from: field(index, "intent.from", Ident::parse(&r.from))?,
             to: field(index, "intent.to", Ident::parse(&r.to))?,
         },
-        IntentJson::ExtractVariable(e) => IntentCall::ExtractVariable {
+        IntentJson::ExtractVariable(e) => Command::ExtractVariable {
             name: field(index, "intent.name", Ident::parse(&e.name))?,
         },
         IntentJson::AddDerive(a) => {
@@ -167,33 +167,33 @@ fn intent(index: usize, j: IntentJson) -> Result<IntentCall> {
                 .collect::<Result<Vec<_>>>()?;
             let derives = NonEmpty::new(names)
                 .ok_or_else(|| anyhow!("blueprint {index}: intent.derives: must not be empty"))?;
-            IntentCall::AddDerive { derives }
+            Command::AddDerive { derives }
         }
-        IntentJson::ExtractFunction(e) => IntentCall::ExtractFunction {
+        IntentJson::ExtractFunction(e) => Command::ExtractFunction {
             name: field(index, "intent.name", Ident::parse(&e.name))?,
         },
-        IntentJson::MoveItem(m) => IntentCall::MoveItem {
+        IntentJson::MoveItem(m) => Command::MoveItem {
             item: field(index, "intent.item", Ident::parse(&m.item))?,
             to: rel(index, "intent.to", &m.to)?,
         },
     })
 }
 
-fn spec(index: usize, j: SpecJson) -> Result<MutationSpec> {
+fn spec(index: usize, j: SpecJson) -> Result<Splice> {
     match j {
         SpecJson::Replace(r) => {
             let path = rel(index, "specs.path", &r.path)?;
             let range = field(index, "specs.range", TextRange::new(r.start, r.end))?;
-            field(index, "specs", MutationSpec::replace(path, range, r.text))
+            field(index, "specs", Splice::replace(path, range, r.text))
         }
         SpecJson::Insert(i) => {
             let path = rel(index, "specs.path", &i.path)?;
-            field(index, "specs", MutationSpec::insert(path, i.at, i.text))
+            field(index, "specs", Splice::insert(path, i.at, i.text))
         }
         SpecJson::Delete(d) => {
             let path = rel(index, "specs.path", &d.path)?;
             let range = field(index, "specs.range", TextRange::new(d.start, d.end))?;
-            field(index, "specs", MutationSpec::delete(path, range))
+            field(index, "specs", Splice::delete(path, range))
         }
     }
 }
@@ -227,12 +227,12 @@ fn base(index: usize, j: BaseJson) -> Result<BaseFp> {
 /// # Contract
 /// - C1: an unknown `intent.kind` (or any unknown field) is an error, and the JSON is not
 ///   guessed at.
-///   tested: blueprint_json::tests::unknown_intent_kind_rejected
+///   tested: blueprint_json::tests::unknown_command_kind_rejected
 /// - C2: a blueprint without `id` gets a UUID v7 and is listed in `generated`.
 ///   tested: blueprint_json::tests::missing_id_is_filled_with_v7
 /// - C3: a domain constructor error (a spec no read covers) is an error naming the blueprint
 ///   index; nothing is loaded for it.
-///   tested: blueprint_json::tests::uncovered_spec_is_a_parse_error
+///   tested: blueprint_json::tests::uncovered_splice_is_a_parse_error
 /// - C4: `bases` is required, and a blueprint whose spec is in a file without a base, or with
 ///   two bases of one path, is an error naming the blueprint index (and the spec).
 ///   tested: blueprint_json::tests::missing_base_is_a_parse_error
@@ -269,7 +269,7 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
                 id
             }
         };
-        let specs = bp
+        let splices = bp
             .specs
             .into_iter()
             .map(|s| spec(index, s))
@@ -303,8 +303,8 @@ fn build(list: Vec<BlueprintJson>) -> Result<ParsedBlueprints> {
             "blueprint",
             Blueprint::new(BlueprintParts {
                 id,
-                intent: intent(index, bp.intent)?,
-                specs,
+                command: intent(index, bp.intent)?,
+                splices,
                 reads,
                 bases,
                 spec_refs,
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_intent_kind_rejected() {
+    fn unknown_command_kind_rejected() {
         let err = parse_blueprints(&json("{\"kind\":\"inline-all\"}", true, true))
             .expect_err("unknown kind");
         assert!(format!("{err:#}").contains("inline-all"), "{err:#}");
@@ -407,16 +407,16 @@ mod tests {
     }
 
     #[test]
-    fn new_intent_kinds_parse() {
+    fn new_command_kinds_parse() {
         let extract = "{\"kind\":\"extract-function\",\"name\":\"helper\"}";
         let parsed = parse_blueprints(&json(extract, true, true)).expect("extract-function");
         let bp = parsed.set.iter().next().expect("one");
-        assert_eq!(bp.intent().to_string(), "extract-function helper");
+        assert_eq!(bp.command().to_string(), "extract-function helper");
         let mv = "{\"kind\":\"move-item\",\"item\":\"Shape\",\"to\":\"geo/src/shapes.rs\"}";
         let parsed = parse_blueprints(&json(mv, true, true)).expect("move-item");
         let bp = parsed.set.iter().next().expect("one");
         assert_eq!(
-            bp.intent().to_string(),
+            bp.command().to_string(),
             "move-item Shape -> geo/src/shapes.rs"
         );
         // An unknown field and a bad path are refused.
@@ -433,9 +433,9 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_spec_is_a_parse_error() {
+    fn uncovered_splice_is_a_parse_error() {
         let err =
-            parse_blueprints(&json(RENAME, true, false)).expect_err("no read covers the spec");
+            parse_blueprints(&json(RENAME, true, false)).expect_err("no read covers the splice");
         assert!(format!("{err:#}").contains("blueprint 0"), "{err:#}");
     }
 
@@ -444,14 +444,14 @@ mod tests {
         // (a) no `bases` key
         let err = parse_blueprints(&json_with(RENAME, true, true, None)).expect_err("required");
         assert!(format!("{err:#}").contains("bases"), "{err:#}");
-        // (b) an empty list with a spec
+        // (b) an empty list with a splice
         let err = parse_blueprints(&json_with(RENAME, true, true, Some(""))).expect_err("no base");
         let text = format!("{err:#}");
         assert!(
             text.contains("blueprint 0") && text.contains("spec 0"),
             "{text}"
         );
-        // (c) a base of the spec's file
+        // (c) a base of the splice's file
         let parsed = parse_blueprints(&json(RENAME, true, true)).expect("parse");
         let bp = parsed.set.iter().next().expect("one");
         assert_eq!(bp.bases().len(), 1);

@@ -8,7 +8,7 @@ use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at
 use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{FileId, Vfs};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
-use ryo_v2_core::domain::{Finding, Fingerprint, IntentKind, RelPath};
+use ryo_v2_core::domain::{CommandKind, Finding, Fingerprint, RelPath};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub struct DetectorPanic {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpanderPanic {
     /// The edit kind whose call panicked; `None` when the panic was outside every edit kind.
-    pub kind: Option<IntentKind>,
+    pub kind: Option<CommandKind>,
     /// The file of the target.
     pub path: Option<RelPath>,
     /// The panic message.
@@ -126,7 +126,7 @@ pub struct RaSession {
     pub(crate) expander_panics: Mutex<BTreeSet<ExpanderPanic>>,
     /// When set, every call of that edit kind in the expander panics; for the tests of the
     /// containment.
-    pub(crate) expander_fault: Option<IntentKind>,
+    pub(crate) expander_fault: Option<CommandKind>,
 }
 
 impl RaSession {
@@ -175,7 +175,7 @@ impl RaSession {
     /// or the candidates of a target) panic; for the tests of the containment, like `poison`.
     /// Nothing in the adapter calls it.
     #[doc(hidden)]
-    pub fn inject_expander_fault(&mut self, kind: Option<IntentKind>) {
+    pub fn inject_expander_fault(&mut self, kind: Option<CommandKind>) {
         self.expander_fault = kind;
     }
 }

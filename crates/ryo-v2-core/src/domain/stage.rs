@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) enum On<'a> {
     /// Whole-file edits over the loaded text (empty for an apply; a search's start state).
     Start(&'a [Edit]),
-    /// A path that passed the stages; the Blueprint's specs and reads are against its result.
+    /// A path that passed the stages; the Blueprint's splices and reads are against its result.
     Parent(&'a Staged),
 }
 
@@ -231,18 +231,18 @@ pub(crate) fn stage(
         .keys()
         .filter_map(|p| view(p).map(|t| ((*p).clone(), t)))
         .collect();
-    if let Err(why) = bp.intent().conforms(bp.specs(), &texts) {
+    if let Err(why) = bp.command().conforms(bp.splices(), &texts) {
         note(Stage::Conformance, false, why.to_string());
         return Err(Refused {
             stage: Stage::Conformance,
             blocking: Blocking::Nonconforming { blueprint: id, why },
         });
     }
-    note(Stage::Conformance, true, bp.intent().to_string());
+    note(Stage::Conformance, true, bp.command().to_string());
 
     // 4. splice
     let mut own = Vec::new();
-    for (path, specs) in &by_file {
+    for (path, splices) in &by_file {
         let Some(text) = texts.get(*path) else {
             // Cannot happen after the freshness stage; reported as a missing file all the same.
             note(Stage::Splice, false, format!("{path} has no text"));
@@ -254,7 +254,7 @@ pub(crate) fn stage(
                 },
             });
         };
-        match splice(text, specs) {
+        match splice(text, splices) {
             Ok(new_text) => own.push(Edit::write((*path).clone(), new_text)),
             Err(err) => {
                 note(Stage::Splice, false, err.to_string());
@@ -268,7 +268,7 @@ pub(crate) fn stage(
     note(Stage::Splice, true, format!("{} edit(s)", own.len()));
 
     // 5. marks
-    let marks = risk_marks([bp.intent().kind()], own_roles.iter().copied());
+    let marks = risk_marks([bp.command().kind()], own_roles.iter().copied());
     note(Stage::Marks, true, mark_names(&marks));
 
     let edits = compose(on_edits, &own, base);
@@ -293,8 +293,8 @@ pub(crate) fn stage(
 mod tests {
     use super::*;
     use crate::domain::{
-        BaseFp, BlueprintId, BlueprintParts, DecisionRecord, Ident, IntentCall, MutationSpec,
-        ReadRange, SpecRef, TextRange,
+        BaseFp, BlueprintId, BlueprintParts, Command, DecisionRecord, Ident, ReadRange, SpecRef,
+        Splice, TextRange,
     };
 
     const BASE: &str = "let a = 1;";
@@ -314,11 +314,11 @@ mod tests {
         let end = u32::try_from(text.len()).unwrap();
         Blueprint::new(BlueprintParts {
             id: bid(n),
-            intent: IntentCall::RenameLocal {
+            command: Command::RenameLocal {
                 from: Ident::parse(from).unwrap(),
                 to: Ident::parse(to).unwrap(),
             },
-            specs: vec![MutationSpec::replace(rel(path), tr(4, 5), to).unwrap()],
+            splices: vec![Splice::replace(rel(path), tr(4, 5), to).unwrap()],
             reads: vec![ReadRange::capture(rel(path), text, tr(0, end)).unwrap()],
             bases: vec![BaseFp::capture(rel(path), text)],
             spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
