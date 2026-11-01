@@ -1,6 +1,6 @@
-//! Identifiers of Blueprints and Rules.
+//! Identifiers of Blueprints.
 //!
-//! Both are UUID version 7. The core never generates one: an id arrives as a value
+//! A Blueprint id is a UUID version 7. The core never generates one: an id arrives as a value
 //! (`arch-lint.toml` denies the generator functions in `domain` and `app`).
 
 use super::DomainError;
@@ -61,10 +61,6 @@ uuid_id! {
     /// Identifies one Blueprint (UUID version 7).
     BlueprintId
 }
-uuid_id! {
-    /// Identifies one Rule (UUID version 7).
-    RuleId
-}
 
 #[cfg(test)]
 mod tests {
@@ -77,14 +73,12 @@ mod tests {
     fn v4_uuid_rejected() {
         let id = BlueprintId::parse(V7).unwrap();
         assert_eq!(id.to_string(), V7);
-        assert_eq!(RuleId::parse(V7).unwrap().to_string(), V7);
         assert_eq!(BlueprintId::from_uuid(id.as_uuid()).unwrap(), id);
         assert_eq!(
             BlueprintId::parse(V4),
             Err(DomainError::Uuid(V4.to_owned()))
         );
-        assert!(RuleId::parse(V4).is_err());
-        assert!(RuleId::from_uuid(uuid::Uuid::nil()).is_err());
+        assert!(BlueprintId::from_uuid(uuid::Uuid::nil()).is_err());
         assert!(BlueprintId::parse("not a uuid").is_err());
     }
 }

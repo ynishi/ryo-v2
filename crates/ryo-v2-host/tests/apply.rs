@@ -99,31 +99,14 @@ fn blueprint(intent: Value, specs: Vec<Value>, reads: Vec<Value>, bases: Vec<Val
     }]})
 }
 
-fn rules(intent: &str) -> (Value, String) {
-    let id = uuid::Uuid::now_v7().to_string();
-    let v = json!({"rules": [{
-        "id": id, "intent": intent,
-        "review": {"reviewer": "me", "reviewed_at_ms": 1, "note": "n"},
-        "min_scope": "affected",
-    }]});
-    (v, id)
-}
-
-fn apply(ws: &Ws, bp: &Value, rules: Option<&Value>) -> (Option<i32>, Value, String) {
+fn apply(ws: &Ws, bp: &Value) -> (Option<i32>, Value, String) {
     let bp_file = ws.json_file("bp.json", bp);
-    let mut args = vec![
-        "apply".to_owned(),
-        ws.dir.to_str().unwrap().to_owned(),
-        bp_file.to_str().unwrap().to_owned(),
-        "--no-proc-macro".to_owned(),
-    ];
-    if let Some(r) = rules {
-        let f = ws.json_file("rules.json", r);
-        args.push("--rules".to_owned());
-        args.push(f.to_str().unwrap().to_owned());
-    }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = ryo(&refs);
+    let out = ryo(&[
+        "apply",
+        ws.dir.to_str().unwrap(),
+        bp_file.to_str().unwrap(),
+        "--no-proc-macro",
+    ]);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let stdout = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
     (out.status.code(), stdout, stderr)
@@ -154,13 +137,12 @@ fn rename_acc(ws: &Ws) -> Value {
 fn apply_rename_local_is_decided() {
     let ws = Ws::new("apply_rename", &[]);
     let bp = rename_acc(&ws);
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
     assert_eq!(code, Some(0), "{err}");
     assert!(err.contains("generated id"), "{err}");
     assert_eq!(out["resolution"], "decided");
     let c = &out["candidates"][0];
-    assert_eq!(c["disposition"], "needs_review/no_rule");
     assert_eq!(c["unseen_classes"], Value::Null);
     let new_text = c["edits"][0]["new_text"].as_str().unwrap();
     assert!(
@@ -172,12 +154,6 @@ fn apply_rename_local_is_decided() {
         std::fs::read_to_string(ws.dir.join("src/lib.rs")).unwrap(),
         LIB
     );
-
-    // A rename is checked by text match only, so no rule may cover it.
-    let (rv, _) = rules("rename-local");
-    let (code, _, err) = apply(&ws, &bp, Some(&rv));
-    assert_eq!(code, Some(1), "{err}");
-    assert!(err.contains("text match"), "{err}");
 }
 
 #[test]
@@ -215,7 +191,7 @@ fn builds_on_chain_is_decided() {
         "bases": [{"path": "src/lib.rs", "fingerprint": fp(&a_text)}],
         "record": {"proposer": "test", "rationale": "test"},
     });
-    let (code, out, err) = apply(&ws, &json!({"blueprints": [a, b]}), None);
+    let (code, out, err) = apply(&ws, &json!({"blueprints": [a, b]}));
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(out["resolution"], "decided");
@@ -247,7 +223,7 @@ fn decided_candidate_lists_its_basis() {
     let bp = rename_acc(&ws);
     // Taken before apply: the fingerprint of the loaded text.
     let expected = base(&ws, "src/lib.rs");
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     assert_eq!(code, Some(0), "{err}\n{out}");
     let basis = &out["candidates"][0]["basis"];
     let file = &basis["files"][0];
@@ -275,7 +251,7 @@ fn apply_breaking_rename_is_failed_new_errors() {
         vec![read(&ws, "src/lib.rs", def)],
         vec![base(&ws, "src/lib.rs")],
     );
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     assert_eq!(code, Some(2), "{err}\n{out}");
     assert_eq!(out["resolution"], "failed");
     let blockers = out["blocking"].as_array().unwrap();
@@ -298,7 +274,7 @@ fn apply_after_disk_change_is_failed_stale() {
     // One byte inside the read range changes (same length): the base drifted, and the read of
     // an edited file is covered by its base, so no read is listed.
     ws.write("src/lib.rs", &LIB.replacen("= 0;", "= 1;", 1));
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     assert_eq!(code, Some(2), "{err}\n{out}");
     assert_eq!(out["blocking"][0]["kind"], "stale", "{out}");
     let drift = out["blocking"][0]["drift"].as_array().unwrap();
@@ -325,7 +301,7 @@ fn apply_after_insert_above_is_failed_stale() {
     let moved = format!("{}{line}{}", &LIB[..line_at.0], &LIB[line_at.0..]);
     assert_eq!(&moved[line_at.0..line_at.1], line, "the bug is exercised");
     ws.write("src/lib.rs", &moved);
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     assert_eq!(code, Some(2), "{err}\n{out}");
     assert_eq!(out["blocking"][0]["kind"], "stale", "{out}");
     let drift = &out["blocking"][0]["drift"][0];
@@ -345,7 +321,7 @@ fn apply_cargo_toml_edit_is_unverifiable() {
         vec![read(&ws, "Cargo.toml", name)],
         vec![base(&ws, "Cargo.toml")],
     );
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     assert_eq!(code, Some(2), "{err}\n{out}");
     assert_eq!(out["blocking"][0]["kind"], "unverifiable", "{out}");
     assert_eq!(out["blocking"][0]["role"], "manifest", "{out}");
@@ -364,15 +340,14 @@ fn apply_build_rs_edit_names_build_script() {
         vec![read(&ws, "build.rs", (0, build.len()))],
         vec![base(&ws, "build.rs")],
     );
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     assert_eq!(code, Some(0), "{err}\n{out}");
     let c = &out["candidates"][0];
     assert_eq!(c["unseen_classes"], json!(["build_script"]), "{out}");
-    assert_eq!(c["disposition"], "needs_review/no_rule");
 }
 
 #[test]
-fn apply_extract_variable_needs_review_behaviour() {
+fn apply_extract_variable_names_borrow_and_behaviour() {
     let ws = Ws::new("apply_extract", &[]);
     let uses = at(
         LIB,
@@ -391,17 +366,11 @@ fn apply_extract_variable_needs_review_behaviour() {
         vec![read(&ws, "src/lib.rs", uses)],
         vec![base(&ws, "src/lib.rs")],
     );
-    let (code, out, err) = apply(&ws, &bp, None);
+    let (code, out, err) = apply(&ws, &bp);
     assert_eq!(code, Some(0), "{err}\n{out}");
     let c = &out["candidates"][0];
     assert_eq!(c["unseen_classes"], json!(["borrow"]), "{out}");
     assert_eq!(c["marks"], json!(["borrow", "behaviour"]), "{out}");
-    assert_eq!(c["disposition"], "needs_review/behaviour");
-
-    let (rv, _) = rules("extract-variable");
-    let (code, _, err) = apply(&ws, &bp, Some(&rv));
-    assert_eq!(code, Some(1));
-    assert!(err.contains("behaviour"), "{err}");
 }
 
 #[test]

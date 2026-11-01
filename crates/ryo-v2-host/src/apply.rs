@@ -2,11 +2,10 @@
 
 use crate::blueprint_json::parse_blueprints;
 use crate::resolution_json::{exit_code, resolution_to_json};
-use crate::rules_json::parse_rules;
 use anyhow::{Context, Result};
 use ryo_v2_core::app::apply::apply_blueprints;
 use ryo_v2_core::app::ports::Analyzer;
-use ryo_v2_core::domain::{BaseFp, ReadRange, RelPath, RuleCatalog, Scope, TextRange};
+use ryo_v2_core::domain::{BaseFp, ReadRange, RelPath, Scope, TextRange};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig};
@@ -19,7 +18,6 @@ use std::sync::Arc;
 pub(crate) struct ApplyArgs {
     pub(crate) workspace: PathBuf,
     pub(crate) blueprints: PathBuf,
-    pub(crate) rules: Option<PathBuf>,
     pub(crate) scope: Scope,
     pub(crate) proc_macro: bool,
 }
@@ -28,14 +26,6 @@ pub(crate) struct ApplyArgs {
 /// nothing to disk.
 pub(crate) fn run_apply(args: &ApplyArgs) -> Result<ExitCode> {
     // JSON errors surface before the (slow) load.
-    let rules = match &args.rules {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("read rules {}", path.display()))?;
-            parse_rules(&text)?
-        }
-        None => RuleCatalog::default(),
-    };
     let text = std::fs::read_to_string(&args.blueprints)
         .with_context(|| format!("read blueprints {}", args.blueprints.display()))?;
     let parsed = parse_blueprints(&text)?;
@@ -60,7 +50,7 @@ pub(crate) fn run_apply(args: &ApplyArgs) -> Result<ExitCode> {
     let mut session = analyzer
         .load(&args.workspace)
         .with_context(|| format!("load {}", args.workspace.display()))?;
-    let resolution = apply_blueprints(&analyzer, &mut session, &parsed.set, &rules, args.scope)?;
+    let resolution = apply_blueprints(&analyzer, &mut session, &parsed.set, args.scope)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&resolution_to_json(&resolution))?

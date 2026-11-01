@@ -36,8 +36,8 @@
 //! - IntentKind: a typed action of the one-layer action space.
 //!   includes: RenameLocal, ExtractVariable, AddDerive, ExtractFunction, MoveItem
 //! - IntentCall: one use of an intent in a blueprint: its kind and validated parameters.
-//! - RiskMark: a reason the engine's own verification is not enough. Borrow, BuildScript,
-//!   ProcMacroCrate and Visibility each name an unseen class (UnseenClass).
+//! - RiskMark: a reason, named in the result, that the engine's own verification is not enough.
+//!   Borrow, BuildScript, ProcMacroCrate and Visibility each name an unseen class (UnseenClass).
 //!   includes: Borrow, BuildScript, ProcMacroCrate, Behaviour, Visibility
 //! - UnseenClass: a kind of error the in-process check does not see; a candidate names it in its
 //!   result and the build after the commit settles it.
@@ -46,12 +46,8 @@
 //!   includes: Source, BuildScript, ProcMacroSource, Manifest
 //! - Staged: a path of blueprints that passed every stage before the check, with the edits it
 //!   would make, the roles of the files it edits and its basis; the only input of a candidate.
-//! - Rule: the record of one review done at registration, allowing auto-apply of one intent kind.
-//! - RuleCatalog: the registered rules, at most one per intent kind.
 //! - Resolution: the outcome of resolving a set of blueprints.
 //!   includes: Decided, Stopped, Failed
-//! - Disposition: what may happen to a passing candidate.
-//!   includes: AutoApplicable, NeedsReview
 //! - Blocking: why a blueprint was not made a candidate.
 //!   includes: Unverifiable, Stale, MissingFile, Nonconforming, Splice, NewErrors, BudgetExhausted,
 //!   CheckFailed, ParentFailed
@@ -125,7 +121,6 @@ pub mod mutation;
 pub mod non_empty;
 pub mod rel_path;
 pub mod resolution;
-pub mod rule;
 pub mod scope;
 pub mod search;
 pub(crate) mod stage;
@@ -141,7 +136,7 @@ pub use error::DomainError;
 pub use error_code::ErrorCode;
 pub use file_role::{FileFacts, FileRole};
 pub use finding::{Finding, FindingCode, ScopedFindings};
-pub use ids::{BlueprintId, RuleId};
+pub use ids::BlueprintId;
 pub use intent::{
     DeriveName, Ident, IntentCall, IntentKind, IntentSpec, Nonconformance, RiskMark, UnseenClass,
 };
@@ -152,11 +147,10 @@ pub use mutation::{MutationSpec, SpecKind};
 pub use non_empty::NonEmpty;
 pub use rel_path::RelPath;
 pub use resolution::{
-    Blocking, Candidate, CheckFailure, DEFAULT_BUDGET, DecisionBudget, DecisionLog, Disposition,
-    Evidence, Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, Provenance, Resolution, ReviewReason,
-    SpecMismatch, Stage, UnseenClasses,
+    Blocking, Candidate, CheckFailure, DEFAULT_BUDGET, DecisionBudget, DecisionLog, Evidence,
+    Infeasible, LogEntry, NEAR_MISS_MAX, NearMiss, Provenance, Resolution, SpecMismatch, Stage,
+    UnseenClasses,
 };
-pub use rule::{ReviewRecord, Rule, RuleCatalog, RuleError};
 pub use scope::Scope;
 pub use search::{
     ChangeProbe, CleanDelta, DEFAULT_WEIGHTS, ExtDelta, Inserted, NewNode, NodeId, PruneStage,

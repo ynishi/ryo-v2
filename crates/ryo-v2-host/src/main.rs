@@ -10,7 +10,6 @@ mod bench;
 mod blueprint_json;
 mod resolution_json;
 mod rss;
-mod rules_json;
 mod search;
 mod search_json;
 
@@ -66,9 +65,6 @@ enum Command {
         workspace: PathBuf,
         /// The blueprints JSON file.
         blueprints: PathBuf,
-        /// Rules JSON file; without it every candidate needs review.
-        #[arg(long, value_name = "FILE")]
-        rules: Option<PathBuf>,
         /// How far the check reaches.
         #[arg(long, value_enum, default_value_t = ApplyScopeArg::Affected)]
         scope: ApplyScopeArg,
@@ -82,9 +78,6 @@ enum Command {
         workspace: PathBuf,
         /// The request JSON file: targets, probes, roots, budget, judge.
         request: PathBuf,
-        /// Rules JSON file; without it every candidate needs review.
-        #[arg(long, value_name = "FILE")]
-        rules: Option<PathBuf>,
         /// How far each check reaches.
         #[arg(long, value_enum, default_value_t = ApplyScopeArg::Affected)]
         scope: ApplyScopeArg,
@@ -143,13 +136,11 @@ fn run() -> Result<ExitCode> {
         Command::Apply {
             workspace,
             blueprints,
-            rules,
             scope,
             no_proc_macro,
         } => apply::run_apply(&apply::ApplyArgs {
             workspace,
             blueprints,
-            rules,
             scope: match scope {
                 ApplyScopeArg::Affected => Scope::Affected,
                 ApplyScopeArg::Workspace => Scope::Workspace,
@@ -159,13 +150,11 @@ fn run() -> Result<ExitCode> {
         Command::Search {
             workspace,
             request,
-            rules,
             scope,
             no_proc_macro,
         } => search::run_search(&search::SearchArgs {
             workspace,
             request,
-            rules,
             scope: match scope {
                 ApplyScopeArg::Affected => Scope::Affected,
                 ApplyScopeArg::Workspace => Scope::Workspace,
@@ -268,8 +257,6 @@ mod tests {
             "apply",
             "/ws",
             "b.json",
-            "--rules",
-            "r.json",
             "--scope",
             "workspace",
             "--no-proc-macro",
@@ -279,6 +266,10 @@ mod tests {
             Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--scope", "both"]).is_err()
         );
         assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws"]).is_err());
+        // SEARCH_LEDGER D6: no registry of Rules, so no `--rules`.
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--rules", "r.json"]).is_err()
+        );
     }
 
     #[test]
@@ -288,8 +279,6 @@ mod tests {
             "search",
             "/ws",
             "req.json",
-            "--rules",
-            "r.json",
             "--scope",
             "workspace",
             "--no-proc-macro",
@@ -299,6 +288,11 @@ mod tests {
             Cli::try_parse_from(["ryo-v2", "search", "/ws", "r.json", "--scope", "both"]).is_err()
         );
         assert!(Cli::try_parse_from(["ryo-v2", "search", "/ws"]).is_err());
+        // SEARCH_LEDGER D6: no registry of Rules, so no `--rules`.
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "search", "/ws", "r.json", "--rules", "x.json"])
+                .is_err()
+        );
     }
 
     #[test]

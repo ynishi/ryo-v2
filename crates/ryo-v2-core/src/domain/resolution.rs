@@ -1,19 +1,16 @@
 //! What came of a set of Blueprints: candidates that passed, or why none did.
 //!
-//! The central rule is [`disposition`]: whether a passing candidate may be applied without a
-//! human or needs a review. It is a table of the Rule and the review, read top to bottom. The
-//! classes of error the in-process check cannot see are named in the candidate
-//! ([`unseen_classes`]); the build after the commit settles them.
+//! A candidate that passed carries its marks and the classes of error the in-process check cannot
+//! see ([`unseen_classes`]) as names; which candidate to take is the caller's choice. The build
+//! after the commit settles the unseen classes.
 //!
-//! The marks and the Rule that feed the table are derived here, from the Blueprints of a path
-//! and the roles of the files it edits ([`risk_marks`], [`covering_rule`]); a caller never
-//! hands them over.
+//! The marks are derived here, from the Blueprints of a path and the roles of the files it edits
+//! ([`risk_marks`]); a caller never hands them over.
 
 use super::stage::Staged;
 use super::{
     Basis, Blueprint, BlueprintId, DomainError, Drift, Edit, FileRole, Fingerprint, IntentKind,
-    NonEmpty, Nonconformance, RelPath, RiskMark, Rule, RuleCatalog, RuleId, Scope, SpliceError,
-    UnseenClass, Verdict,
+    NonEmpty, Nonconformance, RelPath, RiskMark, Scope, SpliceError, UnseenClass, Verdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,61 +33,13 @@ impl std::fmt::Display for UnseenClasses {
     }
 }
 
-/// Why a candidate needs a human.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewReason {
-    /// No Rule covers the intent.
-    NoRule,
-    /// The edit is in a proc-macro crate.
-    ProcMacroCrate,
-    /// The intent can change behaviour.
-    Behaviour,
-    /// The check ran at a narrower scope than the Rule's review holds for.
-    ScopeTooNarrow,
-}
-
-impl std::fmt::Display for ReviewReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ReviewReason::NoRule => "no rule covers the intent",
-            ReviewReason::ProcMacroCrate => "the edit is in a proc-macro crate",
-            ReviewReason::Behaviour => "the intent can change behaviour",
-            ReviewReason::ScopeTooNarrow => "the check scope is narrower than the rule's",
-        })
-    }
-}
-
-/// What may happen to a passing candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Disposition {
-    /// A Rule covers it. The unseen classes it names are settled by the build after the commit.
-    AutoApplicable {
-        /// The Rule.
-        rule: RuleId,
-    },
-    /// A human decides.
-    NeedsReview {
-        /// Why.
-        reason: ReviewReason,
-    },
-}
-
-impl std::fmt::Display for Disposition {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Disposition::AutoApplicable { rule } => write!(f, "auto-applicable (rule {rule})"),
-            Disposition::NeedsReview { reason } => write!(f, "needs review: {reason}"),
-        }
-    }
-}
-
 /// The classes of unseen error that `marks` name, or `None` if there are none.
 ///
 /// # Contract
 /// - C1: the classes are those that [`RiskMark::unseen_class`] gives for `marks`; `None` when it
 ///   gives none (`Behaviour` is not a kind of error, so it adds no class).
 ///   tested: domain::resolution::tests::unseen_classes_follow_the_marks
-///   tested: domain::resolution::tests::visibility_is_named_not_reviewed
+///   tested: domain::resolution::tests::visibility_is_named_as_unseen
 pub fn unseen_classes(marks: &BTreeSet<RiskMark>) -> Option<UnseenClasses> {
     let classes: BTreeSet<UnseenClass> = marks.iter().filter_map(|m| m.unseen_class()).collect();
     if classes.is_empty() {
@@ -98,35 +47,6 @@ pub fn unseen_classes(marks: &BTreeSet<RiskMark>) -> Option<UnseenClasses> {
     } else {
         Some(UnseenClasses(classes))
     }
-}
-
-/// What may happen to a candidate that passed the analyzer.
-///
-/// # Contract
-/// - C1: the first matching row wins: `Behaviour` gives `NeedsReview{Behaviour}`, then
-///   `ProcMacroCrate` gives `NeedsReview{ProcMacroCrate}`, then no Rule gives `NoRule`, then
-///   a `scope` that does not cover the Rule's `min_scope` gives `ScopeTooNarrow`, else
-///   `AutoApplicable`.
-///   tested: domain::resolution::tests::disposition_table_first_row_wins
-/// - C2: marks that only name an unseen class (`Borrow`, `BuildScript`, `Visibility`) do not
-///   change the disposition: adding or removing any of them from any set of marks gives the
-///   same disposition.
-///   tested: domain::resolution::tests::unseen_marks_never_change_disposition
-pub fn disposition(marks: &BTreeSet<RiskMark>, rule: Option<&Rule>, scope: Scope) -> Disposition {
-    let review = |reason| Disposition::NeedsReview { reason };
-    if marks.contains(&RiskMark::Behaviour) {
-        return review(ReviewReason::Behaviour);
-    }
-    if marks.contains(&RiskMark::ProcMacroCrate) {
-        return review(ReviewReason::ProcMacroCrate);
-    }
-    let Some(rule) = rule else {
-        return review(ReviewReason::NoRule);
-    };
-    if !scope.covers(rule.min_scope()) {
-        return review(ReviewReason::ScopeTooNarrow);
-    }
-    Disposition::AutoApplicable { rule: rule.id() }
 }
 
 /// The marks of a change made by `kinds` to files of `roles`.
@@ -158,31 +78,18 @@ pub fn risk_marks(
     marks
 }
 
-/// The Rule that covers every intent of `kinds` (root first, leaf last), or `None`.
-///
-/// # Contract
-/// - C1: `None` for no kinds and when any kind has no Rule in `rules` (the catalog holds each
-///   Rule under its own intent, `RuleCatalog` C2); otherwise the Rule with the widest
-///   `min_scope`, the later one (the leaf's) on a tie.
-///   tested: domain::resolution::tests::covering_rule_needs_every_kind
-pub fn covering_rule<'r>(kinds: &[IntentKind], rules: &'r RuleCatalog) -> Option<&'r Rule> {
-    let mut best: Option<&Rule> = None;
-    for kind in kinds {
-        let rule = rules.for_intent(*kind)?;
-        best = match best {
-            Some(b) if !rule.min_scope().covers(b.min_scope()) => Some(b),
-            _ => Some(rule),
-        };
-    }
-    best
+/// The names of `marks`, comma separated, in their order (empty for no marks).
+pub(crate) fn mark_names(marks: &BTreeSet<RiskMark>) -> String {
+    let names: Vec<String> = marks.iter().map(ToString::to_string).collect();
+    names.join(", ")
 }
 
 /// A Blueprint, or a path of them, that passed the analyzer, with the edits it would make and
-/// what to do next.
+/// its marks.
 ///
 /// ```compile_fail
 /// use ryo_v2_core::domain::Candidate;
-/// // Only the engine builds a candidate: its marks and Rule are derived, never handed over.
+/// // Only the engine builds a candidate: its marks are derived, never handed over.
 /// let _ = Candidate::new;
 /// ```
 ///
@@ -199,7 +106,6 @@ pub struct Candidate {
     basis: Basis,
     marks: BTreeSet<RiskMark>,
     unseen_classes: Option<UnseenClasses>,
-    disposition: Disposition,
 }
 
 impl Candidate {
@@ -212,32 +118,24 @@ impl Candidate {
     /// - C1: returns `Err(verdict)` unless `verdict.passed()`.
     ///   tested: domain::resolution::tests::candidate_refuses_failed_verdict
     /// - C2: the marks are [`risk_marks`] of the intent kinds of the path of `staged` and its
-    ///   roles, the Rule is [`covering_rule`] of those kinds, and `unseen_classes` and
-    ///   `disposition` follow from them with [`unseen_classes`] and [`disposition`]; a path with an
-    ///   intent whose catalog risks hold `Behaviour` is `NeedsReview{Behaviour}` whatever the
-    ///   catalog holds.
-    ///   tested: domain::resolution::tests::candidate_derives_marks_and_rule
+    ///   roles, and `unseen_classes` follows from them with [`unseen_classes`].
+    ///   tested: domain::resolution::tests::candidate_names_its_marks
     ///   tested: domain::resolution::tests::crate_graph_edits_never_pass_silently
-    pub(crate) fn new(
-        staged: Staged,
-        verdict: Verdict,
-        rules: &RuleCatalog,
-        scope: Scope,
-    ) -> Result<Self, Verdict> {
+    pub(crate) fn new(staged: Staged, verdict: Verdict) -> Result<Self, Verdict> {
         if !verdict.passed() {
             return Err(verdict);
         }
         let (path, edits, roles, basis) = staged.into_parts();
-        let kinds: Vec<IntentKind> = path.iter().map(|b| b.intent().kind()).collect();
-        let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
-        let rule = covering_rule(&kinds, rules);
+        let marks = risk_marks(
+            path.iter().map(|b| b.intent().kind()),
+            roles.iter().copied(),
+        );
         Ok(Self {
             path,
             edits,
             verdict,
             basis,
             unseen_classes: unseen_classes(&marks),
-            disposition: disposition(&marks, rule, scope),
             marks,
         })
     }
@@ -281,9 +179,12 @@ impl Candidate {
         self.unseen_classes.as_ref()
     }
 
-    /// What may happen to it.
-    pub fn disposition(&self) -> Disposition {
-        self.disposition
+    /// Its marks as one line, `marks: borrow, behaviour`, or `marks: none` when it has none.
+    pub fn marks_line(&self) -> String {
+        if self.marks.is_empty() {
+            return "marks: none".to_owned();
+        }
+        format!("marks: {}", mark_names(&self.marks))
     }
 }
 
@@ -885,7 +786,7 @@ mod tests {
     use crate::domain::DeriveName;
     use crate::domain::{
         BaseFp, BlueprintParts, DecisionRecord, Diagnostic, Diagnostics, ErrorCode, Ident,
-        IntentCall, MutationSpec, ReadRange, ReviewRecord, TextRange,
+        IntentCall, MutationSpec, ReadRange, TextRange,
     };
 
     fn empty_basis() -> Basis {
@@ -910,19 +811,6 @@ mod tests {
     }
     fn bid() -> BlueprintId {
         BlueprintId::parse("01890a5d-ac96-774b-bcce-b302099a8057").unwrap()
-    }
-    fn review() -> ReviewRecord {
-        ReviewRecord {
-            reviewer: "me".to_owned(),
-            reviewed_at_ms: 1,
-            note: String::new(),
-        }
-    }
-    fn rid(n: u8) -> RuleId {
-        RuleId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a80{n:02x}")).unwrap()
-    }
-    fn rule() -> Rule {
-        Rule::register(rid(0x58), IntentKind::MoveItem, review(), Scope::Workspace).unwrap()
     }
     fn call(kind: IntentKind) -> IntentCall {
         match kind {
@@ -992,17 +880,6 @@ mod tests {
             })
             .collect()
     }
-    /// A catalog holding a Rule of `scope` for each of `kinds`, registration checks aside.
-    fn unchecked(kinds: &[IntentKind], scope: Scope) -> RuleCatalog {
-        RuleCatalog::new(
-            kinds
-                .iter()
-                .zip(0x60u8..)
-                .map(|(k, n)| Rule::unchecked_for_tests(rid(n), *k, review(), scope))
-                .collect(),
-        )
-        .unwrap()
-    }
     fn failing() -> Verdict {
         Verdict::from_diagnostics(Diagnostics {
             errors: vec![Diagnostic {
@@ -1045,50 +922,11 @@ mod tests {
     }
 
     #[test]
-    fn unseen_marks_never_change_disposition() {
-        let rule = rule();
-        let only_unseen = [
-            RiskMark::Borrow,
-            RiskMark::BuildScript,
-            RiskMark::Visibility,
-        ];
-        for mask in 0..32u8 {
-            let m = marks(mask);
-            for r in [None, Some(&rule)] {
-                for scope in [Scope::Affected, Scope::Workspace] {
-                    for u in only_unseen {
-                        let mut with = m.clone();
-                        with.insert(u);
-                        let mut without = m.clone();
-                        without.remove(&u);
-                        assert_eq!(
-                            disposition(&with, r, scope),
-                            disposition(&without, r, scope),
-                            "{m:?} {u} {r:?} {scope}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn visibility_is_named_not_reviewed() {
-        let rule = rule();
+    fn visibility_is_named_as_unseen() {
         let vis = BTreeSet::from([RiskMark::Visibility]);
         assert_eq!(
             unseen_classes(&vis).unwrap().classes(),
             &BTreeSet::from([UnseenClass::Visibility])
-        );
-        assert_eq!(
-            disposition(&vis, Some(&rule), Scope::Workspace),
-            Disposition::AutoApplicable { rule: rule.id() }
-        );
-        assert_eq!(
-            disposition(&vis, None, Scope::Workspace),
-            Disposition::NeedsReview {
-                reason: ReviewReason::NoRule
-            }
         );
         assert_eq!(Stage::Prune.to_string(), "prune");
         assert!(Stage::Marks < Stage::Prune && Stage::Prune < Stage::Check);
@@ -1130,87 +968,30 @@ mod tests {
     }
 
     #[test]
-    fn disposition_table_first_row_wins() {
-        let rule = rule();
-        let id = rule.id();
-        let m = |ms: &[RiskMark]| ms.iter().copied().collect::<BTreeSet<_>>();
-        let review = |reason| Disposition::NeedsReview { reason };
-        // Behaviour beats everything
-        assert_eq!(
-            disposition(
-                &m(&[RiskMark::Behaviour, RiskMark::ProcMacroCrate]),
-                Some(&rule),
-                Scope::Workspace
-            ),
-            review(ReviewReason::Behaviour)
-        );
-        assert_eq!(
-            disposition(&m(&[RiskMark::Behaviour]), None, Scope::Affected),
-            review(ReviewReason::Behaviour)
-        );
-        // ProcMacroCrate beats NoRule
-        assert_eq!(
-            disposition(
-                &m(&[RiskMark::ProcMacroCrate, RiskMark::Borrow]),
-                None,
-                Scope::Workspace
-            ),
-            review(ReviewReason::ProcMacroCrate)
-        );
-        // NoRule beats a mark that names an unseen class
-        assert_eq!(
-            disposition(&m(&[RiskMark::Borrow]), None, Scope::Workspace),
-            review(ReviewReason::NoRule)
-        );
-        // ScopeTooNarrow beats a mark that names an unseen class
-        assert_eq!(
-            disposition(&m(&[RiskMark::Borrow]), Some(&rule), Scope::Affected),
-            review(ReviewReason::ScopeTooNarrow)
-        );
-        assert_eq!(
-            disposition(&m(&[]), Some(&rule), Scope::Affected),
-            review(ReviewReason::ScopeTooNarrow)
-        );
-        assert_eq!(
-            disposition(&m(&[RiskMark::BuildScript]), Some(&rule), Scope::Workspace),
-            Disposition::AutoApplicable { rule: id }
-        );
-        assert_eq!(
-            disposition(&m(&[]), Some(&rule), Scope::Workspace),
-            Disposition::AutoApplicable { rule: id }
-        );
-    }
-
-    #[test]
     fn crate_graph_edits_never_pass_silently() {
         // The pure half; `app::apply::tests` drives the same cases through `apply_blueprints`.
-        let rules = RuleCatalog::new(vec![rule()]).unwrap();
-        for (role, named, disposition) in [
+        for (role, mark, named) in [
             (
                 FileRole::BuildScript,
+                RiskMark::BuildScript,
                 UnseenClass::BuildScript,
-                Disposition::AutoApplicable { rule: rule().id() },
             ),
             (
                 FileRole::ProcMacroSource,
+                RiskMark::ProcMacroCrate,
                 UnseenClass::ProcMacroCrate,
-                Disposition::NeedsReview {
-                    reason: ReviewReason::ProcMacroCrate,
-                },
             ),
         ] {
             let c = Candidate::new(
                 staged(&[IntentKind::MoveItem], BTreeSet::from([role]), vec![]),
                 passing(),
-                &rules,
-                Scope::Workspace,
             )
             .unwrap();
+            assert!(c.marks().contains(&mark), "{role}");
             assert!(
                 c.unseen_classes().unwrap().classes().contains(&named),
                 "{role}"
             );
-            assert_eq!(c.disposition(), disposition, "{role}");
         }
     }
 
@@ -1226,12 +1007,9 @@ mod tests {
     #[test]
     fn candidate_refuses_failed_verdict() {
         let v = failing();
-        let none = RuleCatalog::default();
         let err = Candidate::new(
             staged(&[IntentKind::MoveItem], BTreeSet::new(), vec![]),
             v.clone(),
-            &none,
-            Scope::Affected,
         )
         .unwrap_err();
         assert_eq!(err, v);
@@ -1242,8 +1020,6 @@ mod tests {
                 vec![Edit::delete(RelPath::parse("a.rs").unwrap())],
             ),
             passing(),
-            &none,
-            Scope::Affected,
         )
         .unwrap();
         assert_eq!(ok.blueprint(), ok.path()[1].id());
@@ -1254,60 +1030,23 @@ mod tests {
     }
 
     #[test]
-    fn candidate_derives_marks_and_rule() {
-        let registrable: Vec<IntentKind> = IntentKind::ALL
-            .into_iter()
-            .filter(|k| Rule::register(rid(1), *k, review(), Scope::Affected).is_ok())
-            .collect();
-        let catalogs = [
-            RuleCatalog::default(),
-            unchecked(&registrable, Scope::Workspace),
-            unchecked(&IntentKind::ALL, Scope::Workspace),
-            unchecked(&IntentKind::ALL, Scope::Affected),
-        ];
+    fn candidate_names_its_marks() {
         let mut paths: Vec<Vec<IntentKind>> = IntentKind::ALL.iter().map(|k| vec![*k]).collect();
         for a in IntentKind::ALL {
             for b in IntentKind::ALL {
                 paths.push(vec![a, b]);
             }
         }
-        let mut seen_auto = false;
         for kinds in &paths {
             for roles in role_subsets() {
-                for rules in &catalogs {
-                    for scope in [Scope::Affected, Scope::Workspace] {
-                        let c = Candidate::new(
-                            staged(kinds, roles.clone(), vec![]),
-                            passing(),
-                            rules,
-                            scope,
-                        )
-                        .unwrap();
-                        let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
-                        let rule = covering_rule(kinds, rules);
-                        assert_eq!(c.marks(), &marks);
-                        assert_eq!(c.unseen_classes(), unseen_classes(&marks).as_ref());
-                        assert_eq!(c.disposition(), disposition(&marks, rule, scope));
-                        let kinds_of: Vec<_> = c.path().iter().map(|b| b.intent().kind()).collect();
-                        assert_eq!(&kinds_of, kinds);
-                        if kinds
-                            .iter()
-                            .any(|k| k.spec().risks.contains(&RiskMark::Behaviour))
-                        {
-                            assert_eq!(
-                                c.disposition(),
-                                Disposition::NeedsReview {
-                                    reason: ReviewReason::Behaviour
-                                },
-                                "{kinds:?} {roles:?}"
-                            );
-                        }
-                        seen_auto |= matches!(c.disposition(), Disposition::AutoApplicable { .. });
-                    }
-                }
+                let c = Candidate::new(staged(kinds, roles.clone(), vec![]), passing()).unwrap();
+                let marks = risk_marks(kinds.iter().copied(), roles.iter().copied());
+                assert_eq!(c.marks(), &marks, "{kinds:?} {roles:?}");
+                assert_eq!(c.unseen_classes(), unseen_classes(&marks).as_ref());
+                let kinds_of: Vec<_> = c.path().iter().map(|b| b.intent().kind()).collect();
+                assert_eq!(&kinds_of, kinds);
             }
         }
-        assert!(seen_auto, "the table has an auto-applicable row to guard");
     }
 
     #[test]
@@ -1340,44 +1079,6 @@ mod tests {
                 RiskMark::Behaviour,
                 RiskMark::BuildScript
             ])
-        );
-    }
-
-    #[test]
-    fn covering_rule_needs_every_kind() {
-        use IntentKind::{AddDerive, MoveItem, RenameLocal};
-        let narrow_and_wide = RuleCatalog::new(vec![
-            Rule::unchecked_for_tests(rid(1), RenameLocal, review(), Scope::Affected),
-            Rule::unchecked_for_tests(rid(2), MoveItem, review(), Scope::Workspace),
-        ])
-        .unwrap();
-        let ids =
-            |kinds: &[IntentKind], rules: &RuleCatalog| covering_rule(kinds, rules).map(Rule::id);
-        // no kinds, or a kind without a rule
-        assert_eq!(ids(&[], &narrow_and_wide), None);
-        assert_eq!(ids(&[AddDerive], &narrow_and_wide), None);
-        assert_eq!(ids(&[MoveItem, AddDerive], &narrow_and_wide), None);
-        assert_eq!(ids(&[AddDerive, MoveItem], &narrow_and_wide), None);
-        assert_eq!(ids(&[MoveItem], &RuleCatalog::default()), None);
-        // one rule per kind: the wider min_scope wins, whatever the order
-        assert_eq!(ids(&[MoveItem], &narrow_and_wide), Some(rid(2)));
-        assert_eq!(
-            ids(&[RenameLocal, MoveItem], &narrow_and_wide),
-            Some(rid(2))
-        );
-        assert_eq!(
-            ids(&[MoveItem, RenameLocal], &narrow_and_wide),
-            Some(rid(2))
-        );
-        // a tie goes to the leaf, the later one
-        let tie = unchecked(&[RenameLocal, MoveItem], Scope::Workspace);
-        assert_eq!(
-            ids(&[RenameLocal, MoveItem], &tie),
-            tie.for_intent(MoveItem).map(Rule::id)
-        );
-        assert_eq!(
-            ids(&[MoveItem, RenameLocal], &tie),
-            tie.for_intent(RenameLocal).map(Rule::id)
         );
     }
 
