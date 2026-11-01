@@ -1,7 +1,8 @@
 //! Loading a workspace into a session.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{Deadline, Detector, GapDetector, collect_errors_par, panic_message};
+use crate::diagnostics::{Detector, GapDetector, collect_errors_par, panic_message};
+use crate::fork::Level;
 use crate::rev_deps::{PathFacts, RevDeps, build_rev_deps};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -9,7 +10,7 @@ use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{FileId, Vfs};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
 use ryo_v2_core::domain::{CommandKind, Finding, Fingerprint, RelPath};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -87,6 +88,22 @@ fn capture_load_inputs(root: &Path, rev_deps: &RevDeps) -> LoadInputs {
     }
 }
 
+/// Which port opened the live fork. The two ports share the one live fork of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkPort {
+    /// `Analyzer::fork`.
+    Analyzer,
+    /// `Stacked::fork`, or a fork opened inside the adapter for a `Verifier::check`.
+    Stacked,
+}
+
+/// The live fork of a session: the id its ticket carries, and the port that opened it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Live {
+    pub(crate) id: u64,
+    pub(crate) port: ForkPort,
+}
+
 /// A loaded workspace: the rust-analyzer database, its VFS and the baseline diagnostics.
 pub struct RaSession {
     pub(crate) host: AnalysisHost,
@@ -98,24 +115,33 @@ pub struct RaSession {
     pub(crate) rev_deps: RevDeps,
     /// Every Error at load.
     pub(crate) baseline: Vec<Finding>,
-    /// Set when a panic inside the database may have left it half-updated; the session is
-    /// then not reused (`fork` refuses). `None` at load.
+    /// Set when a revert did not restore the state below it, or a panic inside the database may
+    /// have left it half-updated: the database is not written again, and every operation but
+    /// the end of a fork refuses. `None` at load.
     pub(crate) poisoned: Option<String>,
     pub(crate) threads: usize,
     pub(crate) assert_revert: bool,
     /// Whether the gap detectors run; baseline and fork diagnostics must agree on it.
     pub(crate) gap_detectors: bool,
-    pub(crate) live_fork: bool,
+    /// The one fork that writes into the database now; `None` when the session is at its base.
+    pub(crate) live: Option<Live>,
+    /// The levels of the live fork, bottom first: each is one write on top of the one before,
+    /// and the undo log of that write.
+    pub(crate) stack: Vec<Level>,
+    /// The base text of every load-time file a level modified or deleted, entered before the
+    /// level wrote anything. `Verifier::text` and `Verifier::provenance` read it before the
+    /// database, so they describe the base while a fork is live and after a revert that
+    /// poisoned the session. Cleared when a fork ends on a session that is not poisoned.
+    pub(crate) base_texts: BTreeMap<FileId, String>,
     /// Build-script sources and proc-macro member dirs, from `cargo metadata`.
     pub(crate) path_facts: PathFacts,
     /// Manifests, lock file and toolchain as of load.
     pub(crate) load_inputs: LoadInputs,
-    /// Number of `Verifier::check` calls so far.
-    pub(crate) check_count: u32,
-    /// Cut-off of the diagnostics of the `check` that is running; `None` outside the diagnostics
-    /// step of a `check`.
-    pub(crate) deadline: Option<Deadline>,
-    /// Paths edited by every `check` since the last revert audit.
+    /// Number of writes so far, a refused one included: every `Verifier::check` and every
+    /// `Stacked::write` (an `Analyzer::apply` is not counted). It paces the sampled re-assert.
+    pub(crate) write_count: u32,
+    /// Paths written by every `check` and `Stacked::write` since the last revert audit, a
+    /// refused one included.
     pub(crate) edited_since_audit: BTreeSet<RelPath>,
     /// Detector panics contained so far; collects run on several threads and take `&RaSession`.
     pub(crate) detector_panics: Mutex<BTreeSet<DetectorPanic>>,
@@ -280,11 +306,12 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         threads,
         assert_revert: a.config.assert_revert,
         gap_detectors: a.config.gap_detectors,
-        live_fork: false,
+        live: None,
+        stack: Vec::new(),
+        base_texts: BTreeMap::new(),
         path_facts,
         load_inputs,
-        check_count: 0,
-        deadline: None,
+        write_count: 0,
         edited_since_audit: BTreeSet::new(),
         detector_panics,
         baseline_panics,

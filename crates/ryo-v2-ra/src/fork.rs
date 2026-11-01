@@ -1,9 +1,13 @@
-//! Forks: apply edits in place on the session, diagnose, revert.
+//! Levels: one write of edits applied in place on the session on top of the state below it,
+//! diagnosed, and reverted. A fork is a stack of levels over the session's base state; the
+//! functions here are the level operations that both the `Analyzer` port and `Verifier::check`
+//! are built on.
 
-use crate::RaAnalyzer;
-use crate::diagnostics::{Detector, GapDetector, collect_errors_par, panic_message};
+use crate::diagnostics::{Deadline, Detector, GapDetector, collect_errors_par, panic_message};
 use crate::rev_deps::scoped_files;
-use crate::session::RaSession;
+use crate::session::{ForkPort, RaSession};
+use crate::stack;
+use crate::{DbWritePanic, RaAnalyzer};
 use ra_ap_base_db::salsa::Durability;
 use ra_ap_base_db::{SourceDatabase, SourceRoot, SourceRootId};
 use ra_ap_hir::ChangeWithProcMacros;
@@ -12,22 +16,102 @@ use ra_ap_vfs::file_set::FileSet;
 use ra_ap_vfs::{AbsPathBuf, FileExcluded, FileId, VfsPath};
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
 use ryo_v2_core::domain::baseline::{restrict, same_findings};
-use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings, UnseenClass};
-use std::collections::{BTreeSet, HashMap};
+use ryo_v2_core::domain::text::revert_intact;
+use ryo_v2_core::domain::{
+    Edit, Finding, Fingerprint, RelPath, Scope, ScopedFindings, UnseenClass,
+};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use triomphe::Arc as TriArc;
 
-/// A token for one set of in-place edits on a session; it holds what is needed to revert them.
+/// The ticket of the live `Analyzer` fork of a session. It is an id and nothing else: the
+/// session holds the fork's level, and a ticket that is not the live fork's (another session's,
+/// or one already discarded) is refused with `ForkInUse`.
+#[derive(Debug, Clone)]
 pub struct RaFork {
-    applied: bool,
-    apply_started_ms: u64,
-    /// (file, path, text in the database before the edit)
+    pub(crate) id: u64,
+}
+
+/// One write of a fork: what it changed, the undo log of the change, and what a diagnosis and a
+/// revert of it need.
+pub(crate) struct Level {
+    /// Paths of this write, sorted, unique.
+    edited: Vec<RelPath>,
+    /// Files of the level below that this level wrote, with their text at the level below.
     modified: Vec<(FileId, RelPath, String)>,
+    /// Files this level created: paths that no level had ever known.
     created: Vec<(FileId, RelPath)>,
+    /// Files this level brought back: known to the session, deleted by a level below.
+    revived: Vec<(FileId, RelPath)>,
+    /// Files of the level below that this level deleted, with their text at the level below.
     deleted: Vec<(FileId, RelPath, String)>,
+    /// The first save of each source root this level changed.
     saved_roots: Vec<(SourceRootId, TriArc<SourceRoot>)>,
-    full_scope: Vec<(FileId, RelPath)>,
+    /// The files of the state of this level.
+    live: Vec<(FileId, RelPath)>,
+    /// The files `Scope::Affected` diagnoses at this level; empty when `edited` is.
+    scope: Vec<(FileId, RelPath)>,
+    /// What the re-assert of the revert compares; `Some` iff the write was sampled.
+    sampled: Option<Sampled>,
+    /// Duration of this level's write, from the start of [`push_level`] to the end of the write,
+    /// in ms. Each diagnosis of the level reports it plus its own duration, so that the time
+    /// between diagnoses is never counted.
+    write_ms: u64,
+}
+
+/// The re-assert of a sampled write: the scope it diagnoses after the revert and the findings
+/// that scope had before the write.
+struct Sampled {
+    /// The same edits' scope at the level below; empty when the write has no edit.
+    below_scope: Vec<(FileId, RelPath)>,
+    /// The findings of `below_scope` before this write.
+    expected: Vec<Finding>,
+}
+
+/// Why a level could not be reverted. Every failure leaves the session poisoned.
+pub(crate) enum RevertFailure {
+    /// The revert did not restore the texts of these files, or (when asserted) the findings of
+    /// the level's scope.
+    Mismatch(Vec<RelPath>),
+    /// The revert could not be carried out or confirmed (a database write panicked, or the
+    /// re-assert could not run), or the session was already poisoned and nothing was written for
+    /// this revert. The text names the cause.
+    Poisoned(String),
+}
+
+impl RevertFailure {
+    /// The failure as the `Analyzer` port says it.
+    pub(crate) fn into_analyzer(self) -> AnalyzerError {
+        match self {
+            RevertFailure::Mismatch(_) => AnalyzerError::RevertMismatch,
+            RevertFailure::Poisoned(msg) => AnalyzerError::Poisoned(msg),
+        }
+    }
+}
+
+/// What a write is to do to one path, resolved against the state of the level below.
+enum Action {
+    Modify {
+        id: FileId,
+        rel: RelPath,
+        below: String,
+        new: String,
+    },
+    Delete {
+        id: FileId,
+        rel: RelPath,
+        below: String,
+    },
+    Create {
+        rel: RelPath,
+        new: String,
+    },
+    Revive {
+        id: FileId,
+        rel: RelPath,
+        new: String,
+    },
 }
 
 fn edit_err(path: &RelPath, reason: impl Into<String>) -> AnalyzerError {
@@ -57,102 +141,83 @@ pub(crate) fn db_text(host: &AnalysisHost, id: FileId) -> Result<String, Analyze
     .map_err(|p| AnalyzerError::Panicked(panic_message(p)))
 }
 
-pub(crate) fn fork(session: &mut RaSession) -> Result<RaFork, AnalyzerError> {
-    if let Some(msg) = &session.poisoned {
-        return Err(AnalyzerError::Panicked(format!(
-            "session poisoned by an earlier panic: {msg}"
-        )));
+/// The files of the state the next write lands on: the top level's, or the session's own.
+fn live_below(session: &RaSession) -> &[(FileId, RelPath)] {
+    session
+        .stack
+        .last()
+        .map_or(session.files.as_slice(), |l| l.live.as_slice())
+}
+
+/// The text of `path` at the top level (the base text with no level); `None` when it is not a
+/// file of that state.
+pub(crate) fn text_at_top(
+    session: &RaSession,
+    path: &RelPath,
+) -> Result<Option<String>, AnalyzerError> {
+    match live_below(session).iter().find(|(_, r)| r == path) {
+        Some((id, _)) => db_text(&session.host, *id).map(Some),
+        None => Ok(None),
     }
-    if session.live_fork {
+}
+
+/// The findings of `files`, as the database gives them now, with `known` the files a
+/// diagnostic range may be attributed to. Never cut off.
+fn findings_of(
+    a: &RaAnalyzer,
+    session: &RaSession,
+    files: &[(FileId, RelPath)],
+    known: &[(FileId, RelPath)],
+) -> Result<Vec<Finding>, AnalyzerError> {
+    Ok(collect_errors_par(
+        &session.host,
+        files,
+        known,
+        session.threads,
+        session.gap_detectors,
+        None,
+        Detector {
+            fault: a.detector_fault.as_ref(),
+            panics: &session.detector_panics,
+        },
+    )?
+    .findings)
+}
+
+/// The refusal of an `Analyzer` operation on a poisoned session: the database is not written or
+/// read again.
+fn refuse_poisoned(session: &RaSession) -> Result<(), AnalyzerError> {
+    match &session.poisoned {
+        Some(msg) => Err(AnalyzerError::Poisoned(msg.clone())),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn fork(session: &mut RaSession) -> Result<RaFork, AnalyzerError> {
+    refuse_poisoned(session)?;
+    if session.live.is_some() {
         return Err(AnalyzerError::ForkInUse);
     }
-    session.live_fork = true;
     Ok(RaFork {
-        applied: false,
-        apply_started_ms: 0,
-        modified: Vec::new(),
-        created: Vec::new(),
-        deleted: Vec::new(),
-        saved_roots: Vec::new(),
-        full_scope: Vec::new(),
+        id: stack::open_fork(session, ForkPort::Analyzer),
     })
 }
 
 pub(crate) fn apply(
     a: &RaAnalyzer,
     session: &mut RaSession,
-    fork: &mut RaFork,
+    fork: &RaFork,
     edits: &[Edit],
 ) -> Result<(), AnalyzerError> {
-    if fork.applied {
+    if !stack::is_live(session, fork.id, ForkPort::Analyzer) {
+        return Err(AnalyzerError::ForkInUse);
+    }
+    refuse_poisoned(session)?;
+    if !session.stack.is_empty() {
         return Err(AnalyzerError::AlreadyApplied);
     }
-    fork.apply_started_ms = a.clock.now_ms();
-
-    // Resolve every path first, so a rejected edit leaves the session untouched.
-    // A path not in the workspace is Created; `new_text == None` is Deleted.
-    // Base texts come from the database, before any change is applied.
-    let by_rel: HashMap<&RelPath, FileId> = session.files.iter().map(|(id, r)| (r, *id)).collect();
-    let mut modified: Vec<(FileId, RelPath, String, String)> = Vec::new(); // id, path, base, new
-    let mut created: Vec<(RelPath, String)> = Vec::new();
-    let mut deleted: Vec<(FileId, RelPath, String)> = Vec::new();
-    for edit in edits {
-        match (by_rel.get(&edit.path), &edit.new_text) {
-            (Some(&id), Some(new)) => {
-                let base = db_text(&session.host, id)?;
-                modified.push((id, edit.path.clone(), base, new.clone()));
-            }
-            (Some(&id), None) => {
-                let base = db_text(&session.host, id)?;
-                deleted.push((id, edit.path.clone(), base));
-            }
-            (None, Some(new)) => {
-                if session.root.join(edit.path.as_str()).exists() {
-                    return Err(edit_err(
-                        &edit.path,
-                        "target exists on disk but is not indexed (non-.rs or excluded?)",
-                    ));
-                }
-                created.push((edit.path.clone(), new.clone()));
-            }
-            (None, None) => {
-                return Err(edit_err(
-                    &edit.path,
-                    "cannot delete a file that is not in the workspace",
-                ));
-            }
-        }
-    }
-
-    fork.modified = modified
-        .iter()
-        .map(|(id, rel, base, _)| (*id, rel.clone(), base.clone()))
-        .collect();
-    fork.deleted = deleted;
-
-    // Created registration + Deleted removal from the source root.
-    let mut created_texts: Vec<(FileId, String)> = Vec::new();
-    for (rel, text) in &created {
-        let id = add_created_file(session, fork, rel, text)?;
-        created_texts.push((id, text.clone()));
-    }
-    remove_deleted_files(session, fork)?;
-
-    // Scope: edited crates + dependents. Deleted files cannot be diagnosed (off the root).
-    let mut edited: Vec<&RelPath> = fork.modified.iter().map(|(_, r, _)| r).collect();
-    edited.extend(fork.created.iter().map(|(_, r)| r));
-    edited.extend(fork.deleted.iter().map(|(_, r, _)| r));
-    fork.full_scope = scoped_files(&session.files, &session.rev_deps, &edited);
-
-    let mut new_texts: Vec<(FileId, Option<String>)> = modified
-        .into_iter()
-        .map(|(id, _, _, new)| (id, Some(new)))
-        .collect();
-    new_texts.extend(created_texts.into_iter().map(|(id, t)| (id, Some(t))));
-    new_texts.extend(fork.deleted.iter().map(|(id, _, _)| (*id, None)));
-    apply_texts(&mut session.host, &mut session.poisoned, &new_texts)?;
-    fork.applied = true;
-    Ok(())
+    let sampled = session.assert_revert;
+    push_level(a, session, edits, edited_paths(edits), sampled)
 }
 
 pub(crate) fn diagnostics(
@@ -161,46 +226,52 @@ pub(crate) fn diagnostics(
     fork: &RaFork,
     scope: Scope,
 ) -> Result<ScopedFindings, AnalyzerError> {
-    diagnostics_with_panics(a, session, fork, scope).map(|(found, _)| found)
+    if !stack::is_live(session, fork.id, ForkPort::Analyzer) {
+        return Err(AnalyzerError::ForkInUse);
+    }
+    refuse_poisoned(session)?;
+    diagnose_level(a, session, scope, None).map(|(found, _)| found)
 }
 
-/// The findings of one diagnostics run, and the detector and file of each detector panic
-/// contained in it.
+pub(crate) fn discard(
+    a: &RaAnalyzer,
+    session: &mut RaSession,
+    fork: &RaFork,
+) -> Result<(), AnalyzerError> {
+    if !stack::is_live(session, fork.id, ForkPort::Analyzer) {
+        return Err(AnalyzerError::ForkInUse);
+    }
+    release_levels(a, session).map_err(RevertFailure::into_analyzer)
+}
+
+/// The findings and the files of one diagnosis, and the detector and file of each detector
+/// panic contained in it.
 pub(crate) type Diagnosed = (ScopedFindings, Vec<(GapDetector, RelPath)>);
 
-/// [`diagnostics`], and the detector panics of the run (the `Analyzer` port has no place for
-/// them).
-pub(crate) fn diagnostics_with_panics(
+/// Diagnoses the top level; with no level, nothing. `deadline` cuts the diagnosis off with
+/// `Cancelled`. A diagnosis that ends in an error records no event; one that ends records
+/// `Event::Checked` with the level's write time plus the time of this diagnosis.
+pub(crate) fn diagnose_level(
     a: &RaAnalyzer,
     session: &RaSession,
-    fork: &RaFork,
     scope: Scope,
+    deadline: Option<&Deadline>,
 ) -> Result<Diagnosed, AnalyzerError> {
-    if !fork.applied {
+    let Some(top) = session.stack.last() else {
         return Ok((ScopedFindings::default(), Vec::new()));
-    }
-    let live = |files: &[(FileId, RelPath)]| -> Vec<(FileId, RelPath)> {
-        let mut out: Vec<(FileId, RelPath)> = files
-            .iter()
-            .filter(|(id, _)| !fork.deleted.iter().any(|(did, _, _)| did == id))
-            .cloned()
-            .collect();
-        out.extend(fork.created.iter().cloned());
-        out
     };
-    let workspace = live(&session.files);
+    let started_ms = a.clock.now_ms();
     let diag_scope = match scope {
-        Scope::Affected => live(&fork.full_scope),
-        Scope::Workspace => workspace.clone(),
+        Scope::Affected => &top.scope,
+        Scope::Workspace => &top.live,
     };
-
     let collected = collect_errors_par(
         &session.host,
-        &diag_scope,
-        &workspace,
+        diag_scope,
+        &top.live,
         session.threads,
         session.gap_detectors,
-        session.deadline.as_ref(),
+        deadline,
         Detector {
             fault: a.detector_fault.as_ref(),
             panics: &session.detector_panics,
@@ -212,7 +283,9 @@ pub(crate) fn diagnostics_with_panics(
     a.observer.observe(Event::Checked {
         scope_files: diag_scope.len(),
         total_files: session.files.len(),
-        check_ms: a.clock.now_ms().saturating_sub(fork.apply_started_ms),
+        check_ms: top
+            .write_ms
+            .saturating_add(a.clock.now_ms().saturating_sub(started_ms)),
     });
     let unseen = if collected.unexpanded_macro {
         BTreeSet::from([UnseenClass::UnexpandedMacro])
@@ -229,85 +302,389 @@ pub(crate) fn diagnostics_with_panics(
     ))
 }
 
-pub(crate) fn discard(
-    a: &RaAnalyzer,
-    session: &mut RaSession,
-    fork: RaFork,
-) -> Result<(), AnalyzerError> {
-    let result = revert(a, session, &fork);
-    session.live_fork = false;
-    result
+/// The paths of `edits`, sorted, unique.
+pub(crate) fn edited_paths(edits: &[Edit]) -> Vec<RelPath> {
+    let mut edited: Vec<RelPath> = edits.iter().map(|e| e.path.clone()).collect();
+    edited.sort();
+    edited.dedup();
+    edited
 }
 
-fn revert(a: &RaAnalyzer, session: &mut RaSession, fork: &RaFork) -> Result<(), AnalyzerError> {
-    let t = a.clock.now_ms();
-    let mut base_texts: Vec<(FileId, Option<String>)> = fork
-        .modified
+/// Resolves `edits` (whose paths are `edited`, from [`edited_paths`]) against the state of the
+/// level below, writes them in place and pushes the level. `sampled` says that the revert of this level re-diagnoses its scope and compares it
+/// with what the scope had before the write.
+///
+/// A refused write (`Edit`, or a failure of the diagnosis that sampling takes first) pushes no
+/// level and leaves every text as it was. A panic in a database write poisons the session and
+/// is not undone.
+pub(crate) fn push_level(
+    a: &RaAnalyzer,
+    session: &mut RaSession,
+    edits: &[Edit],
+    edited: Vec<RelPath>,
+    sampled: bool,
+) -> Result<(), AnalyzerError> {
+    let write_started_ms = a.clock.now_ms();
+    let actions = resolve(session, edits)?;
+    enter_base_texts(session, &actions);
+
+    let sampled = if sampled {
+        let below_scope = if edited.is_empty() {
+            Vec::new()
+        } else {
+            let edited_refs: Vec<&RelPath> = edited.iter().collect();
+            scoped_files(live_below(session), &session.rev_deps, &edited_refs)
+        };
+        let expected = if session.stack.is_empty() {
+            let paths: Vec<RelPath> = below_scope.iter().map(|(_, r)| r.clone()).collect();
+            restrict(&session.baseline, &paths)
+        } else {
+            findings_of(a, session, &below_scope, live_below(session))?
+        };
+        Some(Sampled {
+            below_scope,
+            expected,
+        })
+    } else {
+        None
+    };
+
+    let mut level = Level {
+        edited,
+        modified: Vec::new(),
+        created: Vec::new(),
+        revived: Vec::new(),
+        deleted: Vec::new(),
+        saved_roots: Vec::new(),
+        live: Vec::new(),
+        scope: Vec::new(),
+        sampled,
+        write_ms: 0,
+    };
+    let inject = a.db_write_panic == Some(DbWritePanic::Write);
+    if let Err(e) = write_actions(session, &mut level, actions, inject) {
+        // A panic poisoned the session and the database is not touched again; a refusal is
+        // undone, and an undo that panics is that panic, not the refusal.
+        if matches!(e, AnalyzerError::Edit { .. }) {
+            undo(session, &level)?;
+        }
+        return Err(e);
+    }
+
+    let deleted: HashSet<FileId> = level.deleted.iter().map(|(id, _, _)| *id).collect();
+    let mut live: Vec<(FileId, RelPath)> = live_below(session)
         .iter()
-        .map(|(id, _, base)| (*id, Some(base.clone())))
+        .filter(|(id, _)| !deleted.contains(id))
+        .cloned()
         .collect();
+    live.extend(level.created.iter().cloned());
+    live.extend(level.revived.iter().cloned());
+    level.scope = if level.edited.is_empty() {
+        Vec::new()
+    } else {
+        let edited_refs: Vec<&RelPath> = level.edited.iter().collect();
+        scoped_files(&live, &session.rev_deps, &edited_refs)
+    };
+    level.live = live;
+    level.write_ms = a.clock.now_ms().saturating_sub(write_started_ms);
+    session.stack.push(level);
+    Ok(())
+}
+
+/// Resolves each edit against the files of the level below. The last edit of a path wins.
+fn resolve(session: &RaSession, edits: &[Edit]) -> Result<Vec<Action>, AnalyzerError> {
+    let live_by_rel: HashMap<&RelPath, FileId> =
+        live_below(session).iter().map(|(id, r)| (r, *id)).collect();
+    // Every file some level of this fork knows, deleted ones included; built at the first
+    // written path that is not live.
+    let mut known: Option<HashMap<&RelPath, FileId>> = None;
+
+    let mut actions: Vec<Action> = Vec::new();
+    let mut index: HashMap<&RelPath, usize> = HashMap::new();
+    for edit in edits {
+        let action = match (live_by_rel.get(&edit.path), &edit.new_text) {
+            (Some(&id), Some(new)) => Action::Modify {
+                id,
+                rel: edit.path.clone(),
+                below: db_text(&session.host, id)?,
+                new: new.clone(),
+            },
+            (Some(&id), None) => Action::Delete {
+                id,
+                rel: edit.path.clone(),
+                below: db_text(&session.host, id)?,
+            },
+            (None, Some(new)) => match known
+                .get_or_insert_with(|| known_files(session))
+                .get(&edit.path)
+            {
+                Some(&id) => Action::Revive {
+                    id,
+                    rel: edit.path.clone(),
+                    new: new.clone(),
+                },
+                None => {
+                    if session.root.join(edit.path.as_str()).exists() {
+                        return Err(edit_err(
+                            &edit.path,
+                            "target exists on disk but is not indexed (non-.rs or excluded?)",
+                        ));
+                    }
+                    Action::Create {
+                        rel: edit.path.clone(),
+                        new: new.clone(),
+                    }
+                }
+            },
+            (None, None) => {
+                return Err(edit_err(
+                    &edit.path,
+                    "cannot delete a file that is not in the state below",
+                ));
+            }
+        };
+        match index.get(&edit.path) {
+            Some(&i) => actions[i] = action,
+            None => {
+                index.insert(&edit.path, actions.len());
+                actions.push(action);
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// Every file the session or some level of its fork knows, by path, deleted ones included.
+fn known_files(session: &RaSession) -> HashMap<&RelPath, FileId> {
+    let mut known: HashMap<&RelPath, FileId> =
+        session.files.iter().map(|(id, r)| (r, *id)).collect();
+    for level in &session.stack {
+        known.extend(level.created.iter().map(|(id, r)| (r, *id)));
+        known.extend(level.revived.iter().map(|(id, r)| (r, *id)));
+        known.extend(level.deleted.iter().map(|(id, r, _)| (r, *id)));
+    }
+    known
+}
+
+/// Enters the base text of each load-time file `actions` modify or delete that the record does
+/// not hold yet; at its first touch the text below is the base text. Nothing is written yet.
+/// A file a level created is the one file that is not of load time.
+fn enter_base_texts(session: &mut RaSession, actions: &[Action]) {
+    let created: HashSet<FileId> = session
+        .stack
+        .iter()
+        .flat_map(|l| l.created.iter().map(|(id, _)| *id))
+        .collect();
+    for action in actions {
+        if let Action::Modify { id, below, .. } | Action::Delete { id, below, .. } = action
+            && !created.contains(id)
+        {
+            session
+                .base_texts
+                .entry(*id)
+                .or_insert_with(|| below.clone());
+        }
+    }
+}
+
+/// Writes the resolved actions in place, recording each step in `level` as it is made.
+/// `inject` makes the database write of the texts panic (the test hook `DbWritePanic::Write`).
+fn write_actions(
+    session: &mut RaSession,
+    level: &mut Level,
+    actions: Vec<Action>,
+    inject: bool,
+) -> Result<(), AnalyzerError> {
+    let mut new_texts: Vec<(FileId, Option<String>)> = Vec::new();
+    let mut added: Vec<Action> = Vec::new();
+    for action in actions {
+        match action {
+            Action::Modify {
+                id,
+                rel,
+                below,
+                new,
+            } => {
+                level.modified.push((id, rel, below));
+                new_texts.push((id, Some(new)));
+            }
+            Action::Delete { id, rel, below } => {
+                level.deleted.push((id, rel, below));
+                new_texts.push((id, None));
+            }
+            Action::Create { .. } | Action::Revive { .. } => added.push(action),
+        }
+    }
+    for action in added {
+        match action {
+            Action::Create { rel, new } => {
+                let id = add_created_file(session, level, &rel, &new)?;
+                new_texts.push((id, Some(new)));
+            }
+            Action::Revive { id, rel, new } => {
+                add_revived_file(session, level, id, &rel)?;
+                new_texts.push((id, Some(new)));
+            }
+            Action::Modify { .. } | Action::Delete { .. } => {}
+        }
+    }
+    remove_deleted_files(session, level)?;
+    if new_texts.is_empty() {
+        return Ok(());
+    }
+    apply_texts(&mut session.host, &mut session.poisoned, &new_texts, inject)
+}
+
+/// Takes back what a refused write had done before it was refused: the source roots and the vfs
+/// entries of created files. No text was written yet. A panic restoring a root poisons the
+/// session and is the result.
+fn undo(session: &mut RaSession, level: &Level) -> Result<(), AnalyzerError> {
+    let restored = restore_roots(session, level);
+    drop_created(session, level);
+    restored
+}
+
+/// Reverts the top level and returns `true`; with no level, nothing happens and it is `false`.
+///
+/// The level is removed whatever happens. The texts of the files it modified or deleted are
+/// compared with their texts before the write on every revert, and the findings of its scope
+/// when the write was sampled; a difference poisons the session. Every failure of a revert
+/// poisons the session: one that cannot be carried out or confirmed leaves a session that cannot
+/// be trusted. An `Event::Reverted` records the revert unless it could not run to its end.
+pub(crate) fn pop_level(a: &RaAnalyzer, session: &mut RaSession) -> Result<bool, RevertFailure> {
+    let Some(level) = session.stack.pop() else {
+        return Ok(false);
+    };
+    let result = revert_level(a, session, &level);
+    if session.stack.is_empty() && session.poisoned.is_none() {
+        session.base_texts.clear();
+    }
+    result.map(|()| true)
+}
+
+/// The failure of a revert step that left the session unusable: `Poisoned`, with the poison the
+/// step set, or else (a step that failed without setting one) poisoning the session with `e`.
+fn failure(session: &mut RaSession, e: AnalyzerError) -> RevertFailure {
+    let msg = session
+        .poisoned
+        .get_or_insert_with(|| format!("a revert step failed: {e}"));
+    RevertFailure::Poisoned(msg.clone())
+}
+
+fn revert_level(
+    a: &RaAnalyzer,
+    session: &mut RaSession,
+    level: &Level,
+) -> Result<(), RevertFailure> {
+    let t = a.clock.now_ms();
+    let mut texts: Vec<(FileId, Option<String>)> = Vec::new();
+    for (id, rel, text) in level.modified.iter().chain(&level.deleted) {
+        let mut text = text.clone();
+        if a.revert_fault.as_ref() == Some(rel) {
+            text.push('\n');
+        }
+        texts.push((*id, Some(text)));
+    }
     // A created file loses its text (restoring the source root drops it from the module tree).
-    base_texts.extend(
-        fork.created
+    texts.extend(
+        level
+            .created
             .iter()
             .map(|(id, _)| (*id, Some(String::new()))),
     );
-    // A deleted file gets its base text back.
-    base_texts.extend(
-        fork.deleted
-            .iter()
-            .map(|(id, _, base)| (*id, Some(base.clone()))),
-    );
-    if !base_texts.is_empty() {
-        apply_texts(&mut session.host, &mut session.poisoned, &base_texts)?;
+    texts.extend(level.revived.iter().map(|(id, _)| (*id, None)));
+    if !texts.is_empty() {
+        let inject = a.db_write_panic == Some(DbWritePanic::Revert);
+        apply_texts(&mut session.host, &mut session.poisoned, &texts, inject)
+            .map_err(|e| failure(session, e))?;
     }
-    if !fork.saved_roots.is_empty() {
-        restore_roots(session, fork)?;
+    if !level.saved_roots.is_empty() {
+        restore_roots(session, level).map_err(|e| failure(session, e))?;
     }
-    let revert_ok = if session.assert_revert && fork.applied {
-        // Created files are off the root after the revert; deleted ones are back.
-        let assert_scope: Vec<(FileId, RelPath)> = fork
-            .full_scope
-            .iter()
-            .filter(|(id, _)| !fork.created.iter().any(|(cid, _)| cid == id))
-            .cloned()
-            .collect();
-        let paths: Vec<RelPath> = assert_scope.iter().map(|(_, r)| r.clone()).collect();
-        let want = restrict(&session.baseline, &paths);
-        let after = collect_errors_par(
-            &session.host,
-            &assert_scope,
-            &session.files,
-            session.threads,
-            session.gap_detectors,
-            // Revert is outside the cut-off.
-            None,
-            Detector {
-                fault: a.detector_fault.as_ref(),
-                panics: &session.detector_panics,
-            },
-        )?
-        .findings;
-        Some(same_findings(&after, &want))
-    } else {
-        None
+    drop_created(session, level);
+
+    // The texts first: a difference there ends the revert's checks.
+    let before: Vec<(RelPath, Fingerprint)> = level
+        .modified
+        .iter()
+        .chain(&level.deleted)
+        .map(|(_, rel, text)| (rel.clone(), Fingerprint::of(text.as_bytes())))
+        .collect();
+    let after: Vec<(RelPath, Fingerprint)> = level
+        .modified
+        .iter()
+        .chain(&level.deleted)
+        .filter_map(|(id, rel, _)| {
+            let text = db_text(&session.host, *id).ok()?;
+            Some((rel.clone(), Fingerprint::of(text.as_bytes())))
+        })
+        .collect();
+    let text_mismatch = revert_intact(&before, &after).err();
+
+    let revert_ok = match (&text_mismatch, &level.sampled) {
+        (None, Some(sampled)) => {
+            // The texts are back but the revert cannot be confirmed: the session is not trusted.
+            let found = if a.reassert_fault {
+                Err(AnalyzerError::Panicked("injected re-assert fault".into()))
+            } else {
+                findings_of(a, session, &sampled.below_scope, live_below(session))
+            };
+            let found = found.map_err(|e| {
+                session.poisoned = Some(format!("the re-assert after a revert could not run: {e}"));
+                failure(session, e)
+            })?;
+            Some(same_findings(&found, &sampled.expected))
+        }
+        _ => None,
     };
     a.observer.observe(Event::Reverted {
         revert_ms: a.clock.now_ms().saturating_sub(t),
         revert_ok,
     });
+    if let Some(paths) = text_mismatch {
+        session.poisoned = Some(format!(
+            "text of {} file(s) differs after revert",
+            paths.len()
+        ));
+        return Err(RevertFailure::Mismatch(paths));
+    }
     if revert_ok == Some(false) {
         session.poisoned =
-            Some("diagnostics after revert differ from the baseline (re-assert)".to_owned());
-        return Err(AnalyzerError::RevertMismatch);
+            Some("diagnostics after revert differ from those before the write (re-assert)".into());
+        return Err(RevertFailure::Mismatch(level.edited.clone()));
     }
+    Ok(())
+}
+
+/// Ends the fork: reverts every level, top first, under the rules of [`pop_level`].
+///
+/// A session that is already poisoned is not written again: the levels are dropped and the
+/// result is `Poisoned`. A revert that fails has poisoned the session, so the first failure stops
+/// the release at once: nothing more is written, the remaining levels are dropped and that
+/// failure is the result. The base texts the levels recorded stay with a poisoned session; a
+/// session that is not poisoned forgets them.
+pub(crate) fn release_levels(a: &RaAnalyzer, session: &mut RaSession) -> Result<(), RevertFailure> {
+    session.live = None;
+    if let Some(msg) = &session.poisoned {
+        let msg = msg.clone();
+        session.stack.clear();
+        return Err(RevertFailure::Poisoned(msg));
+    }
+    while !session.stack.is_empty() {
+        if let Err(failed) = pop_level(a, session) {
+            session.stack.clear();
+            return Err(failed);
+        }
+    }
+    // A refused write entered base texts and pushed no level.
+    session.base_texts.clear();
     Ok(())
 }
 
 /// Registers a created file in the vfs and its sibling's source root; returns its FileId.
 fn add_created_file(
     session: &mut RaSession,
-    fork: &mut RaFork,
+    level: &mut Level,
     rel: &RelPath,
     text: &str,
 ) -> Result<FileId, AnalyzerError> {
@@ -349,12 +726,49 @@ fn add_created_file(
         }
     };
 
-    // Copy the source root with the new file added (without it `mod x;` does not resolve).
+    let root_id = {
+        let db = session.host.raw_database();
+        db.file_source_root(sibling_id).source_root_id(db)
+    };
+    insert_into_root(session, level, root_id, file_id, vfs_path)?;
     let db = session.host.raw_database_mut();
-    let root_id = db.file_source_root(sibling_id).source_root_id(db);
+    guarded(&mut session.poisoned, || {
+        db.set_file_source_root_with_durability(file_id, root_id, Durability::LOW);
+    })?;
+    level.created.push((file_id, rel.clone()));
+    Ok(file_id)
+}
+
+/// Puts a file a level below deleted back into its source root.
+fn add_revived_file(
+    session: &mut RaSession,
+    level: &mut Level,
+    file_id: FileId,
+    rel: &RelPath,
+) -> Result<(), AnalyzerError> {
+    let vfs_path = session.vfs.file_path(file_id).clone();
+    let root_id = {
+        let db = session.host.raw_database();
+        db.file_source_root(file_id).source_root_id(db)
+    };
+    insert_into_root(session, level, root_id, file_id, vfs_path)?;
+    level.revived.push((file_id, rel.clone()));
+    Ok(())
+}
+
+/// Copies the source root with the file added (without it `mod x;` does not resolve), saving
+/// the root the first time this level changes it.
+fn insert_into_root(
+    session: &mut RaSession,
+    level: &mut Level,
+    root_id: SourceRootId,
+    file_id: FileId,
+    vfs_path: VfsPath,
+) -> Result<(), AnalyzerError> {
+    let db = session.host.raw_database_mut();
     let old_root = db.source_root(root_id).source_root(db);
-    if !fork.saved_roots.iter().any(|(id, _)| *id == root_id) {
-        fork.saved_roots.push((root_id, old_root.clone()));
+    if !level.saved_roots.iter().any(|(id, _)| *id == root_id) {
+        level.saved_roots.push((root_id, old_root.clone()));
     }
     let mut file_set = FileSet::default();
     for f in old_root.iter() {
@@ -369,23 +783,18 @@ fn add_created_file(
             TriArc::new(SourceRoot::new_local(file_set)),
             Durability::LOW,
         );
-    })?;
-    guarded(&mut session.poisoned, || {
-        db.set_file_source_root_with_durability(file_id, root_id, Durability::LOW);
-    })?;
-    fork.created.push((file_id, rel.clone()));
-    Ok(file_id)
+    })
 }
 
 /// Removes deleted files from their source roots. The vfs is not touched: the file still exists
 /// on disk, so restoring its text is enough to revert.
-fn remove_deleted_files(session: &mut RaSession, fork: &mut RaFork) -> Result<(), AnalyzerError> {
+fn remove_deleted_files(session: &mut RaSession, level: &mut Level) -> Result<(), AnalyzerError> {
     let db = session.host.raw_database_mut();
-    for (file_id, _, _) in &fork.deleted {
+    for (file_id, _, _) in &level.deleted {
         let root_id = db.file_source_root(*file_id).source_root_id(db);
         let old_root = db.source_root(root_id).source_root(db);
-        if !fork.saved_roots.iter().any(|(id, _)| *id == root_id) {
-            fork.saved_roots.push((root_id, old_root.clone()));
+        if !level.saved_roots.iter().any(|(id, _)| *id == root_id) {
+            level.saved_roots.push((root_id, old_root.clone()));
         }
         let mut file_set = FileSet::default();
         for f in old_root.iter() {
@@ -407,20 +816,24 @@ fn remove_deleted_files(session: &mut RaSession, fork: &mut RaFork) -> Result<()
     Ok(())
 }
 
-/// Reverts created files: restores the original source roots and drops them from the vfs.
-/// (A path created again gets the same FileId back from the vfs.)
-fn restore_roots(session: &mut RaSession, fork: &RaFork) -> Result<(), AnalyzerError> {
+/// Restores the source roots as they were before the level.
+fn restore_roots(session: &mut RaSession, level: &Level) -> Result<(), AnalyzerError> {
     let db = session.host.raw_database_mut();
-    for (root_id, root) in &fork.saved_roots {
+    for (root_id, root) in &level.saved_roots {
         guarded(&mut session.poisoned, || {
             db.set_source_root_with_durability(*root_id, root.clone(), Durability::LOW);
         })?;
     }
-    for (_, rel) in &fork.created {
+    Ok(())
+}
+
+/// Drops the files a level created from the vfs.
+/// (A path created again gets the same FileId back from the vfs.)
+fn drop_created(session: &mut RaSession, level: &Level) {
+    for (_, rel) in &level.created {
         let abs = AbsPathBuf::assert_utf8(session.root.join(rel.as_str()));
         session.vfs.set_file_contents(VfsPath::from(abs), None);
     }
-    Ok(())
 }
 
 /// Applies texts; `None` removes the file (Deleted / Created revert). A panic poisons the session.
@@ -428,12 +841,16 @@ fn apply_texts(
     host: &mut AnalysisHost,
     poisoned: &mut Option<String>,
     texts: &[(FileId, Option<String>)],
+    inject: bool,
 ) -> Result<(), AnalyzerError> {
     let mut change = ChangeWithProcMacros::default();
     for (file_id, text) in texts {
         change.change_file(*file_id, text.clone());
     }
     guarded(poisoned, || {
+        if inject {
+            panic!("injected database write panic");
+        }
         host.apply_change(change);
     })
 }

@@ -16,6 +16,7 @@ use crate::check::{fingerprints, map_error};
 use crate::diagnostics::{diagnostics_config, panic_message};
 use crate::fork::db_text;
 use crate::session::{ExpanderPanic, RaSession};
+use crate::stack;
 use ra_ap_hir::{Crate, PrefixKind};
 use ra_ap_ide::TextRange as RaRange;
 use ra_ap_ide::{
@@ -1643,9 +1644,7 @@ impl Expander for RaAnalyzer {
         targets: &[Target],
         max: usize,
     ) -> Result<Vec<Blueprint>, ExpandError> {
-        if let Some(msg) = &s.poisoned {
-            return Err(ExpandError::Session(CheckError::Poisoned(msg.clone())));
-        }
+        stack::require_free(s).map_err(ExpandError::Session)?;
         if targets.is_empty() || max == 0 {
             return Ok(Vec::new());
         }
@@ -1658,9 +1657,8 @@ impl Expander for RaAnalyzer {
         paths.sort();
         paths.dedup();
         let before = fingerprints(s, &paths);
-        let mut f = self
-            .fork(s)
-            .map_err(|e| ExpandError::Session(map_error(e, &paths)))?;
+        let mut f =
+            Analyzer::fork(self, s).map_err(|e| ExpandError::Session(map_error(e, &paths)))?;
         let applied = self.apply(s, &mut f, state);
         let out = applied.is_ok().then(|| generate(s, state_fp, targets, max));
         let discarded = self.discard(s, f);
