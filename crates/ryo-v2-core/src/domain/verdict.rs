@@ -69,6 +69,8 @@ impl Verdict {
     ///   and, for a search's composed edits to be those edits, on `stage` C3 (a step only writes).
     ///   tested: ryo-v2-ra tests/stack.rs files_of_and_of_level_equal_the_check_over_a_stack
     ///   tested: ryo-v2-ra tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
+    ///   tested: ryo-v2-ra tests/stack.rs search_and_apply_give_the_same_verdict_on_a_chain
+    ///   tested: ryo-v2-oracle tests/search_recall.rs stacked_verdicts_equal_the_flat_check
     pub fn of_level(
         baseline: &[Finding],
         below: &ScopedFindings,

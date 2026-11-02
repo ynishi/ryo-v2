@@ -273,6 +273,7 @@ pub(crate) fn report_to_json(r: &SearchReport) -> Value {
                 "assess_ms": d.assess_ms,
                 "judge_ms": d.judge_ms,
                 "check_ms": d.check_ms,
+                "writes": d.writes,
             })
         })
         .collect();
@@ -371,6 +372,7 @@ mod tests {
                 depth: 1,
                 generated: 7,
                 kept: 5,
+                writes: 9,
                 ..DepthStats::default()
             }],
             judge_providers: vec![ProviderTag::new("metric").expect("tag")],
@@ -389,6 +391,7 @@ mod tests {
         assert_eq!(v["ranking"][0]["reward"]["edit_bytes"], 30);
         assert_eq!(v["ranking"][0]["prior"], 500);
         assert_eq!(v["depths"][0]["generated"], 7);
+        assert_eq!(v["depths"][0]["writes"], 9);
         assert_eq!(v["judge"]["providers"][0], "metric");
         assert_eq!(v["soft_stopped"], true);
         assert_eq!(v["resolution"]["resolution"], "failed");

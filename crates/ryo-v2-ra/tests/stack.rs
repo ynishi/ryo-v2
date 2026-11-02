@@ -2400,3 +2400,164 @@ fn expand_refuses_a_state_that_is_not_the_top_level() {
     assert_eq!(top_of(&a, &s, &fork), before);
     a.release(&mut s, fork).expect("release");
 }
+
+/// A Blueprint of W with one rewrite of `path`, whose text before it is `text`.
+fn w_blueprint(
+    n: u16,
+    command: ryo_v2_core::domain::Command,
+    path: &str,
+    text: &str,
+    splices: Vec<ryo_v2_core::domain::Splice>,
+    builds_on: Option<ryo_v2_core::domain::BlueprintId>,
+) -> ryo_v2_core::domain::Blueprint {
+    use ryo_v2_core::domain::{
+        BaseFp, Blueprint, BlueprintId, BlueprintParts, DecisionRecord, ReadRange, SpecRef,
+        TextRange,
+    };
+    let len = u32::try_from(text.len()).expect("a short text");
+    Blueprint::new(BlueprintParts {
+        id: BlueprintId::parse(&format!("01890a5d-ac96-774b-bcce-b302099a{n:04x}")).expect("id"),
+        command,
+        splices,
+        reads: vec![
+            ReadRange::capture(rel(path), text, TextRange::new(0, len).expect("range"))
+                .expect("read"),
+        ],
+        bases: vec![BaseFp::capture(rel(path), text)],
+        spec_refs: vec![SpecRef::parse("spec#t").expect("spec ref")],
+        record: DecisionRecord::new("test", "why").expect("record"),
+        builds_on,
+    })
+    .expect("a Blueprint")
+}
+
+/// Proposes `child` for the state `at` and nothing for any other.
+struct ChildAt {
+    at: ryo_v2_core::domain::StateFp,
+    child: ryo_v2_core::domain::Blueprint,
+}
+
+impl Expander for ChildAt {
+    type Session = RaSession;
+    fn expand(
+        &self,
+        _: &mut RaSession,
+        state: &[Edit],
+        _: &[Target],
+        _: usize,
+    ) -> Result<Vec<ryo_v2_core::domain::Blueprint>, ExpandError> {
+        Ok(if ryo_v2_core::domain::StateFp::of(state) == self.at {
+            vec![self.child.clone()]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+#[test]
+fn search_and_apply_give_the_same_verdict_on_a_chain() {
+    use ryo_v2_core::app::apply::apply_blueprints;
+    use ryo_v2_core::app::search::{DEFAULT_SEARCH_BUDGET, SearchInput, search_decision};
+    use ryo_v2_core::domain::{
+        BlueprintSet, Command, DEFAULT_WEIGHTS, Ident, Resolution, Splice, StateFp, TextRange,
+    };
+    use ryo_v2_core::infra::judge::MetricJudge;
+    use ryo_v2_ra::SyntaxAssessor;
+
+    let (a, _) = analyzer(false);
+    let (_f, mut s) = loaded_w("stack_search_and_apply", &a);
+    let range = |at: usize, len: usize| {
+        let at = u32::try_from(at).expect("offset");
+        TextRange::new(at, at + u32::try_from(len).expect("len")).expect("range")
+    };
+    // P renames the parameter `s` of `ga` in a/src/lib.rs.
+    let lib = "a/src/lib.rs";
+    let param = A_LIB.find("ga(s").expect("the parameter") + 3;
+    let call = A_LIB.find("    s.missing").expect("the call") + 4;
+    let p_splices = [param, call]
+        .into_iter()
+        .map(|at| Splice::replace(rel(lib), range(at, 1), "t").expect("splice"))
+        .collect();
+    let rename = Command::RenameLocal {
+        from: Ident::parse("s").expect("ident"),
+        to: Ident::parse("t").expect("ident"),
+    };
+    let p = w_blueprint(1, rename, lib, A_LIB, p_splices, None);
+    let p_text = A_LIB
+        .replace("ga(s: S)", "ga(t: S)")
+        .replace("    s.missing", "    t.missing");
+    // C, on P's state, extracts a variable in a/src/x.rs, adding an error of its own and a macro
+    // call that does not expand.
+    let x = "a/src/x.rs";
+    let one = A_X.find("    1").expect("the literal") + 4;
+    let c_splices = vec![
+        Splice::insert(
+            rel(x),
+            0,
+            "fn helper() {\n    let t = 1u32.nope_c();\n    not_a_macro!();\n}\n",
+        )
+        .expect("insert"),
+        Splice::replace(rel(x), range(one, 1), "t").expect("replace"),
+    ];
+    let extract = Command::ExtractVariable {
+        name: Ident::parse("t").expect("ident"),
+    };
+    let chained = w_blueprint(2, extract.clone(), x, A_X, c_splices.clone(), Some(p.id()));
+    let free = w_blueprint(2, extract, x, A_X, c_splices, None);
+
+    // apply: P, then C built on it, each checked flat from the base.
+    let set = BlueprintSet::new(vec![p.clone(), chained]).expect("a set");
+    let applied = apply_blueprints(&a, &mut s, &set, Scope::Affected).expect("apply");
+    let Resolution::Decided { evidence, .. } = &applied else {
+        panic!("apply decides P: {applied:?}");
+    };
+    let flat: BTreeMap<_, _> = evidence.verdicts().iter().cloned().collect();
+
+    // The search: P as its root, C proposed on P's state, two stacked levels.
+    let expander = ChildAt {
+        at: StateFp::of(&[Edit::write(rel(lib), p_text)]),
+        child: free,
+    };
+    let mut budget = DEFAULT_SEARCH_BUDGET;
+    budget.max_depth = 2;
+    let roots = [p.clone()];
+    let report = search_decision(
+        &a,
+        &expander,
+        &SyntaxAssessor,
+        &MetricJudge,
+        &MonotonicClock::new(),
+        &mut s,
+        &SearchInput {
+            start: &[],
+            roots: &roots,
+            targets: &[],
+            probes: &[],
+            scope: Scope::Affected,
+            budget,
+            weights: DEFAULT_WEIGHTS,
+            keep_trace_edits: false,
+        },
+    )
+    .expect("search");
+    assert_eq!(report.depths.len(), 2, "{report:?}");
+    let Resolution::Decided { evidence, .. } = &report.resolution else {
+        panic!("the search decides P: {report:?}");
+    };
+    let stacked: BTreeMap<_, _> = evidence.verdicts().iter().cloned().collect();
+
+    assert_eq!(stacked.len(), 2, "both checked on the stack: {stacked:?}");
+    assert_eq!(stacked, flat, "the same verdicts, unseen classes included");
+    let p_verdict = &stacked[&p.id()];
+    assert!(p_verdict.passed(), "P passes: {p_verdict:?}");
+    let c = stacked
+        .iter()
+        .find(|(id, _)| **id != p.id())
+        .map(|(_, v)| v)
+        .expect("C's verdict");
+    assert!(!c.passed(), "C adds errors: {c:?}");
+    assert!(
+        c.unseen.contains(&UnseenClass::UnexpandedMacro),
+        "C's macro call is observed: {c:?}"
+    );
+}

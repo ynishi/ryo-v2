@@ -12,7 +12,7 @@ use ryo_v2_core::app::ports::{
 };
 use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::search::compose;
-use ryo_v2_core::domain::{Edit, Finding, Scope, Verdict};
+use ryo_v2_core::domain::{Edit, Finding, RelPath, Scope, ScopedFindings, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
@@ -166,11 +166,24 @@ fn rebuilt_once<A: Analyzer>(
     })
 }
 
+/// The diagnosis of the top level at `scope`, and the files a check of the edits that take the
+/// base to its state covers (`Stacked::files_of`).
+fn diagnose_top<A: Stacked>(
+    a: &A,
+    s: &A::Session,
+    f: &A::Fork,
+    scope: Scope,
+) -> Result<(ScopedFindings, Vec<RelPath>), CheckError> {
+    let found = a.diagnose(s, f, scope)?;
+    Ok((found, a.files_of(s, f, scope)?))
+}
+
 /// One level of `edits` on top of the live fork's top level: write, diagnose, pop.
 ///
-/// The verdict is the diagnosis of the level against `baseline`, so it counts the new errors in
-/// the files that level's own edits reach, at the level's state: an error a level below made in
-/// one of those files is counted too, and one it made in a file outside them is not.
+/// The verdict is formed as the search forms a child's: `Verdict::of_level` of the level's
+/// diagnosis on top of `below`, the findings of the parent's level, kept to the files a check of
+/// the composed edits covers. So it is the verdict the rebuilt mode gives for the same state.
+#[allow(clippy::too_many_arguments)]
 fn stacked_once<A: Stacked>(
     a: &A,
     s: &mut A::Session,
@@ -179,12 +192,13 @@ fn stacked_once<A: Stacked>(
     edits: &[Edit],
     scope: Scope,
     baseline: &[Finding],
+    below: &ScopedFindings,
 ) -> Result<Once> {
     observer.take();
     // A refused write pushes no level, so there is nothing to pop.
     a.write(s, f, edits)
         .context("write the variant as a level")?;
-    let diagnosed = a.diagnose(s, f, scope);
+    let diagnosed = diagnose_top(a, s, f, scope);
     let popped = a.pop(s, f);
     sample_memory(observer);
     let stats = read_events(observer.take());
@@ -192,8 +206,9 @@ fn stacked_once<A: Stacked>(
         (_, Err(CheckError::RevertMismatch { .. })) => ("REVERT-MISMATCH", None),
         (_, Err(e)) => return Err(e).context("pop the variant's level"),
         (Err(e), Ok(_)) => return Err(e).context("diagnose the variant's level"),
-        (Ok(found), Ok(_)) => {
-            let v = Verdict::from_baseline(baseline, &found);
+        (Ok((found, files)), Ok(_)) => {
+            let (v, _) =
+                Verdict::of_level(baseline, below, &found, &Edit::deleted_paths(edits), &files);
             (if v.passed() { "PASS" } else { "FAIL" }, Some(v))
         }
     };
@@ -205,7 +220,8 @@ fn stacked_once<A: Stacked>(
 }
 
 /// Opens a fork, writes `parent` as its level 1 and diagnoses it once; returns the RSS after that
-/// level. The fork is the caller's to release.
+/// level and the findings of its state, formed as the search forms its start state's. The fork is
+/// the caller's to release.
 fn parent_level<A: Stacked>(
     a: &A,
     s: &mut A::Session,
@@ -213,14 +229,21 @@ fn parent_level<A: Stacked>(
     observer: &RecordingObserver,
     parent: &[Edit],
     scope: Scope,
-) -> Result<Option<u64>> {
+    baseline: &[Finding],
+) -> Result<(Option<u64>, ScopedFindings)> {
     a.write(s, f, parent)
         .context("write the --on parent as level 1")?;
-    a.diagnose(s, f, scope)
-        .context("diagnose the --on parent")?;
+    let (found, files) = diagnose_top(a, s, f, scope).context("diagnose the --on parent")?;
+    let (_, kept) = Verdict::of_level(
+        baseline,
+        &ScopedFindings::default(),
+        &found,
+        &Edit::deleted_paths(parent),
+        &files,
+    );
     let rss_kb = rss::current_kb();
     observer.take();
-    Ok(rss_kb)
+    Ok((rss_kb, kept))
 }
 
 /// The repeats of one series on a fork of `a`: the parent is level 1, written and diagnosed once,
@@ -240,12 +263,14 @@ fn stacked_series<A: Stacked>(
 ) -> Result<(bool, Option<u64>)> {
     let baseline = a.baseline(s);
     let mut f = a.fork(s).context("open the fork")?;
-    let ran = parent_level(a, s, &mut f, observer, parent, scope).and_then(|rss_parent| {
-        let reverted = repeat(heading, series, || {
-            stacked_once(a, s, &mut f, observer, variant, scope, &baseline)
-        })?;
-        Ok((reverted, rss_parent))
-    });
+    let ran = parent_level(a, s, &mut f, observer, parent, scope, &baseline).and_then(
+        |(rss_parent, below)| {
+            let reverted = repeat(heading, series, || {
+                stacked_once(a, s, &mut f, observer, variant, scope, &baseline, &below)
+            })?;
+            Ok((reverted, rss_parent))
+        },
+    );
     let released = a.release(s, f);
     let (reverted, rss_parent) = ran?;
     match released {
@@ -575,6 +600,115 @@ mod tests {
         assert!(leak_suspect(&[100, 110, 120, 130, 140]));
         assert!(!leak_suspect(&[100, 101, 100, 101, 100]));
         assert!(!leak_suspect(&[100, 110, 120, 130]));
+    }
+
+    /// A fork whose every diagnosis is `top` and whose `files_of` is `files`.
+    #[derive(Default)]
+    struct FakeStack {
+        levels: std::cell::RefCell<Vec<Vec<Edit>>>,
+        top: ScopedFindings,
+        files: Vec<RelPath>,
+    }
+    impl Verifier for FakeStack {
+        type Session = ();
+        fn text(&self, _: &(), _: &RelPath) -> Option<String> {
+            None
+        }
+        fn facts(&self, _: &(), _: &RelPath) -> ryo_v2_core::domain::FileFacts {
+            ryo_v2_core::domain::FileFacts::default()
+        }
+        fn baseline(&self, _: &()) -> Vec<Finding> {
+            Vec::new()
+        }
+        fn provenance(&self, _: &()) -> ryo_v2_core::domain::Provenance {
+            ryo_v2_core::domain::Provenance::new(
+                "fake",
+                "0",
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap()
+        }
+        fn blind_classes(&self) -> std::collections::BTreeSet<ryo_v2_core::domain::UnseenClass> {
+            Default::default()
+        }
+        fn check(&self, _: &mut (), _: &[Edit], _: Scope) -> Result<ScopedFindings, CheckError> {
+            Ok(ScopedFindings::default())
+        }
+    }
+    impl Stacked for FakeStack {
+        type Fork = ();
+        fn fork(&self, _: &mut ()) -> Result<(), CheckError> {
+            Ok(())
+        }
+        fn write(&self, _: &mut (), _: &mut (), edits: &[Edit]) -> Result<(), CheckError> {
+            self.levels.borrow_mut().push(edits.to_vec());
+            Ok(())
+        }
+        fn levels(&self, _: &(), _: &()) -> Result<usize, CheckError> {
+            Ok(self.levels.borrow().len())
+        }
+        fn fork_text(&self, _: &(), _: &(), _: &RelPath) -> Result<Option<String>, CheckError> {
+            Ok(None)
+        }
+        fn diagnose(&self, _: &(), _: &(), _: Scope) -> Result<ScopedFindings, CheckError> {
+            Ok(self.top.clone())
+        }
+        fn files_of(&self, _: &(), _: &(), _: Scope) -> Result<Vec<RelPath>, CheckError> {
+            Ok(self.files.clone())
+        }
+        fn pop(&self, _: &mut (), _: &mut ()) -> Result<bool, CheckError> {
+            Ok(self.levels.borrow_mut().pop().is_some())
+        }
+        fn release(&self, _: &mut (), _: ()) -> Result<(), CheckError> {
+            self.levels.borrow_mut().clear();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stacked_verdict_is_formed_as_the_search_forms_it() {
+        use ryo_v2_core::domain::UnseenClass;
+        use std::collections::{BTreeMap, BTreeSet};
+        let rel = |p: &str| RelPath::parse(p).unwrap();
+        // The parent's level observed a class on b; the variant's level diagnoses a only.
+        let below = ScopedFindings {
+            files: vec![rel("a.rs"), rel("b.rs")],
+            unseen_at: BTreeMap::from([(
+                UnseenClass::UnresolvedPath,
+                BTreeSet::from([rel("b.rs")]),
+            )]),
+            ..ScopedFindings::default()
+        };
+        let a = FakeStack {
+            top: ScopedFindings {
+                files: vec![rel("a.rs")],
+                ..ScopedFindings::default()
+            },
+            files: vec![rel("a.rs"), rel("b.rs")],
+            ..FakeStack::default()
+        };
+        let observer = RecordingObserver::default();
+        let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
+        let once = stacked_once(
+            &a,
+            &mut (),
+            &mut (),
+            &observer,
+            &variant,
+            Scope::Affected,
+            &[],
+            &below,
+        )
+        .unwrap();
+        let want = Verdict::of_level(&[], &below, &a.top, &[], &a.files).0;
+        assert_eq!(once.verdict, Some(want));
+        // The class kept from below is named: the top level's diagnosis alone would not name it.
+        let named = once.verdict.map(|v| v.unseen).unwrap_or_default();
+        assert_eq!(named, BTreeSet::from([UnseenClass::UnresolvedPath]));
+        assert!(Verdict::from_baseline(&[], &a.top).unseen.is_empty());
+        assert_eq!(once.label, "PASS");
+        assert!(a.levels.borrow().is_empty(), "the level is popped");
     }
 
     #[test]

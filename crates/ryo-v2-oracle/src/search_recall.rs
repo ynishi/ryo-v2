@@ -25,15 +25,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit};
+use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit, Stacked};
 use ryo_v2_core::app::search::{
     DEFAULT_SEARCH_BUDGET, Fate, SearchError, SearchInput, SearchReport, TRIGGER_AFTER_CHECKS,
     TRIGGER_CHECK_GROWTH_PERMILLE, TRIGGER_CHECK_MEDIAN_MS, TRIGGER_DECISION_MEDIAN_MS,
     TRIGGER_HARNESS_MS, TRIGGER_RSS_KB, TraceEntry, search_decision,
 };
+use ryo_v2_core::app::verdict_of;
 use ryo_v2_core::domain::{
     ChangeProbe, DEFAULT_WEIGHTS, DomainError, Edit, Ident, PruneStage, RelPath, Resolution, Scope,
-    SearchBudget, Stage, Target, TextRange, Verdict,
+    SearchBudget, Stage, Target, TextRange,
 };
 use ryo_v2_core::infra::overlay::{OverlayError, overlay_edits};
 use ryo_v2_ra::{DetectorPanic, ExpanderPanic};
@@ -413,6 +414,7 @@ fn kind_ids<S: Serializer>(kinds: &[PlantKind], serializer: S) -> Result<S::Ok, 
 ///   are kept, so reports before and after compare key by key.
 ///   tested: search_recall::tests::row_json_keeps_its_keys_and_values
 ///   tested: search_recall::tests::row_json_carries_the_depth_times
+///   tested: search_recall::tests::row_json_carries_the_level_writes
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DecisionRow {
     /// The case id.
@@ -454,12 +456,15 @@ pub struct DecisionRow {
     pub check_ms: Vec<u64>,
     /// Per depth: the time in the checks of the depth in ms (`DepthStats::check_ms`).
     pub depth_check_ms: Vec<u64>,
-    /// Per depth: the time in the expander in ms (`DepthStats::expand_ms`).
+    /// Per depth: the time in the expansions in ms, the fork's writes and pops to each parent's
+    /// path included (`DepthStats::expand_ms`).
     pub depth_expand_ms: Vec<u64>,
     /// Per depth: the checks that ran (`DepthStats::checked`).
     pub depth_checked: Vec<u16>,
     /// Per depth: the parents expanded (`DepthStats::parents`).
     pub depth_parents: Vec<u16>,
+    /// Per depth: the level writes on the search's fork (`DepthStats::writes`).
+    pub depth_writes: Vec<u32>,
 }
 
 impl DecisionRow {
@@ -488,6 +493,7 @@ impl DecisionRow {
             depth_expand_ms: Vec::new(),
             depth_checked: Vec::new(),
             depth_parents: Vec::new(),
+            depth_writes: Vec::new(),
         }
     }
 }
@@ -554,6 +560,7 @@ pub fn analyze(case: &PlantedCase, truth: &Truth<'_>, report: &SearchReport) -> 
         depth_expand_ms: report.depths.iter().map(|d| d.expand_ms).collect(),
         depth_checked: report.depths.iter().map(|d| d.checked).collect(),
         depth_parents: report.depths.iter().map(|d| d.parents).collect(),
+        depth_writes: report.depths.iter().map(|d| d.writes).collect(),
     }
 }
 
@@ -640,7 +647,7 @@ pub fn run_case<V, E, A, J>(
     budget: SearchBudget,
 ) -> Result<CaseRun, RecallError>
 where
-    V: RevertAudit,
+    V: Stacked + RevertAudit,
     E: Expander<Session = V::Session>,
     A: Assessor,
     J: Judge,
@@ -657,8 +664,9 @@ where
         return Ok(skipped("the overlay makes no edit".into()));
     }
     let clean = case.clean_texts(&edits)?;
-    let checked = match v.check(s, &edits, Scope::Affected) {
-        Ok(checked) => checked,
+    let baseline = v.baseline(s);
+    let verdict = match verdict_of(v, s, &edits, Scope::Affected, &baseline) {
+        Ok(verdict) => verdict,
         // The planted state cannot be judged, and the session is intact: skip the case without
         // the reload a search error makes.
         Err(e @ CheckError::DetectorPanicked { .. }) => {
@@ -666,7 +674,6 @@ where
         }
         Err(e) => return Err(RecallError::Check(e)),
     };
-    let verdict = Verdict::from_baseline(&v.baseline(s), &checked);
     if !verdict.passed() {
         return Ok(skipped(format!(
             "planted state does not verify: {} new errors, {} unmapped",
@@ -1831,13 +1838,42 @@ mod tests {
         assert!(markdown(&rows, three).contains("- outer sample: top 3 of each decision\n"));
     }
 
-    /// The four keys a row has beyond the 18 of the hand-built row.
-    const DEPTH_KEYS: [&str; 4] = [
+    /// The five keys a row has beyond the 18 of the hand-built row.
+    const DEPTH_KEYS: [&str; 5] = [
         "depth_check_ms",
         "depth_expand_ms",
         "depth_checked",
         "depth_parents",
+        "depth_writes",
     ];
+
+    #[test]
+    fn row_json_carries_the_level_writes() {
+        let (p, c) = (planted(), clean());
+        let mut r = report(vec![entry(
+            1,
+            Fate::Passed,
+            Some(0),
+            Some(vec![Edit::write(rel("a/src/lib.rs"), CLEAN)]),
+            1,
+        )]);
+        r.depths = vec![
+            DepthStats {
+                depth: 1,
+                writes: 5,
+                ..DepthStats::default()
+            },
+            DepthStats {
+                depth: 2,
+                writes: 17,
+                ..DepthStats::default()
+            },
+        ];
+        let row = analyze(&case(), &truth(&p, &c), &r);
+        assert_eq!(row.depth_writes, vec![5, 17]);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["depth_writes"], json!([5, 17]));
+    }
 
     #[test]
     fn row_json_carries_the_depth_times() {
@@ -1913,6 +1949,7 @@ mod tests {
             depth_expand_ms: vec![10, 20],
             depth_checked: vec![3, 4],
             depth_parents: vec![1, 2],
+            depth_writes: vec![2, 8],
         };
         let mut got = serde_json::to_value(&row).unwrap();
         let object = got.as_object_mut().unwrap();
