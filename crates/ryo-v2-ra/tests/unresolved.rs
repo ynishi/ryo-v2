@@ -349,9 +349,9 @@ fn detector_panic_is_contained_per_file() {
             .check(&mut s, std::slice::from_ref(&edit), Scope::Affected)
             .expect("a panic the baseline had is named, not a failure");
         assert!(
-            found.unseen.contains(&UnseenClass::UnresolvedPath),
+            found.unseen().contains(&UnseenClass::UnresolvedPath),
             "got {:?}",
-            found.unseen
+            found.unseen()
         );
     }
     assert_eq!(s.detector_panics().len(), 1, "deduplicated");

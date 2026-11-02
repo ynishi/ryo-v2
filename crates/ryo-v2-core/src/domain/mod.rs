@@ -74,6 +74,8 @@
 //!   includes: Blueprint, Session
 //! - CheckFailure: why the check of a blueprint did not finish when the session survived it.
 //!   includes: Edit, Cancelled, Panicked, DetectorPanicked
+//! - ScopedFindings: what one diagnosis looked at and found: its files, their errors, and each
+//!   unseen class it observed with the files it observed it on.
 //! - Verdict: the new errors relative to the baseline and the unseen classes the check observed;
 //!   passed if and only if there are no new errors.
 //! - Evidence: what a decision rested on: the scope, the verdicts, the budget, the provenance and

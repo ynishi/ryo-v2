@@ -374,7 +374,7 @@ mod tests {
     }
     fn observed(class: UnseenClass) -> ScopedFindings {
         ScopedFindings {
-            unseen: BTreeSet::from([class]),
+            unseen_at: BTreeMap::from([(class, BTreeSet::new())]),
             ..Default::default()
         }
     }
@@ -673,7 +673,7 @@ mod tests {
         let mut fake = Fake::new(&[(LIB, BASE)]);
         fake.baseline = errors(1).findings;
         let found = ScopedFindings {
-            unseen: BTreeSet::from([UnseenClass::UnexpandedMacro]),
+            unseen_at: BTreeMap::from([(UnseenClass::UnexpandedMacro, BTreeSet::new())]),
             ..errors(1)
         };
         fake.queue(Ok(found.clone()));

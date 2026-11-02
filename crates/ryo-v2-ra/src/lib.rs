@@ -91,6 +91,8 @@ pub struct RaAnalyzer {
     pub(crate) reassert_fault: bool,
     /// Which database write of the texts panics; a test hook.
     pub(crate) db_write_panic: Option<DbWritePanic>,
+    /// File whose base text cannot be read; a test hook.
+    pub(crate) db_read_fault: Option<RelPath>,
 }
 
 /// The database write of the texts that the test hook `RaAnalyzer::with_db_write_panic` makes
@@ -116,6 +118,7 @@ impl RaAnalyzer {
             revert_fault: None,
             reassert_fault: false,
             db_write_panic: None,
+            db_read_fault: None,
         }
     }
 
@@ -150,6 +153,14 @@ impl RaAnalyzer {
     #[doc(hidden)]
     pub fn with_db_write_panic(mut self, at: Option<DbWritePanic>) -> RaAnalyzer {
         self.db_write_panic = at;
+        self
+    }
+
+    /// Makes every base read of `path` fail as a database read that panics would. For the tests
+    /// of the paths that report such a failure; nothing in the adapter sets it.
+    #[doc(hidden)]
+    pub fn with_db_read_fault(mut self, path: Option<RelPath>) -> RaAnalyzer {
+        self.db_read_fault = path;
         self
     }
 

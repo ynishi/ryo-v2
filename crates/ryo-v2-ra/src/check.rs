@@ -56,12 +56,37 @@ pub(crate) fn revert_error(failed: RevertFailure) -> CheckError {
     }
 }
 
-/// The text of `id` in the base state: the record a level made before it wrote the file, or else
-/// what the database holds.
-fn base_text(s: &RaSession, id: FileId) -> Option<String> {
+/// The text of `path` in the base state. `Ok(None)` means only that `path` is not a file of the
+/// base (not a file of the session); `Err` is a read that failed.
+pub(crate) fn base_text(
+    a: &RaAnalyzer,
+    s: &RaSession,
+    path: &RelPath,
+) -> Result<Option<String>, AnalyzerError> {
+    match s.files.iter().find(|(_, r)| r == path) {
+        Some((id, _)) => base_text_at(a, s, *id).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The text of the session file `id` in the base state: the record a level made before it wrote
+/// the file, or else what the database holds. A read that fails (the database read panics, or the
+/// test hook `RaAnalyzer::with_db_read_fault` names the file) is the error.
+pub(crate) fn base_text_at(
+    a: &RaAnalyzer,
+    s: &RaSession,
+    id: FileId,
+) -> Result<String, AnalyzerError> {
+    if let Some(fault) = &a.db_read_fault
+        && s.files.iter().any(|(i, r)| *i == id && r == fault)
+    {
+        return Err(AnalyzerError::Panicked(format!(
+            "database read fault injected on {fault}"
+        )));
+    }
     match s.base_texts.get(&id) {
-        Some(text) => Some(text.clone()),
-        None => fork::db_text(&s.host, id).ok(),
+        Some(text) => Ok(text.clone()),
+        None => fork::db_text(&s.host, id),
     }
 }
 
@@ -93,7 +118,11 @@ pub(crate) fn diagnose_for_check(
     let mut new_panic = None;
     for (detector, file) in panics {
         if s.baseline_panics.contains(&(detector, file.clone())) {
-            found.unseen.insert(detector.unseen_class());
+            found
+                .unseen_at
+                .entry(detector.unseen_class())
+                .or_default()
+                .insert(file);
         } else if new_panic.is_none() {
             new_panic = Some((detector, file));
         }
@@ -128,8 +157,9 @@ impl Verifier for RaAnalyzer {
     ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
     ///   tested: tests/verifier.rs check_of_unindexed_existing_path_is_edit_error
     fn text(&self, s: &RaSession, path: &RelPath) -> Option<String> {
-        let (id, _) = s.files.iter().find(|(_, r)| r == path)?;
-        base_text(s, *id)
+        // A read failure is not reported here: the port's reads have no `Result` (AR-014, tasks
+        // 10 and 11).
+        base_text(self, s, path).ok().flatten()
     }
 
     /// Facts of `path` from the one `cargo metadata` call at load.
@@ -213,7 +243,9 @@ impl Verifier for RaAnalyzer {
             .files
             .iter()
             .filter_map(|(id, path)| {
-                let text = base_text(s, *id)?;
+                // A read failure is not reported here: the port's reads have no `Result` (AR-014,
+                // tasks 10 and 11).
+                let text = base_text_at(self, s, *id).ok()?;
                 Some((path.clone(), Fingerprint::of(text.as_bytes())))
             })
             .collect();
@@ -262,9 +294,11 @@ impl Verifier for RaAnalyzer {
     ///   where it did not panic at baseline, makes the result `CheckError::DetectorPanicked` (the
     ///   first by detector and file), with the edits still reverted and the session usable; one
     ///   that panicked on the same file at baseline too does not fail the check and names the
-    ///   detector's class (`GapDetector::unseen_class`) in the findings' `unseen`.
+    ///   detector's class (`GapDetector::unseen_class`) in the findings' `unseen_at`, with that
+    ///   file.
     ///   tested: tests/unresolved.rs detector_panic_is_contained_per_file
     ///   tested: tests/gap_detectors.rs each_detector_panic_is_contained_on_its_own
+    ///   tested: tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
     /// - C6: `RevertMismatch` and `Poisoned` win over every other error of the check: an `Edit`,
     ///   a `TimedOut`, a `Panicked` and a `DetectorPanicked`.
     ///   tested: tests/verifier.rs session_errors_win_over_a_detector_panic

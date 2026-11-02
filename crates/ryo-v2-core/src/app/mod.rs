@@ -14,14 +14,14 @@ pub mod write;
 use crate::app::ports::{CheckError, Verifier};
 use crate::domain::{Edit, Finding, Scope, Verdict};
 
-/// The verdict of `edits` at `scope` against `baseline`: what the decision and the check before
-/// a write both ask of the checker.
+/// The verdict of `edits` at `scope` against `baseline`: a check, as the one-level case of
+/// `Verdict::of_level`. What the decision and the check before a write ask of the checker.
 ///
 /// The caller takes `baseline` once per decision (`Verifier::baseline`) and passes it in.
 ///
 /// # Contract
-/// - C1: the verdict is `Verdict::from_baseline(baseline, checked)` of the check's findings; a
-///   check failure is returned as is.
+/// - C1: the verdict is `Verdict::of_check` of the check's findings (`Verdict::of_level` with
+///   nothing below, nothing deleted and the check's files); a check failure is returned as is.
 ///   tested: app::write::tests::decide_and_write_paths_give_the_same_verdict
 pub fn verdict_of<V: Verifier>(
     verifier: &V,
@@ -31,7 +31,7 @@ pub fn verdict_of<V: Verifier>(
     baseline: &[Finding],
 ) -> Result<Verdict, CheckError> {
     let checked = verifier.check(session, edits, scope)?;
-    Ok(Verdict::from_baseline(baseline, &checked))
+    Ok(Verdict::of_check(baseline, &checked))
 }
 
 /// The blind classes of the fake verifiers in the tests of this module: every class a mark names.

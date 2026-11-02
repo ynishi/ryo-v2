@@ -3,6 +3,7 @@
 //! functions here are the level operations that both the `Analyzer` port and `Verifier::check`
 //! are built on.
 
+use crate::check::base_text;
 use crate::diagnostics::{Deadline, Detector, GapDetector, collect_errors_par, panic_message};
 use crate::rev_deps::scoped_files;
 use crate::session::{ForkPort, RaSession};
@@ -20,7 +21,7 @@ use ryo_v2_core::domain::text::revert_intact;
 use ryo_v2_core::domain::{
     Edit, Finding, Fingerprint, RelPath, Scope, ScopedFindings, UnseenClass,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use triomphe::Arc as TriArc;
@@ -287,19 +288,57 @@ pub(crate) fn diagnose_level(
             .write_ms
             .saturating_add(a.clock.now_ms().saturating_sub(started_ms)),
     });
-    let unseen = if collected.unexpanded_macro {
-        BTreeSet::from([UnseenClass::UnexpandedMacro])
-    } else {
-        BTreeSet::new()
-    };
+    let mut unseen_at: BTreeMap<UnseenClass, BTreeSet<RelPath>> = BTreeMap::new();
+    if !collected.unexpanded_macro.is_empty() {
+        unseen_at.insert(
+            UnseenClass::UnexpandedMacro,
+            collected.unexpanded_macro.into_iter().collect(),
+        );
+    }
     Ok((
         ScopedFindings {
             files,
             findings: collected.findings,
-            unseen,
+            unseen_at,
         },
         collected.panics,
     ))
+}
+
+/// The files a one-level check at `scope` covers for the edits that take the base to the top
+/// level's state (`Stacked::files_of`). Those edits' paths are the paths some level edited whose
+/// presence or text at the top level differs from the base: present at the base when a file of
+/// the session, at the top when a file of the top level's state. With no such path a check
+/// diagnoses no file at `Scope::Affected`; at `Scope::Workspace` it diagnoses every file of the
+/// state, the base's with no level. A base text that cannot be read is the error.
+pub(crate) fn files_of(
+    a: &RaAnalyzer,
+    session: &RaSession,
+    scope: Scope,
+) -> Result<Vec<RelPath>, AnalyzerError> {
+    let live = live_below(session);
+    let covered: Vec<(FileId, RelPath)> = match scope {
+        Scope::Workspace => live.to_vec(),
+        Scope::Affected => {
+            let edited: BTreeSet<&RelPath> =
+                session.stack.iter().flat_map(|l| l.edited.iter()).collect();
+            let mut changed: Vec<&RelPath> = Vec::new();
+            for path in edited {
+                if text_at_top(session, path)? != base_text(a, session, path)? {
+                    changed.push(path);
+                }
+            }
+            if changed.is_empty() {
+                Vec::new()
+            } else {
+                scoped_files(live, &session.rev_deps, &changed)
+            }
+        }
+    };
+    let mut files: Vec<RelPath> = covered.into_iter().map(|(_, r)| r).collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 /// The paths of `edits`, sorted, unique.

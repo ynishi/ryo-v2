@@ -119,6 +119,12 @@ pub(crate) fn view_of(edits: &[Edit], base: &View<'_>, path: &RelPath) -> Option
 /// `facts` says what the files are; each stage pushes one entry to `log`; `compared` counts the
 /// fingerprints compared.
 ///
+/// A Blueprint's splices replace ranges of files, so a step never deletes a file, and a node's
+/// composed edits are the paths whose text differs from the base: `Verdict::of_level` C3 rests on
+/// this. A command that deletes a file would not break the composed edits: `compose` drops a
+/// delete of a path the base lacks (`compose` C1), as a check of the composed edits needs; the
+/// stacked verdict of such a level must then pass the paths it deletes as `deleted`.
+///
 /// # Contract
 /// - C1: the stages run in the order file role, freshness (`Basis::check` of `Blueprint::basis`
 ///   against the view), conformance, splice, marks, against the view of `on` over `base`; each
@@ -131,6 +137,8 @@ pub(crate) fn view_of(edits: &[Edit], base: &View<'_>, path: &RelPath) -> Option
 ///   tested: app::search::tests::child_inherits_build_script_role_of_parent
 ///   tested: app::search::tests::search_candidate_basis_is_against_the_loaded_text
 ///   tested: domain::stage::tests::staged_on_a_parent_composes_and_keeps_the_loaded_basis
+/// - C3: every own edit of the staged value writes a text.
+///   tested: domain::stage::tests::own_edits_only_write
 pub(crate) fn stage(
     bp: &Blueprint,
     on: On<'_>,
@@ -293,8 +301,8 @@ pub(crate) fn stage(
 mod tests {
     use super::*;
     use crate::domain::{
-        BaseFp, BlueprintId, BlueprintParts, Command, DecisionRecord, Ident, ReadRange, SpecRef,
-        Splice, TextRange,
+        BaseFp, BlueprintId, BlueprintParts, Command, DecisionRecord, DeriveName, Ident, ReadRange,
+        SpecRef, Splice, TextRange,
     };
 
     const BASE: &str = "let a = 1;";
@@ -387,5 +395,103 @@ mod tests {
         assert!(matches!(refused.blocking, Blocking::Stale { .. }));
         assert_eq!(log.entries().len(), 2);
         assert!(!log.entries()[1].ok());
+    }
+
+    /// A Blueprint of `command` with `splices`, made against `texts`: a base fingerprint and a
+    /// read of the whole text of each file it splices.
+    fn made(n: u8, command: Command, splices: Vec<Splice>, texts: &[(&str, &str)]) -> Blueprint {
+        let whole = |text: &str| tr(0, u32::try_from(text.len()).unwrap());
+        Blueprint::new(BlueprintParts {
+            id: bid(n),
+            command,
+            splices,
+            reads: texts
+                .iter()
+                .map(|(p, t)| ReadRange::capture(rel(p), t, whole(t)).unwrap())
+                .collect(),
+            bases: texts
+                .iter()
+                .map(|(p, t)| BaseFp::capture(rel(p), t))
+                .collect(),
+            spec_refs: vec![SpecRef::parse("spec#t").unwrap()],
+            record: DecisionRecord::new("agent", "why").unwrap(),
+            builds_on: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn own_edits_only_write() {
+        const MOVED: &str = "pub fn moved() {}\n";
+        const S: &str = "pub struct S;\n";
+        let base = |p: &RelPath| match p.as_str() {
+            "src/lib.rs" => Some(BASE.to_owned()),
+            "src/moved.rs" => Some(MOVED.to_owned()),
+            "src/s.rs" => Some(S.to_owned()),
+            _ => None,
+        };
+        let facts = |_: &RelPath| FileFacts::default();
+        let mut log = DecisionLog::default();
+        let mut compared = 0;
+        let mut staged = |bp: &Blueprint, on: On<'_>| {
+            stage(bp, on, &base, &facts, &mut log, &mut compared).expect("staged")
+        };
+
+        // A replace (rename), an insert (derive) and the emptying of a whole file (a move whose
+        // source is the item alone), each against `lib` as the text of `src/lib.rs`.
+        let steps = |n: u8, lib: &str| {
+            let derive = made(
+                n,
+                Command::AddDerive {
+                    derives: NonEmpty::one(DeriveName::parse("Debug").unwrap()),
+                },
+                vec![Splice::insert(rel("src/s.rs"), 0, "#[derive(Debug)]\n").unwrap()],
+                &[("src/s.rs", S)],
+            );
+            let end = u32::try_from(MOVED.len()).unwrap();
+            let moved = made(
+                n + 1,
+                Command::MoveItem {
+                    item: Ident::parse("moved").unwrap(),
+                    to: rel("src/lib.rs"),
+                },
+                vec![
+                    Splice::delete(rel("src/moved.rs"), tr(0, end)).unwrap(),
+                    Splice::insert(rel("src/lib.rs"), 0, MOVED).unwrap(),
+                ],
+                &[("src/moved.rs", MOVED), ("src/lib.rs", lib)],
+            );
+            [derive, moved]
+        };
+
+        let root = staged(&rename(1, "src/lib.rs", BASE, "a", "b"), On::Start(&[]));
+        let mut all = vec![root.clone()];
+        for bp in steps(2, BASE) {
+            all.push(staged(&bp, On::Start(&[])));
+        }
+        for bp in steps(4, ROOT_RESULT) {
+            all.push(staged(&bp, On::Parent(&root)));
+        }
+        for s in &all {
+            assert!(
+                s.own().iter().all(|e| e.new_text.is_some()),
+                "an own edit deletes: {:?}",
+                s.own()
+            );
+            assert!(
+                s.edits().iter().all(|e| e.new_text.is_some()),
+                "a composed edit deletes: {:?}",
+                s.edits()
+            );
+        }
+        // The emptied file is written as an empty text, on the start and on the parent.
+        for s in [&all[2], &all[4]] {
+            assert!(
+                s.own()
+                    .contains(&Edit::write(rel("src/moved.rs"), String::new())),
+                "{:?}",
+                s.own()
+            );
+        }
     }
 }

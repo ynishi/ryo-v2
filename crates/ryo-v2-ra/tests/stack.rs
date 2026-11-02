@@ -74,9 +74,9 @@ fn an_empty_check_diagnoses_nothing() {
         .expect("an empty check is Ok");
     assert!(found.files.is_empty(), "no file diagnosed: {found:?}");
     assert!(
-        found.unseen.is_empty(),
+        found.unseen().is_empty(),
         "no class named: {:?}",
-        found.unseen
+        found.unseen()
     );
     assert!(found.findings.is_empty(), "{:?}", found.findings);
     let baseline = Verifier::baseline(&a, &s);
@@ -89,9 +89,9 @@ fn an_empty_check_diagnoses_nothing() {
         .expect("a workspace scan");
     assert_eq!(all.files, vec![lib()]);
     assert!(
-        all.unseen.contains(&UnseenClass::UnresolvedPath),
+        all.unseen().contains(&UnseenClass::UnresolvedPath),
         "{:?}",
-        all.unseen
+        all.unseen()
     );
 }
 
@@ -563,6 +563,11 @@ fn a_stack_diagnoses_as_its_flat_composition() {
             let stacked = a.diagnose(&s, &fork, Scope::Workspace);
             assert_eq!(stacked, flat, "{at}: Workspace");
             let flat = flat.expect("the flat check");
+            assert_eq!(
+                stacked.as_ref().map(|d| &d.unseen_at),
+                Ok(&flat.unseen_at),
+                "{at}: unseen_at"
+            );
 
             let affected = a.diagnose(&s, &fork, Scope::Affected).expect("affected");
             assert!(
@@ -814,8 +819,16 @@ fn files_outside_the_top_scope_keep_the_level_below() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_outside_scope", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
-    a.write(&mut s, &mut fork, &[w_edit("a/src/lib.rs", &err_fn("l1"))])
-        .expect("L1");
+    // L1 also leaves a macro call in a file of a unexpanded, so a class is observed there.
+    a.write(
+        &mut s,
+        &mut fork,
+        &[
+            w_edit("a/src/lib.rs", &err_fn("l1")),
+            w_edit("a/src/x.rs", "not_a_macro!();\n"),
+        ],
+    )
+    .expect("L1");
     let at_l1 = a.diagnose(&s, &fork, Scope::Workspace).expect("L1");
     a.write(&mut s, &mut fork, &[w_edit("c/src/lib.rs", &err_fn("l2"))])
         .expect("L2");
@@ -835,6 +848,27 @@ fn files_outside_the_top_scope_keep_the_level_below() {
         at_l2.findings.len() > at_l1.findings.len(),
         "level 2 added one in c"
     );
+    // The classes of a's files stay as well: the same files under each class.
+    let classes_of = |found: &ScopedFindings| -> BTreeMap<UnseenClass, BTreeSet<RelPath>> {
+        found
+            .unseen_at
+            .iter()
+            .map(|(class, on)| {
+                let kept: BTreeSet<RelPath> =
+                    on.iter().filter(|p| outside.contains(p)).cloned().collect();
+                (*class, kept)
+            })
+            .filter(|(_, on)| !on.is_empty())
+            .collect()
+    };
+    assert_eq!(
+        classes_of(&at_l1),
+        BTreeMap::from([(
+            UnseenClass::UnexpandedMacro,
+            BTreeSet::from([rel("a/src/x.rs")])
+        )])
+    );
+    assert_eq!(classes_of(&at_l2), classes_of(&at_l1));
     a.release(&mut s, fork).expect("release");
 }
 
@@ -847,7 +881,7 @@ fn an_empty_write_diagnoses_nothing() {
     assert_eq!(a.levels(&s, &fork), Ok(1));
     let affected = a.diagnose(&s, &fork, Scope::Affected).expect("affected");
     assert!(affected.files.is_empty(), "{:?}", affected.files);
-    assert!(affected.unseen.is_empty(), "{:?}", affected.unseen);
+    assert!(affected.unseen().is_empty(), "{:?}", affected.unseen());
     assert!(affected.findings.is_empty());
     let workspace = a.diagnose(&s, &fork, Scope::Workspace).expect("workspace");
     assert_eq!(workspace.files, w_paths_sorted());
@@ -912,7 +946,7 @@ fn a_level_names_the_unseen_it_observes() {
     a.write(&mut s, &mut fork, &[w_edit("c/src/lib.rs", &err_fn("l1"))])
         .expect("L1");
     let at_l1 = a.diagnose(&s, &fork, Scope::Affected).expect("L1");
-    assert!(at_l1.unseen.is_empty(), "{:?}", at_l1.unseen);
+    assert!(at_l1.unseen().is_empty(), "{:?}", at_l1.unseen());
 
     a.write(
         &mut s,
@@ -921,18 +955,21 @@ fn a_level_names_the_unseen_it_observes() {
     )
     .expect("L2");
     let at_l2 = a.diagnose(&s, &fork, Scope::Affected).expect("L2");
-    assert_eq!(at_l2.unseen, BTreeSet::from([UnseenClass::UnexpandedMacro]));
+    assert_eq!(
+        at_l2.unseen(),
+        BTreeSet::from([UnseenClass::UnexpandedMacro])
+    );
 
     // A level above that does not observe it does not name it.
     a.write(&mut s, &mut fork, &[w_edit("c/src/z.rs", &err_fn("l3"))])
         .expect("L3");
     let at_l3 = a.diagnose(&s, &fork, Scope::Affected).expect("L3");
-    assert!(at_l3.unseen.is_empty(), "{:?}", at_l3.unseen);
+    assert!(at_l3.unseen().is_empty(), "{:?}", at_l3.unseen());
 
     assert!(a.pop(&mut s, &mut fork).expect("pop L3"));
     assert!(a.pop(&mut s, &mut fork).expect("pop L2"));
     let again = a.diagnose(&s, &fork, Scope::Affected).expect("L1 again");
-    assert!(again.unseen.is_empty(), "{:?}", again.unseen);
+    assert!(again.unseen().is_empty(), "{:?}", again.unseen());
     a.release(&mut s, fork).expect("release");
 }
 
@@ -949,9 +986,9 @@ fn a_baseline_detector_panic_is_named_at_every_level() {
             .diagnose(&s, &fork, Scope::Affected)
             .unwrap_or_else(|e| panic!("{tag}: a baseline panic fails the level: {e:?}"));
         assert!(
-            found.unseen.contains(&UnseenClass::UnresolvedPath),
+            found.unseen().contains(&UnseenClass::UnresolvedPath),
             "{tag}: {:?}",
-            found.unseen
+            found.unseen()
         );
     }
     a.release(&mut s, fork).expect("release");
@@ -1022,18 +1059,18 @@ fn a_baseline_panic_brought_back_above_is_named() {
     a.write(&mut s, &mut fork, &l1).expect("L1");
     let at_l1 = a.diagnose(&s, &fork, Scope::Affected).expect("L1");
     assert!(
-        !at_l1.unseen.contains(&UnseenClass::UnresolvedPath),
+        !at_l1.unseen().contains(&UnseenClass::UnresolvedPath),
         "the faulted file is not there: {:?}",
-        at_l1.unseen
+        at_l1.unseen()
     );
     a.write(&mut s, &mut fork, &l2).expect("L2");
     let at_l2 = a
         .diagnose(&s, &fork, Scope::Affected)
         .expect("a baseline panic brought back is named, not failed");
     assert!(
-        at_l2.unseen.contains(&UnseenClass::UnresolvedPath),
+        at_l2.unseen().contains(&UnseenClass::UnresolvedPath),
         "{:?}",
-        at_l2.unseen
+        at_l2.unseen()
     );
     let flat = a.check(&mut twin, &compose(&[l1, l2]), Scope::Affected);
     assert_eq!(Ok(at_l2), flat);
@@ -1375,6 +1412,9 @@ fn poisoned_session_refuses_stacked_operations() {
     let poisoned = |r: Result<(), CheckError>| matches!(r, Err(CheckError::Poisoned(_)));
     assert!(poisoned(a.write(&mut s, &mut fork, &[])));
     assert!(poisoned(a.diagnose(&s, &fork, Scope::Affected).map(|_| ())));
+    for scope in [Scope::Affected, Scope::Workspace] {
+        assert!(poisoned(a.files_of(&s, &fork, scope).map(|_| ())));
+    }
     assert!(poisoned(
         a.fork_text(&s, &fork, &rel("a/src/lib.rs")).map(|_| ())
     ));
@@ -1724,7 +1764,7 @@ fn check_is_the_one_level_case() {
     let two = stacked_check(&a2, &mut stacked, &edits, Scope::Affected);
     assert_eq!(one, two, "a baseline detector panic: result");
     let named = one.expect("a baseline panic is named, not failed");
-    assert!(named.unseen.contains(&UnseenClass::UnresolvedPath));
+    assert!(named.unseen().contains(&UnseenClass::UnresolvedPath));
     let (shapes1, shapes2) = (event_shapes(&o1.take()), event_shapes(&o2.take()));
     assert_eq!(shapes1, shapes2, "a baseline detector panic: events");
     assert!(
@@ -1864,4 +1904,349 @@ fn the_diagnoses_of_a_level_do_not_add_up() {
     // Every diagnosis is the write of its level plus itself, which cost the same here.
     assert!(check_ms.iter().all(|ms| *ms == check_ms[0]), "{check_ms:?}");
     assert!(check_ms[0] > 0 && check_ms[0] < IDLE, "{check_ms:?}");
+}
+
+/// Every class of `found` names at least one file, and only files of `found`.
+fn assert_classes_name_their_files(found: &ScopedFindings, what: &str) {
+    for (class, on) in &found.unseen_at {
+        assert!(!on.is_empty(), "{what}: {class:?} names no file");
+        assert!(
+            on.iter().all(|p| found.files.contains(p)),
+            "{what}: {class:?} names {on:?}, outside {:?}",
+            found.files
+        );
+    }
+}
+
+#[test]
+fn a_diagnosis_names_where_it_observed_each_unseen_class() {
+    let x = rel("a/src/x.rs");
+
+    // A macro call that does not expand: the detector is skipped on that file alone.
+    let (a, _) = analyzer(false);
+    let f = w_fixture("stack_unseen_at_macro");
+    let mut s = Analyzer::load(&a, &f.dir).expect("load");
+    let mut twin = Analyzer::load(&a, &f.dir).expect("load the twin");
+    let edits = vec![w_edit("a/src/x.rs", "not_a_macro!();\n")];
+    let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+    a.write(&mut s, &mut fork, &edits).expect("L1");
+    for scope in [Scope::Affected, Scope::Workspace] {
+        let found = a.diagnose(&s, &fork, scope).expect("diagnose");
+        assert_eq!(
+            found.unseen_at,
+            BTreeMap::from([(UnseenClass::UnexpandedMacro, BTreeSet::from([x.clone()]))]),
+            "macro, {scope:?}"
+        );
+        assert_classes_name_their_files(&found, "macro, diagnose");
+        let checked = a.check(&mut twin, &edits, scope).expect("check");
+        assert_eq!(
+            checked.unseen_at, found.unseen_at,
+            "macro, check, {scope:?}"
+        );
+        assert_classes_name_their_files(&checked, "macro, check");
+    }
+    a.release(&mut s, fork).expect("release");
+
+    // A detector that panicked on a file at the baseline: named with that file, at a level that
+    // edits another file of the crate.
+    let (b, _) = analyzer(false);
+    let b = b.with_detector_fault(Some((GapDetector::UnresolvedPath, x.clone())));
+    let g = w_fixture("stack_unseen_at_panic");
+    let mut s = Analyzer::load(&b, &g.dir).expect("load");
+    let mut twin = Analyzer::load(&b, &g.dir).expect("load the twin");
+    let edits = vec![w_edit("a/src/lib.rs", &err_fn("l1"))];
+    let mut fork = Stacked::fork(&b, &mut s).expect("fork");
+    b.write(&mut s, &mut fork, &edits).expect("L1");
+    for scope in [Scope::Affected, Scope::Workspace] {
+        let found = b.diagnose(&s, &fork, scope).expect("diagnose");
+        assert_eq!(
+            found.unseen_at,
+            BTreeMap::from([(UnseenClass::UnresolvedPath, BTreeSet::from([x.clone()]))]),
+            "panic, {scope:?}"
+        );
+        assert_classes_name_their_files(&found, "panic, diagnose");
+        let checked = b.check(&mut twin, &edits, scope).expect("check");
+        assert_eq!(
+            checked.unseen_at, found.unseen_at,
+            "panic, check, {scope:?}"
+        );
+        assert_classes_name_their_files(&checked, "panic, check");
+    }
+    b.release(&mut s, fork).expect("release");
+}
+
+/// The edits that take the base of W to the state after `levels`, as a check is given them: per
+/// path the last edit wins; a write equal to the base text and a delete of a path the base lacks
+/// give no edit.
+fn net(levels: &[Vec<Edit>]) -> Vec<Edit> {
+    let mut last: BTreeMap<RelPath, Option<String>> = BTreeMap::new();
+    for edit in levels.iter().flatten() {
+        last.insert(edit.path.clone(), edit.new_text.clone());
+    }
+    last.into_iter()
+        .filter_map(|(path, text)| {
+            let base = W_FILES
+                .iter()
+                .find(|(p, _)| *p == path.as_str())
+                .map(|(_, t)| *t);
+            match (text, base) {
+                (Some(text), Some(base)) if text == base => None,
+                (Some(text), _) => Some(Edit::write(path, text)),
+                (None, Some(_)) => Some(Edit::delete(path)),
+                (None, None) => None,
+            }
+        })
+        .collect()
+}
+
+/// The paths `edits` delete.
+fn deleted_by(edits: &[Edit]) -> Vec<RelPath> {
+    edits
+        .iter()
+        .filter(|e| e.new_text.is_none())
+        .map(|e| e.path.clone())
+        .collect()
+}
+
+#[test]
+fn files_of_and_of_level_equal_the_check_over_a_stack() {
+    let (a, _) = analyzer(false);
+    let f = w_fixture("stack_files_of");
+    let mut s = Analyzer::load(&a, &f.dir).expect("load the stacked session");
+    let mut twin = Analyzer::load(&a, &f.dir).expect("load the flat twin");
+    let baseline = Verifier::baseline(&a, &s);
+    let z = "c/src/z.rs";
+    let mut all = sequences();
+    // Changed, then written back to base.
+    all.push(vec![
+        vec![w_edit(z, &err_fn("z1"))],
+        vec![Edit::write(rel(z), C_Z)],
+    ]);
+    // Written back to base at a lower level, then changed again.
+    all.push(vec![
+        vec![w_edit(z, &err_fn("z1"))],
+        vec![Edit::write(rel(z), C_Z)],
+        vec![w_edit(z, &err_fn("z3"))],
+    ]);
+
+    for scope in [Scope::Affected, Scope::Workspace] {
+        // A fork with no level: the files of a check with no edit (none at Affected).
+        let fork = Stacked::fork(&a, &mut s).expect("fork");
+        let none = a
+            .files_of(&s, &fork, scope)
+            .expect("files_of with no level");
+        let flat = a
+            .check(&mut twin, &[], scope)
+            .expect("a check with no edit");
+        assert_eq!(none, flat.files, "no level, {scope:?}");
+        if matches!(scope, Scope::Affected) {
+            assert!(none.is_empty(), "{none:?}");
+        }
+        a.release(&mut s, fork).expect("release");
+
+        for (n, levels) in all.iter().enumerate() {
+            let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+            let mut below = ScopedFindings::default();
+            for (k, edits) in levels.iter().enumerate() {
+                let at = format!("sequence {n}, level {}, {scope:?}", k + 1);
+                a.write(&mut s, &mut fork, edits)
+                    .unwrap_or_else(|e| panic!("{at}: {e:?}"));
+                let level = a.diagnose(&s, &fork, scope).expect("diagnose");
+                let files = a.files_of(&s, &fork, scope).expect("files_of");
+                let flat_edits = net(&levels[..=k]);
+                let flat = a
+                    .check(&mut twin, &flat_edits, scope)
+                    .unwrap_or_else(|e| panic!("{at}: the flat check: {e:?}"));
+                assert_eq!(files, flat.files, "{at}: files_of");
+                if flat_edits.is_empty() && matches!(scope, Scope::Affected) {
+                    assert!(files.is_empty(), "{at}: every path is back at base");
+                }
+
+                let (verdict, found) =
+                    Verdict::of_level(&baseline, &below, &level, &deleted_by(edits), &files);
+                assert_eq!(found, flat, "{at}: findings");
+                let (want, _) = Verdict::of_level(
+                    &baseline,
+                    &ScopedFindings::default(),
+                    &flat,
+                    &[],
+                    &flat.files,
+                );
+                assert_eq!(verdict, want, "{at}: verdict");
+                below = found;
+            }
+            a.release(&mut s, fork).expect("release");
+        }
+    }
+}
+
+/// Every finding of `found` is on one of its files.
+fn assert_findings_on_their_files(found: &ScopedFindings, what: &str) {
+    for finding in &found.findings {
+        assert!(
+            found.files.contains(&finding.path),
+            "{what}: {finding:?} is on no file of {:?}",
+            found.files
+        );
+    }
+}
+
+#[test]
+fn a_finding_is_on_a_file_of_its_diagnosis() {
+    // Crate a pulls part.rs in with `include!`, and part.rs reads a constant lib.rs defines:
+    // removing it from lib.rs gives an error rust-analyzer reports in part.rs, a file no level
+    // edits. Crate c is apart from a.
+    const LIB: &str = "include!(\"part.rs\");\npub const MISSING_VALUE: u32 = 0;\n";
+    const LIB_DROPPED: &str = "include!(\"part.rs\");\n";
+    const LIB_FIXED: &str = "include!(\"part.rs\");\npub const MISSING_VALUE: u32 = 1;\n";
+    const PART: &str = "// part\npub fn g() -> u32 {\n    MISSING_VALUE\n}\n";
+    const C: &str = "pub fn cf() {}\n";
+    let manifest = |name: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+    };
+    let (a_cargo, c_cargo) = (manifest("ia"), manifest("ic"));
+    let fixture = |test: &str| {
+        Fixture::new(
+            test,
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\nmembers = [\"a\", \"c\"]\nresolver = \"2\"\n",
+                ),
+                ("a/Cargo.toml", &a_cargo),
+                ("c/Cargo.toml", &c_cargo),
+                ("a/src/lib.rs", LIB),
+                ("a/src/part.rs", PART),
+                ("c/src/lib.rs", C),
+            ],
+        )
+    };
+    let (lib, part, c) = (
+        rel("a/src/lib.rs"),
+        rel("a/src/part.rs"),
+        rel("c/src/lib.rs"),
+    );
+    let c_err = format!("{C}{}", err_fn("c2"));
+    // L1 drops the constant, L2 edits only crate c, L3 brings a constant back.
+    let levels = [
+        vec![Edit::write(lib.clone(), LIB_DROPPED)],
+        vec![Edit::write(c.clone(), c_err.clone())],
+        vec![Edit::write(lib.clone(), LIB_FIXED)],
+    ];
+    let flat_edits = [
+        vec![Edit::write(lib.clone(), LIB_DROPPED)],
+        vec![
+            Edit::write(lib.clone(), LIB_DROPPED),
+            Edit::write(c.clone(), c_err.clone()),
+        ],
+        vec![
+            Edit::write(lib.clone(), LIB_FIXED),
+            Edit::write(c.clone(), c_err.clone()),
+        ],
+    ];
+    let on_part = |found: &ScopedFindings| found.findings.iter().any(|f| f.path == part);
+
+    let (a, _) = analyzer(false);
+    let f = fixture("stack_finding_on_its_files");
+    let mut s = Analyzer::load(&a, &f.dir).expect("load the stacked session");
+    let mut twin = Analyzer::load(&a, &f.dir).expect("load the flat twin");
+    let baseline = Verifier::baseline(&a, &s);
+    assert!(
+        baseline.iter().all(|b| b.path != part),
+        "no error in part.rs at the base: {baseline:?}"
+    );
+
+    for scope in [Scope::Affected, Scope::Workspace] {
+        let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+        let mut below = ScopedFindings::default();
+        for (k, edits) in levels.iter().enumerate() {
+            let at = format!("level {}, {scope:?}", k + 1);
+            a.write(&mut s, &mut fork, edits)
+                .unwrap_or_else(|e| panic!("{at}: {e:?}"));
+            let level = a.diagnose(&s, &fork, scope).expect("diagnose");
+            assert_findings_on_their_files(&level, &format!("{at}, diagnose"));
+            let flat = a
+                .check(&mut twin, &flat_edits[k], scope)
+                .unwrap_or_else(|e| panic!("{at}: the flat check: {e:?}"));
+            assert_findings_on_their_files(&flat, &format!("{at}, check"));
+
+            match k {
+                // The error of the edit of lib.rs is on part.rs, at the level and in the check.
+                0 => {
+                    assert!(on_part(&level), "{at}: {:?}", level.findings);
+                    assert!(on_part(&flat), "{at}: {:?}", flat.findings);
+                }
+                // Crate a is outside the top scope at Affected: its error is the level below's.
+                1 => assert_eq!(
+                    on_part(&level),
+                    matches!(scope, Scope::Workspace),
+                    "{at}: {:?}",
+                    level.findings
+                ),
+                // The fix of lib.rs clears part.rs.
+                _ => {
+                    assert!(!on_part(&level), "{at}: {:?}", level.findings);
+                    assert!(!on_part(&flat), "{at}: {:?}", flat.findings);
+                }
+            }
+
+            let files = a.files_of(&s, &fork, scope).expect("files_of");
+            let (verdict, found) = Verdict::of_level(&baseline, &below, &level, &[], &files);
+            assert_eq!(found, flat, "{at}: findings");
+            assert_eq!(
+                verdict,
+                Verdict::of_check(&baseline, &flat),
+                "{at}: verdict"
+            );
+            assert_eq!(on_part(&found), k < 2, "{at}: the composed findings");
+            below = found;
+        }
+        a.release(&mut s, fork).expect("release");
+    }
+}
+
+#[test]
+fn a_failed_base_read_is_a_session_error() {
+    let z = rel("c/src/z.rs");
+    let (a, _) = analyzer(false);
+    let a = a.with_db_read_fault(Some(z.clone()));
+    let (_f, mut s) = loaded_w("stack_failed_base_read", &a);
+
+    // L1 changes z, L2 writes its base text back: whether z is an edit of the state needs its
+    // base text.
+    let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+    a.write(&mut s, &mut fork, &[w_edit("c/src/z.rs", &err_fn("z1"))])
+        .expect("L1");
+    a.write(&mut s, &mut fork, &[Edit::write(z.clone(), C_Z)])
+        .expect("L2");
+    let failed = a.files_of(&s, &fork, Scope::Affected);
+    assert!(
+        matches!(&failed, Err(e @ CheckError::Load(_)) if e.reach() == CheckReach::Session),
+        "{failed:?}"
+    );
+
+    // Not poisoned: the fork, its levels and its texts are as before, and it is used and ends.
+    assert_eq!(a.levels(&s, &fork), Ok(2));
+    assert_eq!(a.fork_text(&s, &fork, &z), Ok(Some(C_Z.to_owned())));
+    a.diagnose(&s, &fork, Scope::Affected)
+        .expect("a diagnosis still runs");
+    assert!(a.pop(&mut s, &mut fork).expect("pop"));
+    assert_eq!(a.levels(&s, &fork), Ok(1));
+    let stale = fork.clone();
+    a.release(&mut s, fork).expect("release");
+    assert_eq!(
+        a.files_of(&s, &stale, Scope::Affected),
+        Err(CheckError::ForkInUse),
+        "a ticket that is not the live fork's"
+    );
+
+    // The boundary of the deferral (AR-014): the reads of `Verifier` map the failure as today.
+    assert_eq!(a.text(&s, &z), None);
+    assert!(!a.provenance(&s).files().contains_key(&z));
+    a.check(
+        &mut s,
+        &[w_edit("a/src/lib.rs", &err_fn("c"))],
+        Scope::Affected,
+    )
+    .expect("the session is not poisoned");
 }
