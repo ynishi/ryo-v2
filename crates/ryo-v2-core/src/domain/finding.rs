@@ -95,8 +95,9 @@ impl ScopedFindings {
             .iter()
             .filter(|f| !top.contains(&f.path) && !gone.contains(&f.path))
             .collect();
+        let below_kept: BTreeSet<&Finding> = from_below.iter().copied().collect();
         let from_top = self.findings.iter().filter(|f| {
-            !gone.contains(&f.path) && (top.contains(&f.path) || !from_below.contains(f))
+            !gone.contains(&f.path) && (top.contains(&f.path) || !below_kept.contains(f))
         });
         let mut findings: Vec<Finding> = from_below
             .iter()

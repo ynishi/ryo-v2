@@ -341,6 +341,56 @@ pub(crate) fn files_of(
     Ok(files)
 }
 
+/// Whether `state` (edits over the base) is the state of the top level: every path some level
+/// edited and every path of `state` has, at the top level, the text `state` gives it (the last
+/// edit of the path wins; `None` is absent), or its base text when `state` does not name it.
+/// Every other path no level edited is at its base text at the top level too. A text that cannot
+/// be read, at the top or at the base, is the error.
+pub(crate) fn state_is_top(
+    a: &RaAnalyzer,
+    session: &RaSession,
+    state: &[Edit],
+) -> Result<bool, AnalyzerError> {
+    let mut wanted: BTreeMap<&RelPath, Option<&str>> = BTreeMap::new();
+    for edit in state {
+        wanted.insert(&edit.path, edit.new_text.as_deref());
+    }
+    let edited: BTreeSet<&RelPath> = session
+        .stack
+        .iter()
+        .flat_map(|l| l.edited.iter())
+        .chain(wanted.keys().copied())
+        .collect();
+    for path in edited {
+        let at_top = text_at_top(session, path)?;
+        let same = match wanted.get(path) {
+            Some(text) => at_top.as_deref() == *text,
+            None => at_top == base_text(a, session, path)?,
+        };
+        if !same {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Why a write refuses a delete of a path that is not a file of the state it lands on.
+pub(crate) const NOT_IN_THE_STATE_BELOW: &str =
+    "cannot delete a file that is not in the state below";
+
+/// The first edit of `state` that a write of it on the base refuses as `resolve` does there: a
+/// delete of a path that is not a file of the base. A write of `state` on the base refuses
+/// nothing else that a level could have written, so with `state` the state of the top level
+/// (`state_is_top`) this is the one refusal left to look for.
+pub(crate) fn refused_delete_at_base<'s>(
+    session: &RaSession,
+    state: &'s [Edit],
+) -> Option<&'s Edit> {
+    state
+        .iter()
+        .find(|e| e.new_text.is_none() && !session.files.iter().any(|(_, r)| *r == e.path))
+}
+
 /// The paths of `edits`, sorted, unique.
 pub(crate) fn edited_paths(edits: &[Edit]) -> Vec<RelPath> {
     let mut edited: Vec<RelPath> = edits.iter().map(|e| e.path.clone()).collect();
@@ -475,12 +525,7 @@ fn resolve(session: &RaSession, edits: &[Edit]) -> Result<Vec<Action>, AnalyzerE
                     }
                 }
             },
-            (None, None) => {
-                return Err(edit_err(
-                    &edit.path,
-                    "cannot delete a file that is not in the state below",
-                ));
-            }
+            (None, None) => return Err(edit_err(&edit.path, NOT_IN_THE_STATE_BELOW)),
         };
         match index.get(&edit.path) {
             Some(&i) => actions[i] = action,

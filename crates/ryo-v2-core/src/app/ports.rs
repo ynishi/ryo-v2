@@ -245,8 +245,8 @@ pub trait RevertAudit: Verifier {
 /// after a release that found the session poisoned.
 ///
 /// An adapter whose forks write into the session's one database allows one live fork per
-/// session, and while it is live the session's other operations refuse with `ForkInUse`. An
-/// adapter whose forks are separate copies may keep several live.
+/// session, and while it is live the session's other operations refuse with `ForkInUse`, except an
+/// expansion of its top level. An adapter whose forks are separate copies may keep several live.
 ///
 /// # Contract
 /// - C1: on a poisoned session `fork`, and given the live fork's ticket `write`, `diagnose`,
@@ -256,9 +256,10 @@ pub trait RevertAudit: Verifier {
 ///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
 ///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
 /// - C2: while a fork of an adapter with one live fork per session is live, `Verifier::check`,
-///   `RevertAudit::audit_revert`, `Expander::expand` (as `ExpandError::Session`) and a second
-///   `fork` are `ForkInUse`, or `Poisoned` on a poisoned session, before they change anything; an
-///   operation given a ticket that is not the live fork's is `ForkInUse`.
+///   `RevertAudit::audit_revert` and a second `fork` are `ForkInUse`, or `Poisoned` on a poisoned
+///   session, before they change anything, and so is `Expander::expand` (as
+///   `ExpandError::Session`) while that fork is an `Analyzer` fork; an operation given a ticket
+///   that is not the live fork's is `ForkInUse`.
 ///   tested: ryo-v2-ra tests/stack.rs session_operations_refuse_while_a_fork_is_live
 ///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
 /// - C3: while a fork is live, and after a release that found the session poisoned,
@@ -465,6 +466,15 @@ pub trait Expander {
     /// Children of the state `state` (edits over the session base), at most `max`, within
     /// `targets`. Observable session state afterwards = before. Reads and splices are against
     /// the state's text.
+    ///
+    /// When a stacked fork is live on the session, `state` is the state of its top level, and the
+    /// children are read there: nothing is written.
+    ///
+    /// # Contract
+    /// - C1: with a stacked fork live on the session and `state` the state of its top level, the
+    ///   result is what `expand` gives for `state` with no fork live, and afterwards the fork has
+    ///   the same levels and every text is as before.
+    ///   tested: ryo-v2-ra tests/stack.rs expand_reads_the_top_level_of_a_live_fork
     fn expand(
         &self,
         s: &mut Self::Session,

@@ -47,6 +47,28 @@ pub(crate) fn require_free(s: &RaSession) -> Result<(), CheckError> {
     Ok(())
 }
 
+/// What an expansion reads, by the fork live on its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpandOn {
+    /// No fork is live: the state is written on an `Analyzer` fork of the base and read there.
+    Base,
+    /// A stacked fork is live: its top level is read, and nothing is written.
+    StackedTop,
+}
+
+/// The guard of an expansion: the poison first; then a live `Analyzer` fork is `ForkInUse`, and a
+/// live stacked fork is read at its top level.
+pub(crate) fn expand_on(s: &RaSession) -> Result<ExpandOn, CheckError> {
+    if let Some(msg) = &s.poisoned {
+        return Err(CheckError::Poisoned(msg.clone()));
+    }
+    match s.live.map(|l| l.port) {
+        None => Ok(ExpandOn::Base),
+        Some(ForkPort::Stacked) => Ok(ExpandOn::StackedTop),
+        Some(ForkPort::Analyzer) => Err(CheckError::ForkInUse),
+    }
+}
+
 /// The guard of an operation that holds a ticket and may end or read the fork: the ticket against
 /// the live fork. A wrong ticket changes nothing and wins over the poison.
 fn require_ticket(s: &RaSession, f: &RaStack) -> Result<(), CheckError> {

@@ -1451,13 +1451,14 @@ fn session_operations_refuse_while_a_fork_is_live() {
         Err(CheckError::ForkInUse)
     );
     assert_eq!(a.audit_revert(&mut s), Err(CheckError::ForkInUse));
-    for state in [Vec::new(), vec![edit.clone()]] {
-        let expanded = a.expand(&mut s, &state, &target, 10);
-        assert!(
-            matches!(expanded, Err(ExpandError::Session(CheckError::ForkInUse))),
-            "{expanded:?}"
-        );
-    }
+    // An expansion is not refused: it reads the top level, whose state is L1's edits.
+    let expanded = a.expand(
+        &mut s,
+        &[w_edit("c/src/lib.rs", &err_fn("l1"))],
+        &target,
+        10,
+    );
+    assert!(expanded.is_ok(), "{expanded:?}");
     assert!(matches!(
         Analyzer::fork(&a, &mut s),
         Err(AnalyzerError::ForkInUse)
@@ -1468,7 +1469,7 @@ fn session_operations_refuse_while_a_fork_is_live() {
     ));
     assert_eq!(a.levels(&s, &fork), Ok(1), "the fork was not touched");
     a.release(&mut s, fork).expect("release");
-    // Nothing refused was counted: this check is write 2, and it is sampled.
+    // Nothing refused, and no expansion, was counted: this check is write 2, and it is sampled.
     obs.take();
     a.check(&mut s, std::slice::from_ref(&edit), Scope::Affected)
         .expect("write 2");
@@ -2225,6 +2226,23 @@ fn a_failed_base_read_is_a_session_error() {
         "{failed:?}"
     );
 
+    // The expander's check of the state against the top level needs z's base text too: `state`
+    // does not name z, which a level edited.
+    let texts_before: Vec<Option<String>> = w_paths()
+        .iter()
+        .map(|p| a.fork_text(&s, &fork, p).expect("fork_text"))
+        .collect();
+    let expanded = a.expand(&mut s, &[], &[Target::new(rel("c/src/lib.rs"), None)], 10);
+    assert!(
+        matches!(&expanded, Err(ExpandError::Session(e @ CheckError::Load(_))) if e.reach() == CheckReach::Session),
+        "{expanded:?}"
+    );
+    let texts_after: Vec<Option<String>> = w_paths()
+        .iter()
+        .map(|p| a.fork_text(&s, &fork, p).expect("fork_text"))
+        .collect();
+    assert_eq!(texts_after, texts_before, "the expansion changed a text");
+
     // Not poisoned: the fork, its levels and its texts are as before, and it is used and ends.
     assert_eq!(a.levels(&s, &fork), Ok(2));
     assert_eq!(a.fork_text(&s, &fork, &z), Ok(Some(C_Z.to_owned())));
@@ -2249,4 +2267,136 @@ fn a_failed_base_read_is_a_session_error() {
         Scope::Affected,
     )
     .expect("the session is not poisoned");
+}
+
+/// Functions with a local binding and a call to name, so every command has something to offer.
+const LOCALS_LIB: &str = "pub fn h() -> u32 {\n    let v = x::xf();\n    v + 1\n}\n";
+const LOCALS_X: &str = "pub fn k() -> u32 {\n    let w = xf();\n    w * 2\n}\n";
+
+/// The levels of the live fork and the texts of every file of W at its top level.
+fn top_of(a: &RaAnalyzer, s: &RaSession, f: &RaStack) -> (usize, Vec<Option<String>>) {
+    (
+        a.levels(s, f).expect("levels"),
+        w_paths()
+            .iter()
+            .map(|p| a.fork_text(s, f, p).expect("fork_text"))
+            .collect(),
+    )
+}
+
+#[test]
+fn expand_reads_the_top_level_of_a_live_fork() {
+    let (a, obs) = analyzer(false);
+    let (f, mut s) = loaded_w("stack_expand_top", &a);
+    let mut twin = Analyzer::load(&a, &f.dir).expect("load the twin");
+    let targets = [
+        Target::new(rel("a/src/lib.rs"), None),
+        Target::new(rel("a/src/x.rs"), None),
+    ];
+    let l1 = vec![w_edit("a/src/lib.rs", LOCALS_LIB)];
+    let l2 = vec![w_edit("a/src/x.rs", LOCALS_X)];
+
+    let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+    a.write(&mut s, &mut fork, &l1).expect("L1");
+    a.write(&mut s, &mut fork, &l2).expect("L2");
+    // At L2 the state is both levels' edits; after a pop it is L1's.
+    for (k, state) in [compose(&[l1.clone(), l2.clone()]), l1.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        let at = format!("level {}", 2 - k);
+        let expected = a
+            .expand(&mut twin, &state, &targets, 500)
+            .unwrap_or_else(|e| panic!("{at}: the expansion with no fork: {e:?}"));
+        assert!(!expected.is_empty(), "{at}: the state offers children");
+
+        let before = top_of(&a, &s, &fork);
+        obs.take();
+        let got = a
+            .expand(&mut s, &state, &targets, 500)
+            .unwrap_or_else(|e| panic!("{at}: the expansion on the fork: {e:?}"));
+        assert_eq!(got, expected, "{at}: the children");
+        assert!(
+            checked_or_reverted(&obs.take()).is_empty(),
+            "{at}: the expansion wrote or diagnosed"
+        );
+        assert_eq!(top_of(&a, &s, &fork), before, "{at}: the fork changed");
+        if k == 0 {
+            assert!(a.pop(&mut s, &mut fork).expect("pop L2"));
+        }
+    }
+    // A state that also deletes a path the base lacks has L1's files, and a write of it on the
+    // base refuses the delete: both expansions give that refusal.
+    let gone = [l1.clone(), vec![Edit::delete(rel("a/src/gone.rs"))]].concat();
+    let expected = a.expand(&mut twin, &gone, &targets, 500);
+    assert!(
+        matches!(&expected, Err(ExpandError::Analysis(_))),
+        "{expected:?}"
+    );
+    let before = top_of(&a, &s, &fork);
+    assert_eq!(a.expand(&mut s, &gone, &targets, 500), expected);
+    assert_eq!(
+        top_of(&a, &s, &fork),
+        before,
+        "the refusal changed the fork"
+    );
+    a.release(&mut s, fork).expect("release");
+    a.check(&mut s, &l1, Scope::Affected)
+        .expect("the session is usable after the fork");
+}
+
+#[test]
+fn expand_refuses_a_state_that_is_not_the_top_level() {
+    let (a, obs) = analyzer(false);
+    let (_f, mut s) = loaded_w("stack_expand_not_top", &a);
+    let targets = [Target::new(rel("a/src/lib.rs"), None)];
+    let l1 = w_edit("a/src/lib.rs", LOCALS_LIB);
+
+    let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+    a.write(&mut s, &mut fork, std::slice::from_ref(&l1))
+        .expect("L1");
+    let before = top_of(&a, &s, &fork);
+    let refused: [(&str, Vec<Edit>, &[Target]); 5] = [
+        ("no edit: a level's path left out", Vec::new(), &targets),
+        (
+            "another text of the level's path",
+            vec![w_edit("a/src/lib.rs", &err_fn("other"))],
+            &targets,
+        ),
+        (
+            "a path no level edited, at another text",
+            vec![l1.clone(), w_edit("b/src/y.rs", &err_fn("y"))],
+            &targets,
+        ),
+        (
+            "a delete of the level's path",
+            vec![Edit::delete(rel("a/src/lib.rs"))],
+            &targets,
+        ),
+        ("no target", Vec::new(), &[]),
+    ];
+    for (what, state, targets) in refused {
+        obs.take();
+        let expanded = a.expand(&mut s, &state, targets, 10);
+        assert!(
+            matches!(expanded, Err(ExpandError::Session(CheckError::ForkInUse))),
+            "{what}: {expanded:?}"
+        );
+        assert!(
+            checked_or_reverted(&obs.take()).is_empty(),
+            "{what}: the refusal wrote or diagnosed"
+        );
+        assert_eq!(top_of(&a, &s, &fork), before, "{what}: the fork changed");
+    }
+
+    // A path no level edited, named at its base text, is the top level's state.
+    let at_base = a.expand(
+        &mut s,
+        &[l1.clone(), w_edit("b/src/y.rs", "")],
+        &targets,
+        10,
+    );
+    assert!(at_base.is_ok(), "{at_base:?}");
+    assert_eq!(top_of(&a, &s, &fork), before);
+    a.release(&mut s, fork).expect("release");
 }
