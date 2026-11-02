@@ -1567,7 +1567,46 @@ fn generate(
     }
 }
 
+/// The expansion of `state` with a stacked fork live: it is read at the top level, which must be
+/// `state`, and nothing is written. What it returns for that state is what the expansion with no
+/// fork returns: nothing for no target or no room, the refusal of a delete that a write of `state`
+/// on the base refuses, else the Blueprints generated from the database, which holds the texts of
+/// `state` as a write of it on the base would.
+fn expand_at_top(
+    a: &RaAnalyzer,
+    s: &RaSession,
+    state: &[Edit],
+    targets: &[Target],
+    max: usize,
+) -> Result<Vec<Blueprint>, ExpandError> {
+    let is_top = crate::fork::state_is_top(a, s, state).map_err(|e| {
+        ExpandError::Session(CheckError::Load(format!("database read failed: {e}")))
+    })?;
+    if !is_top {
+        return Err(ExpandError::Session(CheckError::ForkInUse));
+    }
+    if targets.is_empty() || max == 0 {
+        return Ok(Vec::new());
+    }
+    if let Some(e) = crate::fork::refused_delete_at_base(s, state) {
+        return Err(state_edit_rejected(
+            &e.path,
+            crate::fork::NOT_IN_THE_STATE_BELOW,
+        ));
+    }
+    generate(s, StateFp::of(state), targets, max)
+}
+
+/// The failure of an expansion whose state a write of it on the base refuses: this parent yields
+/// nothing.
+fn state_edit_rejected(path: &RelPath, reason: &str) -> ExpandError {
+    ExpandError::Analysis(format!("state edit rejected: {path}: {reason}"))
+}
+
 /// Blueprints for the five commands, from the code of a search state.
+///
+/// With a stacked fork live on the session, `state` is that of its top level, and it is read there
+/// without a write; with an `Analyzer` fork live, `expand` is refused.
 ///
 /// # Contract
 /// - C1: every returned Blueprint passes the conformance check of its command against the
@@ -1634,6 +1673,14 @@ fn generate(
 ///   tested: tests/expand_gen.rs extract_variable_restores_a_literal_argument
 ///   tested: tests/expand_gen.rs extract_variable_offers_no_path_argument
 ///   tested: expand::tests::a_reference_or_literal_argument_is_a_variable_shape
+/// - C16: with a stacked fork live on the session, a `state` that is not the state of the top
+///   level (a path a level or `state` edits has another text there) is
+///   `ExpandError::Session(CheckError::ForkInUse)` and changes nothing.
+///   tested: tests/stack.rs expand_refuses_a_state_that_is_not_the_top_level
+/// - C17: with a stacked fork live, a base text the check of `state` against the top level
+///   needs and cannot read makes `expand` `ExpandError::Session(CheckError::Load(..))`, and
+///   changes nothing.
+///   tested: tests/stack.rs a_failed_base_read_is_a_session_error
 impl Expander for RaAnalyzer {
     type Session = RaSession;
 
@@ -1644,7 +1691,9 @@ impl Expander for RaAnalyzer {
         targets: &[Target],
         max: usize,
     ) -> Result<Vec<Blueprint>, ExpandError> {
-        stack::require_free(s).map_err(ExpandError::Session)?;
+        if stack::expand_on(s).map_err(ExpandError::Session)? == stack::ExpandOn::StackedTop {
+            return expand_at_top(self, s, state, targets, max);
+        }
         if targets.is_empty() || max == 0 {
             return Ok(Vec::new());
         }
@@ -1675,9 +1724,7 @@ impl Expander for RaAnalyzer {
         }
         if let Err(e) = applied {
             return Err(match e {
-                AnalyzerError::Edit { path, reason } => {
-                    ExpandError::Analysis(format!("state edit rejected: {path}: {reason}"))
-                }
+                AnalyzerError::Edit { path, reason } => state_edit_rejected(&path, &reason),
                 other => ExpandError::Session(map_error(other, &paths)),
             });
         }

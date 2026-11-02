@@ -545,9 +545,9 @@ pub struct Note {\n    pub text: String,\n}\n";
                 .check(&mut s, std::slice::from_ref(&edit), Scope::Affected)
                 .expect("a panic the baseline had is named, not a failure");
             assert!(
-                found.unseen.contains(&d.unseen_class()),
+                found.unseen().contains(&d.unseen_class()),
                 "{d}: got {:?}",
-                found.unseen
+                found.unseen()
             );
         }
         // On a session whose baseline had no panic, the same panic means the file cannot be

@@ -75,7 +75,8 @@ impl StateFp {
 /// # Contract
 /// - C1: for each path the child's edit replaces the parent's; a write whose text equals
 ///   what `base` gives for the path is dropped, so a file back at its base text leaves the
-///   state; the result is sorted by path.
+///   state, and so is a delete of a path `base` has no text for (a file created, then
+///   deleted); the result is sorted by path.
 ///   tested: domain::search::tests::compose_drops_writes_equal_to_base
 pub fn compose(
     parent: &[Edit],
@@ -88,9 +89,22 @@ pub fn compose(
     }
     by_path
         .into_iter()
-        .filter(|(path, text)| text.is_none() || *text != base(path))
+        .filter(|(path, text)| *text != base(path))
         .map(|(path, new_text)| Edit { path, new_text })
         .collect()
+}
+
+/// How a stacked fork gets from the levels it holds to those of a path: the levels to pop, and
+/// the nodes whose levels to write then, in order.
+///
+/// # Contract
+/// - C1: the count is the number of nodes of `held` after the longest common prefix of `held`
+///   and `path`, and the nodes are those of `path` after it, in order; `repath(p, p)` pops and
+///   writes nothing.
+///   tested: domain::search::tests::repath_keeps_the_common_prefix
+pub fn repath<'a>(held: &[NodeId], path: &'a [NodeId]) -> (usize, &'a [NodeId]) {
+    let common = held.iter().zip(path).take_while(|(h, p)| h == p).count();
+    (held.len() - common, &path[common..])
 }
 
 /// Where a change is wanted: a file and, if known, a range of it.
@@ -664,6 +678,19 @@ mod tests {
     fn w(path: &str, text: &str) -> Edit {
         Edit::write(rel(path), text)
     }
+
+    #[test]
+    fn repath_keeps_the_common_prefix() {
+        let [r, a, b, c, d] = [0, 1, 2, 3, 4].map(NodeId);
+        assert_eq!(repath(&[r, a, b], &[r, a, c, d]), (1, [c, d].as_slice()));
+        assert_eq!(repath(&[], &[r]), (0, [r].as_slice()));
+        let p = [r, a, b];
+        assert_eq!(repath(&p, &p), (0, [].as_slice()));
+        assert_eq!(repath(&[r, a], &[r]), (1, [].as_slice()));
+        // Nothing in common: every held level goes.
+        assert_eq!(repath(&[a, b], &[c]), (2, [c].as_slice()));
+    }
+
     fn bp() -> Blueprint {
         let read = ReadRange::capture(rel("a.rs"), "let a = a;", tr(0, 10)).unwrap();
         Blueprint::new(BlueprintParts {
@@ -778,6 +805,9 @@ mod tests {
         // a delete stays, and so does a write of a file with no base
         let out = compose(&[], &[Edit::delete(rel("b.rs")), w("new.rs", "x")], &base);
         assert_eq!(out, vec![Edit::delete(rel("b.rs")), w("new.rs", "x")]);
+        // a file created by the parent and deleted by the child leaves the state
+        let out = compose(&[w("new.rs", "x")], &[Edit::delete(rel("new.rs"))], &base);
+        assert!(out.is_empty(), "{out:?}");
         assert!(compose(&[], &[], &base).is_empty());
     }
 

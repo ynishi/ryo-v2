@@ -25,19 +25,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit};
+use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit, Stacked};
 use ryo_v2_core::app::search::{
     DEFAULT_SEARCH_BUDGET, Fate, SearchError, SearchInput, SearchReport, TRIGGER_AFTER_CHECKS,
     TRIGGER_CHECK_GROWTH_PERMILLE, TRIGGER_CHECK_MEDIAN_MS, TRIGGER_DECISION_MEDIAN_MS,
     TRIGGER_HARNESS_MS, TRIGGER_RSS_KB, TraceEntry, search_decision,
 };
+use ryo_v2_core::app::verdict_of;
 use ryo_v2_core::domain::{
     ChangeProbe, DEFAULT_WEIGHTS, DomainError, Edit, Ident, PruneStage, RelPath, Resolution, Scope,
-    SearchBudget, Stage, Target, TextRange, Verdict,
+    SearchBudget, Stage, Target, TextRange,
 };
 use ryo_v2_core::infra::overlay::{OverlayError, overlay_edits};
 use ryo_v2_ra::{DetectorPanic, ExpanderPanic};
-use serde_json::{Value, json};
+use serde::{Serialize, Serializer};
 
 use crate::planted::{PlantKind, texts_match};
 
@@ -400,14 +401,28 @@ fn survived(t: &TraceEntry) -> bool {
     t.audited || matches!(t.fate, Fate::Passed | Fate::Failed { .. } | Fate::TimedOut)
 }
 
+/// The kinds as their kebab-case ids, the shape a row has in the report.
+fn kind_ids<S: Serializer>(kinds: &[PlantKind], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(kinds.iter().map(|k| k.id()))
+}
+
 /// One decision, measured or skipped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Contract
+/// - C1: serialized, a row is an object with one key per field, of the field's name and value;
+///   the kinds are their kebab-case ids. The keys and values of the hand-built row it replaced
+///   are kept, so reports before and after compare key by key.
+///   tested: search_recall::tests::row_json_keeps_its_keys_and_values
+///   tested: search_recall::tests::row_json_carries_the_depth_times
+///   tested: search_recall::tests::row_json_carries_the_level_writes
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DecisionRow {
     /// The case id.
     pub id: String,
     /// The base workspace.
     pub ws: String,
     /// The kinds planted.
+    #[serde(serialize_with = "kind_ids")]
     pub kinds: Vec<PlantKind>,
     /// The depth of the best.
     pub depth: u8,
@@ -439,6 +454,17 @@ pub struct DecisionRow {
     pub wall_ms: u64,
     /// The time of each check in ms (filled by the caller that observes them).
     pub check_ms: Vec<u64>,
+    /// Per depth: the time in the checks of the depth in ms (`DepthStats::check_ms`).
+    pub depth_check_ms: Vec<u64>,
+    /// Per depth: the time in the expansions in ms, the fork's writes and pops to each parent's
+    /// path included (`DepthStats::expand_ms`).
+    pub depth_expand_ms: Vec<u64>,
+    /// Per depth: the checks that ran (`DepthStats::checked`).
+    pub depth_checked: Vec<u16>,
+    /// Per depth: the parents expanded (`DepthStats::parents`).
+    pub depth_parents: Vec<u16>,
+    /// Per depth: the level writes on the search's fork (`DepthStats::writes`).
+    pub depth_writes: Vec<u32>,
 }
 
 impl DecisionRow {
@@ -463,31 +489,12 @@ impl DecisionRow {
             noul_audited_passed: 0,
             wall_ms: 0,
             check_ms: Vec::new(),
+            depth_check_ms: Vec::new(),
+            depth_expand_ms: Vec::new(),
+            depth_checked: Vec::new(),
+            depth_parents: Vec::new(),
+            depth_writes: Vec::new(),
         }
-    }
-
-    /// The row as JSON.
-    pub fn to_json(&self) -> Value {
-        json!({
-            "id": self.id,
-            "ws": self.ws,
-            "kinds": self.kinds.iter().map(|k| k.id()).collect::<Vec<_>>(),
-            "depth": self.depth,
-            "skipped": self.skipped,
-            "generated": self.generated,
-            "hit": self.hit,
-            "best_rank": self.best_rank,
-            "fate": self.fate,
-            "top3": self.top3,
-            "final_rank": self.final_rank,
-            "decided": self.decided,
-            "candidates": self.candidates,
-            "kept": self.kept,
-            "noul_audited": self.noul_audited,
-            "noul_audited_passed": self.noul_audited_passed,
-            "wall_ms": self.wall_ms,
-            "check_ms": self.check_ms,
-        })
     }
 }
 
@@ -549,6 +556,11 @@ pub fn analyze(case: &PlantedCase, truth: &Truth<'_>, report: &SearchReport) -> 
         ),
         wall_ms: report.elapsed_ms,
         check_ms: Vec::new(),
+        depth_check_ms: report.depths.iter().map(|d| d.check_ms).collect(),
+        depth_expand_ms: report.depths.iter().map(|d| d.expand_ms).collect(),
+        depth_checked: report.depths.iter().map(|d| d.checked).collect(),
+        depth_parents: report.depths.iter().map(|d| d.parents).collect(),
+        depth_writes: report.depths.iter().map(|d| d.writes).collect(),
     }
 }
 
@@ -635,7 +647,7 @@ pub fn run_case<V, E, A, J>(
     budget: SearchBudget,
 ) -> Result<CaseRun, RecallError>
 where
-    V: RevertAudit,
+    V: Stacked + RevertAudit,
     E: Expander<Session = V::Session>,
     A: Assessor,
     J: Judge,
@@ -652,8 +664,9 @@ where
         return Ok(skipped("the overlay makes no edit".into()));
     }
     let clean = case.clean_texts(&edits)?;
-    let checked = match v.check(s, &edits, Scope::Affected) {
-        Ok(checked) => checked,
+    let baseline = v.baseline(s);
+    let verdict = match verdict_of(v, s, &edits, Scope::Affected, &baseline) {
+        Ok(verdict) => verdict,
         // The planted state cannot be judged, and the session is intact: skip the case without
         // the reload a search error makes.
         Err(e @ CheckError::DetectorPanicked { .. }) => {
@@ -661,7 +674,6 @@ where
         }
         Err(e) => return Err(RecallError::Check(e)),
     };
-    let verdict = Verdict::from_baseline(&v.baseline(s), &checked);
     if !verdict.passed() {
         return Ok(skipped(format!(
             "planted state does not verify: {} new errors, {} unmapped",
@@ -1202,50 +1214,135 @@ impl ContainedPanics {
         out
     }
 
-    /// The JSON of `--report`: `{"detector": [{ws,path,message}], "expander": [{ws,kind,path,message}]}`.
-    pub fn to_json(&self) -> Value {
-        json!({
-            "detector": self.detector.iter().map(|(ws, d)| json!({
-                "ws": ws,
-                "path": d.path.as_str(),
-                "message": d.message,
-            })).collect::<Vec<_>>(),
-            "expander": self.expander.iter().map(|(ws, e)| json!({
-                "ws": ws,
-                "kind": e.kind.map(|k| k.id()),
-                "path": e.path.as_ref().map(|p| p.as_str()),
-                "message": e.message,
-            })).collect::<Vec<_>>(),
-        })
+    /// The panics as the `--report` file holds them. The entries are the report's own shapes, not
+    /// those of the records a session keeps: a detector entry leaves the detector out, and an
+    /// expander entry writes its kind as an id.
+    pub fn report(&self) -> PanicsReport<'_> {
+        PanicsReport {
+            detector: self
+                .detector
+                .iter()
+                .map(|(ws, d)| DetectorEntry {
+                    ws,
+                    path: d.path.as_str(),
+                    message: &d.message,
+                })
+                .collect(),
+            expander: self
+                .expander
+                .iter()
+                .map(|(ws, e)| ExpanderEntry {
+                    ws,
+                    kind: e.kind.map(|k| k.id()),
+                    path: e.path.as_ref().map(|p| p.as_str()),
+                    message: &e.message,
+                })
+                .collect(),
+        }
     }
 }
 
-/// The whole run as JSON.
-pub fn report_json(rows: &[DecisionRow], t: RunInfo) -> Value {
-    let all = Counts::of(rows);
-    json!({
-        "decisions": all.measured,
-        "skipped": all.skipped,
-        "generated": all.generated,
-        "hit": all.hit,
-        "beam": t.k(),
-        "recall_at_beam": all.recall(),
-        "hit_over_all": all.recall_of_all(),
-        "generation_rate": all.generation_rate(),
-        "top3_rate": all.top3_rate(),
-        "verdict": verdict(all.generated, all.recall()).id(),
-        "harness_ms": t.harness_ms,
-        "outer_check_ms": t.outer_check_ms,
-        "outer_sample": match t.outer_sample {
-            OuterSample::Off => Value::Null,
-            OuterSample::All => json!("all"),
-            OuterSample::Top(n) => json!(n.get()),
-        },
-        "search_ms": t.search_ms(),
-        "rss_kb": t.rss_kb,
-        "triggers": trigger_lines(rows, t),
-        "rows": rows.iter().map(DecisionRow::to_json).collect::<Vec<_>>(),
-    })
+/// The contained panics of a run, as the `--report` file holds them: `detector` entries of `ws`,
+/// `path` and `message`, and `expander` entries of `ws`, `kind` (its id, or null), `path` (or null)
+/// and `message`.
+#[derive(Debug, Serialize)]
+pub struct PanicsReport<'a> {
+    detector: Vec<DetectorEntry<'a>>,
+    expander: Vec<ExpanderEntry<'a>>,
+}
+
+/// A detector panic in the report.
+#[derive(Debug, Serialize)]
+struct DetectorEntry<'a> {
+    ws: &'a str,
+    path: &'a str,
+    message: &'a str,
+}
+
+/// An expander panic in the report.
+#[derive(Debug, Serialize)]
+struct ExpanderEntry<'a> {
+    ws: &'a str,
+    kind: Option<&'static str>,
+    path: Option<&'a str>,
+    message: &'a str,
+}
+
+/// `outer_sample` in the report: null without an outer check, `"all"`, or the number of candidates
+/// per decision.
+fn outer_sample_value<S: Serializer>(
+    sample: &OuterSample,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match sample {
+        OuterSample::Off => serializer.serialize_none(),
+        OuterSample::All => serializer.serialize_str("all"),
+        OuterSample::Top(n) => n.get().serialize(serializer),
+    }
+}
+
+/// The whole run, as the `--report` file holds it.
+///
+/// # Contract
+/// - C1: serialized, the report is the object `--report` writes: the keys decisions, skipped,
+///   generated, hit, beam, recall_at_beam, hit_over_all, generation_rate, top3_rate, verdict,
+///   harness_ms, outer_check_ms, outer_sample, search_ms, rss_kb, triggers and rows with the
+///   values the hand-built report gave them, and contained_panics, with its detector and expander
+///   entries, when panics are given; rows are as `DecisionRow` C1 says.
+///   tested: search_recall::tests::report_json_keeps_its_keys_and_values
+#[derive(Debug, Serialize)]
+pub struct Report<'a> {
+    decisions: usize,
+    skipped: usize,
+    generated: usize,
+    hit: usize,
+    beam: usize,
+    recall_at_beam: Option<f64>,
+    hit_over_all: Option<f64>,
+    generation_rate: Option<f64>,
+    top3_rate: Option<f64>,
+    verdict: &'static str,
+    harness_ms: u64,
+    outer_check_ms: u64,
+    #[serde(serialize_with = "outer_sample_value")]
+    outer_sample: OuterSample,
+    search_ms: u64,
+    rss_kb: Option<u64>,
+    triggers: Vec<String>,
+    rows: &'a [DecisionRow],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contained_panics: Option<PanicsReport<'a>>,
+}
+
+impl<'a> Report<'a> {
+    /// The report of `rows` under `t`, with the contained `panics` when the run collected them.
+    pub fn of(
+        rows: &'a [DecisionRow],
+        t: RunInfo,
+        panics: Option<&'a ContainedPanics>,
+    ) -> Report<'a> {
+        let all = Counts::of(rows);
+        Report {
+            decisions: all.measured,
+            skipped: all.skipped,
+            generated: all.generated,
+            hit: all.hit,
+            beam: t.k(),
+            recall_at_beam: all.recall(),
+            hit_over_all: all.recall_of_all(),
+            generation_rate: all.generation_rate(),
+            top3_rate: all.top3_rate(),
+            verdict: verdict(all.generated, all.recall()).id(),
+            harness_ms: t.harness_ms,
+            outer_check_ms: t.outer_check_ms,
+            outer_sample: t.outer_sample,
+            search_ms: t.search_ms(),
+            rss_kb: t.rss_kb,
+            triggers: trigger_lines(rows, t),
+            rows,
+            contained_panics: panics.map(ContainedPanics::report),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1257,6 +1354,7 @@ mod tests {
         StateFp,
     };
     use ryo_v2_ra::GapDetector;
+    use serde_json::{Value, json};
 
     #[test]
     fn contained_panics_lines_count_and_list() {
@@ -1288,7 +1386,10 @@ mod tests {
                 CommandKind::ExtractVariable.id()
             )
         );
-        assert_eq!(p.to_json()["expander"][0]["ws"], "ws1");
+        assert_eq!(
+            serde_json::to_value(p.report()).unwrap()["expander"][0]["ws"],
+            "ws1"
+        );
     }
 
     fn rel(s: &str) -> RelPath {
@@ -1662,7 +1763,7 @@ mod tests {
             unknown.ends_with("(not measured: budget unknown)"),
             "{unknown}"
         );
-        let json = report_json(
+        let json = serde_json::to_value(Report::of(
             &[row("a", true, true)],
             RunInfo {
                 harness_ms: 983_033,
@@ -1670,7 +1771,9 @@ mod tests {
                 budget: default,
                 ..RunInfo::default()
             },
-        );
+            None,
+        ))
+        .unwrap();
         assert_eq!(json["search_ms"], 348_068);
         assert_eq!(json["outer_check_ms"], 634_965);
         assert_eq!(json["harness_ms"], 983_033);
@@ -1710,20 +1813,289 @@ mod tests {
     fn report_names_the_outer_sample() {
         let rows = [row("a", true, true)];
         let off = RunInfo::default();
-        assert_eq!(report_json(&rows, off)["outer_sample"], Value::Null);
+        assert_eq!(
+            serde_json::to_value(Report::of(&rows, off, None)).unwrap()["outer_sample"],
+            Value::Null
+        );
         assert!(!markdown(&rows, off).contains("outer sample"));
         let all = RunInfo {
             outer_sample: OuterSample::All,
             ..RunInfo::default()
         };
-        assert_eq!(report_json(&rows, all)["outer_sample"], "all");
+        assert_eq!(
+            serde_json::to_value(Report::of(&rows, all, None)).unwrap()["outer_sample"],
+            "all"
+        );
         assert!(markdown(&rows, all).contains("- outer sample: all\n"));
         let three = RunInfo {
             outer_sample: OuterSample::Top(NonZeroUsize::new(3).unwrap()),
             ..RunInfo::default()
         };
-        assert_eq!(report_json(&rows, three)["outer_sample"], 3);
+        assert_eq!(
+            serde_json::to_value(Report::of(&rows, three, None)).unwrap()["outer_sample"],
+            3
+        );
         assert!(markdown(&rows, three).contains("- outer sample: top 3 of each decision\n"));
+    }
+
+    /// The five keys a row has beyond the 18 of the hand-built row.
+    const DEPTH_KEYS: [&str; 5] = [
+        "depth_check_ms",
+        "depth_expand_ms",
+        "depth_checked",
+        "depth_parents",
+        "depth_writes",
+    ];
+
+    #[test]
+    fn row_json_carries_the_level_writes() {
+        let (p, c) = (planted(), clean());
+        let mut r = report(vec![entry(
+            1,
+            Fate::Passed,
+            Some(0),
+            Some(vec![Edit::write(rel("a/src/lib.rs"), CLEAN)]),
+            1,
+        )]);
+        r.depths = vec![
+            DepthStats {
+                depth: 1,
+                writes: 5,
+                ..DepthStats::default()
+            },
+            DepthStats {
+                depth: 2,
+                writes: 17,
+                ..DepthStats::default()
+            },
+        ];
+        let row = analyze(&case(), &truth(&p, &c), &r);
+        assert_eq!(row.depth_writes, vec![5, 17]);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["depth_writes"], json!([5, 17]));
+    }
+
+    #[test]
+    fn row_json_carries_the_depth_times() {
+        let (p, c) = (planted(), clean());
+        let mut r = report(vec![entry(
+            1,
+            Fate::Passed,
+            Some(0),
+            Some(vec![Edit::write(rel("a/src/lib.rs"), CLEAN)]),
+            1,
+        )]);
+        r.depths = vec![
+            DepthStats {
+                depth: 1,
+                parents: 1,
+                generated: 9,
+                kept: 4,
+                checked: 3,
+                expand_ms: 11,
+                check_ms: 120,
+                ..DepthStats::default()
+            },
+            DepthStats {
+                depth: 2,
+                parents: 4,
+                generated: 30,
+                kept: 6,
+                checked: 5,
+                expand_ms: 31,
+                check_ms: 340,
+                ..DepthStats::default()
+            },
+        ];
+        let row = analyze(&case(), &truth(&p, &c), &r);
+        assert_eq!(row.depth_check_ms, vec![120, 340]);
+        assert_eq!(row.depth_expand_ms, vec![11, 31]);
+        assert_eq!(row.depth_checked, vec![3, 5]);
+        assert_eq!(row.depth_parents, vec![1, 4]);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["depth_check_ms"], json!([120, 340]));
+        assert_eq!(json["depth_expand_ms"], json!([11, 31]));
+        assert_eq!(json["depth_checked"], json!([3, 5]));
+        assert_eq!(json["depth_parents"], json!([1, 4]));
+        // A row that was not measured has no depth.
+        let skipped = serde_json::to_value(DecisionRow::skipped(&case(), "why")).unwrap();
+        for key in DEPTH_KEYS {
+            assert_eq!(skipped[key], json!([]), "{key}");
+        }
+    }
+
+    #[test]
+    fn row_json_keeps_its_keys_and_values() {
+        let row = DecisionRow {
+            id: "c1".into(),
+            ws: "lab".into(),
+            kinds: vec![PlantKind::ObscureName, PlantKind::InlineFunction],
+            depth: 2,
+            skipped: None,
+            generated: true,
+            hit: true,
+            best_rank: Some(3),
+            fate: Some("passed".into()),
+            top3: true,
+            final_rank: None,
+            decided: true,
+            candidates: vec![12, 7],
+            kept: vec![5, 4],
+            noul_audited: 2,
+            noul_audited_passed: 1,
+            wall_ms: 1234,
+            check_ms: vec![40, 50, 60],
+            depth_check_ms: vec![90, 120],
+            depth_expand_ms: vec![10, 20],
+            depth_checked: vec![3, 4],
+            depth_parents: vec![1, 2],
+            depth_writes: vec![2, 8],
+        };
+        let mut got = serde_json::to_value(&row).unwrap();
+        let object = got.as_object_mut().unwrap();
+        for key in DEPTH_KEYS {
+            assert!(object.remove(key).is_some(), "the row has {key}");
+        }
+        assert_eq!(
+            got,
+            json!({
+                "id": "c1",
+                "ws": "lab",
+                "kinds": ["obscure-name", "inline-function"],
+                "depth": 2,
+                "skipped": null,
+                "generated": true,
+                "hit": true,
+                "best_rank": 3,
+                "fate": "passed",
+                "top3": true,
+                "final_rank": null,
+                "decided": true,
+                "candidates": [12, 7],
+                "kept": [5, 4],
+                "noul_audited": 2,
+                "noul_audited_passed": 1,
+                "wall_ms": 1234,
+                "check_ms": [40, 50, 60],
+            })
+        );
+        // The other shape of every option: a row that was not measured.
+        let mut got = serde_json::to_value(DecisionRow::skipped(&case(), "why")).unwrap();
+        let object = got.as_object_mut().unwrap();
+        for key in DEPTH_KEYS {
+            assert!(object.remove(key).is_some(), "the row has {key}");
+        }
+        assert_eq!(
+            got,
+            json!({
+                "id": "c",
+                "ws": "lab",
+                "kinds": ["obscure-name"],
+                "depth": 1,
+                "skipped": "why",
+                "generated": false,
+                "hit": false,
+                "best_rank": null,
+                "fate": null,
+                "top3": false,
+                "final_rank": null,
+                "decided": false,
+                "candidates": [],
+                "kept": [],
+                "noul_audited": 0,
+                "noul_audited_passed": 0,
+                "wall_ms": 0,
+                "check_ms": [],
+            })
+        );
+    }
+
+    #[test]
+    fn report_json_keeps_its_keys_and_values() {
+        let rows = [row("a", true, true), DecisionRow::skipped(&case(), "why")];
+        let mut panics = ContainedPanics::default();
+        panics.absorb(
+            "ws1",
+            &[DetectorPanic {
+                detector: GapDetector::DuplicateName,
+                path: rel("src/a.rs"),
+                message: "boom\nmore".to_owned(),
+            }],
+            &[
+                ExpanderPanic {
+                    kind: Some(CommandKind::ExtractVariable),
+                    path: None,
+                    message: "bang".to_owned(),
+                },
+                ExpanderPanic {
+                    kind: None,
+                    path: Some(rel("src/b.rs")),
+                    message: "bing".to_owned(),
+                },
+            ],
+        );
+        let info = |outer_sample| RunInfo {
+            harness_ms: 1000,
+            outer_check_ms: 400,
+            outer_sample,
+            rss_kb: Some(777),
+            ..RunInfo::default()
+        };
+        let all = info(OuterSample::All);
+        let expected = json!({
+            "decisions": 1,
+            "skipped": 1,
+            "generated": 1,
+            "hit": 1,
+            "beam": RECALL_K,
+            "recall_at_beam": 1.0,
+            "hit_over_all": 1.0,
+            "generation_rate": 1.0,
+            "top3_rate": 0.0,
+            "verdict": "insufficient",
+            "harness_ms": 1000,
+            "outer_check_ms": 400,
+            "outer_sample": "all",
+            "search_ms": 600,
+            "rss_kb": 777,
+            "triggers": trigger_lines(&rows, all),
+            "rows": [
+                serde_json::to_value(&rows[0]).unwrap(),
+                serde_json::to_value(&rows[1]).unwrap(),
+            ],
+            "contained_panics": {
+                "detector": [{"ws": "ws1", "path": "src/a.rs", "message": "boom\nmore"}],
+                "expander": [
+                    {"ws": "ws1", "kind": null, "path": "src/b.rs", "message": "bing"},
+                    {"ws": "ws1", "kind": "extract-variable", "path": null, "message": "bang"},
+                ],
+            },
+        });
+        let got = serde_json::to_value(Report::of(&rows, all, Some(&panics))).unwrap();
+        assert_eq!(got, expected);
+        // Without panics the key is absent; the other values are the same.
+        let mut without = expected;
+        without.as_object_mut().unwrap().remove("contained_panics");
+        let got = serde_json::to_value(Report::of(&rows, all, None)).unwrap();
+        assert_eq!(got, without);
+        // The three shapes of `outer_sample`.
+        let shape = |sample| {
+            serde_json::to_value(Report::of(&rows, info(sample), None)).unwrap()["outer_sample"]
+                .clone()
+        };
+        assert_eq!(shape(OuterSample::Off), Value::Null);
+        assert_eq!(shape(OuterSample::All), json!("all"));
+        assert_eq!(
+            shape(OuterSample::Top(NonZeroUsize::new(3).unwrap())),
+            json!(3)
+        );
+        // A run without a known memory size says null.
+        let unknown = RunInfo {
+            rss_kb: None,
+            ..all
+        };
+        let got = serde_json::to_value(Report::of(&rows, unknown, None)).unwrap();
+        assert_eq!(got["rss_kb"], Value::Null);
     }
 
     #[test]

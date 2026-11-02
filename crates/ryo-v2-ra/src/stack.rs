@@ -47,6 +47,28 @@ pub(crate) fn require_free(s: &RaSession) -> Result<(), CheckError> {
     Ok(())
 }
 
+/// What an expansion reads, by the fork live on its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpandOn {
+    /// No fork is live: the state is written on an `Analyzer` fork of the base and read there.
+    Base,
+    /// A stacked fork is live: its top level is read, and nothing is written.
+    StackedTop,
+}
+
+/// The guard of an expansion: the poison first; then a live `Analyzer` fork is `ForkInUse`, and a
+/// live stacked fork is read at its top level.
+pub(crate) fn expand_on(s: &RaSession) -> Result<ExpandOn, CheckError> {
+    if let Some(msg) = &s.poisoned {
+        return Err(CheckError::Poisoned(msg.clone()));
+    }
+    match s.live.map(|l| l.port) {
+        None => Ok(ExpandOn::Base),
+        Some(ForkPort::Stacked) => Ok(ExpandOn::StackedTop),
+        Some(ForkPort::Analyzer) => Err(CheckError::ForkInUse),
+    }
+}
+
 /// The guard of an operation that holds a ticket and may end or read the fork: the ticket against
 /// the live fork. A wrong ticket changes nothing and wins over the poison.
 fn require_ticket(s: &RaSession, f: &RaStack) -> Result<(), CheckError> {
@@ -102,6 +124,20 @@ pub(crate) fn write_level(
 ///   tested: tests/stack.rs stacked_writes_are_audited
 /// - C3: an `Analyzer` fork and a stacked fork share the one live fork of the session.
 ///   tested: tests/stack.rs session_operations_refuse_while_a_fork_is_live
+/// - C4: every unseen class of a diagnosis, a check's included, has in `unseen_at` each file it
+///   was observed on and no other: the files where the unresolved-path detector was skipped for
+///   a macro call that did not expand, and those where a detector panicked as it did at the
+///   baseline; no class has an empty set.
+///   tested: tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
+/// - C5: a base text that `files_of` needs and cannot read (a database read that fails)
+///   makes it `CheckError::Load`, of reach `Session`; the session is not poisoned, and the
+///   fork, its levels and every text are as before.
+///   tested: tests/stack.rs a_failed_base_read_is_a_session_error
+/// - C6: every finding of a diagnosis, a check's included, is on a file the diagnosis covers.
+///   An error is on the scanned file, or, when rust-analyzer reports its range in another file
+///   (code pulled in with `include!`), on that file, which is in the scanned file's crate
+///   (`diagnostics::collect_errors` C1, C3 and C4); and every scope holds whole crates.
+///   tested: tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
 impl Stacked for RaAnalyzer {
     type Fork = RaStack;
 
@@ -140,6 +176,18 @@ impl Stacked for RaAnalyzer {
     ) -> Result<ScopedFindings, CheckError> {
         require_usable(s, f)?;
         diagnose_for_check(self, s, scope)
+    }
+
+    fn files_of(
+        &self,
+        s: &RaSession,
+        f: &RaStack,
+        scope: Scope,
+    ) -> Result<Vec<RelPath>, CheckError> {
+        require_usable(s, f)?;
+        // Only a read can fail here, and it writes nothing: a session error, not a poison.
+        fork::files_of(self, s, scope)
+            .map_err(|e| CheckError::Load(format!("database read failed: {e}")))
     }
 
     fn pop(&self, s: &mut RaSession, f: &mut RaStack) -> Result<bool, CheckError> {

@@ -202,6 +202,12 @@ pub trait Verifier {
     fn blind_classes(&self) -> BTreeSet<UnseenClass>;
     /// Applies `edits`, diagnoses the files of `scope`, and reverts. The observable state of
     /// the session afterwards is the state before.
+    ///
+    /// # Contract
+    /// - C1: every finding of the result is on one of the result's `files`, one the analyzer
+    ///   attributes to another file than the one it scanned included; `Verdict::of_check` and so
+    ///   `app::verdict_of` and `Verdict::of_level` C3 rest on it.
+    ///   tested: ryo-v2-ra tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
     fn check(
         &self,
         s: &mut Self::Session,
@@ -239,20 +245,21 @@ pub trait RevertAudit: Verifier {
 /// after a release that found the session poisoned.
 ///
 /// An adapter whose forks write into the session's one database allows one live fork per
-/// session, and while it is live the session's other operations refuse with `ForkInUse`. An
-/// adapter whose forks are separate copies may keep several live.
+/// session, and while it is live the session's other operations refuse with `ForkInUse`, except an
+/// expansion of its top level. An adapter whose forks are separate copies may keep several live.
 ///
 /// # Contract
 /// - C1: on a poisoned session `fork`, and given the live fork's ticket `write`, `diagnose`,
-///   `fork_text` and `pop`, are `Poisoned`; `levels` still answers; `release` ends the fork and
-///   is `Poisoned`. A ticket that is not the live fork's is `ForkInUse` before the poison is
-///   looked at, and changes nothing.
+///   `files_of`, `fork_text` and `pop`, are `Poisoned`; `levels` still answers; `release` ends
+///   the fork and is `Poisoned`. A ticket that is not the live fork's is `ForkInUse` before the
+///   poison is looked at, and changes nothing.
 ///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
 ///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
 /// - C2: while a fork of an adapter with one live fork per session is live, `Verifier::check`,
-///   `RevertAudit::audit_revert`, `Expander::expand` (as `ExpandError::Session`) and a second
-///   `fork` are `ForkInUse`, or `Poisoned` on a poisoned session, before they change anything; an
-///   operation given a ticket that is not the live fork's is `ForkInUse`.
+///   `RevertAudit::audit_revert` and a second `fork` are `ForkInUse`, or `Poisoned` on a poisoned
+///   session, before they change anything, and so is `Expander::expand` (as
+///   `ExpandError::Session`) while that fork is an `Analyzer` fork; an operation given a ticket
+///   that is not the live fork's is `ForkInUse`.
 ///   tested: ryo-v2-ra tests/stack.rs session_operations_refuse_while_a_fork_is_live
 ///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
 /// - C3: while a fork is live, and after a release that found the session poisoned,
@@ -290,8 +297,8 @@ pub trait Stacked: Verifier {
     ///   tested: ryo-v2-ra tests/stack.rs a_level_writes_against_the_state_below
     /// - C3: a stack diagnoses as its flat composition: at level k, `diagnose` at
     ///   `Scope::Workspace` gives what `Verifier::check` at `Scope::Workspace` gives for the edits
-    ///   that take the base to the state of level k (the same files, findings and unseen classes,
-    ///   or the same failure of its diagnosis), and at `Scope::Affected` its files are the top
+    ///   that take the base to the state of level k (the same files, findings and `unseen_at`, or
+    ///   the same failure of its diagnosis), and at `Scope::Affected` its files are the top
     ///   level's scope and their findings are those that check gives on them.
     ///   tested: ryo-v2-ra tests/stack.rs a_stack_diagnoses_as_its_flat_composition
     /// - C4: a refused write (`Edit`, or a failure of the diagnosis it takes of the level below)
@@ -345,7 +352,7 @@ pub trait Stacked: Verifier {
     /// - C2: with no level the result is `ScopedFindings::default()`.
     ///   tested: ryo-v2-ra tests/stack.rs pop_without_a_level_is_false
     /// - C3: a file outside the top level's `Scope::Affected` has, at the top level, the findings
-    ///   it has at the level below.
+    ///   it has at the level below, and the same files under each class of `unseen_at`.
     ///   tested: ryo-v2-ra tests/stack.rs files_outside_the_top_scope_keep_the_level_below
     /// - C4: the adapter's check time limit cuts a diagnosis off with `TimedOut`; the levels stay
     ///   and the fork stays usable.
@@ -365,12 +372,42 @@ pub trait Stacked: Verifier {
     ///   the top level plus the duration of this diagnosis: an earlier diagnosis of the level,
     ///   the time between calls and the pop that made the level the top are not in it.
     ///   tested: ryo-v2-ra tests/stack.rs the_diagnoses_of_a_level_do_not_add_up
+    /// - C8: every class of the result's `unseen_at` names at least one file, and only files of
+    ///   the result; by `Stacked` C4 so does every class of a check's findings.
+    ///   tested: ryo-v2-ra tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
+    /// - C9: every finding of the result is on one of the result's `files`, one the analyzer
+    ///   attributes to another file than the one it scanned included; by `Stacked` C4 so is every
+    ///   finding of a check. A finding below is so on a file of its own diagnosis, and a file
+    ///   diagnosed again replaces it (`ScopedFindings::on_top_of`).
+    ///   tested: ryo-v2-ra tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
     fn diagnose(
         &self,
         s: &Self::Session,
         f: &Self::Fork,
         scope: Scope,
     ) -> Result<ScopedFindings, CheckError>;
+
+    /// The files a one-level `Verifier::check` at `scope` covers for the edits that take the base
+    /// to the top level's state. The adapter derives those edits' paths from its own levels, so
+    /// a caller cannot name a wrong set. The caller keeps a composed verdict to these files
+    /// (`Verdict::of_level`).
+    ///
+    /// # Contract
+    /// - C1: the files, sorted, are those of `Verifier::check` at `scope` of the edits that take
+    ///   the base to the top level's state: one edit per path some level edited whose presence or
+    ///   text at the top level differs from the base, and no other.
+    ///   tested: ryo-v2-ra tests/stack.rs files_of_and_of_level_equal_the_check_over_a_stack
+    /// - C2: with no level, or with every path the levels edited back at its base presence and
+    ///   text, the result at `Scope::Affected` is empty, as a check with no edit diagnoses no file
+    ///   there; at `Scope::Workspace` it is every file of the top level's state, as such a check
+    ///   diagnoses every file.
+    ///   tested: ryo-v2-ra tests/stack.rs files_of_and_of_level_equal_the_check_over_a_stack
+    fn files_of(
+        &self,
+        s: &Self::Session,
+        f: &Self::Fork,
+        scope: Scope,
+    ) -> Result<Vec<RelPath>, CheckError>;
 
     /// Reverts the top level.
     ///
@@ -429,6 +466,15 @@ pub trait Expander {
     /// Children of the state `state` (edits over the session base), at most `max`, within
     /// `targets`. Observable session state afterwards = before. Reads and splices are against
     /// the state's text.
+    ///
+    /// When a stacked fork is live on the session, `state` is the state of its top level, and the
+    /// children are read there: nothing is written.
+    ///
+    /// # Contract
+    /// - C1: with a stacked fork live on the session and `state` the state of its top level, the
+    ///   result is what `expand` gives for `state` with no fork live, and afterwards the fork has
+    ///   the same levels and every text is as before.
+    ///   tested: ryo-v2-ra tests/stack.rs expand_reads_the_top_level_of_a_live_fork
     fn expand(
         &self,
         s: &mut Self::Session,

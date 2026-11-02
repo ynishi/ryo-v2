@@ -139,9 +139,11 @@ pub enum GapDetector {
     ///   all expand is not skipped.
     ///   tested: tests/unresolved.rs unresolved_names_outside_an_unexpanded_macro_file_are_still_reported
     ///   tested: tests/unresolved.rs a_file_whose_macros_expand_keeps_its_findings
-    /// - C3: a diagnostics run that skips a file by C1 names `UnexpandedMacro` in the `unseen` of
-    ///   its findings; a run that skips none, or that runs no gap detector, does not.
+    /// - C3: a diagnostics run that skips a file by C1 names `UnexpandedMacro` in the `unseen_at`
+    ///   of its findings, with that file; a run that skips none, or that runs no gap detector,
+    ///   does not.
     ///   tested: tests/unresolved.rs unexpanded_macro_file_names_the_class
+    ///   tested: tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
     UnresolvedPath,
     /// A name an item and a `use` both define (E0255), `duplicate.rs`.
     DuplicateName,
@@ -320,7 +322,7 @@ fn collect_errors(
                 let line_of = |at: TextSize| index.line_col(at).line + 1;
                 for (which, run) in DETECTORS {
                     if unexpanded_macro && which.skips_files_with_unexpanded_macros() {
-                        found.unexpanded_macro = true;
+                        found.unexpanded_macro.push(rel.clone());
                         continue;
                     }
                     // Each detector is contained on its own: a panic in one costs this file
@@ -379,7 +381,8 @@ struct Collected {
     native: Vec<Finding>,
     foreign: Vec<Finding>,
     panics: Vec<(GapDetector, RelPath)>,
-    unexpanded_macro: bool,
+    /// The files on which the unresolved-path detector was skipped.
+    unexpanded_macro: Vec<RelPath>,
 }
 
 impl Collected {
@@ -387,7 +390,7 @@ impl Collected {
         self.native.extend(other.native);
         self.foreign.extend(other.foreign);
         self.panics.extend(other.panics);
-        self.unexpanded_macro |= other.unexpanded_macro;
+        self.unexpanded_macro.extend(other.unexpanded_macro);
     }
 
     /// Native findings and the foreign ones no native finding equals (once each), sorted.
@@ -406,10 +409,13 @@ impl Collected {
         let mut panics = self.panics;
         panics.sort();
         panics.dedup();
+        let mut unexpanded_macro = self.unexpanded_macro;
+        unexpanded_macro.sort();
+        unexpanded_macro.dedup();
         Collect {
             findings: all,
             panics,
-            unexpanded_macro: self.unexpanded_macro,
+            unexpanded_macro,
         }
     }
 }
@@ -422,9 +428,9 @@ pub(crate) struct Collect {
     /// The session's record keeps a panic once however many collects hit it; this list is of this
     /// collect only.
     pub(crate) panics: Vec<(GapDetector, RelPath)>,
-    /// Whether the unresolved-path detector stayed silent on some file of this collect because a
-    /// macro call on it was not expanded.
-    pub(crate) unexpanded_macro: bool,
+    /// The files of this collect on which the unresolved-path detector stayed silent because a
+    /// macro call on them was not expanded; sorted, unique.
+    pub(crate) unexpanded_macro: Vec<RelPath>,
 }
 
 /// Parallel [`collect_errors`]: chunks the files and diagnoses each chunk on its own snapshot.

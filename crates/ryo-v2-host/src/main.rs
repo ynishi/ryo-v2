@@ -58,6 +58,11 @@ enum Command {
         /// Skip the post-revert re-diagnosis (revert_ms then excludes it; revert_ok prints `-`).
         #[arg(long)]
         no_assert_revert: bool,
+        /// Measure each VARIANT as a child of the PARENT overlay, two ways: `rebuilt` (the
+        /// parent's and the variant's edits composed and verified from BASE) and `stacked` (the
+        /// variant written as a level on top of the parent's level of one fork).
+        #[arg(long, value_name = "PARENT")]
+        on: Option<PathBuf>,
     },
     /// Verify BLUEPRINTS against the workspace and print the Resolution as JSON (a dry run: nothing is written).
     Apply {
@@ -174,6 +179,7 @@ fn run() -> Result<ExitCode> {
             scope,
             no_proc_macro,
             no_assert_revert,
+            on,
         } => {
             let (base, variants) = match large {
                 Some(path) => {
@@ -205,6 +211,7 @@ fn run() -> Result<ExitCode> {
             bench::run(&BenchArgs {
                 base,
                 variants,
+                on,
                 repeat,
                 scopes,
                 proc_macro: !no_proc_macro,
@@ -238,6 +245,28 @@ mod tests {
             "ryo-v2", "bench", "--large", "/x", "--repeat", "3", "--scope", "both",
         ]);
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn cli_parses_bench_on() {
+        let ok = Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v1", "/v2", "--on", "/p"])
+            .map_err(|e| e.to_string())
+            .expect("parses");
+        match ok.command {
+            Command::Bench { variants, on, .. } => {
+                assert_eq!(on, Some(PathBuf::from("/p")));
+                assert_eq!(variants, vec![PathBuf::from("/v1"), PathBuf::from("/v2")]);
+            }
+            _ => panic!("not bench"),
+        }
+        let without = Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v"])
+            .map_err(|e| e.to_string())
+            .expect("parses without --on");
+        match without.command {
+            Command::Bench { on, .. } => assert!(on.is_none()),
+            _ => panic!("not bench"),
+        }
+        assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--on"]).is_err());
     }
 
     #[test]
