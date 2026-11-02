@@ -37,8 +37,8 @@ use ryo_v2_oracle::cargo_check::{CheckOutput, cargo_check};
 use ryo_v2_oracle::materials::Materials;
 use ryo_v2_oracle::planted::{PlantKind, generate, generate_pair, read_clean, sites, write_case};
 use ryo_v2_oracle::search_recall::{
-    ContainedPanics, DecisionRow, OuterSample, PlantedCase, RunInfo, markdown, outer_sample,
-    parse_outer_sample, report_json, run_case, terminal,
+    ContainedPanics, DecisionRow, OuterSample, PlantedCase, Report, RunInfo, markdown,
+    outer_sample, parse_outer_sample, run_case, terminal,
 };
 use ryo_v2_ra::{RaAnalyzer, RaConfig, SyntaxAssessor};
 
@@ -476,9 +476,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
     text.push_str(&panic_text);
     println!("{text}");
     if let Some(path) = report {
-        let mut json = report_json(&rows, triggers);
-        json["contained_panics"] = panics.to_json();
-        let json = serde_json::to_string_pretty(&json)?;
+        let json = serde_json::to_string_pretty(&Report::of(&rows, triggers, Some(&panics)))?;
         std::fs::write(&path, json + "\n").with_context(|| format!("write {}", path.display()))?;
     }
     if let Some(path) = md {
