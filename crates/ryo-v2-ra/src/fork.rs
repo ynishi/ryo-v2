@@ -266,10 +266,31 @@ pub(crate) fn diagnose_level(
         Scope::Affected => &top.scope,
         Scope::Workspace => &top.live,
     };
+    let diagnosed = diagnose_files(a, session, &session.host, diag_scope, &top.live, deadline)?;
+    a.observer.observe(Event::Checked {
+        scope_files: diag_scope.len(),
+        total_files: session.files.len(),
+        check_ms: top
+            .write_ms
+            .saturating_add(a.clock.now_ms().saturating_sub(started_ms)),
+    });
+    Ok(diagnosed)
+}
+
+/// Diagnoses `diag_scope` on `host`, as [`diagnose_level`] does for a level, with `live` the
+/// files a diagnostic range may be attributed to; records no event.
+pub(crate) fn diagnose_files(
+    a: &RaAnalyzer,
+    session: &RaSession,
+    host: &AnalysisHost,
+    diag_scope: &[(FileId, RelPath)],
+    live: &[(FileId, RelPath)],
+    deadline: Option<&Deadline>,
+) -> Result<Diagnosed, AnalyzerError> {
     let collected = collect_errors_par(
-        &session.host,
+        host,
         diag_scope,
-        &top.live,
+        live,
         session.threads,
         session.gap_detectors,
         deadline,
@@ -281,13 +302,6 @@ pub(crate) fn diagnose_level(
     let mut files: Vec<RelPath> = diag_scope.iter().map(|(_, r)| r.clone()).collect();
     files.sort();
     files.dedup();
-    a.observer.observe(Event::Checked {
-        scope_files: diag_scope.len(),
-        total_files: session.files.len(),
-        check_ms: top
-            .write_ms
-            .saturating_add(a.clock.now_ms().saturating_sub(started_ms)),
-    });
     let mut unseen_at: BTreeMap<UnseenClass, BTreeSet<RelPath>> = BTreeMap::new();
     if !collected.unexpanded_macro.is_empty() {
         unseen_at.insert(

@@ -1,0 +1,15 @@
+error[E0382]: borrow of moved value: `open`
+ --> tests/compile-fail/open_layer_used_after_seal.rs:6:5
+  |
+4 | fn misuse<Db: EngineDb>(mut open: OpenLayer<Db>, file: Db::File) {
+  |                         -------- move occurs because `open` has type `OpenLayer<Db>`, which does not implement the `Copy` trait
+5 |     let _sealed = open.seal();
+  |                        ------ `open` moved due to this method call
+6 |     open.write(file, "after the seal");
+  |     ^^^^ value borrowed here after move
+  |
+note: `OpenLayer::<Db>::seal` takes ownership of the receiver `self`, which moves `open`
+ --> src/lib.rs
+  |
+  |     pub fn seal(self) -> Result<SealedLayer<Db>, (OpenLayer<Db>, EngineError)> {
+  |                 ^^^^

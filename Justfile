@@ -27,6 +27,67 @@ rust-test:
 deny:
     cargo deny check
 
+# The vendored salsa against upstream (vendor/VENDORED, D11). First diffs each vendored crate
+# against its crates.io package (the `.crate` in cargo's registry cache, else downloaded, checked
+# against the sha256 in vendor/VENDORED) and fails on a hunk without the `ryo-v2 fork:` mark;
+# then runs upstream's own suite, every case, on the toolchain salsa ships for it
+# (vendor/salsa/rust-toolchain.toml; installed here, a no-op when present) with the features
+# rust-analyzer enables plus `fork`. Not part of `check`; `pre-push` runs it.
+salsa-upstream:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cache="${CARGO_HOME:-$HOME/.cargo}/registry/cache"
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    bad=0
+    while read -r _ name version sum; do
+        pkg="$name-$version"
+        crate=""
+        for c in "$cache"/index.crates.io-*/"$pkg.crate"; do
+            if [ -f "$c" ]; then crate="$c"; break; fi
+        done
+        if [ -z "$crate" ]; then
+            crate="$work/$pkg.crate"
+            curl -sSfL "https://static.crates.io/crates/$name/$pkg.crate" -o "$crate"
+        fi
+        if ! echo "${sum#sha256:}  $crate" | sha256sum -c --quiet - >/dev/null; then
+            echo "salsa-upstream: $pkg.crate does not have the sha256 vendor/VENDORED gives" >&2
+            exit 1
+        fi
+        tar -xzf "$crate" -C "$work"
+        rc=0
+        diff -rN -U0 -x .cargo-ok -x .cargo_vcs_info.json -x Cargo.lock -x target \
+            "$work/$pkg" "vendor/$name" > "$work/$name.diff" || rc=$?
+        if [ "$rc" -gt 1 ]; then
+            echo "salsa-upstream: diff of vendor/$name failed" >&2
+            exit 1
+        fi
+        unmarked="$(awk '
+            function flush() { if (h != "" && !m) print f ": " h; h = ""; m = 0 }
+            /^diff / { flush(); f = $NF; hdr = 1; next }
+            hdr && /^--- / { next }
+            hdr && /^\+\+\+ / { hdr = 0; next }
+            /^Binary files / { flush(); print "binary: " $0; next }
+            /^@@/ { flush(); h = $0; n++; next }
+            /^\+.*(\/\/|#) ryo-v2 fork:/ { m = 1 }
+            END { flush(); print n + 0 > "/dev/stderr" }
+        ' "$work/$name.diff" 2>"$work/$name.count")"
+        if [ -n "$unmarked" ]; then
+            echo "salsa-upstream: vendor/$name: hunks without the 'ryo-v2 fork:' mark:" >&2
+            printf '%s\n' "$unmarked" >&2
+            bad=1
+        else
+            echo "salsa-upstream: vendor/$name against $pkg.crate: $(cat "$work/$name.count") hunks, all marked"
+        fi
+    done < <(grep -E '^ +crate ' vendor/VENDORED)
+    [ "$bad" -eq 0 ] || exit 1
+    rustup toolchain install 1.98 --profile minimal --no-self-update
+    cd vendor/salsa
+    # `persistence` is added to rust-analyzer's set so that upstream's compile-fail and
+    # compile-pass cases (gated on inventory and persistence) run too; `manual_registration`
+    # needs `not(inventory)` and is left to upstream.
+    env -u RUSTUP_TOOLCHAIN cargo test --locked --features fork,rayon,salsa_unstable,macros,inventory,triomphe,persistence
+
 # Compares ryo-v2-ra with corpus/*/expected. Never runs cargo check.
 oracle:
     cargo test -p ryo-v2-oracle --test oracle -- --nocapture
@@ -208,6 +269,6 @@ commit-msg-check:
     echo "commit-msg-check: $range ok"
 
 # The gate before a hand-over: run it after the last commit, over the tree
-# that is actually handed over.
-pre-push: branch-check commit-msg-check check
+# that is actually handed over. `salsa-upstream` builds the vendored salsa on its own toolchain.
+pre-push: branch-check commit-msg-check check salsa-upstream
 

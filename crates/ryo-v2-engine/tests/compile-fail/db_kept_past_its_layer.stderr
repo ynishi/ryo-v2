@@ -1,0 +1,8 @@
+error[E0515]: cannot return value referencing local variable `open`
+ --> tests/compile-fail/db_kept_past_its_layer.rs:6:5
+  |
+6 |     open.db()
+  |     ----^^^^^
+  |     |
+  |     returns a value referencing data owned by the current function
+  |     `open` is borrowed here

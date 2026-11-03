@@ -19,11 +19,15 @@ ryo-v2-ra = { path = "crates/ryo-v2-ra", version = "0.1.0" }
 arch-lint = "0.11"
 
 # rust-analyzer as a library. Pinned exactly: the ra_ap_* crates promise no API
-# stability (rust-analyzer issue #11615). Only `ryo-v2-ra` depends on them; the
-# entry points are `ra_ap_ide` and `ra_ap_hir` (the crates architecture.md calls
-# API boundaries). Bumped as one change, with the oracle counts re-measured.
+# stability (rust-analyzer issue #11615). Two crates depend on them: `ryo-v2-ra`,
+# whose entry points are `ra_ap_ide` and `ra_ap_hir` (the crates architecture.md
+# calls API boundaries), and `ryo-v2-engine` (D11), which binds the fork Engine to
+# `ra_ap_ide_db::RootDatabase` and `ra_ap_base_db::FileText` (`ra_ap_ide` and
+# `ra_ap_hir_ty` in its tests only). Bumped as one change, with the oracle counts
+# re-measured and the Engine's tests re-run.
 ra_ap_ide = "=0.0.358"
 ra_ap_hir = "=0.0.358"
+ra_ap_hir_ty = "=0.0.358"
 ra_ap_base_db = "=0.0.358"
 ra_ap_vfs = "=0.0.358"
 ra_ap_load-cargo = "=0.0.358"
@@ -31,6 +35,12 @@ ra_ap_project_model = "=0.0.358"
 ra_ap_ide_db = "=0.0.358"
 ra_ap_syntax = "=0.0.358"
 triomphe = "0.1"
+
+# salsa itself, for `ryo-v2-engine` (D11): the vendored, patched 0.28.5 through the
+# `[patch.crates-io]` below, the version the ra_ap_* stack names. Default features off: a member
+# names the features it needs, and none adds one rust-analyzer does not already enable except
+# `fork`, so the process's salsa is built as rust-analyzer builds it, plus the fork API.
+salsa = { version = "=0.28.5", default-features = false }
 
 anyhow = "1"
 thiserror = "2"
@@ -46,6 +56,13 @@ clap = { version = "4", features = ["derive"] }
 missing_docs = "warn"
 # Every allowance is a row of UNSAFE.tsv; crates/ryo-v2-core/tests/unsafe_ceiling.rs keeps the two equal.
 unsafe_code = "deny"
+
+# salsa and salsa-macro-rules 0.28.5, the versions ra_ap_* 0.0.358 names, vendored and patched
+# for the fork Engine (D11; vendor/VENDORED). Every crate of the process that uses salsa, RA's
+# included, builds against these. Upstream's own suite runs on them with `just salsa-upstream`.
+[patch.crates-io]
+salsa = { path = "vendor/salsa" }
+salsa-macro-rules = { path = "vendor/salsa-macro-rules" }
 
 # The ra_ap_* stack is slow unoptimized even for tests; dependencies get opt-level 2.
 [profile.dev.package."*"]

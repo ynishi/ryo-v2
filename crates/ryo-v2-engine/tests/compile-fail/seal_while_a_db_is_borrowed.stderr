@@ -1,0 +1,11 @@
+error[E0505]: cannot move out of `open` because it is borrowed
+ --> tests/compile-fail/seal_while_a_db_is_borrowed.rs:6:19
+  |
+4 | fn misuse<Db: EngineDb>(open: OpenLayer<Db>) {
+  |                         ---- binding `open` declared here
+5 |     let db = open.db();
+  |              ---- borrow of `open` occurs here
+6 |     let _sealed = open.seal();
+  |                   ^^^^ move out of `open` occurs here
+7 |     drop(db);
+  |          -- borrow later used here

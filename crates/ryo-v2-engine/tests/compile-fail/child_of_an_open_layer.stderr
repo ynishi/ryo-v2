@@ -1,0 +1,5 @@
+error[E0599]: no method named `child` found for reference `&OpenLayer<Db>` in the current scope
+ --> tests/compile-fail/child_of_an_open_layer.rs:5:23
+  |
+5 |     let _child = open.child();
+  |                       ^^^^^ method not found in `&OpenLayer<Db>`

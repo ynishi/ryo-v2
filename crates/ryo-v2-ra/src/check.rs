@@ -101,11 +101,56 @@ pub(crate) fn diagnose_for_check(
     let deadline = a
         .check_timeout_ms
         .map(|ms| Deadline::after(a.clock.clone(), ms));
-    let (mut found, panics) = match fork::diagnose_level(a, s, scope, deadline.as_ref()) {
+    finish_check(
+        a,
+        s,
+        deadline.as_ref(),
+        fork::diagnose_level(a, s, scope, deadline.as_ref()),
+    )
+}
+
+impl RaAnalyzer {
+    /// Diagnoses every file of the session on `db` as a check at `Scope::Workspace` diagnoses its
+    /// level: the same collect, cut-off and detector rules, so with `db` holding the state of a
+    /// check's edits the result is that check's. For the fork Engine's differential gate (D11,
+    /// stage 2): `db` is a handle of a layer over the session's own frozen database (lent with
+    /// [`RaSession::lend_database`]), with modify-only edits, so the session's files are the
+    /// layer's. Not a port: the Engine is put behind the ports at stage 3. The clone of `db` it
+    /// makes lives only for the call.
+    ///
+    /// # Contract
+    /// - C1: on a layer whose chain wrote modify-only edits, the result equals `check` of the
+    ///   composed edits on a twin session of the same workspace (findings, files, `unseen_at`).
+    ///   tested: ryo-v2-engine tests/v2.rs v2_layers_diagnose_as_their_flat_check
+    #[doc(hidden)]
+    pub fn diagnose_database(
+        &self,
+        s: &RaSession,
+        db: &ra_ap_ide_db::RootDatabase,
+    ) -> Result<ScopedFindings, CheckError> {
+        let host = ra_ap_ide::AnalysisHost::with_database(db.clone());
+        let deadline = self
+            .check_timeout_ms
+            .map(|ms| Deadline::after(self.clock.clone(), ms));
+        let diagnosed = fork::diagnose_files(self, s, &host, &s.files, &s.files, deadline.as_ref());
+        finish_check(self, s, deadline.as_ref(), diagnosed)
+    }
+}
+
+/// The verdict of a check's diagnosis: the cut-off as `TimedOut`, and a detector that panicked
+/// where it did not at the baseline as `DetectorPanicked` (one that did is a blind spot named in
+/// `unseen_at`).
+fn finish_check(
+    a: &RaAnalyzer,
+    s: &RaSession,
+    deadline: Option<&Deadline>,
+    diagnosed: Result<fork::Diagnosed, AnalyzerError>,
+) -> Result<ScopedFindings, CheckError> {
+    let (mut found, panics) = match diagnosed {
         Ok(diagnosed) => diagnosed,
         Err(AnalyzerError::Cancelled) => {
             return Err(match a.check_timeout_ms {
-                Some(limit_ms) if deadline.as_ref().is_some_and(Deadline::was_hit) => {
+                Some(limit_ms) if deadline.is_some_and(Deadline::was_hit) => {
                     CheckError::TimedOut { limit_ms }
                 }
                 _ => CheckError::Cancelled,
