@@ -93,6 +93,8 @@ pub struct RaAnalyzer {
     pub(crate) db_write_panic: Option<DbWritePanic>,
     /// File whose base text cannot be read; a test hook.
     pub(crate) db_read_fault: Option<RelPath>,
+    /// Whether the diagnosis of every revert audit fails to run; a test hook.
+    pub(crate) audit_fault: bool,
 }
 
 /// The database write of the texts that the test hook `RaAnalyzer::with_db_write_panic` makes
@@ -119,6 +121,7 @@ impl RaAnalyzer {
             reassert_fault: false,
             db_write_panic: None,
             db_read_fault: None,
+            audit_fault: false,
         }
     }
 
@@ -161,6 +164,15 @@ impl RaAnalyzer {
     #[doc(hidden)]
     pub fn with_db_read_fault(mut self, path: Option<RelPath>) -> RaAnalyzer {
         self.db_read_fault = path;
+        self
+    }
+
+    /// Makes the diagnosis of every revert audit fail as a diagnostic thread that panics would,
+    /// before it diagnoses a file. For the tests of an audit that cannot run; nothing else sets
+    /// it.
+    #[doc(hidden)]
+    pub fn with_audit_fault(mut self, fault: bool) -> RaAnalyzer {
+        self.audit_fault = fault;
         self
     }
 

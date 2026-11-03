@@ -336,32 +336,43 @@ impl Verifier for RaAnalyzer {
 ///   tested: tests/timeout.rs audit_revert_is_ok_after_checks_and_refuses_poisoned
 /// - C2: a session already poisoned gives `CheckError::Poisoned`.
 ///   tested: tests/timeout.rs audit_revert_is_ok_after_checks_and_refuses_poisoned
+/// - C3: an audit whose diagnosis cannot run returns that failure and keeps every path it was
+///   to audit, so the next audit diagnoses them; an audit that runs to its end, clean or not,
+///   forgets the paths it audited.
+///   tested: tests/timeout.rs a_failed_audit_keeps_its_paths
 impl RevertAudit for RaAnalyzer {
     fn audit_revert(&self, s: &mut RaSession) -> Result<(), CheckError> {
         stack::require_free(s)?;
         if s.edited_since_audit.is_empty() {
             return Ok(());
         }
-        let edited: Vec<RelPath> = std::mem::take(&mut s.edited_since_audit)
-            .into_iter()
-            .collect();
+        // The record is kept until the diagnosis has run to its end: an audit that cannot run
+        // leaves every path for the next one.
+        let edited: Vec<RelPath> = s.edited_since_audit.iter().cloned().collect();
         let refs: Vec<&RelPath> = edited.iter().collect();
         let scope = scoped_files(&s.files, &s.rev_deps, &refs);
-        let found = collect_errors_par(
-            &s.host,
-            &scope,
-            &s.files,
-            s.threads,
-            s.gap_detectors,
-            // An audit is never cut off.
-            None,
-            Detector {
-                fault: self.detector_fault.as_ref(),
-                panics: &s.detector_panics,
-            },
-        )
-        .map_err(|e| map_error(e, &edited))?
-        .findings;
+        let collected = if self.audit_fault {
+            Err(AnalyzerError::Panicked(
+                "injected revert audit fault".to_owned(),
+            ))
+        } else {
+            collect_errors_par(
+                &s.host,
+                &scope,
+                &s.files,
+                s.threads,
+                s.gap_detectors,
+                // An audit is never cut off.
+                None,
+                Detector {
+                    fault: self.detector_fault.as_ref(),
+                    panics: &s.detector_panics,
+                },
+            )
+        };
+        let found = collected.map_err(|e| map_error(e, &edited))?.findings;
+        // `edited` is the whole record, and nothing writes to it while the audit holds the session.
+        s.edited_since_audit.clear();
         let paths: Vec<RelPath> = scope.iter().map(|(_, r)| r.clone()).collect();
         if same_findings(&found, &restrict(&s.baseline, &paths)) {
             Ok(())

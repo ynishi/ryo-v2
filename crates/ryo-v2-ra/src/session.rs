@@ -204,6 +204,13 @@ impl RaSession {
     pub fn inject_expander_fault(&mut self, kind: Option<CommandKind>) {
         self.expander_fault = kind;
     }
+
+    /// The paths written since the last revert audit that ran to its end, sorted; for the tests
+    /// of the audit.
+    #[doc(hidden)]
+    pub fn pending_audit(&self) -> Vec<RelPath> {
+        self.edited_since_audit.iter().cloned().collect()
+    }
 }
 
 /// Relative path of `path` under `root`, as a [`RelPath`].
