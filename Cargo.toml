@@ -47,6 +47,13 @@ missing_docs = "warn"
 # Every allowance is a row of UNSAFE.tsv; crates/ryo-v2-core/tests/unsafe_ceiling.rs keeps the two equal.
 unsafe_code = "deny"
 
+# salsa and salsa-macro-rules 0.28.5, the versions ra_ap_* 0.0.358 names, vendored and patched
+# for the fork Engine (D11; vendor/VENDORED). Every crate of the process that uses salsa, RA's
+# included, builds against these. Upstream's own suite runs on them with `just salsa-upstream`.
+[patch.crates-io]
+salsa = { path = "vendor/salsa" }
+salsa-macro-rules = { path = "vendor/salsa-macro-rules" }
+
 # The ra_ap_* stack is slow unoptimized even for tests; dependencies get opt-level 2.
 [profile.dev.package."*"]
 opt-level = 2
