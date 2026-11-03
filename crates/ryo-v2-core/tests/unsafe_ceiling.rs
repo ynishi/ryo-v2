@@ -6,7 +6,9 @@
 //!    workspace lints (`tests/manifest.rs` rule 2); a vendored crate keeps its own rules.
 //! 2. A Rust file under `crates/` (build output skipped) that names the lint at all, in an
 //!    allowance or anywhere else, is one of [`ALLOWED`]; each of those names it in an inner
-//!    `allow` attribute, so the allowance covers that module and nothing else.
+//!    `allow` attribute, so the allowance covers that module and nothing else. The one exception
+//!    is a file that names the lint only in inner `forbid` attributes (`ryo-v2-engine`'s crate
+//!    root, D11): a `forbid` cannot be lowered below it, so it allows nothing.
 //! 3. `UNSAFE.tsv` at the root is the ledger of those allowances: a header of the seven columns
 //!    of [`COLUMNS`], then exactly one row per allowed file, with a verdict that is neither empty
 //!    nor `unknown`.
@@ -97,10 +99,18 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// problems and the files that name the lint.
 fn allowance_problems(files: &[(String, String)]) -> (Vec<String>, BTreeSet<String>) {
     let inner_allow = format!("#![allow({LINT})]");
+    let inner_forbid = format!("#![forbid({LINT})]");
     let mut out = Vec::new();
     let mut naming = BTreeSet::new();
     for (rel, text) in files {
         if !text.contains(LINT) {
+            continue;
+        }
+        let only_forbids = text
+            .lines()
+            .filter(|l| l.contains(LINT))
+            .all(|l| l.trim() == inner_forbid);
+        if only_forbids {
             continue;
         }
         naming.insert(rel.clone());
@@ -222,6 +232,20 @@ fn an_allowance_elsewhere_or_off_the_ledger_is_a_problem() {
         format!("#[allow({LINT})]\nmod m {{}}\n"),
     );
     assert_eq!(allowance_problems(&[outer]).0.len(), 1);
+
+    // A file that only forbids the lint allows nothing; one that also allows it is a problem.
+    let forbid = (
+        "crates/ryo-v2-core/src/f.rs".to_owned(),
+        format!("//! f\n#![forbid({LINT})]\n"),
+    );
+    let (problems, naming) = allowance_problems(std::slice::from_ref(&forbid));
+    assert_none(problems);
+    assert!(naming.is_empty());
+    let forbid_and_allow = (
+        forbid.0,
+        format!("{}#[allow({LINT})]\nfn f() {{}}\n", forbid.1),
+    );
+    assert_eq!(allowance_problems(&[forbid_and_allow]).0.len(), 1);
 
     let (_, naming) = allowance_problems(&[alloc]);
     let header = COLUMNS.join("\t");

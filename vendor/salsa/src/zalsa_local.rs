@@ -46,6 +46,10 @@ pub struct ZalsaLocal {
     most_recent_pages: UnsafeCell<FxHashMap<IngredientIndex, PageIndex>>,
 
     cancelled: CancellationToken,
+
+    // ryo-v2 fork: whether `cancelled` is a layer's token, shared by every handle of the layer
+    // (src/fork/); `uncancel` then leaves it as it is
+    layer_token: bool,
 }
 
 /// A cancellation token that can be used to cancel a query computation for a specific local `Database`.
@@ -91,7 +95,30 @@ impl ZalsaLocal {
             query_stack: RefCell::new(QueryStack::default()),
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
             cancelled: CancellationToken::default(),
+            // ryo-v2 fork: a handle's own token, as upstream
+            layer_token: false,
         }
+    }
+
+    // ryo-v2 fork: a handle of a layer uses the layer's token, so cancelling the layer reaches
+    // every handle of it (src/fork/)
+    pub(crate) fn with_cancellation_token(cancelled: CancellationToken) -> Self {
+        ZalsaLocal {
+            cancelled,
+            layer_token: true,
+            ..ZalsaLocal::new()
+        }
+    }
+
+    // ryo-v2 fork: `fork::set_layer` gives a handle its layer's token
+    pub(crate) fn set_cancellation_token(&mut self, cancelled: CancellationToken) {
+        self.cancelled = cancelled;
+        self.layer_token = true;
+    }
+
+    // ryo-v2 fork: read by `ZalsaView::unwind_if_revision_cancelled` for an ancestor's token
+    pub(crate) fn is_cancellation_disabled(&self) -> bool {
+        self.cancelled.0.load(Ordering::Relaxed) & CancellationToken::DISABLED_MASK != 0
     }
 
     pub(crate) fn record_unfilled_pages(&mut self, table: &Table) {
@@ -466,6 +493,12 @@ impl ZalsaLocal {
 
     #[inline]
     pub(crate) fn uncancel(&self) {
+        // ryo-v2 fork: a layer's token is shared by every handle of the layer and read by its
+        // descendants; one handle's `attach` scope ending must not drop the layer's cancellation
+        // for all of them, so a layer's cancellation is final
+        if self.layer_token {
+            return;
+        }
         self.cancelled.reset();
     }
 

@@ -2,6 +2,8 @@
 use std::marker::PhantomData;
 use std::panic::RefUnwindSafe;
 
+// ryo-v2 fork: a handle holds a view (the shared `Zalsa` and the handle's layer)
+use crate::fork::ZalsaView;
 use crate::sync::{Arc, Condvar, Mutex};
 use crate::zalsa::{ErasedJar, HasJar, Zalsa, ZalsaDatabase};
 use crate::zalsa_local::{self, ZalsaLocal};
@@ -11,7 +13,8 @@ use crate::{Database, Event, EventKind};
 pub struct StorageHandle<Db> {
     // Note: Drop order is important, zalsa_impl needs to drop before coordinate
     /// Reference to the database.
-    zalsa_impl: Arc<Zalsa>,
+    // ryo-v2 fork: the `Arc<Zalsa>` and the handle's layer; a clone keeps the layer
+    zalsa_impl: ZalsaView,
 
     // Note: Drop order is important, coordinate needs to drop after zalsa_impl
     /// Coordination data for cancellation of other handles when `zalsa_mut` is called.
@@ -27,7 +30,8 @@ impl<Db> Clone for StorageHandle<Db> {
         *self.coordinate.clones.lock() += 1;
 
         Self {
-            zalsa_impl: self.zalsa_impl.clone(),
+            // ryo-v2 fork: the view is copied only here, for a counted handle; a clone keeps the layer
+            zalsa_impl: self.zalsa_impl.clone_for_handle(),
             coordinate: CoordinateDrop(Arc::clone(&self.coordinate)),
             phantom: PhantomData,
         }
@@ -50,7 +54,8 @@ impl<Db: Database> StorageHandle<Db> {
         jars: Vec<ErasedJar>,
     ) -> Self {
         Self {
-            zalsa_impl: Arc::new(Zalsa::new::<Db>(event_callback, jars)),
+            // ryo-v2 fork: a new database is a base handle without a layer
+            zalsa_impl: ZalsaView::new(Zalsa::new::<Db>(event_callback, jars)),
             coordinate: CoordinateDrop(Arc::new(Coordinate {
                 clones: Mutex::new(1),
                 cvar: Default::default(),
@@ -158,6 +163,14 @@ impl<Db: Database> Storage<Db> {
     ///
     /// Needs to be paired with a call to `reset_cancellation_flag`.
     fn cancel_others(&mut self) -> &mut Zalsa {
+        // ryo-v2 fork: a layered handle never writes the base, and a frozen base takes no write:
+        // both panic here, before the wait below could block on another handle
+        assert!(
+            self.handle.zalsa_impl.layer().is_none(),
+            "ryo-v2 fork: a setter on a layered handle (writes into a layer go through \
+             `salsa::fork::set_input_field`)"
+        );
+        self.handle.zalsa_impl.fork().assert_not_frozen("zalsa_mut");
         debug_assert!(
             self.zalsa_local
                 .try_with_query_stack(|stack| stack.is_empty())
@@ -178,7 +191,8 @@ impl<Db: Database> Storage<Db> {
         }
 
         // The ref count on the `Arc` should now be 1
-        let zalsa = Arc::get_mut(&mut self.handle.zalsa_impl).unwrap();
+        // ryo-v2 fork: the `Arc<Zalsa>` sits in the view
+        let zalsa = Arc::get_mut(self.handle.zalsa_impl.zalsa_arc_mut()).unwrap();
         // Increment the cancellation count only after cancelled workers have dropped their
         // handles. Otherwise, a worker unwinding from cancellation could insert a provisional
         // memo with the new cancellation count.
@@ -242,7 +256,8 @@ impl<Db: Database> StorageBuilder<Db> {
 #[allow(clippy::undocumented_unsafe_blocks)] // TODO(#697) document safety
 unsafe impl<T: HasStorage> ZalsaDatabase for T {
     #[inline(always)]
-    fn zalsa(&self) -> &Zalsa {
+    // ryo-v2 fork: the view carries the handle's layer (it derefs to `Zalsa`)
+    fn zalsa(&self) -> &ZalsaView {
         &self.storage().handle.zalsa_impl
     }
 
@@ -260,8 +275,29 @@ impl<Db: Database> Clone for Storage<Db> {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
-            zalsa_local: ZalsaLocal::new(),
+            // ryo-v2 fork: a clone of a layered handle keeps the layer (in `handle`) and uses the
+            // layer's cancellation token; a clone of a base handle gets its own token, as upstream
+            zalsa_local: match self.handle.zalsa_impl.layer() {
+                Some(layer) => ZalsaLocal::with_cancellation_token(layer.cancellation_token()),
+                None => ZalsaLocal::new(),
+            },
         }
+    }
+}
+
+// ryo-v2 fork: what the fork layer (src/fork/) reads and sets on a handle
+impl<Db> Storage<Db> {
+    pub(crate) fn fork_view(&self) -> &ZalsaView {
+        &self.handle.zalsa_impl
+    }
+
+    pub(crate) fn fork_parts_mut(&mut self) -> (&mut ZalsaView, &mut ZalsaLocal) {
+        (&mut self.handle.zalsa_impl, &mut self.zalsa_local)
+    }
+
+    /// The number of live handles of this database, clones included, read without waiting.
+    pub fn handle_count(&self) -> usize {
+        *self.handle.coordinate.clones.lock()
     }
 }
 

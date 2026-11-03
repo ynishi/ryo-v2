@@ -1,0 +1,5 @@
+error[E0599]: no method named `db` found for reference `&SealedLayer<Db>` in the current scope
+ --> tests/compile-fail/db_of_a_sealed_layer.rs:5:22
+  |
+5 |     let _db = sealed.db();
+  |                      ^^ method not found in `&SealedLayer<Db>`

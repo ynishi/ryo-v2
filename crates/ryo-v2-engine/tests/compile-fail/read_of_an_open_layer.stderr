@@ -1,0 +1,5 @@
+error[E0599]: no method named `read` found for reference `&OpenLayer<Db>` in the current scope
+ --> tests/compile-fail/read_of_an_open_layer.rs:5:18
+  |
+5 |     let _ = open.read(|_db| ());
+  |                  ^^^^ method not found in `&OpenLayer<Db>`

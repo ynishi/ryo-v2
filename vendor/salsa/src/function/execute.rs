@@ -106,7 +106,8 @@ where
             id,
             Memo::new(
                 Some(new_value),
-                zalsa.current_revision(),
+                // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+                zalsa.unrouted_revision(),
                 completed_query.revisions,
             ),
             memo_ingredient_index,
@@ -134,7 +135,8 @@ where
         let mut last_provisional_memo_opt: Option<&Memo<C>> = None;
 
         let mut last_stale_tracked_ids: Vec<(Identity, Id)> = Vec::new();
-        let current_revision = zalsa.current_revision();
+        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+        let current_revision = zalsa.unrouted_revision();
         let cancellation_count = zalsa.runtime().cancellation_count();
         let mut opt_old_memo = opt_old_memo;
         let mut iteration = IterationStamp::initial(cancellation_count);
@@ -405,7 +407,8 @@ impl MemoHeader {
         // * ensure that tracked struct created during the previous iteration
         //   (and are owned by the query) are alive even if the query in this iteration no longer creates them.
         // * ensure the final returned memo depends on all inputs from all iterations.
-        if self.may_be_provisional() && self.verified_at.load() == zalsa.current_revision() {
+        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+        if self.may_be_provisional() && self.verified_at.load() == zalsa.unrouted_revision() {
             active_query.seed_iteration(&self.revisions);
         }
     }
@@ -554,7 +557,8 @@ impl<C: Configuration> Drop for PoisonProvisionalIfPanicking<'_, C> {
                 IterationStamp::initial(self.zalsa.runtime().cancellation_count()),
             );
 
-            let memo = Memo::new(None, self.zalsa.current_revision(), revisions);
+            // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+            let memo = Memo::new(None, self.zalsa.unrouted_revision(), revisions);
             self.ingredient
                 .insert_memo(self.zalsa, self.id, memo, self.memo_ingredient_index);
         }
@@ -888,6 +892,11 @@ fn try_complete_cycle_head(
             .as_function()
             .expect("cycle heads must be function ingredients");
         if let Some(memo) = function.memo(zalsa, head.database_key_index.key_index()) {
+            // ryo-v2 fork: a store into a base memo, refused while the base is frozen; under a
+            // layer unreachable (stub in `fetch`), step 2b
+            zalsa
+                .fork()
+                .assert_not_frozen("a memo's cycle iteration count");
             memo.header()
                 .set_cycle_iteration_count(head.database_key_index, iteration);
         }

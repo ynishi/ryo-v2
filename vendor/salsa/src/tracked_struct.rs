@@ -11,6 +11,8 @@ use hashbrown::hash_table::Entry;
 use thin_vec::ThinVec;
 use tracked_field::FieldIngredientImpl;
 
+// ryo-v2 fork: the entry points take the handle's view
+use crate::fork::ZalsaView;
 use crate::function::VerifyResult;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::id::{AsId, FromId};
@@ -503,10 +505,17 @@ where
 
     pub fn new_struct<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         mut fields: C::Fields<'db>,
     ) -> C::Struct<'db> {
+        // ryo-v2 fork: stub; without a layer, creating or reusing a struct writes the base, refused
+        // while the base is frozen
+        if zalsa.layer().is_some() {
+            crate::fork::not_yet_supported("creating a tracked struct (step 2b)");
+        }
+        zalsa.fork().assert_not_frozen("a tracked-struct creation");
         let identity_hash = IdentityHash {
             ingredient_index: self.ingredient_index,
             hash: crate::hash::hash(&C::untracked_fields(&fields)),
@@ -563,7 +572,8 @@ where
         current_deps: &Stamp,
         fields: C::Fields<'db>,
     ) -> Id {
-        let current_revision = zalsa.current_revision();
+        // ryo-v2 fork: unreachable under a layer (stub in `new_struct`), step 2b
+        let current_revision = zalsa.unrouted_revision();
         let value = |_| Value {
             updated_at: OptionalAtomicRevision::new(Some(current_revision)),
             durability: current_deps.durability,
@@ -627,6 +637,9 @@ where
         current_deps: &Stamp,
         fields: C::Fields<'db>,
     ) -> Result<Id, C::Fields<'db>> {
+        // ryo-v2 fork: an update of a tracked struct is a base write, refused while the base is
+        // frozen; under a layer unreachable (stub in `new_struct`), step 2b
+        zalsa.fork().assert_not_frozen("a tracked-struct update");
         let data_raw = Self::data_raw(zalsa.table(), id);
 
         // The protocol is:
@@ -673,7 +686,8 @@ where
             );
 
             // The value is already read-locked, but we can reuse it safely as per above.
-            if last_updated_at == Some(zalsa.current_revision()) {
+            // ryo-v2 fork: unreachable under a layer (stub in `new_struct`), step 2b
+            if last_updated_at == Some(zalsa.unrouted_revision()) {
                 return Ok(id);
             }
 
@@ -747,7 +761,8 @@ where
         *durability = current_deps.durability;
         // SAFETY: `updated_at` is never exclusively borrowed, so borrowing it is sound
         // release the lock
-        let swapped_out = unsafe { (*data_raw).updated_at.swap(Some(zalsa.current_revision())) };
+        // ryo-v2 fork: unreachable under a layer (stub in `new_struct`), step 2b
+        let swapped_out = unsafe { (*data_raw).updated_at.swap(Some(zalsa.unrouted_revision())) };
         assert!(
             swapped_out.is_none(),
             "two concurrent writers to {id:?}, should not be possible"
@@ -788,6 +803,9 @@ where
     /// unspecified results (but not UB). See [`InternedIngredient::delete_index`] for more
     /// discussion and important considerations.
     pub(crate) fn delete_entity(&self, zalsa: &Zalsa, id: Id) {
+        // ryo-v2 fork: deleting a tracked struct is a base write, refused while the base is
+        // frozen; under a layer unreachable (stub in `fetch`), step 2b
+        zalsa.fork().assert_not_frozen("a tracked-struct deletion");
         zalsa.event(&|| {
             Event::new(crate::EventKind::DidDiscard {
                 key: self.database_key_index(id),
@@ -802,7 +820,8 @@ where
             None => {
                 panic!("cannot delete write-locked id `{id:?}`; value leaked across threads");
             }
-            Some(r) if r == zalsa.current_revision() => panic!(
+            // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+            Some(r) if r == zalsa.unrouted_revision() => panic!(
                 "cannot delete read-locked id `{id:?}`; value leaked across threads or user functions not deterministic"
             ),
             Some(_) => (),
@@ -866,13 +885,19 @@ where
     /// Used for debugging.
     pub fn leak_fields<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        zalsa: &'db ZalsaView,
         s: C::Struct<'db>,
     ) -> &'db C::Fields<'db> {
+        // ryo-v2 fork: stub
+        if zalsa.layer().is_some() {
+            crate::fork::not_yet_supported("reading a tracked struct (step 2b)");
+        }
         let id = AsId::as_id(&s);
         let data = Self::data_raw(zalsa.table(), id);
         // SAFETY: `data` is a valid pointer acquired from the table.
-        unsafe { self.lock_fields(data, zalsa.current_revision()) }
+        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
+        unsafe { self.lock_fields(data, zalsa.unrouted_revision()) }
     }
 
     /// Access to this tracked field.
@@ -881,17 +906,23 @@ where
     /// The caller is responsible for selecting the appropriate element.
     pub fn tracked_field<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         s: C::Struct<'db>,
         relative_tracked_index: usize,
     ) -> &'db C::Fields<'db> {
+        // ryo-v2 fork: stub
+        if zalsa.layer().is_some() {
+            crate::fork::not_yet_supported("reading a tracked struct (step 2b)");
+        }
         let id = AsId::as_id(&s);
         let field_ingredient_index = self.ingredient_index.successor(relative_tracked_index);
         let data = Self::data_raw(zalsa.table(), id);
 
         // SAFETY: `data` is a valid pointer acquired from the table.
-        let fields = unsafe { self.lock_fields(data, zalsa.current_revision()) };
+        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
+        let fields = unsafe { self.lock_fields(data, zalsa.unrouted_revision()) };
 
         // SAFETY: We just acquired the read lock (in `Self::fields`), so accessing `revisions` will not be able to alias
         let field_changed_at = unsafe { (&(*data).revisions)[relative_tracked_index].load() };
@@ -912,9 +943,14 @@ where
     /// The caller is responsible for selecting the appropriate element.
     pub fn untracked_field<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        zalsa: &'db ZalsaView,
         s: C::Struct<'db>,
     ) -> &'db C::Fields<'db> {
+        // ryo-v2 fork: stub
+        if zalsa.layer().is_some() {
+            crate::fork::not_yet_supported("reading a tracked struct (step 2b)");
+        }
         let id = AsId::as_id(&s);
         let data = Self::data_raw(zalsa.table(), id);
 
@@ -922,7 +958,8 @@ where
         // as IDs that are reused increment their generation, invalidating any
         // dependent queries directly.
         // SAFETY: `data` is a valid pointer acquired from the table.
-        unsafe { self.lock_fields(data, zalsa.current_revision()) }
+        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
+        unsafe { self.lock_fields(data, zalsa.unrouted_revision()) }
     }
 
     /// Returns all data corresponding to the tracked struct.

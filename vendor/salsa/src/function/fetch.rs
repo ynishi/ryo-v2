@@ -2,6 +2,8 @@ use crate::cycle::{CycleRecoveryStrategy, IterationStamp};
 use crate::function::eviction::EvictionPolicy;
 use crate::function::memo::Memo;
 use crate::function::sync::ClaimResult;
+// ryo-v2 fork: `fetch` takes the handle's view
+use crate::fork::ZalsaView;
 use crate::function::{Configuration, IngredientImpl, Reentrancy};
 use crate::zalsa::{MemoIngredientIndex, Zalsa};
 use crate::zalsa_local::{QueryRevisions, ZalsaLocal};
@@ -15,10 +17,15 @@ where
     pub fn fetch<'db>(
         &'db self,
         db: &'db C::DbView,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view, so that a layered handle stops at the stub below
+        zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         id: Id,
     ) -> &'db C::Output<'db> {
+        // ryo-v2 fork: stub, memos are not routed through a layer yet
+        if zalsa.layer().is_some() {
+            crate::fork::not_yet_supported("a tracked function call (memo routing, step 2b)");
+        }
         zalsa.unwind_if_revision_cancelled(zalsa_local);
 
         let database_key_index = self.database_key_index(id);
@@ -190,7 +197,8 @@ where
                     // Don't replace a poisoned memo from this execution with a new initial value.
                     if memo.value.is_none()
                         && memo.header.may_be_provisional()
-                        && memo.header.verified_at.load() == zalsa.current_revision()
+                        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+                        && memo.header.verified_at.load() == zalsa.unrouted_revision()
                         && revisions.iteration().cancellation_count() == cancellation_count
                     {
                         Cancelled::PropagatedPanic.throw();
@@ -199,7 +207,8 @@ where
                     // Ideally, we'd use the last provisional memo even if it wasn't a cycle head in the last iteration
                     // but that would require inserting itself as a cycle head, which either requires clone
                     // on the value OR a concurrent `Vec` for cycle heads.
-                    if memo.header.verified_at.load() == zalsa.current_revision()
+                    // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+                    if memo.header.verified_at.load() == zalsa.unrouted_revision()
                         && memo.value.is_some()
                         && revisions.iteration().cancellation_count() == cancellation_count
                         && revisions.cycle_heads().contains(&database_key_index)
@@ -227,7 +236,8 @@ where
                 let iteration = memo_guard
                     .and_then(|old_memo| {
                         let revisions = &old_memo.header.revisions;
-                        if old_memo.header.verified_at.load() == zalsa.current_revision()
+                        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+                        if old_memo.header.verified_at.load() == zalsa.unrouted_revision()
                             && old_memo.value.is_some()
                             && revisions.iteration().cancellation_count() == cancellation_count
                         {
@@ -243,7 +253,8 @@ where
                 self.insert_memo(
                     zalsa,
                     id,
-                    Memo::new(Some(initial_value), zalsa.current_revision(), revisions),
+                    // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+                    Memo::new(Some(initial_value), zalsa.unrouted_revision(), revisions),
                     memo_ingredient_index,
                 )
             }

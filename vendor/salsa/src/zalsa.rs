@@ -5,6 +5,8 @@ use std::panic::RefUnwindSafe;
 use hashbrown::HashMap;
 use rustc_hash::FxHashMap;
 
+// ryo-v2 fork: the view and the fork state of a base
+use crate::fork::{ForkState, ZalsaView};
 use crate::hash::TypeIdHasher;
 use crate::ingredient::{Ingredient, Jar};
 use crate::plumbing::SalsaStructInDb;
@@ -31,13 +33,15 @@ pub unsafe trait ZalsaDatabase: Any {
     /// Plumbing method: access both zalsa and zalsa-local at once.
     /// More efficient if you need both as it does only a single vtable dispatch.
     #[doc(hidden)]
-    fn zalsas(&self) -> (&Zalsa, &ZalsaLocal) {
+    // ryo-v2 fork: the view carries the handle's layer (it derefs to `Zalsa`)
+    fn zalsas(&self) -> (&ZalsaView, &ZalsaLocal) {
         (self.zalsa(), self.zalsa_local())
     }
 
     /// Plumbing method: Access the internal salsa methods.
     #[doc(hidden)]
-    fn zalsa(&self) -> &Zalsa;
+    // ryo-v2 fork: the view carries the handle's layer (it derefs to `Zalsa`)
+    fn zalsa(&self) -> &ZalsaView;
 
     /// Plumbing method: Access the internal salsa methods for mutating the database.
     ///
@@ -171,6 +175,9 @@ pub struct Zalsa {
     runtime: Runtime,
 
     event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync>>,
+
+    // ryo-v2 fork: identity as a base, the frozen flag and the isolation counters (src/fork/)
+    fork: ForkState,
 }
 
 /// All fields on Zalsa are locked behind [`Mutex`]es and [`RwLock`]s and cannot enter
@@ -196,6 +203,8 @@ impl Zalsa {
             event_callback,
             #[cfg(not(feature = "inventory"))]
             nonce: NONCE.nonce(),
+            // ryo-v2 fork: a new base, not frozen
+            fork: ForkState::new(),
         };
 
         // Collect and initialize all registered ingredients.
@@ -230,6 +239,12 @@ impl Zalsa {
         &self.runtime
     }
 
+    // ryo-v2 fork: the base's fork state (src/fork/)
+    #[inline]
+    pub(crate) fn fork(&self) -> &ForkState {
+        &self.fork
+    }
+
     pub(crate) fn runtime_mut(&mut self) -> &mut Runtime {
         &mut self.runtime
     }
@@ -250,7 +265,8 @@ impl Zalsa {
     /// Returns the [`MemoTable`][] for the salsa struct with the given id
     pub(crate) fn memo_table_for<T: SalsaStructInDb>(&self, id: Id) -> MemoTableWithTypes<'_> {
         // SAFETY: We are supplying the correct current revision.
-        unsafe { T::memo_table(self, id, self.current_revision()) }
+        // ryo-v2 fork: memo tables are not routed through a layer yet (step 2b)
+        unsafe { T::memo_table(self, id, self.unrouted_revision()) }
     }
 
     /// Returns the ingredient at the given index, or panics if it is out-of-bounds.
@@ -437,14 +453,17 @@ impl Zalsa {
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
     #[inline]
-    pub fn current_revision(&self) -> Revision {
+    // ryo-v2 fork: the base's revision; crate-private, so that a handle reads its revision through
+    // `ZalsaView::current_revision` and the compiler finds every site that could lose the layer
+    pub(crate) fn base_revision(&self) -> Revision {
         self.runtime.current_revision()
     }
 
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
     #[inline]
-    pub fn last_changed_revision(&self, durability: Durability) -> Revision {
+    // ryo-v2 fork: the base's last-changed revision; crate-private, see `base_revision`
+    pub(crate) fn base_last_changed(&self, durability: Durability) -> Revision {
         self.runtime.last_changed_revision(durability)
     }
 

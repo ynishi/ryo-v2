@@ -356,7 +356,8 @@ impl MemoHeader {
             memo = self.tracing_debug(has_value)
         );
         let verified_at = self.verified_at.load();
-        let revision_now = zalsa.current_revision();
+        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+        let revision_now = zalsa.unrouted_revision();
 
         if verified_at == revision_now {
             // Already verified.
@@ -374,7 +375,8 @@ impl MemoHeader {
         database_key_index: DatabaseKeyIndex,
         verified_at: Revision,
     ) -> ShallowUpdate {
-        let last_changed = zalsa.last_changed_revision(self.revisions.durability);
+        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+        let last_changed = zalsa.unrouted_last_changed(self.revisions.durability);
         crate::tracing::trace!(
             "{database_key_index:?}: check_durability({database_key_index:#?}, last_changed={:?} <= verified_at={:?}) = {:?}",
             last_changed,
@@ -641,6 +643,12 @@ fn deep_verify_edges(
 
     // This value is only read once the memo is verified. It's therefore safe
     // to write a non-final value here.
+    // ryo-v2 fork: a store into a base memo, refused while the base is frozen; under a layer
+    // unreachable (stub in `fetch`), step 2b
+    #[cfg(feature = "accumulator")]
+    zalsa
+        .fork()
+        .assert_not_frozen("a memo's accumulated inputs");
     #[cfg(feature = "accumulator")]
     old_revisions.accumulated_inputs.store(inputs);
 
@@ -699,6 +707,9 @@ fn validate_provisional(
     }
     // Relaxed is sufficient here because there are no other writes we need to ensure have
     // happened before marking this memo as verified-final.
+    // ryo-v2 fork: a store into a base memo, refused while the base is frozen; under a layer
+    // unreachable (stub in `fetch`), step 2b
+    zalsa.fork().assert_not_frozen("a memo's verified_final");
     memo_revisions.verified_final.store(true, Ordering::Relaxed);
     true
 }
@@ -718,7 +729,8 @@ fn validate_same_iteration(
     // This is an optimization to avoid unnecessary re-execution within the same revision.
     // Don't apply it when verifying memos from past revisions. We want them to re-execute
     // to verify their cycle heads and all participating queries.
-    if memo_verified_at != zalsa.current_revision() {
+    // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+    if memo_verified_at != zalsa.unrouted_revision() {
         return false;
     }
 

@@ -32,6 +32,12 @@ ra_ap_ide_db = "=0.0.358"
 ra_ap_syntax = "=0.0.358"
 triomphe = "0.1"
 
+# salsa itself, for `ryo-v2-engine` (D11): the vendored, patched 0.28.5 through the
+# `[patch.crates-io]` below, the version the ra_ap_* stack names. Default features off: a member
+# names the features it needs, and none adds one rust-analyzer does not already enable except
+# `fork`, so the process's salsa is built as rust-analyzer builds it, plus the fork API.
+salsa = { version = "=0.28.5", default-features = false }
+
 anyhow = "1"
 thiserror = "2"
 uuid = { version = "1", default-features = false }

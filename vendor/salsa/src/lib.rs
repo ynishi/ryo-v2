@@ -262,6 +262,13 @@ mod database;
 mod database_impl;
 mod durability;
 mod event;
+// ryo-v2 fork: the fork layer (D11, src/fork/). It is always compiled, since every handle routes
+// through it; its API is public as `salsa::fork` with the `fork` feature.
+#[cfg(feature = "fork")]
+pub mod fork;
+#[cfg(not(feature = "fork"))]
+#[allow(dead_code, unreachable_pub)]
+mod fork;
 mod function;
 mod hash;
 mod id;
@@ -351,6 +358,8 @@ pub mod plumbing {
     pub use crate::cycle::CycleRecoveryStrategy;
     pub use crate::database::{Database, current_revision};
     pub use crate::durability::Durability;
+    // ryo-v2 fork: what `ZalsaDatabase::zalsa` returns
+    pub use crate::fork::ZalsaView;
     pub use crate::id::{AsId, FromId, FromIdWithDb, Id};
     pub use crate::ingredient::{Ingredient, Jar, Location};
     pub use crate::ingredient_cache::IngredientCache;

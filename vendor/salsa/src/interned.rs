@@ -14,6 +14,8 @@ use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
 use crate::durability::{AtomicDurability, Durability};
+// ryo-v2 fork: the entry points take the handle's view
+use crate::fork::ZalsaView;
 use crate::function::VerifyResult;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::id::{AsId, FromId};
@@ -393,7 +395,8 @@ where
     /// If `key` is already interned, returns the existing [`Id`] for the interned data.
     pub fn intern<'db, Key>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view, so that a layered handle stops at the stub in `intern_id`
+        zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         key: Key,
     ) -> C::Struct<'db>
@@ -410,7 +413,8 @@ where
     /// If `key` is already interned, returns the existing [`Id`] for the interned data.
     pub fn intern_id<'db, Key>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view, so that a layered handle stops at the stub below
+        zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         key: Key,
     ) -> crate::Id
@@ -423,8 +427,16 @@ where
         C::Fields<'db>: HashEqLike<Key>,
         Key: Lookup<C::Fields<'db>>,
     {
+        // ryo-v2 fork: stub, interned values are not routed through a layer yet
+        if zalsa.layer().is_some() {
+            crate::fork::not_yet_supported("interning a value (step 2b)");
+        }
+        // ryo-v2 fork: interning stores revisions and may insert, a base write, refused while the
+        // base is frozen
+        zalsa.fork().assert_not_frozen("interning a value");
         // Record the current revision as active.
-        let current_revision = zalsa.current_revision();
+        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
+        let current_revision = zalsa.unrouted_revision();
         if C::REVISIONS != IMMORTAL {
             self.revision_queue.record(current_revision);
         }
@@ -627,7 +639,8 @@ where
         C::Fields<'db>: HashEqLike<Key>,
         Key: Lookup<C::Fields<'db>>,
     {
-        let current_revision = zalsa.current_revision();
+        // ryo-v2 fork: unreachable under a layer (stub in `intern_id`), step 2b
+        let current_revision = zalsa.unrouted_revision();
 
         // Record the durability of the current query on the interned value.
         let (durability, last_interned_at) = zalsa_local
@@ -923,7 +936,8 @@ where
     #[inline]
     pub fn data<'db>(&'db self, zalsa: &'db Zalsa, id: Id) -> &'db C::Fields<'db> {
         let value = zalsa.table().get::<Value<C>>(id);
-        value.assert_validated(zalsa.current_revision());
+        // ryo-v2 fork: under a layer the generated getters stop at the stub in `fields`, step 2b
+        value.assert_validated(zalsa.unrouted_revision());
 
         debug_assert_eq!(
             id,
@@ -943,7 +957,11 @@ where
     ///
     /// Note that this is not "leaking" since no dependency edge is required.
     #[inline]
-    pub fn fields<'db>(&'db self, zalsa: &'db Zalsa, s: C::Struct<'db>) -> &'db C::Fields<'db> {
+    // ryo-v2 fork: the view, so that a layered handle stops at the stub
+    pub fn fields<'db>(&'db self, zalsa: &'db ZalsaView, s: C::Struct<'db>) -> &'db C::Fields<'db> {
+        if zalsa.layer().is_some() {
+            crate::fork::not_yet_supported("reading an interned value (step 2b)");
+        }
         self.data(zalsa, AsId::as_id(&s))
     }
 
@@ -958,6 +976,11 @@ where
 
     /// Returns all data corresponding to the interned struct.
     pub fn entries<'db>(&'db self, zalsa: &'db Zalsa) -> impl Iterator<Item = StructEntry<'db, C>> {
+        // ryo-v2 fork: enumerating stores `last_interned_at` on every entry, a base write, refused
+        // while the base is frozen, from a layered handle too (it reaches here through `Deref`)
+        zalsa
+            .fork()
+            .assert_not_frozen("enumerating interned values");
         // SAFETY: `should_lock` is `true`
         unsafe { self.entries_inner(true, zalsa) }
     }
@@ -989,7 +1012,8 @@ where
                 value
                     .lru
                     .last_interned_at
-                    .store(last_interned_at.max(zalsa.current_revision()));
+                    // ryo-v2 fork: entries are read through the base `Zalsa`, not a layer
+                    .store(last_interned_at.max(zalsa.unrouted_revision()));
                 // SAFETY: We hold the lock for the shard containing the value.
                 unsafe { *value.lru.id.get() }
             } else {
@@ -1100,7 +1124,12 @@ where
         _revision: Revision,
     ) -> VerifyResult {
         // Record the current revision as active.
-        let current_revision = zalsa.current_revision();
+        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b; the stores below are
+        // base writes, refused while the base is frozen
+        zalsa
+            .fork()
+            .assert_not_frozen("an interned value marked as read");
+        let current_revision = zalsa.unrouted_revision();
         if C::REVISIONS != IMMORTAL {
             self.revision_queue.record(current_revision);
         }

@@ -8,6 +8,8 @@ mod sealed {
 pub trait SingletonChoice: sealed::Sealed + Default {
     fn with_scope(&self, cb: impl FnOnce() -> Id) -> Id;
     fn index(&self) -> Option<Id>;
+    // ryo-v2 fork: whether the input is a singleton, whose creation a layer refuses (src/fork/)
+    const IS_SINGLETON: bool;
 }
 
 pub struct Singleton {
@@ -15,6 +17,9 @@ pub struct Singleton {
 }
 impl sealed::Sealed for Singleton {}
 impl SingletonChoice for Singleton {
+    // ryo-v2 fork: see the trait
+    const IS_SINGLETON: bool = true;
+
     fn with_scope(&self, cb: impl FnOnce() -> Id) -> Id {
         if self.index.load(Ordering::Acquire) != 0 {
             panic!("singleton struct may not be duplicated");
@@ -51,6 +56,9 @@ impl Default for Singleton {
 pub struct NotSingleton;
 impl sealed::Sealed for NotSingleton {}
 impl SingletonChoice for NotSingleton {
+    // ryo-v2 fork: see the trait
+    const IS_SINGLETON: bool = false;
+
     fn with_scope(&self, cb: impl FnOnce() -> Id) -> Id {
         cb()
     }

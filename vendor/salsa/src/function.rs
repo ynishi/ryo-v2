@@ -332,6 +332,9 @@ where
         mut memo: memo::Memo<C>,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> &'db memo::Memo<C> {
+        // ryo-v2 fork: a memo insert into a table slot is a base write, refused while the base is
+        // frozen; under a layer unreachable (stub in `fetch`), step 2b
+        zalsa.fork().assert_not_frozen("a memo insert");
         if let Some(tracked_struct_ids) = memo.header.revisions.tracked_struct_ids_mut() {
             tracked_struct_ids.shrink_to_fit();
         }

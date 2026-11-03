@@ -8,6 +8,8 @@ pub mod singleton;
 
 use input_field::FieldIngredientImpl;
 
+// ryo-v2 fork: input values per layer (src/fork/)
+use crate::fork::{InputEntry, Layer, SharedWriteKind, ZalsaView};
 use crate::function::VerifyResult;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::id::{AsId, FromId, FromIdWithDb};
@@ -145,12 +147,27 @@ impl<C: Configuration> IngredientImpl<C> {
 
     pub fn new_input(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the new slot is a counted shared write of the base
+        // (its revisions, given by the caller, are the layer's), refused on a sealed layer
+        zalsa: &ZalsaView,
         zalsa_local: &ZalsaLocal,
         fields: C::Fields,
         revisions: C::Revisions,
         durabilities: C::Durabilities,
     ) -> C::Struct {
+        // ryo-v2 fork: count the shared write; refuse a sealed layer, and a singleton, whose index
+        // the base and every layer share; without a layer, a frozen base takes no new input
+        if let Some(layer) = zalsa.layer() {
+            if <C::Singleton as SingletonChoice>::IS_SINGLETON {
+                crate::fork::not_yet_supported("creating a singleton input (step 2b)");
+            }
+            layer.assert_open("an input creation");
+            zalsa
+                .fork()
+                .record_shared_write(SharedWriteKind::SlotAllocation);
+        } else {
+            zalsa.fork().assert_not_frozen("an input creation");
+        }
         let id = self.singleton.with_scope(|| {
             zalsa_local
                 .allocate(zalsa, self.ingredient_index, |_| Value::<C> {
@@ -229,13 +246,26 @@ impl<C: Configuration> IngredientImpl<C> {
     /// The caller is responsible for selecting the appropriate element.
     pub fn field<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view, through whose layer the read resolves
+        zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         id: C::Struct,
         field_index: usize,
     ) -> &'db C::Fields {
         let field_ingredient_index = self.ingredient_index.successor(field_index);
         let id = id.as_id();
+        // ryo-v2 fork: under a layer, the newest values on the layer's chain, else the base slot's
+        if let Some(entry) = zalsa
+            .layer()
+            .and_then(|layer| layer.input::<C>(self.ingredient_index, id))
+        {
+            zalsa_local.report_tracked_read_simple(
+                DatabaseKeyIndex::new(field_ingredient_index, id),
+                entry.durabilities[field_index],
+                entry.revisions[field_index],
+            );
+            return &entry.fields;
+        }
         let value = Self::data(zalsa, id);
         let durability = value.durabilities[field_index];
         let revision = value.revisions[field_index];
@@ -260,10 +290,65 @@ impl<C: Configuration> IngredientImpl<C> {
 
     /// Peek at the field values without recording any read dependency.
     /// Used for debug printouts.
-    pub fn leak_fields<'db>(&'db self, zalsa: &'db Zalsa, id: C::Struct) -> &'db C::Fields {
+    // ryo-v2 fork: the view, through whose layer the read resolves
+    pub fn leak_fields<'db>(&'db self, zalsa: &'db ZalsaView, id: C::Struct) -> &'db C::Fields {
         let id = id.as_id();
+        // ryo-v2 fork: under a layer, the newest values on the layer's chain, else the base slot's
+        if let Some(entry) = zalsa
+            .layer()
+            .and_then(|layer| layer.input::<C>(self.ingredient_index, id))
+        {
+            return &entry.fields;
+        }
         let value = Self::data(zalsa, id);
         &value.fields
+    }
+
+    // ryo-v2 fork: the write of `salsa::fork::set_input_field`: stores in `layer` the input's
+    // newest fields on the chain (else the base slot's) with `setter` applied, the field's revision
+    // set to the layer's, and every other revision and durability inherited. Refused on a sealed
+    // layer and for a field whose durability is above LOW (a layer writes only LOW, D11 E3).
+    pub(crate) fn set_field_in_layer(
+        &self,
+        zalsa: &Zalsa,
+        layer: &Layer,
+        id: C::Struct,
+        field_index: usize,
+        setter: impl FnOnce(&mut C::Fields),
+    ) where
+        C::Fields: Clone,
+    {
+        let id = id.as_id();
+        // The read of the current entry, the setter and the insert run under the layer's write
+        // lock: a concurrent write to another field of the input is not lost, and a concurrent
+        // seal comes before (the write is refused) or after.
+        let _write = layer.begin_write("an input write");
+        let mut entry = match layer.input::<C>(self.ingredient_index, id) {
+            Some(entry) => InputEntry::<C> {
+                fields: entry.fields.clone(),
+                revisions: entry.revisions.clone(),
+                durabilities: entry.durabilities.clone(),
+            },
+            None => {
+                let value = Self::data(zalsa, id);
+                let fields = 0..C::FIELD_DEBUG_NAMES.len();
+                InputEntry::<C> {
+                    fields: value.fields.clone(),
+                    revisions: fields.clone().map(|i| value.revisions[i]).collect(),
+                    durabilities: fields.map(|i| value.durabilities[i]).collect(),
+                }
+            }
+        };
+        let durability = entry.durabilities[field_index];
+        assert!(
+            durability == Durability::LOW,
+            "ryo-v2 fork: a layer writes only LOW fields; field `{}` of `{}` has {durability:?}",
+            C::FIELD_DEBUG_NAMES[field_index],
+            C::DEBUG_NAME,
+        );
+        entry.revisions[field_index] = layer.revision();
+        setter(&mut entry.fields);
+        layer.insert_input(self.ingredient_index, id, entry);
     }
 }
 

@@ -302,6 +302,12 @@ impl Runtime {
         r_new
     }
 
+    // ryo-v2 fork: moves the current revision to `max(current, r)` without touching the
+    // last-changed revisions; `Zalsa::advance_revision_past` follows it with `new_revision`
+    pub(crate) fn raise_current_revision(&mut self, r: Revision) {
+        self.revisions[0] = self.revisions[0].max(r);
+    }
+
     /// Block until `other_id` completes executing `database_key`, or return `BlockResult::Cycle`
     /// immediately in case of a cycle.
     ///

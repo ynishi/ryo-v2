@@ -275,7 +275,10 @@ impl MemoHeader {
             })
         });
 
-        self.verified_at.store(zalsa.current_revision());
+        // ryo-v2 fork: a stamp is a base write, refused while the base is frozen; under a layer
+        // unreachable (stub in `fetch`), step 2b
+        zalsa.fork().assert_not_frozen("a memo's verified_at");
+        self.verified_at.store(zalsa.unrouted_revision());
     }
 
     pub(super) fn mark_outputs_as_verified(
@@ -586,7 +589,8 @@ impl Iterator for TryClaimCycleHeadsIter<'_> {
                         iteration,
                         verified_at,
                     } => {
-                        if verified_at == self.zalsa.current_revision()
+                        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
+                        if verified_at == self.zalsa.unrouted_revision()
                             && iteration.cancellation_count()
                                 == self.zalsa.runtime().cancellation_count()
                         {

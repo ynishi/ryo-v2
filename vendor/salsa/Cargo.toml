@@ -49,8 +49,8 @@ default = [
     "accumulator",
 ]
 detailed-trace = []
-# ryo-v2 fork: the fork layer (src/fork/); declared ahead of its code so `just salsa-upstream`
-# names the feature set it will run with. Enables nothing yet.
+# ryo-v2 fork: the fork layer (src/fork/). Its routing is always compiled (every handle goes
+# through it); the feature makes its API public as `salsa::fork` and turns on `tests/fork.rs`.
 fork = []
 inventory = ["dep:inventory"]
 macros = ["dep:salsa-macros"]
@@ -332,6 +332,11 @@ path = "tests/interned-structs.rs"
 [[test]]
 name = "lru"
 path = "tests/lru.rs"
+
+# ryo-v2 fork: the fork layer's own tests (D11); gated on the `fork` feature inside the file
+[[test]]
+name = "fork"
+path = "tests/fork.rs"
 
 [[test]]
 name = "manual_registration"
