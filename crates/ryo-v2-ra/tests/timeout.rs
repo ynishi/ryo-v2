@@ -21,6 +21,7 @@ fn analyzer(timeout_ms: Option<u64>) -> RaAnalyzer {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
+            engine: common::engine(),
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -41,6 +42,10 @@ fn loaded(test: &str) -> (Fixture, RaAnalyzer, RaSession) {
 
 #[test]
 fn check_past_timeout_is_timed_out_and_session_usable() {
+    common::both(check_past_timeout_is_timed_out_and_session_usable_on);
+}
+
+fn check_past_timeout_is_timed_out_and_session_usable_on() {
     let (_f, plain, mut s) = loaded("timeout_cut");
     let base_findings = Verifier::baseline(&plain, &s);
     let edit = lib_edit("\npub fn b() {}\n");
@@ -69,6 +74,10 @@ fn check_past_timeout_is_timed_out_and_session_usable() {
 
 #[test]
 fn audit_revert_is_ok_after_checks_and_refuses_poisoned() {
+    common::both(audit_revert_is_ok_after_checks_and_refuses_poisoned_on);
+}
+
+fn audit_revert_is_ok_after_checks_and_refuses_poisoned_on() {
     let (_f, a, mut s) = loaded("timeout_audit");
     // Nothing recorded: Ok.
     a.audit_revert(&mut s).expect("nothing to audit");
@@ -92,6 +101,10 @@ fn audit_revert_is_ok_after_checks_and_refuses_poisoned() {
 
 #[test]
 fn a_failed_audit_keeps_its_paths() {
+    common::both(a_failed_audit_keeps_its_paths_on);
+}
+
+fn a_failed_audit_keeps_its_paths_on() {
     let f = Fixture::new(
         "timeout_audit_fault",
         &[

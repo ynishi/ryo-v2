@@ -9,6 +9,7 @@ mod assess;
 mod check;
 mod diagnostics;
 mod duplicate;
+mod engine;
 mod expand;
 mod field_bounds;
 mod fork;
@@ -62,6 +63,23 @@ pub struct RaConfig {
     ///   tested: tests/verifier.rs cfg_test_config_diagnoses_test_module
     ///   tested: tests/verifier.rs ra_config_default_diagnoses_test_code
     pub cfg_test: bool,
+    /// The backend of the forks (`Stacked`, `Analyzer`, and a check, which is a one-level fork):
+    /// `false` (the default) writes each level in place and reverts it from its undo log; `true`
+    /// runs it on the fork Engine (D11): the base is frozen while a fork is live, a level is a
+    /// layer over it, `pop` drops the top layer and `release` drops them all, so the base is
+    /// never written.
+    ///
+    /// # Contract
+    /// - C1: every differential and contract test of `Stacked`, `Verifier` and the cut-off gives
+    ///   the same results on both backends, where the Engine has no revert to get wrong (a
+    ///   revert fault, a re-assert of a revert and a database write of a revert have no
+    ///   counterpart there), and except a level's write that panics: on the Engine it poisons
+    ///   only its dropped layer and is of reach Blueprint (`Stacked` C8), where the undo log
+    ///   poisons the session.
+    ///   tested: tests/stack.rs a_stack_diagnoses_as_its_flat_composition
+    ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
+    ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
+    pub engine: bool,
 }
 
 impl Default for RaConfig {
@@ -73,6 +91,7 @@ impl Default for RaConfig {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: true,
+            engine: false,
         }
     }
 }
@@ -97,6 +116,8 @@ pub struct RaAnalyzer {
     pub(crate) db_read_fault: Option<RelPath>,
     /// Whether the diagnosis of every revert audit fails to run; a test hook.
     pub(crate) audit_fault: bool,
+    /// Whether every diagnosis of a level panics before it diagnoses a file; a test hook.
+    pub(crate) diagnose_panic: bool,
 }
 
 /// The database write of the texts that the test hook `RaAnalyzer::with_db_write_panic` makes
@@ -124,7 +145,17 @@ impl RaAnalyzer {
             db_write_panic: None,
             db_read_fault: None,
             audit_fault: false,
+            diagnose_panic: false,
         }
+    }
+
+    /// Makes every diagnosis of a level (a check's included) panic inside the level, before it
+    /// diagnoses a file, as a panic of rust-analyzer in a query of that level would. For the
+    /// tests of the poison of a layer; nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_diagnose_panic(mut self, panic: bool) -> RaAnalyzer {
+        self.diagnose_panic = panic;
+        self
     }
 
     /// Makes that detector panic on that file in every collect this analyzer runs.

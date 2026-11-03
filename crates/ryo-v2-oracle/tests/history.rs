@@ -66,6 +66,7 @@ fn run_pair(pair: &HistoryPair, proc_macro: bool) -> Result<(Outcome, Option<u64
             gap_detectors: switch_on("RYO_V2_ORACLE_GAP_DETECTORS"),
             assert_revert_every: None,
             cfg_test: switch_on("RYO_V2_ORACLE_CFG_TEST"),
+            engine: false,
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),

@@ -20,7 +20,13 @@
 //!   durability and its own `updated_at` (the layer's revision); the struct keeps its id. A stale
 //!   struct is tombstoned in the layer, never deleted from the base;
 //! - its own claims, dependency graph and cycle-head transfers, so that two layers never block or
-//!   join each other.
+//!   join each other;
+//! - the table slots it owns: a tracked struct it created with a new identity and a value it
+//!   interned. They are given back when the layer drops and taken again by later layers with a
+//!   bumped generation, or the same id for an immortal interned value (module `owned`). An interned value a layer inserted is seen only by that
+//!   layer's chain: a lookup matches a value of the base or of a layer of the chain, so siblings
+//!   that intern the same content get an id each (the linear history of each chain, rather than
+//!   one id for a content in every layer).
 //!
 //! A handle without a layer behaves as upstream salsa.
 //!
@@ -39,6 +45,7 @@
 //! - a layer of another base, or of an earlier freeze of this one, cannot be set on a handle;
 //! - a layered input write is refused for a field whose durability is above `LOW`.
 
+mod owned;
 mod store;
 mod view;
 
@@ -48,6 +55,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+pub(crate) use self::owned::LayerFreeList;
+use self::owned::{OwnedSlots, SlotCounters};
 use self::store::Sharded;
 pub use self::view::ZalsaView;
 use crate::input::Configuration as InputConfiguration;
@@ -94,6 +103,12 @@ pub(crate) struct ForkState {
     skipped_revision_queue_records: AtomicUsize,
     skipped_lru_uses: AtomicUsize,
     refused_writes: AtomicUsize,
+    /// The accounting of layer-owned slots, shared with every layer (a dropping layer counts its
+    /// frees without a reference to this state).
+    slots: Arc<SlotCounters>,
+    /// The `allocated` count of every table page at the current freeze: the slots the base
+    /// fingerprint reads. A slot a layer may take again is never among them (I2).
+    frozen_allocated: Mutex<Vec<usize>>,
 }
 
 impl ForkState {
@@ -109,7 +124,14 @@ impl ForkState {
             skipped_revision_queue_records: AtomicUsize::new(0),
             skipped_lru_uses: AtomicUsize::new(0),
             refused_writes: AtomicUsize::new(0),
+            slots: Arc::new(SlotCounters::default()),
+            frozen_allocated: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Counts an input created under a layer: a slot kept for the life of the database.
+    pub(crate) fn record_created_input(&self) {
+        SlotCounters::add(&self.slots.created_inputs, 1);
     }
 
     #[inline]
@@ -214,6 +236,28 @@ pub struct SharedWrites {
     pub last_interned_at_stores: usize,
     /// Claims taken under a layer in a function's sync table (keyed by the layer).
     pub sync_claims: usize,
+    /// Slots a dropped layer gave back and a later layer took again, with a bumped generation (a
+    /// tracked struct with a new identity, an interned value).
+    pub slot_reuses: usize,
+    /// Slots dropped layers gave back to their ingredient's layer free list.
+    pub slot_frees: usize,
+}
+
+/// The table slots of a base that layers own or kept, now (D11, I2).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LayerSlots {
+    /// Slots live layers own: allocated or taken again under a layer and not yet given back by its
+    /// drop. 0 once every layer has dropped.
+    pub owned: usize,
+    /// Slots given back that will never be taken again: a generation that cannot be bumped, or a
+    /// slot given back after a thaw by a layer of an earlier freeze.
+    pub leaked: usize,
+    /// Inputs created under a layer. They are not owned and never given back: rust-analyzer's
+    /// `Files` map, which every handle of the base shares, keeps their ids, and a later creation
+    /// of the same file in any layer sets the text of that input. So they grow with the distinct
+    /// files created, not with the layers.
+    pub created_inputs: usize,
 }
 
 /// The base writes layers reached and did not make, by kind (D11, E2 "not done").
@@ -325,6 +369,10 @@ pub struct Layer {
     stamp_count: AtomicUsize,
     tracked_count: AtomicUsize,
     tombstone_count: AtomicUsize,
+    /// The accounting of layer-owned slots of the base (shared with `ForkState`).
+    slot_counters: Arc<SlotCounters>,
+    /// The table slots this layer owns, given back when it drops.
+    owned: Mutex<OwnedSlots>,
 }
 
 /// The locks of a layer are held only for one map lookup or insert, which runs no user code and
@@ -345,9 +393,25 @@ impl std::fmt::Debug for Layer {
     }
 }
 
+/// A dropping layer gives back the slots it owns: nothing reaches them any more (its handles and
+/// children, which hold it, are gone), so a later layer may take them again.
+impl Drop for Layer {
+    fn drop(&mut self) {
+        let given = self.owned.lock().give_back(self.base);
+        if given > 0 {
+            SlotCounters::add(&self.slot_counters.frees, given);
+            self.slot_counters
+                .owned
+                .fetch_sub(given, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Layer {
-    fn new(base: u64, parent: Option<Arc<Layer>>) -> Arc<Layer> {
+    fn new(base: u64, slot_counters: Arc<SlotCounters>, parent: Option<Arc<Layer>>) -> Arc<Layer> {
         Arc::new(Layer {
+            slot_counters,
+            owned: Mutex::new(OwnedSlots::default()),
             base,
             revision: next_layer_revision(),
             parent,
@@ -429,6 +493,34 @@ impl Layer {
     #[inline]
     pub(crate) fn key(&self) -> usize {
         self.revision.as_usize()
+    }
+
+    /// The identity of the freeze this layer was made under (`ForkState::epoch`).
+    #[inline]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.base
+    }
+
+    /// Whether a value owned by `owner` (a layer's [`Layer::key`], 0 for the base) is seen by this
+    /// layer's chain.
+    #[inline]
+    pub(crate) fn sees_owner(&self, owner: usize) -> bool {
+        owner == 0 || self.chain().any(|l| l.key() == owner)
+    }
+
+    /// Records slot `id` of `shard` of `list`'s ingredient as owned by this layer: given back
+    /// when it drops. `reused` when it was taken again from the free list.
+    pub(crate) fn own_slot(&self, list: &Arc<LayerFreeList>, shard: u16, id: Id, reused: bool) {
+        self.owned.lock().insert(list, shard, id);
+        SlotCounters::add(&self.slot_counters.owned, 1);
+        if reused {
+            SlotCounters::add(&self.slot_counters.reuses, 1);
+        }
+    }
+
+    /// Counts a slot of a free list that will never be taken again.
+    pub(crate) fn record_leaked_slot(&self) {
+        SlotCounters::add(&self.slot_counters.leaked, 1);
     }
 
     /// The revision of the newest layer of the chain that has writes, if any.
@@ -685,6 +777,9 @@ pub fn freeze<Db: HasStorage>(db: &Db) -> Revision {
     state
         .epoch
         .store(BASE_ID.fetch_add(1, Ordering::Relaxed), Ordering::Release);
+    // The slots the base fingerprint reads: those present now. No layer exists yet, so none of
+    // them is layer-owned under this freeze.
+    *state.frozen_allocated.lock() = view.table().fork_allocated();
     let base_revision = view.base_revision();
     LAYER_REVISION.fetch_max(base_revision.as_usize(), Ordering::SeqCst);
     base_revision
@@ -708,7 +803,7 @@ pub fn root_layer<Db: HasStorage>(db: &Db) -> Arc<Layer> {
         view.fork().is_frozen(),
         "ryo-v2 fork: layers need a frozen base"
     );
-    Layer::new(view.fork().epoch(), None)
+    Layer::new(view.fork().epoch(), Arc::clone(&view.fork().slots), None)
 }
 
 /// A new open layer on `parent`.
@@ -719,7 +814,11 @@ pub fn child_layer(parent: &Arc<Layer>) -> Arc<Layer> {
         parent.is_sealed(),
         "ryo-v2 fork: only a sealed layer gets a child"
     );
-    Layer::new(parent.base, Some(Arc::clone(parent)))
+    Layer::new(
+        parent.base,
+        Arc::clone(&parent.slot_counters),
+        Some(Arc::clone(parent)),
+    )
 }
 
 /// Sets `layer` on the handle `db`: from here on its reads resolve through the layer's chain,
@@ -766,6 +865,18 @@ pub fn shared_writes<Db: HasStorage>(db: &Db) -> SharedWrites {
         interned_inserts: state.interned_inserts.load(Ordering::Relaxed),
         last_interned_at_stores: state.last_interned_at_stores.load(Ordering::Relaxed),
         sync_claims: state.sync_claims.load(Ordering::Relaxed),
+        slot_reuses: SlotCounters::get(&state.slots.reuses),
+        slot_frees: SlotCounters::get(&state.slots.frees),
+    }
+}
+
+/// The table slots layers of the base `db` belongs to own or kept, now.
+pub fn layer_slots<Db: HasStorage>(db: &Db) -> LayerSlots {
+    let slots = &db.storage().fork_view().fork().slots;
+    LayerSlots {
+        owned: SlotCounters::get(&slots.owned),
+        leaked: SlotCounters::get(&slots.leaked),
+        created_inputs: SlotCounters::get(&slots.created_inputs),
     }
 }
 
@@ -792,7 +903,9 @@ pub fn refused_writes<Db: HasStorage>(db: &Db) -> usize {
 /// A summary of everything a base keeps that layers must not change (I2), per table slot: a hash
 /// over the number of the slot's memos, every memo's `verified_at`, `changed_at` and durability,
 /// an input's field revisions and durabilities, a tracked struct's `updated_at`, durability and
-/// field revisions, and an interned value's durability.
+/// field revisions, and an interned value's durability. Only the slots present at the freeze are
+/// read, less the interned values a layer of an earlier freeze owned (a layer may take those
+/// again): a slot allocated or taken again under a layer is not base state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseFingerprint {
     /// `(page, slot, hash)` of every slot, in table order.
@@ -807,8 +920,8 @@ impl BaseFingerprint {
         self.slots.len()
     }
 
-    /// Whether every slot of `self` is unchanged in `later`. Slots allocated after `self` was
-    /// taken (a listed shared write: a value only a layer reaches) are not compared. `Err`
+    /// Whether every slot of `self` is unchanged in `later`. Slots `later` has and `self` has
+    /// not are not compared. `Err`
     /// names the first slot that differs or is missing.
     pub fn preserved_in(&self, later: &BaseFingerprint) -> Result<(), String> {
         let later: FxHashMap<(usize, usize), u64> = later
@@ -827,9 +940,10 @@ impl BaseFingerprint {
     }
 }
 
-/// The fingerprint of the base `db` belongs to. Reads every slot of the base; layers may run
-/// queries meanwhile (their writes to the base are atomic stores and slots published by the
-/// table's `allocated` count), but the result is a consistent summary only with none running.
+/// The fingerprint of the base `db` belongs to. Reads every slot the base had at the freeze;
+/// layers may run queries meanwhile (their writes to those slots are atomic stores; the slots
+/// they allocate or take again are not read), but the result is a consistent summary only with
+/// none running.
 ///
 /// Panics if the base is not frozen: on a base that takes writes, a query on another handle
 /// could write a slot (a tracked struct's durability, an input's revisions) during the read.
@@ -839,7 +953,8 @@ pub fn base_fingerprint<Db: HasStorage>(db: &Db) -> BaseFingerprint {
         view.fork().is_frozen(),
         "ryo-v2 fork: a base fingerprint needs a frozen base"
     );
-    view.table().fork_fingerprint()
+    let frozen = view.fork().frozen_allocated.lock().clone();
+    view.table().fork_fingerprint(&frozen)
 }
 
 /// Why [`try_thaw`] refused.
@@ -886,6 +1001,10 @@ pub fn try_thaw<Db: HasStorage>(db: &mut Db) -> Result<Revision, ThawRefused> {
     // `reserved - 1 >= base`, so the base moves to exactly `reserved`.
     let revision = zalsa.advance_revision_past(Revision::from(reserved - 1));
     debug_assert_eq!(revision.as_usize(), reserved);
+    // What dropped layers gave back becomes the base's again: tracked slots go to the base's own
+    // free list, and layer-interned values leave the key maps (the base's lookup has no owner
+    // check), their slots staying on the layer free lists.
+    zalsa.fork_thaw_ingredients();
     zalsa.fork().frozen.store(false, Ordering::Release);
     Ok(revision)
 }
@@ -927,5 +1046,14 @@ impl Zalsa {
     pub fn advance_revision_past(&mut self, r: Revision) -> Revision {
         self.runtime_mut().raise_current_revision(r);
         self.new_revision()
+    }
+
+    /// Runs [`Ingredient::fork_thaw`](crate::ingredient::Ingredient::fork_thaw) on every
+    /// ingredient, with the base's table.
+    pub(crate) fn fork_thaw_ingredients(&mut self) {
+        let (ingredients, table) = self.ingredients_and_table_mut();
+        for ingredient in ingredients {
+            ingredient.fork_thaw(table);
+        }
     }
 }

@@ -355,6 +355,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                 gap_detectors: true,
                 assert_revert_every: assert_every,
                 cfg_test: true,
+                engine: false,
             },
             clock.clone(),
             observer.clone(),

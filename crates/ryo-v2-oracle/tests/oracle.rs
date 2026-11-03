@@ -166,6 +166,7 @@ fn oracle() {
                 gap_detectors: gap_detectors_on,
                 assert_revert_every: None,
                 cfg_test: cfg_test_on,
+                engine: false,
             },
             Arc::new(MonotonicClock::new()),
             observer.clone(),

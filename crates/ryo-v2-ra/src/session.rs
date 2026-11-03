@@ -153,6 +153,18 @@ pub struct RaSession {
     /// When set, every call of that edit kind in the expander panics; for the tests of the
     /// containment.
     pub(crate) expander_fault: Option<CommandKind>,
+    /// Whether forks run on layers of the fork Engine (`RaConfig.engine`, D11), fixed at load.
+    pub(crate) engine: bool,
+    /// The frozen base while a fork lives on the Engine; its database is out of `host`
+    /// meanwhile (`host` holds `spare_db`). `None` with no fork live, and on the undo log.
+    pub(crate) frozen: Option<crate::engine::EngineBase>,
+    /// The empty database `host` holds while the base is frozen, kept between forks so a freeze
+    /// does not build one.
+    pub(crate) spare_db: Option<ra_ap_ide_db::RootDatabase>,
+    /// Every `FileId` the database's file map holds beyond the files of load time (a file a
+    /// level created, on either backend; the map never forgets one). A layer creating one of
+    /// them sets its inputs in the layer instead of creating them.
+    pub(crate) created_in_db: BTreeSet<FileId>,
 }
 
 impl RaSession {
@@ -236,6 +248,16 @@ impl RaSession {
     #[doc(hidden)]
     pub fn return_database(&mut self, db: ra_ap_ide_db::RootDatabase) {
         *self.host.raw_database_mut() = db;
+    }
+
+    /// The fork counters of the session's database (D11): what layers did to it since load, and
+    /// whether it is frozen. `None` while a fork is live on the Engine (the database is then the
+    /// Engine's frozen base). For the tests of the reference check and of the isolation.
+    #[doc(hidden)]
+    pub fn fork_counters(&self) -> Option<ryo_v2_engine::Counters> {
+        self.frozen
+            .is_none()
+            .then(|| ryo_v2_engine::counters(self.host.raw_database()))
     }
 
     /// The `FileId` of the load-time file `path`, if it is one.
@@ -362,5 +384,9 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         baseline_panics,
         expander_panics: Mutex::new(BTreeSet::new()),
         expander_fault: None,
+        engine: a.config.engine,
+        frozen: None,
+        spare_db: None,
+        created_in_db: BTreeSet::new(),
     })
 }

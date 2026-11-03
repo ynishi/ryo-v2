@@ -168,6 +168,9 @@ impl<C: Configuration> IngredientImpl<C> {
             zalsa
                 .fork()
                 .record_shared_write(SharedWriteKind::SlotAllocation);
+            // ryo-v2 fork: kept for the life of the database, not owned by the layer (outside
+            // salsa, rust-analyzer's `Files` map keeps the id for every handle of the base)
+            zalsa.fork().record_created_input();
         } else {
             zalsa.fork().assert_not_frozen("an input creation");
         }
@@ -610,11 +613,12 @@ where
     }
 
     // ryo-v2 fork: every field's revision and durability (isolation check, I2)
-    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) -> bool {
         for i in 0..C::FIELD_DEBUG_NAMES.len() {
             hasher.write_usize(self.revisions[i].as_usize());
             hasher.write_u8(self.durabilities[i].index() as u8);
         }
+        true
     }
 }
 

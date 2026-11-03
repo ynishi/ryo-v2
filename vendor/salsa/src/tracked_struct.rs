@@ -12,7 +12,7 @@ use thin_vec::ThinVec;
 use tracked_field::FieldIngredientImpl;
 
 // ryo-v2 fork: the entry points take the handle's view; under a layer the layer holds entries
-use crate::fork::{ChainMemo, ChainTracked, Layer, SharedWriteKind, ZalsaView};
+use crate::fork::{ChainMemo, ChainTracked, Layer, LayerFreeList, SharedWriteKind, ZalsaView};
 use crate::function::VerifyResult;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::id::{AsId, FromId};
@@ -266,6 +266,11 @@ where
 
     /// Store freed ids
     free_list: SegQueue<Id>,
+
+    // ryo-v2 fork: the slots dropped layers gave back (structs they created with a new
+    // identity), shared with the layers; taken again only under a layer, and moved to
+    // `free_list` at a thaw
+    layer_free: Arc<LayerFreeList>,
 
     memo_table_types: Arc<MemoTableTypes>,
 }
@@ -557,6 +562,8 @@ where
             ingredient_index: index,
             phantom: PhantomData,
             free_list: Default::default(),
+            // ryo-v2 fork: one shard: a tracked slot is taken again by any layer
+            layer_free: LayerFreeList::new(1),
             memo_table_types: Arc::new(MemoTableTypes::default()),
         }
     }
@@ -666,7 +673,7 @@ where
             };
         }
 
-        let id = self.allocate_in_layer(zalsa, zalsa_local, &current_deps, fields);
+        let id = self.allocate_in_layer(zalsa, layer, zalsa_local, &current_deps, fields);
         crate::tracing::trace!(
             "Allocated new tracked struct {key:?} in a layer",
             key = self.database_key_index(id)
@@ -752,20 +759,22 @@ where
         Ok(id)
     }
 
-    // ryo-v2 fork: a new slot under a layer: no free-list reuse (a frozen base's freed ids keep
-    // their generation), counted as a shared write; only the layer that created it reaches it
+    // ryo-v2 fork: a slot under a layer, owned by the layer and given back when it drops; only
+    // the layer's chain reaches it. A slot a dropped layer of this freeze gave back is taken
+    // again with a bumped generation, as upstream's free list does (one of an earlier freeze is
+    // leaked: the base fingerprint of this freeze may read it); else a new slot (a counted shared
+    // write). The base's free list is never used (a frozen base's freed ids keep their
+    // generation for every chain).
     fn allocate_in_layer<'db>(
         &'db self,
         zalsa: &'db ZalsaView,
+        layer: &'db Layer,
         zalsa_local: &'db ZalsaLocal,
         current_deps: &Stamp,
         fields: C::Fields<'db>,
     ) -> Id {
         let current_revision = zalsa.current_revision();
-        zalsa
-            .fork()
-            .record_shared_write(SharedWriteKind::SlotAllocation);
-        let (id, _) = zalsa_local.allocate::<Value<C>>(zalsa, self.ingredient_index, |_| Value {
+        let value = |_| Value {
             updated_at: OptionalAtomicRevision::new(Some(current_revision)),
             durability: current_deps.durability,
             revisions: C::new_revisions(current_deps.changed_at),
@@ -774,7 +783,34 @@ where
             // SAFETY: We only ever access the memos of a value that we allocated through
             // our `MemoTableTypes`.
             memos: unsafe { MemoTable::new(self.memo_table_types()) },
-        });
+        };
+
+        while let Some(free) = self.layer_free.pop(0) {
+            if free.epoch != layer.epoch() {
+                layer.record_leaked_slot();
+                continue;
+            }
+            let Some(id) = free.id.next_generation() else {
+                layer.record_leaked_slot();
+                continue;
+            };
+            // SAFETY: The slot was given back by a dropped layer of this freeze, which owned it:
+            // only that layer's chain reached it, and every layer of the chain has dropped, so no
+            // reference to it is alive; the base fingerprint of this freeze does not read it (it
+            // was allocated after the freeze), and no other layer takes it (it was popped here).
+            let data_raw = unsafe { &mut *Self::data_raw(zalsa.table(), id) };
+            // As upstream's free-list reuse: the old contents are dropped here. A layer inserts no
+            // memo into a slot's table, so the memo table is empty.
+            *data_raw = value(id);
+            layer.own_slot(&self.layer_free, 0, id, true);
+            return id;
+        }
+
+        zalsa
+            .fork()
+            .record_shared_write(SharedWriteKind::SlotAllocation);
+        let (id, _) = zalsa_local.allocate::<Value<C>>(zalsa, self.ingredient_index, value);
+        layer.own_slot(&self.layer_free, 0, id, false);
         id
     }
 
@@ -1435,6 +1471,19 @@ where
         &mut self.memo_table_types
     }
 
+    // ryo-v2 fork: at a thaw, the slots dropped layers gave back become the base's: each is
+    // marked deleted (`updated_at` `None`, as `delete_entity` leaves a slot) and pushed onto the
+    // base's own free list, from which a base allocation takes it again with a bumped generation
+    fn fork_thaw(&mut self, table: &mut Table) {
+        for free in self.layer_free.take_all() {
+            // SAFETY: `table` is exclusive; the slot was given back by a dropped layer, so no
+            // reference to it is alive.
+            let data = unsafe { &mut *Self::data_raw(table, free.id) };
+            data.updated_at.swap(None);
+            self.free_list.push(free.id);
+        }
+    }
+
     /// Returns memory usage information about any tracked structs.
     #[cfg(feature = "salsa_unstable")]
     unsafe fn memory_usage(
@@ -1611,12 +1660,13 @@ where
     }
 
     // ryo-v2 fork: `updated_at`, the durability and every field revision (isolation check, I2)
-    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) -> bool {
         hasher.write_usize(self.updated_at.load().map_or(0, Revision::as_usize));
         hasher.write_u8(self.durability.index() as u8);
         for i in 0..C::TRACKED_FIELD_INDICES.len() {
             hasher.write_usize(self.revisions[i].load().as_usize());
         }
+        true
     }
 }
 

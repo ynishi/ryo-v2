@@ -52,10 +52,9 @@ fn analyzer() -> RaAnalyzer {
         RaConfig {
             proc_macro: false,
             threads: Some(2),
-            assert_revert: false,
             gap_detectors: true,
-            assert_revert_every: None,
             cfg_test: false,
+            ..RaConfig::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -310,11 +309,17 @@ fn run_gate(base: &str, dir: &Path, sequences: &[(&'static str, Vec<Level>)]) ->
         Ok(()),
         "the base's memos, revisions and updated_at are those at the freeze"
     );
+    // Every layer but the root has dropped, and gave back what it owned.
+    assert_eq!(
+        after.slots.owned, 0,
+        "layer-owned slots after every layer dropped"
+    );
     eprintln!(
-        "V2 {base}: {compared} levels compared, 0 differences; I2: refused {}, {:?}, {:?}, {} base slots and {} memos unchanged",
+        "V2 {base}: {compared} levels compared, 0 differences; I2: refused {}, {:?}, {:?}, {:?}, {} base slots and {} memos unchanged",
         after.refused,
         after.shared,
         after.skipped,
+        after.slots,
         at_freeze.fingerprint.slots(),
         at_freeze.fingerprint.memos,
     );

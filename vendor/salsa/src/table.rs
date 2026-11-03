@@ -71,10 +71,13 @@ pub unsafe trait Slot: Any + Send + Sync {
     }
 
     // ryo-v2 fork: feeds what a layer must not change in this slot (revisions, `updated_at`,
-    // durability) to `hasher`, for the isolation check (I2)
-    /// Hashes the slot's revisions for the fork isolation check (ryo-v2 fork).
-    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+    // durability) to `hasher`, for the isolation check (I2); `false` when the slot is not base
+    // state (a value a layer owned, which a layer may take again), so it is not read further
+    /// Hashes the slot's revisions for the fork isolation check (ryo-v2 fork); `false` when the
+    /// slot is not base state.
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) -> bool {
         let _ = hasher;
+        true
     }
 }
 
@@ -99,7 +102,7 @@ struct SlotVTable {
     memos_mut: SlotMemosMutFnErased,
     // ryo-v2 fork: [`Slot::memos_in_layer`] and [`Slot::fork_fingerprint`], erased
     memos_in_layer: SlotMemosUncheckedFnErased,
-    fork_fingerprint: unsafe fn(*const (), &mut dyn std::hash::Hasher),
+    fork_fingerprint: unsafe fn(*const (), &mut dyn std::hash::Hasher) -> bool,
     /// The type name of what is stored as entries in data.
     type_name: fn() -> &'static str,
     /// A drop impl to call when the own page drops
@@ -437,23 +440,43 @@ impl Table {
         unsafe { page.memo_types.attach_memos(memos) }
     }
 
+    // ryo-v2 fork: the `allocated` count of every page, in page order, at a freeze: the slots
+    // the base fingerprint reads (I2)
+    pub(crate) fn fork_allocated(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (page_index, page) in self.pages.iter() {
+            if out.len() <= page_index {
+                out.resize(page_index + 1, 0);
+            }
+            out[page_index] = page.allocated.load(Ordering::Acquire);
+        }
+        out
+    }
+
     // ryo-v2 fork: the fingerprint of everything a layer must not change in the base (I2): the
     // number of slots and of memos, and a hash over every slot's revisions and every memo's
-    // `verified_at` and `changed_at`. Reads every slot: the caller (`fork::base_fingerprint`)
-    // checked that the base is frozen, so no slot below `allocated` is written meanwhile except
-    // by atomic stores, and no memo of a slot is inserted, replaced or freed.
-    pub(crate) fn fork_fingerprint(&self) -> crate::fork::BaseFingerprint {
+    // `verified_at` and `changed_at`. Reads the slots below `frozen[page]` (`fork_allocated` at
+    // the freeze), so no slot a layer allocated or may take again under this freeze; of those, an
+    // interned value a layer of an earlier freeze owned is skipped (its slot says so atomically
+    // before anything else is read), since a layer may take it again. The caller
+    // (`fork::base_fingerprint`) checked that the base is frozen, so no slot read is written
+    // meanwhile except by atomic stores, and no memo of a slot is inserted, replaced or freed.
+    pub(crate) fn fork_fingerprint(&self, frozen: &[usize]) -> crate::fork::BaseFingerprint {
         use std::hash::Hasher;
         let mut slots = Vec::new();
         let mut memos = 0;
         for (page_index, page) in self.pages.iter() {
-            let len = page.allocated.load(Ordering::Acquire);
+            let frozen_len = frozen.get(page_index).copied().unwrap_or(0);
+            let len = page.allocated.load(Ordering::Acquire).min(frozen_len);
             for slot in 0..len {
                 let mut hasher = rustc_hash::FxHasher::default();
                 let slot_ptr = page.get(SlotIndex::new(slot));
-                // SAFETY: `slot_ptr` points to an initialized slot of the page's type; the base is
-                // frozen (caller), so its non-atomic fields are not written meanwhile.
-                unsafe { (page.slot_vtable.fork_fingerprint)(slot_ptr, &mut hasher) };
+                // SAFETY: `slot_ptr` points to an initialized slot of the page's type, present at
+                // the freeze; the base is frozen (caller), so its non-atomic fields are not written
+                // meanwhile, and a slot a layer may write again reports `false` from atomic reads.
+                if !unsafe { (page.slot_vtable.fork_fingerprint)(slot_ptr, &mut hasher) } {
+                    continue;
+                }
                 // SAFETY: The slot is initialized, and the base is frozen (caller), so the slot is
                 // not reused or deleted and its memo table not written.
                 let table = unsafe { &*(page.slot_vtable.memos_unchecked)(slot_ptr) };

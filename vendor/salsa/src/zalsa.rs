@@ -249,6 +249,13 @@ impl Zalsa {
         &mut self.runtime
     }
 
+    // ryo-v2 fork: the ingredients and the table at once, for `fork::try_thaw`
+    pub(crate) fn ingredients_and_table_mut(
+        &mut self,
+    ) -> (&mut [Box<dyn Ingredient>], &mut Table) {
+        (&mut self.ingredients_vec, self.runtime.table_mut())
+    }
+
     /// Returns the [`Table`] used to store the value of salsa structs
     #[inline]
     pub fn table(&self) -> &Table {

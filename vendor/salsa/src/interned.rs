@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 
 use crate::durability::{AtomicDurability, Durability};
 // ryo-v2 fork: the entry points take the handle's view; a layer's shared writes are counted
-use crate::fork::{SharedWriteKind, SkippedWriteKind, ZalsaView};
+use crate::fork::{LayerFreeList, SharedWriteKind, SkippedWriteKind, ZalsaView};
 use crate::function::VerifyResult;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::id::{AsId, FromId};
@@ -24,6 +24,7 @@ use crate::plumbing::{self, Jar, ZalsaLocal};
 use crate::revision::AtomicRevision;
 use crate::sync::{Arc, Mutex, max_parallelism};
 use crate::table::Slot;
+use crate::table::Table; // ryo-v2 fork: for `Ingredient::fork_thaw`
 use crate::table::memo::{MemoTable, MemoTableTypes, MemoTableWithTypesMut};
 use crate::zalsa::{IngredientIndex, JarKind, Zalsa};
 use crate::zalsa_local::QueryEdge;
@@ -111,6 +112,14 @@ pub struct IngredientImpl<C: Configuration> {
 
     memo_table_types: Arc<MemoTableTypes>,
 
+    // ryo-v2 fork: the slots dropped layers gave back, per shard (a value's shard is fixed),
+    // shared with the layers; taken again only under a layer
+    layer_free: Arc<LayerFreeList>,
+
+    // ryo-v2 fork: whether a value a layer owns entered the key maps since the last thaw: a thaw
+    // with none skips the scan of the key maps (most ingredients take no value under a layer)
+    layer_values_in_maps: std::sync::atomic::AtomicBool,
+
     _marker: PhantomData<fn() -> C>,
 }
 
@@ -183,6 +192,18 @@ where
     /// lock, so it must only be published after initializing the fields and memos and removing
     /// the value from the LRU. A non-reusable value never becomes reusable again.
     durability: AtomicDurability,
+
+    // ryo-v2 fork: who owns the value: 0 for the base, else the key of the layer that interned
+    // it, which alone with its descendants sees it. Written under the shard lock, read under it
+    // by a lookup and atomically by the base fingerprint. A slot once owned by a layer stays
+    // non-zero (it is taken again only by layers). 32 bits, so the value keeps upstream's size
+    // (it sits in the padding beside `shard` and `durability`)
+    owner: std::sync::atomic::AtomicU32,
+}
+
+// ryo-v2 fork: the owner a layer's values carry: its key, which must fit 32 bits
+fn owner_of(layer: &crate::fork::Layer) -> u32 {
+    u32::try_from(layer.key()).expect("ryo-v2 fork: more than 2^32 layer revisions")
 }
 
 /// Type-erased state stored in the intrusive LRU list.
@@ -362,6 +383,9 @@ where
             memo_table_types: Arc::new(MemoTableTypes::default()),
             revision_queue: RevisionQueue::new(C::REVISIONS),
             shift,
+            // ryo-v2 fork: one free list per shard
+            layer_free: LayerFreeList::new(shards.len()),
+            layer_values_in_maps: std::sync::atomic::AtomicBool::new(false),
             shards,
             _marker: PhantomData,
         }
@@ -620,13 +644,17 @@ where
         slot.new_id
     }
 
-    // ryo-v2 fork: `intern_id` under a layer (D11, E2, E7). An existing value gets its
-    // `last_interned_at` raised to the layer's revision (a counted shared write; it only raises
-    // the value's last use); its durability is not raised, no revision is recorded in the revision
-    // queue, and no LRU entry moves. A new value is inserted into the shard (a counted shared
-    // write: content-keyed, so every layer interning the same content gets the same id) as an
-    // immortal value, never in the LRU. While the base is frozen no slot is reused, so a read
-    // records no dependency edge, only the revision (as a non-reusable value does upstream).
+    // ryo-v2 fork: `intern_id` under a layer (D11, E2, E7). A lookup matches a value of the base
+    // or of a layer of the handle's chain (its `owner`): each chain sees the values of its own
+    // linear history, so siblings that intern the same content get an id each. An existing value
+    // gets its `last_interned_at` raised to the layer's revision (a counted shared write; it only
+    // raises the value's last use); its durability is not raised, no revision is recorded in the
+    // revision queue, and no LRU entry moves. A new value is owned by the top layer and given
+    // back when the layer drops: it takes a slot a dropped layer gave back, with a bumped
+    // generation, or else a new slot (counted shared writes), as an immortal value, never in the
+    // LRU. No base slot is reused while frozen, and a slot taken again belongs to no live chain,
+    // so a read records no dependency edge, only the revision (as a non-reusable value does
+    // upstream).
     fn intern_id_in_layer<'db, Key>(
         &'db self,
         zalsa: &'db ZalsaView,
@@ -638,6 +666,9 @@ where
         C::Fields<'db>: HashEqLike<Key>,
         Key: Lookup<C::Fields<'db>>,
     {
+        let layer = zalsa
+            .layer()
+            .expect("ryo-v2 fork: `intern_id_in_layer` runs on a layered handle");
         let current_revision = zalsa.current_revision();
         if C::REVISIONS != IMMORTAL {
             zalsa
@@ -651,7 +682,11 @@ where
         let shard = unsafe { &mut *self.shards.get_unchecked(shard_index).lock() };
 
         // SAFETY: We hold the lock for the shard containing the value.
-        let eq = |value: &ValueKey| unsafe { Self::value_eq(value.value::<C>(), &key) };
+        let eq = |value: &ValueKey| unsafe {
+            let value = value.value::<C>();
+            layer.sees_owner(value.owner.load(std::sync::atomic::Ordering::Relaxed) as usize)
+                && Self::value_eq(value, &key)
+        };
 
         if let Some(value) = shard.key_map.find(hash, eq) {
             // SAFETY: Values remain allocated for the lifetime of the database.
@@ -690,32 +725,53 @@ where
             .active_query()
             .map(|_| current_revision)
             .unwrap_or(Revision::max());
+        // Before a slot is taken: user code (`into_owned`) may panic.
+        // SAFETY: We call `from_internal_data` to restore the correct lifetime before access.
+        let fields = unsafe { self.to_internal_data(key.into_owned()) };
 
-        let (id, value) = zalsa_local.allocate(zalsa, self.ingredient_index, |id| Value::<C> {
-            shard: shard_index as u16,
-            lru: LruEntry {
-                link: LinkedListLink::new(),
-                id: UnsafeCell::new(id),
-                last_interned_at: AtomicRevision::new(last_interned_at),
-            },
-            // SAFETY: We call `from_internal_data` to restore the correct lifetime before access.
-            fields: UnsafeCell::new(unsafe { self.to_internal_data(key.into_owned()) }),
-            // SAFETY: We only ever access the memos of a value that we allocated through
-            // our `MemoTableTypes`.
-            memos: UnsafeCell::new(unsafe { MemoTable::new(self.memo_table_types()) }),
-            // Immortal: never in the LRU, never reused, also after a thaw.
-            durability: AtomicDurability::new(Durability::MAX),
-        });
-        zalsa
-            .fork()
-            .record_shared_write(SharedWriteKind::SlotAllocation);
+        let id = match self.reuse_in_layer(
+            zalsa,
+            layer,
+            shard,
+            shard_index,
+            hash,
+            fields,
+            last_interned_at,
+        ) {
+            Ok(id) => id,
+            Err(fields) => {
+                let (id, value) =
+                    zalsa_local.allocate(zalsa, self.ingredient_index, |id| Value::<C> {
+                        shard: shard_index as u16,
+                        lru: LruEntry {
+                            link: LinkedListLink::new(),
+                            id: UnsafeCell::new(id),
+                            last_interned_at: AtomicRevision::new(last_interned_at),
+                        },
+                        fields: UnsafeCell::new(fields),
+                        // SAFETY: We only ever access the memos of a value that we allocated
+                        // through our `MemoTableTypes`.
+                        memos: UnsafeCell::new(unsafe { MemoTable::new(self.memo_table_types()) }),
+                        // Immortal: never in the LRU, never reused by the base.
+                        durability: AtomicDurability::new(Durability::MAX),
+                        owner: std::sync::atomic::AtomicU32::new(owner_of(layer)),
+                    });
+                zalsa
+                    .fork()
+                    .record_shared_write(SharedWriteKind::SlotAllocation);
+
+                // SAFETY: We hold this ingredient's shard lock, and `value` is the live, stable
+                // value that we just allocated in that shard.
+                unsafe { self.insert_value(shard, hash, value) };
+                self.layer_values_in_maps
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                layer.own_slot(&self.layer_free, shard_index as u16, id, false);
+                id
+            }
+        };
         zalsa
             .fork()
             .record_shared_write(SharedWriteKind::InternedInsert);
-
-        // SAFETY: We hold this ingredient's shard lock, and `value` is the live, stable value that
-        // we just allocated in that shard.
-        unsafe { self.insert_value(shard, hash, value) };
 
         zalsa_local.report_tracked_read_revision(current_revision);
 
@@ -727,6 +783,89 @@ where
         });
 
         id
+    }
+
+    // ryo-v2 fork: takes again, for `fields` under `layer`, a slot of shard `shard_index` that a
+    // dropped layer gave back: its dead value leaves the key map (if a thaw did not remove it
+    // already), the slot gets `fields`, a bumped generation (the same id for an immortal
+    // ingredient) and `layer` as its owner, and is
+    // published as `intern_id_in_layer` publishes a new value. `Err(fields)` when the free list of
+    // the shard has no slot whose generation can be bumped. The caller holds the shard's lock.
+    #[allow(clippy::too_many_arguments)]
+    fn reuse_in_layer(
+        &self,
+        zalsa: &ZalsaView,
+        layer: &crate::fork::Layer,
+        shard: &mut IngredientShard,
+        shard_index: usize,
+        hash: u64,
+        fields: C::Fields<'static>,
+        last_interned_at: Revision,
+    ) -> Result<Id, C::Fields<'static>> {
+        while let Some(free) = self.layer_free.pop(shard_index) {
+            // A reusable ingredient bumps the generation, as upstream's reuse does. An immortal
+            // one keeps the id: upstream never moves an immortal value's generation, and code
+            // relies on it (rust-analyzer packs a `SyntaxContext` as the bare index and rebuilds
+            // the id with generation 0). Keeping it is sound because no holder of the old value
+            // is alive (its owner's chain has dropped).
+            let new_id = if C::REVISIONS == IMMORTAL {
+                Some(free.id)
+            } else {
+                free.id.next_generation()
+            };
+            let Some(new_id) = new_id else {
+                // The dead value stays in the key map until a thaw; no chain sees its owner.
+                layer.record_leaked_slot();
+                continue;
+            };
+            let value = zalsa.table().get::<Value<C>>(free.id);
+            debug_assert_eq!(value.shard as usize, shard_index);
+
+            // Reserve space while the dead value is still intact: resizing runs user hashing.
+            // SAFETY: We hold the lock for the shard containing every value passed to `hasher`.
+            let hasher = |value: &ValueKey| unsafe { self.value_hash(value.value::<C>()) };
+            shard.key_map.reserve(1, hasher);
+
+            // SAFETY: We hold the lock for the shard containing the value.
+            let old_hash = unsafe { self.value_hash(value) };
+            let value_key = ValueKey::new(value);
+            if let Ok(entry) = shard
+                .key_map
+                .find_entry(old_hash, |found| found.0 == value_key.0)
+            {
+                entry.remove();
+            }
+
+            // SAFETY: The slot was given back by a dropped layer that owned it: only that layer's
+            // chain saw it (the lookup checks the owner), and every layer of the chain has
+            // dropped, so no reference to its fields or memos is alive; the base fingerprint
+            // skips it (its owner is not 0); we hold its shard's lock, which guards the fields,
+            // the id and the owner; it is in no LRU (immortal) and its memo table is empty (a
+            // layer inserts no memo into a slot's table).
+            let old_fields = unsafe { std::mem::replace(&mut *value.fields.get(), fields) };
+            // SAFETY: We hold the shard lock, which protects the ID.
+            unsafe { *value.lru.id.get() = new_id };
+            value
+                .owner
+                .store(owner_of(layer), std::sync::atomic::Ordering::Release);
+            shard.key_map.insert_unique(hash, value_key, hasher);
+            value.lru.last_interned_at.store(last_interned_at);
+            self.layer_values_in_maps
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Owned before user code (`Drop` of the old fields) runs: a panic there leaves the
+            // slot published and given back when the layer drops, not lost.
+            layer.own_slot(&self.layer_free, shard_index as u16, new_id, true);
+            drop(old_fields);
+
+            zalsa.event(&|| {
+                Event::new(EventKind::DidReuseInternedValue {
+                    key: self.database_key_index(new_id),
+                    revision: zalsa.current_revision(),
+                })
+            });
+            return Ok(new_id);
+        }
+        Err(fields)
     }
 
     /// The cold path for interning a value, allocating a new slot.
@@ -773,6 +912,8 @@ where
             // our `MemoTableTypes`.
             memos: UnsafeCell::new(unsafe { MemoTable::new(self.memo_table_types()) }),
             durability: AtomicDurability::new(durability),
+            // ryo-v2 fork: interned by a handle of the base
+            owner: std::sync::atomic::AtomicU32::new(0),
         });
 
         // Insert the newly allocated value.
@@ -1346,6 +1487,24 @@ where
         &mut self.memo_table_types
     }
 
+    // ryo-v2 fork: at a thaw, every value a layer owned leaves the key maps, so the base, whose
+    // lookup has no owner check, never finds one; their slots stay on the layer free list (or
+    // with a layer that outlived the thaw, which gives them back when it drops), for later layers
+    fn fork_thaw(&mut self, table: &mut Table) {
+        _ = table;
+        // Set (under a shard lock) by every insert of a layer's value; exclusive access here.
+        if !std::mem::take(self.layer_values_in_maps.get_mut()) {
+            return;
+        }
+        for shard in self.shards.iter_mut() {
+            shard.get_mut().key_map.retain(|value| {
+                // SAFETY: The table, which keeps every value, is alive (exclusive access).
+                let value = unsafe { value.value::<C>() };
+                value.owner.load(std::sync::atomic::Ordering::Relaxed) == 0
+            });
+        }
+    }
+
     /// Returns memory usage information about any interned values.
     #[cfg(all(not(feature = "shuttle"), feature = "salsa_unstable"))]
     unsafe fn memory_usage(
@@ -1438,9 +1597,14 @@ where
     }
 
     // ryo-v2 fork: the durability, which a layer never raises (isolation check, I2);
-    // `last_interned_at` is a shared write and is left out
-    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+    // `last_interned_at` is a shared write and is left out. A value a layer owned is not base
+    // state (a layer may take its slot again): skipped, after one atomic load of its owner
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) -> bool {
+        if self.owner.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            return false;
+        }
         hasher.write_u8(self.durability.load().index() as u8);
+        true
     }
 }
 
@@ -1887,6 +2051,8 @@ mod persistence {
                 durability,
                 shard: _,
                 memos: _,
+                // ryo-v2 fork: not serialized; a deserialized value is the base's
+                owner: _,
             } = self;
             let LruEntry {
                 link: _,
@@ -1986,6 +2152,8 @@ mod persistence {
                         MemoTable::new(ingredient.memo_table_types())
                     }),
                     durability: AtomicDurability::new(value.durability),
+                    // ryo-v2 fork: a deserialized value is the base's
+                    owner: std::sync::atomic::AtomicU32::new(0),
                 };
 
                 // Force initialize the relevant page.

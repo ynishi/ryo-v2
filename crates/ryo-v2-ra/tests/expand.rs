@@ -116,6 +116,7 @@ fn load(f: &Fixture) -> (RaAnalyzer, RaSession) {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
+            engine: false,
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),

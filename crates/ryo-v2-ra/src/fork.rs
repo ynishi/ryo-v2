@@ -35,18 +35,19 @@ pub struct RaFork {
 }
 
 /// One write of a fork: what it changed, the undo log of the change, and what a diagnosis and a
-/// revert of it need.
+/// revert of it need. On the Engine (`RaConfig.engine`) the level is a layer and its undo log
+/// (`modified`, `saved_roots`, `sampled`) stays empty.
 pub(crate) struct Level {
     /// Paths of this write, sorted, unique.
-    edited: Vec<RelPath>,
+    pub(crate) edited: Vec<RelPath>,
     /// Files of the level below that this level wrote, with their text at the level below.
     modified: Vec<(FileId, RelPath, String)>,
     /// Files this level created: paths that no level had ever known.
-    created: Vec<(FileId, RelPath)>,
+    pub(crate) created: Vec<(FileId, RelPath)>,
     /// Files this level brought back: known to the session, deleted by a level below.
-    revived: Vec<(FileId, RelPath)>,
+    pub(crate) revived: Vec<(FileId, RelPath)>,
     /// Files of the level below that this level deleted, with their text at the level below.
-    deleted: Vec<(FileId, RelPath, String)>,
+    pub(crate) deleted: Vec<(FileId, RelPath, String)>,
     /// The first save of each source root this level changed.
     saved_roots: Vec<(SourceRootId, TriArc<SourceRoot>)>,
     /// The files of the state of this level.
@@ -58,7 +59,28 @@ pub(crate) struct Level {
     /// Duration of this level's write, from the start of [`push_level`] to the end of the write,
     /// in ms. Each diagnosis of the level reports it plus its own duration, so that the time
     /// between diagnoses is never counted.
-    write_ms: u64,
+    pub(crate) write_ms: u64,
+    /// The level's layer on the Engine; `None` on the undo log.
+    pub(crate) layer: Option<crate::engine::LevelLayer>,
+}
+
+impl Level {
+    /// A level of the write of `edited` with nothing written yet.
+    pub(crate) fn new(edited: Vec<RelPath>) -> Level {
+        Level {
+            edited,
+            modified: Vec::new(),
+            created: Vec::new(),
+            revived: Vec::new(),
+            deleted: Vec::new(),
+            saved_roots: Vec::new(),
+            live: Vec::new(),
+            scope: Vec::new(),
+            sampled: None,
+            write_ms: 0,
+            layer: None,
+        }
+    }
 }
 
 /// The re-assert of a sampled write: the scope it diagnoses after the revert and the findings
@@ -92,7 +114,7 @@ impl RevertFailure {
 }
 
 /// What a write is to do to one path, resolved against the state of the level below.
-enum Action {
+pub(crate) enum Action {
     Modify {
         id: FileId,
         rel: RelPath,
@@ -135,11 +157,46 @@ fn guarded<T>(poisoned: &mut Option<String>, f: impl FnOnce() -> T) -> Result<T,
 /// The text of `id` as the database holds it now. `Files::file_text` panics on an unknown id,
 /// so this is wrapped.
 pub(crate) fn db_text(host: &AnalysisHost, id: FileId) -> Result<String, AnalyzerError> {
-    catch_unwind(AssertUnwindSafe(|| {
-        let db = host.raw_database();
-        db.file_text(id).text(db).to_string()
-    }))
-    .map_err(|p| AnalyzerError::Panicked(panic_message(p)))
+    db_text_in(host.raw_database(), id)
+}
+
+/// [`db_text`] on a database handle.
+pub(crate) fn db_text_in(
+    db: &ra_ap_ide_db::RootDatabase,
+    id: FileId,
+) -> Result<String, AnalyzerError> {
+    catch_unwind(AssertUnwindSafe(|| db.file_text(id).text(db).to_string()))
+        .map_err(|p| AnalyzerError::Panicked(panic_message(p)))
+}
+
+/// The text of `id` at the top level of the live fork, the base text with no level: what the
+/// database holds now on the undo log, the top layer's text on the Engine.
+pub(crate) fn top_text(session: &RaSession, id: FileId) -> Result<String, AnalyzerError> {
+    if session.frozen.is_some() {
+        crate::engine::top_text(session, id)
+    } else {
+        db_text(&session.host, id)
+    }
+}
+
+/// The text of `id` in the database of the base: the frozen base's while a fork is live on the
+/// Engine, else what the database holds now (which a fork on the undo log has written).
+pub(crate) fn base_db_text(session: &RaSession, id: FileId) -> Result<String, AnalyzerError> {
+    if session.frozen.is_some() {
+        crate::engine::base_text(session, id)
+    } else {
+        db_text(&session.host, id)
+    }
+}
+
+/// Runs `f` with a host of the state of the top level of the live fork: the session's host on
+/// the undo log and with no fork; on the Engine one over the top level's layer, or a throwaway
+/// child of it once it is sealed (`engine::with_top_host`).
+pub(crate) fn with_top_host<R>(
+    session: &RaSession,
+    f: impl FnOnce(&AnalysisHost) -> R,
+) -> Result<R, AnalyzerError> {
+    crate::engine::with_top_host(session, f)
 }
 
 /// The files of the state the next write lands on: the top level's, or the session's own.
@@ -157,7 +214,7 @@ pub(crate) fn text_at_top(
     path: &RelPath,
 ) -> Result<Option<String>, AnalyzerError> {
     match live_below(session).iter().find(|(_, r)| r == path) {
-        Some((id, _)) => db_text(&session.host, *id).map(Some),
+        Some((id, _)) => top_text(session, *id).map(Some),
         None => Ok(None),
     }
 }
@@ -199,8 +256,9 @@ pub(crate) fn fork(session: &mut RaSession) -> Result<RaFork, AnalyzerError> {
     if session.live.is_some() {
         return Err(AnalyzerError::ForkInUse);
     }
+    let engine = session.engine;
     Ok(RaFork {
-        id: stack::open_fork(session, ForkPort::Analyzer),
+        id: stack::open_fork(session, ForkPort::Analyzer, engine)?,
     })
 }
 
@@ -266,7 +324,14 @@ pub(crate) fn diagnose_level(
         Scope::Affected => &top.scope,
         Scope::Workspace => &top.live,
     };
-    let diagnosed = diagnose_files(a, session, &session.host, diag_scope, &top.live, deadline)?;
+    let diagnosed = with_top_host(session, |host| {
+        diagnose_files(a, session, host, diag_scope, &top.live, deadline)
+    })?;
+    // On the Engine a panic of the diagnosis in the top level's open layer poisons that layer.
+    if let Err(AnalyzerError::Panicked(msg)) = &diagnosed {
+        crate::engine::poison_top_if_open(session, msg);
+    }
+    let diagnosed = diagnosed?;
     a.observer.observe(Event::Checked {
         scope_files: diag_scope.len(),
         total_files: session.files.len(),
@@ -287,6 +352,12 @@ pub(crate) fn diagnose_files(
     live: &[(FileId, RelPath)],
     deadline: Option<&Deadline>,
 ) -> Result<Diagnosed, AnalyzerError> {
+    if a.diagnose_panic {
+        // The test hook: the diagnosis fails as a panic of rust-analyzer in a query would.
+        return Err(AnalyzerError::Panicked(
+            "injected diagnosis panic".to_owned(),
+        ));
+    }
     let collected = collect_errors_par(
         host,
         diag_scope,
@@ -427,6 +498,9 @@ pub(crate) fn push_level(
     edited: Vec<RelPath>,
     sampled: bool,
 ) -> Result<(), AnalyzerError> {
+    if session.frozen.is_some() {
+        return crate::engine::push_level(a, session, edits, edited, sampled);
+    }
     let write_started_ms = a.clock.now_ms();
     let actions = resolve(session, edits)?;
     enter_base_texts(session, &actions);
@@ -452,18 +526,8 @@ pub(crate) fn push_level(
         None
     };
 
-    let mut level = Level {
-        edited,
-        modified: Vec::new(),
-        created: Vec::new(),
-        revived: Vec::new(),
-        deleted: Vec::new(),
-        saved_roots: Vec::new(),
-        live: Vec::new(),
-        scope: Vec::new(),
-        sampled,
-        write_ms: 0,
-    };
+    let mut level = Level::new(edited);
+    level.sampled = sampled;
     let inject = a.db_write_panic == Some(DbWritePanic::Write);
     if let Err(e) = write_actions(session, &mut level, actions, inject) {
         // A panic poisoned the session and the database is not touched again; a refusal is
@@ -474,6 +538,16 @@ pub(crate) fn push_level(
         return Err(e);
     }
 
+    finish_level(session, &mut level);
+    level.write_ms = a.clock.now_ms().saturating_sub(write_started_ms);
+    session.stack.push(level);
+    Ok(())
+}
+
+/// Sets the files of the state of a written `level` (those of the level below without the ones
+/// it deleted, with the ones it created and revived) and the files its `Scope::Affected`
+/// diagnoses. Both backends.
+pub(crate) fn finish_level(session: &RaSession, level: &mut Level) {
     let deleted: HashSet<FileId> = level.deleted.iter().map(|(id, _, _)| *id).collect();
     let mut live: Vec<(FileId, RelPath)> = live_below(session)
         .iter()
@@ -489,13 +563,10 @@ pub(crate) fn push_level(
         scoped_files(&live, &session.rev_deps, &edited_refs)
     };
     level.live = live;
-    level.write_ms = a.clock.now_ms().saturating_sub(write_started_ms);
-    session.stack.push(level);
-    Ok(())
 }
 
 /// Resolves each edit against the files of the level below. The last edit of a path wins.
-fn resolve(session: &RaSession, edits: &[Edit]) -> Result<Vec<Action>, AnalyzerError> {
+pub(crate) fn resolve(session: &RaSession, edits: &[Edit]) -> Result<Vec<Action>, AnalyzerError> {
     let live_by_rel: HashMap<&RelPath, FileId> =
         live_below(session).iter().map(|(id, r)| (r, *id)).collect();
     // Every file some level of this fork knows, deleted ones included; built at the first
@@ -509,13 +580,13 @@ fn resolve(session: &RaSession, edits: &[Edit]) -> Result<Vec<Action>, AnalyzerE
             (Some(&id), Some(new)) => Action::Modify {
                 id,
                 rel: edit.path.clone(),
-                below: db_text(&session.host, id)?,
+                below: top_text(session, id)?,
                 new: new.clone(),
             },
             (Some(&id), None) => Action::Delete {
                 id,
                 rel: edit.path.clone(),
-                below: db_text(&session.host, id)?,
+                below: top_text(session, id)?,
             },
             (None, Some(new)) => match known
                 .get_or_insert_with(|| known_files(session))
@@ -650,6 +721,9 @@ fn undo(session: &mut RaSession, level: &Level) -> Result<(), AnalyzerError> {
 /// poisons the session: one that cannot be carried out or confirmed leaves a session that cannot
 /// be trusted. An `Event::Reverted` records the revert unless it could not run to its end.
 pub(crate) fn pop_level(a: &RaAnalyzer, session: &mut RaSession) -> Result<bool, RevertFailure> {
+    if session.frozen.is_some() {
+        return crate::engine::pop_level(a, session);
+    }
     let Some(level) = session.stack.pop() else {
         return Ok(false);
     };
@@ -762,6 +836,9 @@ fn revert_level(
 /// failure is the result. The base texts the levels recorded stay with a poisoned session; a
 /// session that is not poisoned forgets them.
 pub(crate) fn release_levels(a: &RaAnalyzer, session: &mut RaSession) -> Result<(), RevertFailure> {
+    if session.frozen.is_some() {
+        return crate::engine::release_levels(a, session);
+    }
     session.live = None;
     if let Some(msg) = &session.poisoned {
         let msg = msg.clone();
@@ -779,14 +856,8 @@ pub(crate) fn release_levels(a: &RaAnalyzer, session: &mut RaSession) -> Result<
     Ok(())
 }
 
-/// Registers a created file in the vfs and its sibling's source root; returns its FileId.
-fn add_created_file(
-    session: &mut RaSession,
-    level: &mut Level,
-    rel: &RelPath,
-    text: &str,
-) -> Result<FileId, AnalyzerError> {
-    // The source root comes from a sibling file of the same crate.
+/// The session file whose source root a file created at `rel` joins: a file of the same crate.
+pub(crate) fn sibling_file(session: &RaSession, rel: &RelPath) -> Result<FileId, AnalyzerError> {
     let rel_path = Path::new(rel.as_str());
     let owner_dir = session
         .rev_deps
@@ -794,7 +865,7 @@ fn add_created_file(
         .filter(|d| rel_path.starts_with(d))
         .max_by_key(|d| d.as_os_str().len())
         .cloned();
-    let sibling_id = session
+    session
         .files
         .iter()
         .find(|(_, r)| {
@@ -803,15 +874,24 @@ fn add_created_file(
                 .is_none_or(|d| Path::new(r.as_str()).starts_with(d))
         })
         .map(|(id, _)| *id)
-        .ok_or_else(|| edit_err(rel, "no sibling file to determine the source root"))?;
+        .ok_or_else(|| edit_err(rel, "no sibling file to determine the source root"))
+}
 
+/// Registers a file created at `rel` with `text` in the vfs and returns its FileId and path
+/// (the same FileId as the last time the path was created); records the FileId as one the
+/// database's file map will hold. A FileId the vfs refuses leaves no vfs entry and is `Edit`.
+pub(crate) fn vfs_create(
+    session: &mut RaSession,
+    rel: &RelPath,
+    text: &str,
+) -> Result<(FileId, VfsPath), AnalyzerError> {
     let abs = AbsPathBuf::assert_utf8(session.root.join(rel.as_str()));
     let vfs_path = VfsPath::from(abs);
     session
         .vfs
         .set_file_contents(vfs_path.clone(), Some(text.as_bytes().to_vec()));
-    let file_id = match session.vfs.file_id(&vfs_path) {
-        Some((id, FileExcluded::No)) => id,
+    match session.vfs.file_id(&vfs_path) {
+        Some((id, FileExcluded::No)) => Ok((id, vfs_path)),
         other => {
             // Leave no vfs entry behind.
             session.vfs.set_file_contents(vfs_path, None);
@@ -820,9 +900,43 @@ fn add_created_file(
             } else {
                 "vfs did not assign a FileId"
             };
-            return Err(edit_err(rel, reason));
+            Err(edit_err(rel, reason))
         }
-    };
+    }
+}
+
+/// `old` with `added` in it and `removed` out of it, as a local source root.
+pub(crate) fn root_with(
+    old: &SourceRoot,
+    added: Option<(FileId, VfsPath)>,
+    removed: Option<FileId>,
+) -> TriArc<SourceRoot> {
+    let mut file_set = FileSet::default();
+    for f in old.iter() {
+        if Some(f) == removed {
+            continue;
+        }
+        if let Some(p) = old.path_for_file(&f) {
+            file_set.insert(f, p.clone());
+        }
+    }
+    if let Some((id, path)) = added {
+        file_set.insert(id, path);
+    }
+    TriArc::new(SourceRoot::new_local(file_set))
+}
+
+/// Registers a created file in the vfs and its sibling's source root; returns its FileId.
+fn add_created_file(
+    session: &mut RaSession,
+    level: &mut Level,
+    rel: &RelPath,
+    text: &str,
+) -> Result<FileId, AnalyzerError> {
+    // The source root comes from a sibling file of the same crate.
+    let sibling_id = sibling_file(session, rel)?;
+    let (file_id, vfs_path) = vfs_create(session, rel, text)?;
+    let first = !session.created_in_db.contains(&file_id);
 
     let root_id = {
         let db = session.host.raw_database();
@@ -832,7 +946,14 @@ fn add_created_file(
     let db = session.host.raw_database_mut();
     guarded(&mut session.poisoned, || {
         db.set_file_source_root_with_durability(file_id, root_id, Durability::LOW);
+        // Both inputs of a created file enter the database's file map together, which keeps
+        // them for good: a layer that creates the file later sets both in itself (the Engine
+        // cannot create one input of a file and set the other). The text is written below.
+        if first {
+            db.set_file_text(file_id, "");
+        }
     })?;
+    session.created_in_db.insert(file_id);
     level.created.push((file_id, rel.clone()));
     Ok(file_id)
 }
@@ -868,19 +989,9 @@ fn insert_into_root(
     if !level.saved_roots.iter().any(|(id, _)| *id == root_id) {
         level.saved_roots.push((root_id, old_root.clone()));
     }
-    let mut file_set = FileSet::default();
-    for f in old_root.iter() {
-        if let Some(p) = old_root.path_for_file(&f) {
-            file_set.insert(f, p.clone());
-        }
-    }
-    file_set.insert(file_id, vfs_path);
+    let new_root = root_with(&old_root, Some((file_id, vfs_path)), None);
     guarded(&mut session.poisoned, || {
-        db.set_source_root_with_durability(
-            root_id,
-            TriArc::new(SourceRoot::new_local(file_set)),
-            Durability::LOW,
-        );
+        db.set_source_root_with_durability(root_id, new_root, Durability::LOW);
     })
 }
 
@@ -894,21 +1005,9 @@ fn remove_deleted_files(session: &mut RaSession, level: &mut Level) -> Result<()
         if !level.saved_roots.iter().any(|(id, _)| *id == root_id) {
             level.saved_roots.push((root_id, old_root.clone()));
         }
-        let mut file_set = FileSet::default();
-        for f in old_root.iter() {
-            if f == *file_id {
-                continue;
-            }
-            if let Some(p) = old_root.path_for_file(&f) {
-                file_set.insert(f, p.clone());
-            }
-        }
+        let new_root = root_with(&old_root, None, Some(*file_id));
         guarded(&mut session.poisoned, || {
-            db.set_source_root_with_durability(
-                root_id,
-                TriArc::new(SourceRoot::new_local(file_set)),
-                Durability::LOW,
-            );
+            db.set_source_root_with_durability(root_id, new_root, Durability::LOW);
         })?;
     }
     Ok(())
@@ -927,7 +1026,7 @@ fn restore_roots(session: &mut RaSession, level: &Level) -> Result<(), AnalyzerE
 
 /// Drops the files a level created from the vfs.
 /// (A path created again gets the same FileId back from the vfs.)
-fn drop_created(session: &mut RaSession, level: &Level) {
+pub(crate) fn drop_created(session: &mut RaSession, level: &Level) {
     for (_, rel) in &level.created {
         let abs = AbsPathBuf::assert_utf8(session.root.join(rel.as_str()));
         session.vfs.set_file_contents(VfsPath::from(abs), None);
