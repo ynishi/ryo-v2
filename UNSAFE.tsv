@@ -1,0 +1,2 @@
+file	enclosing item	kind	classification	SAFETY	verdict	note
+crates/ryo-v2-host/src/bin/engine-probe/alloc.rs	impl GlobalAlloc for Counting	unsafe impl + unsafe fn alloc/alloc_zeroed/dealloc/realloc (forwarding blocks)	measurement: forwards every call to System unchanged and adds the size to an atomic	the layout and pointer are passed to System as received; the counters never touch the memory	keep	a binary of its own; no library crate links it

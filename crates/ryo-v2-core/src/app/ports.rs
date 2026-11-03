@@ -507,6 +507,18 @@ pub trait Judge {
 /// 計測・進捗の event。時間は Clock::now_ms の差 (ms)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    /// Workspace indexed: the load's files are known and the baseline has not started.
+    ///
+    /// # Contract
+    /// - C1: an adapter that reports it emits it once per load, before `Event::Loaded`, with the
+    ///   same `load_ms` and `files` as that `Event::Loaded`.
+    ///   tested: ryo-v2-ra tests/smoke.rs indexed_comes_before_loaded
+    Indexed {
+        /// Load time, as in the `Event::Loaded` of the same load.
+        load_ms: u64,
+        /// Local files, as in the `Event::Loaded` of the same load.
+        files: usize,
+    },
     /// Workspace loaded and baseline taken.
     Loaded {
         /// Load time.

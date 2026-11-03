@@ -1,5 +1,7 @@
 [workspace]
 members = ["crates/*"]
+# Vendored crates keep their own lints and tests; `unsafe_code` below binds the members only.
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
@@ -42,6 +44,8 @@ clap = { version = "4", features = ["derive"] }
 # inherits none of these.
 [workspace.lints.rust]
 missing_docs = "warn"
+# Every allowance is a row of UNSAFE.tsv; crates/ryo-v2-core/tests/unsafe_ceiling.rs keeps the two equal.
+unsafe_code = "deny"
 
 # The ra_ap_* stack is slow unoptimized even for tests; dependencies get opt-level 2.
 [profile.dev.package."*"]

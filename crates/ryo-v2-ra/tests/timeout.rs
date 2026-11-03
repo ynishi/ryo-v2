@@ -89,3 +89,45 @@ fn audit_revert_is_ok_after_checks_and_refuses_poisoned() {
         Err(CheckError::Poisoned(_))
     ));
 }
+
+#[test]
+fn a_failed_audit_keeps_its_paths() {
+    let f = Fixture::new(
+        "timeout_audit_fault",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+            ),
+            ("src/lib.rs", "pub mod a;\npub mod b;\n"),
+            ("src/a.rs", "pub fn a() {}\n"),
+            ("src/b.rs", "pub fn b() {}\n"),
+        ],
+    );
+    let plain = analyzer(None);
+    let mut s = plain.load(&f.dir).expect("load fixture");
+    for (path, text) in [
+        ("src/a.rs", "pub fn a() {}\n\npub fn a2() {}\n"),
+        ("src/b.rs", "pub fn b() {}\n\npub fn b2() {}\n"),
+    ] {
+        plain
+            .check(&mut s, &[Edit::write(rel(path), text)], Scope::Affected)
+            .expect("check");
+    }
+    let both = vec![rel("src/a.rs"), rel("src/b.rs")];
+    assert_eq!(s.pending_audit(), both);
+
+    // An audit that cannot run returns the failure and keeps what it was to audit.
+    let faulty = analyzer(None).with_audit_fault(true);
+    assert!(matches!(
+        faulty.audit_revert(&mut s),
+        Err(CheckError::Panicked(_))
+    ));
+    assert_eq!(s.pending_audit(), both);
+
+    // The next audit diagnoses them and forgets them.
+    plain
+        .audit_revert(&mut s)
+        .expect("clean reverts audit clean");
+    assert!(s.pending_audit().is_empty());
+}

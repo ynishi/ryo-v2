@@ -3,22 +3,26 @@
 //! With `--on <parent overlay>` it measures one child two ways: `rebuilt`, the parent's edits
 //! composed with the variant's and verified from the base, and `stacked`, the variant's edits
 //! that the parent does not already make, written as a level on top of the parent's level of one
-//! `Stacked` fork.
+//! `Stacked` fork, by `stacked::stacked_series`.
+//!
+//! Memory and CPU time are read through `proc.rs`: a failed read is an error of the run, so the
+//! host runs on Linux only. With `--on` every run also prints its process CPU ms, its wall ms
+//! and its core occupancy ([`occupancy`]).
 
-use crate::rss;
+use crate::proc::{self, ProcError};
+use crate::stacked::{self, Point};
 use anyhow::{Context, Result};
-use ryo_v2_core::app::ports::{
-    Analyzer, AnalyzerError, CheckError, Event, Observer, Stacked, Verifier,
-};
+use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Event, Observer, Verifier};
 use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::search::compose;
-use ryo_v2_core::domain::{Edit, Finding, RelPath, Scope, ScopedFindings, Verdict};
+use ryo_v2_core::domain::{Edit, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
 use ryo_v2_ra::{RaAnalyzer, RaConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Arguments of one bench invocation.
 pub struct BenchArgs {
@@ -66,6 +70,45 @@ struct RunStats {
     revert_ms: u64,
     revert_ok: Option<bool>,
     rss_kb: Option<u64>,
+    /// The run's CPU and wall time; measured with `--on` only.
+    usage: Option<Usage>,
+}
+
+/// The process CPU time and the wall time of one run, from its write to the end of its revert.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Usage {
+    cpu_ms: u64,
+    wall_ms: f64,
+}
+
+/// A run's start: the process CPU ms and the instant.
+type Start = (u64, Instant);
+
+/// Reads the CPU time of this process: `proc::cpu_ms`, or a failing reader in a test.
+type CpuReader = fn() -> Result<u64, ProcError>;
+
+/// Starts measuring a run's usage.
+fn start(cpu: CpuReader) -> Result<Start, ProcError> {
+    Ok((cpu()?, Instant::now()))
+}
+
+/// The usage of a run started at `started`, ending now.
+fn finish(cpu: CpuReader, (cpu0, t0): Start) -> Result<Usage, ProcError> {
+    let cpu1 = cpu()?;
+    Ok(Usage {
+        cpu_ms: cpu1.saturating_sub(cpu0),
+        wall_ms: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// The core occupancy of a run: the share of `threads` cores its process kept busy.
+///
+/// # Contract
+/// - C1: a check's occupancy is its process CPU ms over its wall ms times the configured threads;
+///   a failed CPU read is an error of the run, not a missing value.
+///   tested: bench::tests::occupancy_is_cpu_over_wall_times_threads
+pub fn occupancy(cpu_ms: u64, wall_ms: f64, threads: usize) -> f64 {
+    cpu_ms as f64 / (wall_ms * threads as f64)
 }
 
 /// The result of one run: its events, and its verdict unless the revert failed.
@@ -81,6 +124,7 @@ struct Series {
     check_ms: Vec<u64>,
     revert_ms: Vec<u64>,
     rss_kb: Vec<u64>,
+    occupancy: Vec<f64>,
 }
 
 /// Where a series is printed: its variant, scope and mode, and the number of repeats.
@@ -92,9 +136,13 @@ struct Heading<'a> {
     mode: &'a str,
     n_edits: usize,
     repeat: u32,
+    /// The session's diagnostic threads with `--on`, where each run's usage is measured;
+    /// `None` without it.
+    threads: Option<usize>,
 }
 
-fn scope_name(scope: Scope) -> &'static str {
+/// The scope's name, as the bench prints it.
+pub fn scope_name(scope: Scope) -> &'static str {
     match scope {
         Scope::Affected => "affected",
         Scope::Workspace => "workspace",
@@ -108,9 +156,19 @@ fn triple(xs: &[u64]) -> String {
     }
 }
 
-fn sample_memory(observer: &RecordingObserver) {
-    if let Some(rss_kb) = rss::current_kb() {
-        observer.observe(Event::Memory { rss_kb });
+/// Records the VmRSS of this process as an `Event::Memory`; a failed read is the error.
+fn sample_memory(observer: &RecordingObserver) -> Result<(), ProcError> {
+    let rss_kb = proc::vm_rss_kb()?;
+    observer.observe(Event::Memory { rss_kb });
+    Ok(())
+}
+
+/// The label of a run: PASS or FAIL by its verdict, REVERT-MISMATCH without one.
+pub fn label_of(verdict: Option<&Verdict>) -> &'static str {
+    match verdict {
+        Some(v) if v.passed() => "PASS",
+        Some(_) => "FAIL",
+        None => "REVERT-MISMATCH",
     }
 }
 
@@ -136,161 +194,133 @@ fn read_events(events: Vec<Event>) -> RunStats {
                 stats.revert_ok = revert_ok;
             }
             Event::Memory { rss_kb } => stats.rss_kb = Some(rss_kb),
-            Event::Loaded { .. } => {}
+            Event::Indexed { .. } | Event::Loaded { .. } => {}
         }
     }
     stats
 }
 
-/// One `verify` of `edits` from the base.
+/// One `verify` of `edits` from the base; with `measure`, its usage from before the `verify`
+/// to after it.
 fn rebuilt_once<A: Analyzer>(
     analyzer: &A,
     session: &mut A::Session,
     observer: &RecordingObserver,
     edits: &[Edit],
     scope: Scope,
+    measure: bool,
 ) -> Result<Once> {
     observer.take();
+    let started = if measure {
+        Some(start(proc::cpu_ms)?)
+    } else {
+        None
+    };
     let result = verify(analyzer, session, edits, scope);
-    sample_memory(observer);
-    let stats = read_events(observer.take());
-    let (label, verdict) = match result {
-        Ok(v) => (if v.passed() { "PASS" } else { "FAIL" }, Some(v)),
-        Err(AnalyzerError::RevertMismatch) => ("REVERT-MISMATCH", None),
+    let usage = match started {
+        Some(s) => Some(finish(proc::cpu_ms, s)?),
+        None => None,
+    };
+    sample_memory(observer)?;
+    let mut stats = read_events(observer.take());
+    stats.usage = usage;
+    let verdict = match result {
+        Ok(v) => Some(v),
+        Err(AnalyzerError::RevertMismatch) => None,
         Err(e) => return Err(e.into()),
     };
     Ok(Once {
         stats,
-        label,
+        label: label_of(verdict.as_ref()),
         verdict,
     })
 }
 
-/// The diagnosis of the top level at `scope`, and the files a check of the edits that take the
-/// base to its state covers (`Stacked::files_of`).
-fn diagnose_top<A: Stacked>(
-    a: &A,
-    s: &A::Session,
-    f: &A::Fork,
-    scope: Scope,
-) -> Result<(ScopedFindings, Vec<RelPath>), CheckError> {
-    let found = a.diagnose(s, f, scope)?;
-    Ok((found, a.files_of(s, f, scope)?))
+/// The bench's hook on `stacked::stacked_series`. It reads VmRSS after the parent's level and,
+/// at the end of each repeat, the repeat's events with a VmRSS read, and prints the repeat as a
+/// rebuilt run is printed. A failed read is the hook's error, so it ends the series.
+struct StackedRecord<'a> {
+    observer: &'a RecordingObserver,
+    heading: &'a Heading<'a>,
+    series: &'a mut Series,
+    /// The repeats recorded so far.
+    runs: u32,
+    /// The VmRSS after the parent's level, once it is diagnosed.
+    rss_parent: Option<u64>,
+    /// The CPU reader of the repeats' usage, measured when the heading has threads.
+    cpu: CpuReader,
+    /// The start of the current repeat's usage.
+    started: Option<Start>,
 }
 
-/// One level of `edits` on top of the live fork's top level: write, diagnose, pop.
-///
-/// The verdict is formed as the search forms a child's: `Verdict::of_level` of the level's
-/// diagnosis on top of `below`, the findings of the parent's level, kept to the files a check of
-/// the composed edits covers. So it is the verdict the rebuilt mode gives for the same state.
-#[allow(clippy::too_many_arguments)]
-fn stacked_once<A: Stacked>(
-    a: &A,
-    s: &mut A::Session,
-    f: &mut A::Fork,
-    observer: &RecordingObserver,
-    edits: &[Edit],
-    scope: Scope,
-    baseline: &[Finding],
-    below: &ScopedFindings,
-) -> Result<Once> {
-    observer.take();
-    // A refused write pushes no level, so there is nothing to pop.
-    a.write(s, f, edits)
-        .context("write the variant as a level")?;
-    let diagnosed = diagnose_top(a, s, f, scope);
-    let popped = a.pop(s, f);
-    sample_memory(observer);
-    let stats = read_events(observer.take());
-    let (label, verdict) = match (diagnosed, popped) {
-        (_, Err(CheckError::RevertMismatch { .. })) => ("REVERT-MISMATCH", None),
-        (_, Err(e)) => return Err(e).context("pop the variant's level"),
-        (Err(e), Ok(_)) => return Err(e).context("diagnose the variant's level"),
-        (Ok((found, files)), Ok(_)) => {
-            let (v, _) =
-                Verdict::of_level(baseline, below, &found, &Edit::deleted_paths(edits), &files);
-            (if v.passed() { "PASS" } else { "FAIL" }, Some(v))
+impl StackedRecord<'_> {
+    fn observe(&mut self, point: Point<'_>) -> Result<(), ProcError> {
+        match point {
+            Point::ParentDiagnosed => {
+                self.rss_parent = Some(proc::vm_rss_kb()?);
+                self.observer.take();
+            }
+            // A repeat's events are those from its write on, and so is its usage.
+            Point::BeforeWrite => {
+                self.observer.take();
+                if self.heading.threads.is_some() {
+                    self.started = Some(start(self.cpu)?);
+                }
+            }
+            Point::AfterWrite | Point::AfterDiagnose | Point::BeforePop => {}
+            Point::AfterPop(verdict) => {
+                let usage = match self.started.take() {
+                    Some(s) => Some(finish(self.cpu, s)?),
+                    None => None,
+                };
+                sample_memory(self.observer)?;
+                let mut stats = read_events(self.observer.take());
+                stats.usage = usage;
+                self.runs += 1;
+                record(
+                    self.heading,
+                    self.series,
+                    self.runs,
+                    &stats,
+                    label_of(verdict),
+                    verdict,
+                );
+            }
         }
-    };
-    Ok(Once {
-        stats,
-        label,
-        verdict,
-    })
-}
-
-/// Opens a fork, writes `parent` as its level 1 and diagnoses it once; returns the RSS after that
-/// level and the findings of its state, formed as the search forms its start state's. The fork is
-/// the caller's to release.
-fn parent_level<A: Stacked>(
-    a: &A,
-    s: &mut A::Session,
-    f: &mut A::Fork,
-    observer: &RecordingObserver,
-    parent: &[Edit],
-    scope: Scope,
-    baseline: &[Finding],
-) -> Result<(Option<u64>, ScopedFindings)> {
-    a.write(s, f, parent)
-        .context("write the --on parent as level 1")?;
-    let (found, files) = diagnose_top(a, s, f, scope).context("diagnose the --on parent")?;
-    let (_, kept) = Verdict::of_level(
-        baseline,
-        &ScopedFindings::default(),
-        &found,
-        &Edit::deleted_paths(parent),
-        &files,
-    );
-    let rss_kb = rss::current_kb();
-    observer.take();
-    Ok((rss_kb, kept))
-}
-
-/// The repeats of one series on a fork of `a`: the parent is level 1, written and diagnosed once,
-/// and each repeat writes `variant` as level 2, diagnoses it and pops it. The fork is released at
-/// the end, whatever happened. Returns whether every run and the release of the parent's level
-/// reverted, and the RSS after the parent level.
-#[allow(clippy::too_many_arguments)]
-fn stacked_series<A: Stacked>(
-    a: &A,
-    s: &mut A::Session,
-    observer: &RecordingObserver,
-    parent: &[Edit],
-    variant: &[Edit],
-    scope: Scope,
-    heading: &Heading<'_>,
-    series: &mut Series,
-) -> Result<(bool, Option<u64>)> {
-    let baseline = a.baseline(s);
-    let mut f = a.fork(s).context("open the fork")?;
-    let ran = parent_level(a, s, &mut f, observer, parent, scope, &baseline).and_then(
-        |(rss_parent, below)| {
-            let reverted = repeat(heading, series, || {
-                stacked_once(a, s, &mut f, observer, variant, scope, &baseline, &below)
-            })?;
-            Ok((reverted, rss_parent))
-        },
-    );
-    let released = a.release(s, f);
-    let (reverted, rss_parent) = ran?;
-    match released {
-        Ok(()) => Ok((reverted, rss_parent)),
-        // A failed revert poisoned the session, so its release fails too; the series is
-        // counted as a revert failure, as a rebuilt one is, and the release failure is printed.
-        Err(e) if !reverted => {
-            eprintln!("{}: release after a failed revert: {e}", heading.name);
-            Ok((false, rss_parent))
-        }
-        // The parent's level did not revert to the base: a revert failure of the series too.
-        Err(e @ CheckError::RevertMismatch { .. }) => {
-            eprintln!(
-                "{}: REVERT-MISMATCH releasing the parent level: {e}",
-                heading.name
-            );
-            Ok((false, rss_parent))
-        }
-        Err(e) => Err(e).context("release the fork"),
+        Ok(())
     }
+}
+
+/// Runs `f` with the hook `run` passes to `stacked::stacked_series` for a series of `repeat`
+/// repeats; returns what `f` returns, the runs the hook recorded, the VmRSS reads among them and
+/// the VmRSS it read after the parent's level.
+#[cfg(test)]
+pub(crate) fn with_bench_hook<R>(
+    repeat: u32,
+    f: impl FnOnce(&mut dyn FnMut(Point<'_>) -> Result<(), ProcError>) -> R,
+) -> (R, usize, usize, Option<u64>) {
+    let observer = RecordingObserver::default();
+    let heading = Heading {
+        name: "fake",
+        scope: "affected",
+        mode: " mode stacked",
+        n_edits: 1,
+        repeat,
+        threads: Some(1),
+    };
+    let mut series = Series::default();
+    let mut rec = StackedRecord {
+        observer: &observer,
+        heading: &heading,
+        series: &mut series,
+        runs: 0,
+        rss_parent: None,
+        cpu: proc::cpu_ms,
+        started: None,
+    };
+    let out = f(&mut |point| rec.observe(point));
+    let rss_parent = rec.rss_parent;
+    (out, series.check_ms.len(), series.rss_kb.len(), rss_parent)
 }
 
 /// Runs `heading.repeat` times, prints each run and adds it to `series`. Returns false at the
@@ -300,51 +330,76 @@ fn repeat(
     series: &mut Series,
     mut once: impl FnMut() -> Result<Once>,
 ) -> Result<bool> {
+    for i in 1..=heading.repeat {
+        let Once {
+            stats,
+            label,
+            verdict,
+        } = once()?;
+        record(heading, series, i, &stats, label, verdict.as_ref());
+        if verdict.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Prints run `i` of a series and adds it to `series`.
+fn record(
+    heading: &Heading<'_>,
+    series: &mut Series,
+    i: u32,
+    stats: &RunStats,
+    label: &str,
+    verdict: Option<&Verdict>,
+) {
     let Heading {
         name,
         scope,
         mode,
         n_edits,
         repeat: total,
+        threads,
     } = *heading;
-    for i in 1..=total {
-        let Once {
-            stats,
-            label,
-            verdict,
-        } = once()?;
-        let ok = match stats.revert_ok {
-            Some(b) => b.to_string(),
-            None => "-".to_string(),
-        };
-        let new = verdict.as_ref().map_or(0, |v| {
-            v.new_errors.errors.len() + v.new_errors.unmapped.len()
-        });
-        let rss_txt = stats.rss_kb.map_or("-".to_string(), |k| k.to_string());
-        println!(
-            "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}",
-            stats.scope_files, stats.total_files, stats.check_ms, stats.revert_ms,
-        );
-        if i == 1
-            && let Some(v) = &verdict
-        {
-            for d in &v.new_errors.errors {
-                println!("  + [{}] {}:{}", d.code, d.path, d.line);
-            }
-            for d in &v.new_errors.unmapped {
-                println!("  + [ra:{}] {}:{}", d.ra_code, d.path, d.line);
-            }
+    let ok = match stats.revert_ok {
+        Some(b) => b.to_string(),
+        None => "-".to_string(),
+    };
+    let new = verdict.map_or(0, |v| {
+        v.new_errors.errors.len() + v.new_errors.unmapped.len()
+    });
+    let rss_txt = stats.rss_kb.map_or("-".to_string(), |k| k.to_string());
+    // Additive: the columns of a run without `--on` end the line as before.
+    let usage_txt = match (threads, stats.usage) {
+        (Some(t), Some(u)) => {
+            let occ = occupancy(u.cpu_ms, u.wall_ms, t);
+            series.occupancy.push(occ);
+            format!(
+                " cpu_ms {} wall_ms {:.0} occupancy {occ:.2}",
+                u.cpu_ms, u.wall_ms
+            )
         }
-        series.check_ms.push(stats.check_ms);
-        series.revert_ms.push(stats.revert_ms);
-        if let Some(k) = stats.rss_kb {
-            series.rss_kb.push(k);
+        _ => String::new(),
+    };
+    println!(
+        "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}{usage_txt}",
+        stats.scope_files, stats.total_files, stats.check_ms, stats.revert_ms,
+    );
+    if i == 1
+        && let Some(v) = verdict
+    {
+        for d in &v.new_errors.errors {
+            println!("  + [{}] {}:{}", d.code, d.path, d.line);
         }
-        if verdict.is_none() {
-            return Ok(false);
+        for d in &v.new_errors.unmapped {
+            println!("  + [ra:{}] {}:{}", d.ra_code, d.path, d.line);
         }
     }
-    Ok(true)
+    series.check_ms.push(stats.check_ms);
+    series.revert_ms.push(stats.revert_ms);
+    if let Some(k) = stats.rss_kb {
+        series.rss_kb.push(k);
+    }
 }
 
 /// Loads `args.base` once and runs every variant; prints the fixed output format.
@@ -360,10 +415,12 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         observer.clone(),
     );
     let mut session = analyzer.load(&args.base)?;
-    sample_memory(&observer);
-    let mut rss_after_load = None;
+    let rss_after_load = proc::vm_rss_kb().context("read the RSS after load")?;
     for event in observer.take() {
         match event {
+            Event::Indexed { load_ms, files } => {
+                eprintln!("[indexed] {load_ms} ms, {files} local files");
+            }
             Event::Loaded {
                 load_ms,
                 baseline_ms,
@@ -375,14 +432,10 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     "[baseline] {baseline_errors} pre-existing errors in {baseline_ms} ms (cold)"
                 );
             }
-            Event::Memory { rss_kb } => rss_after_load = Some(rss_kb),
-            Event::Checked { .. } | Event::Reverted { .. } => {}
+            Event::Memory { .. } | Event::Checked { .. } | Event::Reverted { .. } => {}
         }
     }
-    match rss_after_load {
-        Some(kb) => eprintln!("[rss] {kb} kB after load"),
-        None => eprintln!("[rss] - kB after load"),
-    }
+    eprintln!("[rss] {rss_after_load} kB after load");
 
     let parent = match &args.on {
         Some(dir) => {
@@ -395,6 +448,8 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         }
         None => None,
     };
+    // With `--on` each run's usage is measured against the session's diagnostic threads.
+    let threads = parent.as_ref().map(|_| session.threads());
     let modes: &[Mode] = if parent.is_some() {
         &[Mode::Rebuilt, Mode::Stacked]
     } else {
@@ -417,11 +472,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         // at the parent's text not being one (stacked).
         let (child, own) = match &parent {
             Some(parent) => {
-                let own: Vec<Edit> = edits
-                    .iter()
-                    .filter(|e| !parent.contains(e))
-                    .cloned()
-                    .collect();
+                let own = stacked::own_edits(parent, &edits);
                 if own.is_empty() {
                     println!("{name}: SKIP (no edits vs the --on parent)");
                     continue;
@@ -448,21 +499,34 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     mode: &mode_txt,
                     n_edits: child.len(),
                     repeat: args.repeat,
+                    threads,
                 };
                 let (reverted, extra) = match (mode, &parent) {
                     (Mode::Stacked, Some(parent)) => {
                         heading.n_edits = own.len();
-                        let (reverted, rss) = stacked_series(
+                        let mut rec = StackedRecord {
+                            observer: &observer,
+                            heading: &heading,
+                            series: &mut series,
+                            runs: 0,
+                            rss_parent: None,
+                            cpu: proc::cpu_ms,
+                            started: None,
+                        };
+                        let reverted = stacked::stacked_series(
                             &analyzer,
                             &mut session,
-                            &observer,
+                            &name,
                             parent,
                             &own,
                             scope,
-                            &heading,
-                            &mut series,
+                            args.repeat,
+                            &mut |point| rec.observe(point),
                         )?;
-                        let rss = rss.map_or("-".to_string(), |k| k.to_string());
+                        // A series that returns has diagnosed the parent's level.
+                        let rss = rec
+                            .rss_parent
+                            .context("the --on parent's level was not diagnosed")?;
                         (
                             reverted,
                             format!("{mode_txt} rss_kb_after_parent_level {rss}"),
@@ -470,7 +534,14 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     }
                     _ => {
                         let reverted = repeat(&heading, &mut series, || {
-                            rebuilt_once(&analyzer, &mut session, &observer, &child, scope)
+                            rebuilt_once(
+                                &analyzer,
+                                &mut session,
+                                &observer,
+                                &child,
+                                scope,
+                                threads.is_some(),
+                            )
                         })?;
                         (reverted, mode_txt.clone())
                     }
@@ -523,8 +594,19 @@ fn print_summary(
         let max = s.rss_kb.iter().max().copied().unwrap_or(0);
         format!("{}/{}/{max}", s.rss_kb[0], s.rss_kb[s.rss_kb.len() - 1])
     };
+    // Additive, with `--on`: the median occupancy of the warm runs (the first run alone when
+    // there is no warm one).
+    let warm_occupancy = if s.occupancy.len() > 1 {
+        &s.occupancy[1..]
+    } else {
+        &s.occupancy[..]
+    };
+    let occ_txt = match median(warm_occupancy) {
+        Some(m) => format!(" warm_occupancy_median {m:.2}"),
+        None => String::new(),
+    };
     println!(
-        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}",
+        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt}",
         s.check_ms[0],
         triple(warm_check),
         triple(warm_revert),
@@ -546,6 +628,14 @@ pub fn summarize(xs: &[u64]) -> Option<(u64, u64, u64)> {
     let mut v = xs.to_vec();
     v.sort_unstable();
     Some((v[0], v[(v.len() - 1) / 2], v[v.len() - 1]))
+}
+
+/// The median of `xs`, the lower one for an even count, as [`summarize`] takes it. None when
+/// empty.
+pub fn median(xs: &[f64]) -> Option<f64> {
+    let mut v = xs.to_vec();
+    v.sort_unstable_by(f64::total_cmp);
+    v.get(v.len().checked_sub(1)? / 2).copied()
 }
 
 /// Least-squares slope of xs against 0..n (per step); 0.0 when n < 2.
@@ -602,113 +692,93 @@ mod tests {
         assert!(!leak_suspect(&[100, 110, 120, 130]));
     }
 
-    /// A fork whose every diagnosis is `top` and whose `files_of` is `files`.
-    #[derive(Default)]
-    struct FakeStack {
-        levels: std::cell::RefCell<Vec<Vec<Edit>>>,
-        top: ScopedFindings,
-        files: Vec<RelPath>,
+    /// A CPU read that fails, as `proc::cpu_ms` does where `/proc/self/stat` is absent.
+    fn failed_cpu() -> Result<u64, ProcError> {
+        Err(ProcError::Read {
+            file: PathBuf::from("/proc/self/stat"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })
     }
-    impl Verifier for FakeStack {
-        type Session = ();
-        fn text(&self, _: &(), _: &RelPath) -> Option<String> {
-            None
+
+    #[test]
+    fn occupancy_is_cpu_over_wall_times_threads() {
+        // 400 CPU ms in 100 wall ms on 8 threads: half the cores.
+        assert_eq!(occupancy(400, 100.0, 8), 0.5);
+        assert_eq!(occupancy(100, 100.0, 1), 1.0);
+        assert_eq!(occupancy(0, 50.0, 4), 0.0);
+
+        // The bench's hook with threads: a repeat's line gets its usage, the series its
+        // occupancy, and the figure is CPU over wall times threads.
+        let observer = RecordingObserver::default();
+        let heading = Heading {
+            name: "fake",
+            scope: "affected",
+            mode: " mode stacked",
+            n_edits: 1,
+            repeat: 1,
+            threads: Some(2),
+        };
+        let mut series = Series::default();
+        let mut rec = StackedRecord {
+            observer: &observer,
+            heading: &heading,
+            series: &mut series,
+            runs: 0,
+            rss_parent: None,
+            cpu: proc::cpu_ms,
+            started: None,
+        };
+        rec.observe(Point::BeforeWrite).unwrap();
+        let mut x = 0u64;
+        for _ in 0..2_000_000 {
+            x = std::hint::black_box(x.wrapping_add(1));
         }
-        fn facts(&self, _: &(), _: &RelPath) -> ryo_v2_core::domain::FileFacts {
-            ryo_v2_core::domain::FileFacts::default()
-        }
-        fn baseline(&self, _: &()) -> Vec<Finding> {
-            Vec::new()
-        }
-        fn provenance(&self, _: &()) -> ryo_v2_core::domain::Provenance {
-            ryo_v2_core::domain::Provenance::new(
-                "fake",
-                "0",
-                Default::default(),
-                Default::default(),
-            )
-            .unwrap()
-        }
-        fn blind_classes(&self) -> std::collections::BTreeSet<ryo_v2_core::domain::UnseenClass> {
-            Default::default()
-        }
-        fn check(&self, _: &mut (), _: &[Edit], _: Scope) -> Result<ScopedFindings, CheckError> {
-            Ok(ScopedFindings::default())
-        }
-    }
-    impl Stacked for FakeStack {
-        type Fork = ();
-        fn fork(&self, _: &mut ()) -> Result<(), CheckError> {
-            Ok(())
-        }
-        fn write(&self, _: &mut (), _: &mut (), edits: &[Edit]) -> Result<(), CheckError> {
-            self.levels.borrow_mut().push(edits.to_vec());
-            Ok(())
-        }
-        fn levels(&self, _: &(), _: &()) -> Result<usize, CheckError> {
-            Ok(self.levels.borrow().len())
-        }
-        fn fork_text(&self, _: &(), _: &(), _: &RelPath) -> Result<Option<String>, CheckError> {
-            Ok(None)
-        }
-        fn diagnose(&self, _: &(), _: &(), _: Scope) -> Result<ScopedFindings, CheckError> {
-            Ok(self.top.clone())
-        }
-        fn files_of(&self, _: &(), _: &(), _: Scope) -> Result<Vec<RelPath>, CheckError> {
-            Ok(self.files.clone())
-        }
-        fn pop(&self, _: &mut (), _: &mut ()) -> Result<bool, CheckError> {
-            Ok(self.levels.borrow_mut().pop().is_some())
-        }
-        fn release(&self, _: &mut (), _: ()) -> Result<(), CheckError> {
-            self.levels.borrow_mut().clear();
-            Ok(())
+        rec.observe(Point::AfterDiagnose).unwrap();
+        rec.observe(Point::BeforePop).unwrap();
+        rec.observe(Point::AfterPop(None)).unwrap();
+        assert_eq!(series.occupancy.len(), 1);
+        assert!(series.occupancy[0] >= 0.0 && series.occupancy[0].is_finite());
+
+        // A failed CPU read at the start or the end of a repeat is the hook's error, so it ends
+        // the series; no occupancy is recorded for that repeat.
+        for fail_at_end in [false, true] {
+            let mut series = Series::default();
+            let mut rec = StackedRecord {
+                observer: &observer,
+                heading: &heading,
+                series: &mut series,
+                runs: 0,
+                rss_parent: None,
+                cpu: if fail_at_end {
+                    proc::cpu_ms
+                } else {
+                    failed_cpu
+                },
+                started: None,
+            };
+            let begun = rec.observe(Point::BeforeWrite);
+            let ended = if fail_at_end {
+                begun.unwrap();
+                rec.cpu = failed_cpu;
+                rec.observe(Point::AfterPop(None))
+            } else {
+                begun
+            };
+            match ended {
+                Err(e @ ProcError::Read { .. }) => {
+                    assert!(e.to_string().contains("/proc/self/stat"), "{e}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(series.occupancy.is_empty());
         }
     }
 
     #[test]
-    fn a_stacked_verdict_is_formed_as_the_search_forms_it() {
-        use ryo_v2_core::domain::UnseenClass;
-        use std::collections::{BTreeMap, BTreeSet};
-        let rel = |p: &str| RelPath::parse(p).unwrap();
-        // The parent's level observed a class on b; the variant's level diagnoses a only.
-        let below = ScopedFindings {
-            files: vec![rel("a.rs"), rel("b.rs")],
-            unseen_at: BTreeMap::from([(
-                UnseenClass::UnresolvedPath,
-                BTreeSet::from([rel("b.rs")]),
-            )]),
-            ..ScopedFindings::default()
-        };
-        let a = FakeStack {
-            top: ScopedFindings {
-                files: vec![rel("a.rs")],
-                ..ScopedFindings::default()
-            },
-            files: vec![rel("a.rs"), rel("b.rs")],
-            ..FakeStack::default()
-        };
-        let observer = RecordingObserver::default();
-        let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
-        let once = stacked_once(
-            &a,
-            &mut (),
-            &mut (),
-            &observer,
-            &variant,
-            Scope::Affected,
-            &[],
-            &below,
-        )
-        .unwrap();
-        let want = Verdict::of_level(&[], &below, &a.top, &[], &a.files).0;
-        assert_eq!(once.verdict, Some(want));
-        // The class kept from below is named: the top level's diagnosis alone would not name it.
-        let named = once.verdict.map(|v| v.unseen).unwrap_or_default();
-        assert_eq!(named, BTreeSet::from([UnseenClass::UnresolvedPath]));
-        assert!(Verdict::from_baseline(&[], &a.top).unseen.is_empty());
-        assert_eq!(once.label, "PASS");
-        assert!(a.levels.borrow().is_empty(), "the level is popped");
+    fn median_is_the_lower_middle() {
+        assert_eq!(median(&[0.3, 0.1, 0.2]), Some(0.2));
+        assert_eq!(median(&[0.4, 0.1, 0.3, 0.2]), Some(0.2));
+        assert_eq!(median(&[]), None);
     }
 
     #[test]

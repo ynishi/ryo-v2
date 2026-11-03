@@ -204,6 +204,19 @@ impl RaSession {
     pub fn inject_expander_fault(&mut self, kind: Option<CommandKind>) {
         self.expander_fault = kind;
     }
+
+    /// The number of threads a diagnosis of this session runs on: `RaConfig.threads`, or the
+    /// available parallelism when that is `None`, fixed at load.
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// The paths written since the last revert audit that ran to its end, sorted; for the tests
+    /// of the audit.
+    #[doc(hidden)]
+    pub fn pending_audit(&self) -> Vec<RelPath> {
+        self.edited_since_audit.iter().cloned().collect()
+    }
 }
 
 /// Relative path of `path` under `root`, as a [`RelPath`].
@@ -262,6 +275,10 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         }
     }
     let load_ms = a.clock.now_ms().saturating_sub(t0);
+    a.observer.observe(Event::Indexed {
+        load_ms,
+        files: files.len(),
+    });
 
     let (rev_deps, path_facts) = build_rev_deps(&root).unwrap_or_default();
     let load_inputs = capture_load_inputs(&root, &rev_deps);

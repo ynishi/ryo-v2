@@ -4,19 +4,20 @@
 //! The argument parser's definition (clap's derive types) is the only
 //! description of the commands: help, the command list and validation come
 //! from it, not from a second hand-kept table.
+//!
+//! The host runs on Linux only: `bench` reads its figures from `/proc` (`proc.rs`), and a read
+//! that fails is an error of the run.
 
 mod apply;
-mod bench;
 mod blueprint_json;
 mod resolution_json;
-mod rss;
 mod search;
 mod search_json;
 
 use anyhow::Result;
-use bench::BenchArgs;
 use clap::{Parser, Subcommand};
 use ryo_v2_core::domain::{Scope, TextRange};
+use ryo_v2_host::bench::{self, BenchArgs};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
