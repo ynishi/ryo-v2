@@ -3,16 +3,18 @@
 //! With `--on <parent overlay>` it measures one child two ways: `rebuilt`, the parent's edits
 //! composed with the variant's and verified from the base, and `stacked`, the variant's edits
 //! that the parent does not already make, written as a level on top of the parent's level of one
-//! `Stacked` fork.
+//! `Stacked` fork, by `stacked::stacked_series`.
+//!
+//! Memory is read through `proc.rs`: a failed read is an error of the run, so the host runs on
+//! Linux only.
 
-use crate::rss;
+use crate::proc::{self, ProcError};
+use crate::stacked::{self, Point};
 use anyhow::{Context, Result};
-use ryo_v2_core::app::ports::{
-    Analyzer, AnalyzerError, CheckError, Event, Observer, Stacked, Verifier,
-};
+use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Event, Observer, Verifier};
 use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::search::compose;
-use ryo_v2_core::domain::{Edit, Finding, RelPath, Scope, ScopedFindings, Verdict};
+use ryo_v2_core::domain::{Edit, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
@@ -108,9 +110,19 @@ fn triple(xs: &[u64]) -> String {
     }
 }
 
-fn sample_memory(observer: &RecordingObserver) {
-    if let Some(rss_kb) = rss::current_kb() {
-        observer.observe(Event::Memory { rss_kb });
+/// Records the VmRSS of this process as an `Event::Memory`; a failed read is the error.
+fn sample_memory(observer: &RecordingObserver) -> Result<(), ProcError> {
+    let rss_kb = proc::vm_rss_kb()?;
+    observer.observe(Event::Memory { rss_kb });
+    Ok(())
+}
+
+/// The label of a run: PASS or FAIL by its verdict, REVERT-MISMATCH without one.
+pub fn label_of(verdict: Option<&Verdict>) -> &'static str {
+    match verdict {
+        Some(v) if v.passed() => "PASS",
+        Some(_) => "FAIL",
+        None => "REVERT-MISMATCH",
     }
 }
 
@@ -152,145 +164,90 @@ fn rebuilt_once<A: Analyzer>(
 ) -> Result<Once> {
     observer.take();
     let result = verify(analyzer, session, edits, scope);
-    sample_memory(observer);
+    sample_memory(observer)?;
     let stats = read_events(observer.take());
-    let (label, verdict) = match result {
-        Ok(v) => (if v.passed() { "PASS" } else { "FAIL" }, Some(v)),
-        Err(AnalyzerError::RevertMismatch) => ("REVERT-MISMATCH", None),
+    let verdict = match result {
+        Ok(v) => Some(v),
+        Err(AnalyzerError::RevertMismatch) => None,
         Err(e) => return Err(e.into()),
     };
     Ok(Once {
         stats,
-        label,
+        label: label_of(verdict.as_ref()),
         verdict,
     })
 }
 
-/// The diagnosis of the top level at `scope`, and the files a check of the edits that take the
-/// base to its state covers (`Stacked::files_of`).
-fn diagnose_top<A: Stacked>(
-    a: &A,
-    s: &A::Session,
-    f: &A::Fork,
-    scope: Scope,
-) -> Result<(ScopedFindings, Vec<RelPath>), CheckError> {
-    let found = a.diagnose(s, f, scope)?;
-    Ok((found, a.files_of(s, f, scope)?))
+/// The bench's hook on `stacked::stacked_series`. It reads VmRSS after the parent's level and,
+/// at the end of each repeat, the repeat's events with a VmRSS read, and prints the repeat as a
+/// rebuilt run is printed. A failed read is the hook's error, so it ends the series.
+struct StackedRecord<'a> {
+    observer: &'a RecordingObserver,
+    heading: &'a Heading<'a>,
+    series: &'a mut Series,
+    /// The repeats recorded so far.
+    runs: u32,
+    /// The VmRSS after the parent's level, once it is diagnosed.
+    rss_parent: Option<u64>,
 }
 
-/// One level of `edits` on top of the live fork's top level: write, diagnose, pop.
-///
-/// The verdict is formed as the search forms a child's: `Verdict::of_level` of the level's
-/// diagnosis on top of `below`, the findings of the parent's level, kept to the files a check of
-/// the composed edits covers. So it is the verdict the rebuilt mode gives for the same state.
-#[allow(clippy::too_many_arguments)]
-fn stacked_once<A: Stacked>(
-    a: &A,
-    s: &mut A::Session,
-    f: &mut A::Fork,
-    observer: &RecordingObserver,
-    edits: &[Edit],
-    scope: Scope,
-    baseline: &[Finding],
-    below: &ScopedFindings,
-) -> Result<Once> {
-    observer.take();
-    // A refused write pushes no level, so there is nothing to pop.
-    a.write(s, f, edits)
-        .context("write the variant as a level")?;
-    let diagnosed = diagnose_top(a, s, f, scope);
-    let popped = a.pop(s, f);
-    sample_memory(observer);
-    let stats = read_events(observer.take());
-    let (label, verdict) = match (diagnosed, popped) {
-        (_, Err(CheckError::RevertMismatch { .. })) => ("REVERT-MISMATCH", None),
-        (_, Err(e)) => return Err(e).context("pop the variant's level"),
-        (Err(e), Ok(_)) => return Err(e).context("diagnose the variant's level"),
-        (Ok((found, files)), Ok(_)) => {
-            let (v, _) =
-                Verdict::of_level(baseline, below, &found, &Edit::deleted_paths(edits), &files);
-            (if v.passed() { "PASS" } else { "FAIL" }, Some(v))
+impl StackedRecord<'_> {
+    fn observe(&mut self, point: Point<'_>) -> Result<(), ProcError> {
+        match point {
+            Point::ParentDiagnosed => {
+                self.rss_parent = Some(proc::vm_rss_kb()?);
+                self.observer.take();
+            }
+            // A repeat's events are those from its write on.
+            Point::BeforeWrite => {
+                self.observer.take();
+            }
+            Point::AfterDiagnose | Point::BeforePop => {}
+            Point::AfterPop(verdict) => {
+                sample_memory(self.observer)?;
+                let stats = read_events(self.observer.take());
+                self.runs += 1;
+                record(
+                    self.heading,
+                    self.series,
+                    self.runs,
+                    &stats,
+                    label_of(verdict),
+                    verdict,
+                );
+            }
         }
-    };
-    Ok(Once {
-        stats,
-        label,
-        verdict,
-    })
-}
-
-/// Opens a fork, writes `parent` as its level 1 and diagnoses it once; returns the RSS after that
-/// level and the findings of its state, formed as the search forms its start state's. The fork is
-/// the caller's to release.
-fn parent_level<A: Stacked>(
-    a: &A,
-    s: &mut A::Session,
-    f: &mut A::Fork,
-    observer: &RecordingObserver,
-    parent: &[Edit],
-    scope: Scope,
-    baseline: &[Finding],
-) -> Result<(Option<u64>, ScopedFindings)> {
-    a.write(s, f, parent)
-        .context("write the --on parent as level 1")?;
-    let (found, files) = diagnose_top(a, s, f, scope).context("diagnose the --on parent")?;
-    let (_, kept) = Verdict::of_level(
-        baseline,
-        &ScopedFindings::default(),
-        &found,
-        &Edit::deleted_paths(parent),
-        &files,
-    );
-    let rss_kb = rss::current_kb();
-    observer.take();
-    Ok((rss_kb, kept))
-}
-
-/// The repeats of one series on a fork of `a`: the parent is level 1, written and diagnosed once,
-/// and each repeat writes `variant` as level 2, diagnoses it and pops it. The fork is released at
-/// the end, whatever happened. Returns whether every run and the release of the parent's level
-/// reverted, and the RSS after the parent level.
-#[allow(clippy::too_many_arguments)]
-fn stacked_series<A: Stacked>(
-    a: &A,
-    s: &mut A::Session,
-    observer: &RecordingObserver,
-    parent: &[Edit],
-    variant: &[Edit],
-    scope: Scope,
-    heading: &Heading<'_>,
-    series: &mut Series,
-) -> Result<(bool, Option<u64>)> {
-    let baseline = a.baseline(s);
-    let mut f = a.fork(s).context("open the fork")?;
-    let ran = parent_level(a, s, &mut f, observer, parent, scope, &baseline).and_then(
-        |(rss_parent, below)| {
-            let reverted = repeat(heading, series, || {
-                stacked_once(a, s, &mut f, observer, variant, scope, &baseline, &below)
-            })?;
-            Ok((reverted, rss_parent))
-        },
-    );
-    let released = a.release(s, f);
-    let (reverted, rss_parent) = ran?;
-    match released {
-        Ok(()) => Ok((reverted, rss_parent)),
-        // A failed revert poisoned the session, so its release fails too; the series is
-        // counted as a revert failure, as a rebuilt one is, and the release failure is printed.
-        Err(e) if !reverted => {
-            eprintln!("{}: release after a failed revert: {e}", heading.name);
-            Ok((false, rss_parent))
-        }
-        // The parent's level did not revert to the base: a revert failure of the series too.
-        Err(e @ CheckError::RevertMismatch { .. }) => {
-            eprintln!(
-                "{}: REVERT-MISMATCH releasing the parent level: {e}",
-                heading.name
-            );
-            Ok((false, rss_parent))
-        }
-        Err(e) => Err(e).context("release the fork"),
+        Ok(())
     }
+}
+
+/// Runs `f` with the hook `run` passes to `stacked::stacked_series` for a series of `repeat`
+/// repeats; returns what `f` returns, the runs the hook recorded, the VmRSS reads among them and
+/// the VmRSS it read after the parent's level.
+#[cfg(test)]
+pub(crate) fn with_bench_hook<R>(
+    repeat: u32,
+    f: impl FnOnce(&mut dyn FnMut(Point<'_>) -> Result<(), ProcError>) -> R,
+) -> (R, usize, usize, Option<u64>) {
+    let observer = RecordingObserver::default();
+    let heading = Heading {
+        name: "fake",
+        scope: "affected",
+        mode: " mode stacked",
+        n_edits: 1,
+        repeat,
+    };
+    let mut series = Series::default();
+    let mut rec = StackedRecord {
+        observer: &observer,
+        heading: &heading,
+        series: &mut series,
+        runs: 0,
+        rss_parent: None,
+    };
+    let out = f(&mut |point| rec.observe(point));
+    let rss_parent = rec.rss_parent;
+    (out, series.check_ms.len(), series.rss_kb.len(), rss_parent)
 }
 
 /// Runs `heading.repeat` times, prints each run and adds it to `series`. Returns false at the
@@ -300,6 +257,29 @@ fn repeat(
     series: &mut Series,
     mut once: impl FnMut() -> Result<Once>,
 ) -> Result<bool> {
+    for i in 1..=heading.repeat {
+        let Once {
+            stats,
+            label,
+            verdict,
+        } = once()?;
+        record(heading, series, i, &stats, label, verdict.as_ref());
+        if verdict.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Prints run `i` of a series and adds it to `series`.
+fn record(
+    heading: &Heading<'_>,
+    series: &mut Series,
+    i: u32,
+    stats: &RunStats,
+    label: &str,
+    verdict: Option<&Verdict>,
+) {
     let Heading {
         name,
         scope,
@@ -307,44 +287,33 @@ fn repeat(
         n_edits,
         repeat: total,
     } = *heading;
-    for i in 1..=total {
-        let Once {
-            stats,
-            label,
-            verdict,
-        } = once()?;
-        let ok = match stats.revert_ok {
-            Some(b) => b.to_string(),
-            None => "-".to_string(),
-        };
-        let new = verdict.as_ref().map_or(0, |v| {
-            v.new_errors.errors.len() + v.new_errors.unmapped.len()
-        });
-        let rss_txt = stats.rss_kb.map_or("-".to_string(), |k| k.to_string());
-        println!(
-            "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}",
-            stats.scope_files, stats.total_files, stats.check_ms, stats.revert_ms,
-        );
-        if i == 1
-            && let Some(v) = &verdict
-        {
-            for d in &v.new_errors.errors {
-                println!("  + [{}] {}:{}", d.code, d.path, d.line);
-            }
-            for d in &v.new_errors.unmapped {
-                println!("  + [ra:{}] {}:{}", d.ra_code, d.path, d.line);
-            }
+    let ok = match stats.revert_ok {
+        Some(b) => b.to_string(),
+        None => "-".to_string(),
+    };
+    let new = verdict.map_or(0, |v| {
+        v.new_errors.errors.len() + v.new_errors.unmapped.len()
+    });
+    let rss_txt = stats.rss_kb.map_or("-".to_string(), |k| k.to_string());
+    println!(
+        "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}",
+        stats.scope_files, stats.total_files, stats.check_ms, stats.revert_ms,
+    );
+    if i == 1
+        && let Some(v) = verdict
+    {
+        for d in &v.new_errors.errors {
+            println!("  + [{}] {}:{}", d.code, d.path, d.line);
         }
-        series.check_ms.push(stats.check_ms);
-        series.revert_ms.push(stats.revert_ms);
-        if let Some(k) = stats.rss_kb {
-            series.rss_kb.push(k);
-        }
-        if verdict.is_none() {
-            return Ok(false);
+        for d in &v.new_errors.unmapped {
+            println!("  + [ra:{}] {}:{}", d.ra_code, d.path, d.line);
         }
     }
-    Ok(true)
+    series.check_ms.push(stats.check_ms);
+    series.revert_ms.push(stats.revert_ms);
+    if let Some(k) = stats.rss_kb {
+        series.rss_kb.push(k);
+    }
 }
 
 /// Loads `args.base` once and runs every variant; prints the fixed output format.
@@ -360,8 +329,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         observer.clone(),
     );
     let mut session = analyzer.load(&args.base)?;
-    sample_memory(&observer);
-    let mut rss_after_load = None;
+    let rss_after_load = proc::vm_rss_kb().context("read the RSS after load")?;
     for event in observer.take() {
         match event {
             Event::Loaded {
@@ -375,14 +343,10 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     "[baseline] {baseline_errors} pre-existing errors in {baseline_ms} ms (cold)"
                 );
             }
-            Event::Memory { rss_kb } => rss_after_load = Some(rss_kb),
-            Event::Checked { .. } | Event::Reverted { .. } => {}
+            Event::Memory { .. } | Event::Checked { .. } | Event::Reverted { .. } => {}
         }
     }
-    match rss_after_load {
-        Some(kb) => eprintln!("[rss] {kb} kB after load"),
-        None => eprintln!("[rss] - kB after load"),
-    }
+    eprintln!("[rss] {rss_after_load} kB after load");
 
     let parent = match &args.on {
         Some(dir) => {
@@ -452,17 +416,27 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                 let (reverted, extra) = match (mode, &parent) {
                     (Mode::Stacked, Some(parent)) => {
                         heading.n_edits = own.len();
-                        let (reverted, rss) = stacked_series(
+                        let mut rec = StackedRecord {
+                            observer: &observer,
+                            heading: &heading,
+                            series: &mut series,
+                            runs: 0,
+                            rss_parent: None,
+                        };
+                        let reverted = stacked::stacked_series(
                             &analyzer,
                             &mut session,
-                            &observer,
+                            &name,
                             parent,
                             &own,
                             scope,
-                            &heading,
-                            &mut series,
+                            args.repeat,
+                            &mut |point| rec.observe(point),
                         )?;
-                        let rss = rss.map_or("-".to_string(), |k| k.to_string());
+                        // A series that returns has diagnosed the parent's level.
+                        let rss = rec
+                            .rss_parent
+                            .context("the --on parent's level was not diagnosed")?;
                         (
                             reverted,
                             format!("{mode_txt} rss_kb_after_parent_level {rss}"),
@@ -600,115 +574,6 @@ mod tests {
         assert!(leak_suspect(&[100, 110, 120, 130, 140]));
         assert!(!leak_suspect(&[100, 101, 100, 101, 100]));
         assert!(!leak_suspect(&[100, 110, 120, 130]));
-    }
-
-    /// A fork whose every diagnosis is `top` and whose `files_of` is `files`.
-    #[derive(Default)]
-    struct FakeStack {
-        levels: std::cell::RefCell<Vec<Vec<Edit>>>,
-        top: ScopedFindings,
-        files: Vec<RelPath>,
-    }
-    impl Verifier for FakeStack {
-        type Session = ();
-        fn text(&self, _: &(), _: &RelPath) -> Option<String> {
-            None
-        }
-        fn facts(&self, _: &(), _: &RelPath) -> ryo_v2_core::domain::FileFacts {
-            ryo_v2_core::domain::FileFacts::default()
-        }
-        fn baseline(&self, _: &()) -> Vec<Finding> {
-            Vec::new()
-        }
-        fn provenance(&self, _: &()) -> ryo_v2_core::domain::Provenance {
-            ryo_v2_core::domain::Provenance::new(
-                "fake",
-                "0",
-                Default::default(),
-                Default::default(),
-            )
-            .unwrap()
-        }
-        fn blind_classes(&self) -> std::collections::BTreeSet<ryo_v2_core::domain::UnseenClass> {
-            Default::default()
-        }
-        fn check(&self, _: &mut (), _: &[Edit], _: Scope) -> Result<ScopedFindings, CheckError> {
-            Ok(ScopedFindings::default())
-        }
-    }
-    impl Stacked for FakeStack {
-        type Fork = ();
-        fn fork(&self, _: &mut ()) -> Result<(), CheckError> {
-            Ok(())
-        }
-        fn write(&self, _: &mut (), _: &mut (), edits: &[Edit]) -> Result<(), CheckError> {
-            self.levels.borrow_mut().push(edits.to_vec());
-            Ok(())
-        }
-        fn levels(&self, _: &(), _: &()) -> Result<usize, CheckError> {
-            Ok(self.levels.borrow().len())
-        }
-        fn fork_text(&self, _: &(), _: &(), _: &RelPath) -> Result<Option<String>, CheckError> {
-            Ok(None)
-        }
-        fn diagnose(&self, _: &(), _: &(), _: Scope) -> Result<ScopedFindings, CheckError> {
-            Ok(self.top.clone())
-        }
-        fn files_of(&self, _: &(), _: &(), _: Scope) -> Result<Vec<RelPath>, CheckError> {
-            Ok(self.files.clone())
-        }
-        fn pop(&self, _: &mut (), _: &mut ()) -> Result<bool, CheckError> {
-            Ok(self.levels.borrow_mut().pop().is_some())
-        }
-        fn release(&self, _: &mut (), _: ()) -> Result<(), CheckError> {
-            self.levels.borrow_mut().clear();
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_stacked_verdict_is_formed_as_the_search_forms_it() {
-        use ryo_v2_core::domain::UnseenClass;
-        use std::collections::{BTreeMap, BTreeSet};
-        let rel = |p: &str| RelPath::parse(p).unwrap();
-        // The parent's level observed a class on b; the variant's level diagnoses a only.
-        let below = ScopedFindings {
-            files: vec![rel("a.rs"), rel("b.rs")],
-            unseen_at: BTreeMap::from([(
-                UnseenClass::UnresolvedPath,
-                BTreeSet::from([rel("b.rs")]),
-            )]),
-            ..ScopedFindings::default()
-        };
-        let a = FakeStack {
-            top: ScopedFindings {
-                files: vec![rel("a.rs")],
-                ..ScopedFindings::default()
-            },
-            files: vec![rel("a.rs"), rel("b.rs")],
-            ..FakeStack::default()
-        };
-        let observer = RecordingObserver::default();
-        let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
-        let once = stacked_once(
-            &a,
-            &mut (),
-            &mut (),
-            &observer,
-            &variant,
-            Scope::Affected,
-            &[],
-            &below,
-        )
-        .unwrap();
-        let want = Verdict::of_level(&[], &below, &a.top, &[], &a.files).0;
-        assert_eq!(once.verdict, Some(want));
-        // The class kept from below is named: the top level's diagnosis alone would not name it.
-        let named = once.verdict.map(|v| v.unseen).unwrap_or_default();
-        assert_eq!(named, BTreeSet::from([UnseenClass::UnresolvedPath]));
-        assert!(Verdict::from_baseline(&[], &a.top).unseen.is_empty());
-        assert_eq!(once.label, "PASS");
-        assert!(a.levels.borrow().is_empty(), "the level is popped");
     }
 
     #[test]
