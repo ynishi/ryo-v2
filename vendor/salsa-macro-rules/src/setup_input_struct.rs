@@ -206,7 +206,8 @@ macro_rules! setup_input_struct {
                     zalsa: &$zalsa::Zalsa
                 ) -> impl Iterator<Item = $zalsa::DatabaseKeyIndex> + '_ {
                     let ingredient_index = zalsa.lookup_jar_by_type::<$zalsa_struct::JarImpl<$Configuration>>();
-                    <$Configuration>::ingredient_(zalsa).entries(zalsa).map(|entry| entry.key())
+                    // ryo-v2 fork: the base's enumeration (a layered handle's `entries` refuses)
+                    <$Configuration>::ingredient_(zalsa).entries_in_base(zalsa).map(|entry| entry.key())
                 }
 
                 #[inline]

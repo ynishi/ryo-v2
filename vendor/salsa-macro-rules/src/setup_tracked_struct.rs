@@ -200,6 +200,31 @@ macro_rules! setup_tracked_struct {
                     )* false
                 }
 
+                // ryo-v2 fork: `update_fields` without the update, by reference (a re-run under a
+                // fork layer keeps the struct's id and stores the new fields in the layer)
+                fn fields_changed<$db_lt>(
+                    old_fields: &Self::Fields<$db_lt>,
+                    new_fields: &Self::Fields<$db_lt>,
+                    changed: &mut [bool],
+                ) -> bool {
+                    $(
+                        changed[$relative_tracked_index] = $zalsa::field_changed(
+                            &old_fields.$absolute_tracked_index,
+                            &new_fields.$absolute_tracked_index,
+                            $tracked_field_equality,
+                        );
+                    )*
+
+                    $(
+                        $zalsa::field_changed(
+                            &old_fields.$absolute_untracked_index,
+                            &new_fields.$absolute_untracked_index,
+                            $untracked_field_equality,
+                        )
+                        |
+                    )* false
+                }
+
                 $(
                     fn heap_size(value: &Self::Fields<'_>) -> Option<usize> {
                         Some($heap_size_fn(value))
@@ -275,7 +300,8 @@ macro_rules! setup_tracked_struct {
                     zalsa: &$zalsa::Zalsa
                 ) -> impl Iterator<Item = $zalsa::DatabaseKeyIndex> + '_ {
                     let ingredient_index = zalsa.lookup_jar_by_type::<$zalsa_struct::JarImpl<$Configuration>>();
-                    <$Configuration>::ingredient_(zalsa).entries(zalsa).map(|entry| entry.key())
+                    // ryo-v2 fork: the base's enumeration (a layered handle's `entries` refuses)
+                    <$Configuration>::ingredient_(zalsa).entries_in_base(zalsa).map(|entry| entry.key())
                 }
 
                 #[inline]

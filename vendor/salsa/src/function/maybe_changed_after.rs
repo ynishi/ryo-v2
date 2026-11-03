@@ -5,11 +5,14 @@ use crate::database::RawDatabase;
 use crate::function::memo::{ErasedMemo, MemoHeader, TryClaimCycleHeadsIter, TryClaimHeadsResult};
 use crate::function::sync::{ClaimGuard, ClaimResult};
 use crate::function::{Configuration, IngredientImpl, Reentrancy, SyncTable};
-use crate::table::memo::MemoSlot;
+// ryo-v2 fork: the memo slot is `FnMemoSlot` (the layer's chain, then the base slot)
 use std::sync::atomic::Ordering;
 
 use crate::key::DatabaseKeyIndex;
-use crate::zalsa::{MemoIngredientIndex, Zalsa, ZalsaDatabase};
+// ryo-v2 fork: verification reads and stamps through the handle's layer
+use crate::fork::ZalsaView;
+use crate::function::memo::FnMemoSlot;
+use crate::zalsa::{MemoIngredientIndex, ZalsaDatabase};
 use crate::zalsa_local::{QueryEdgeKind, QueryEdges, QueryOriginRef, QueryRevisions, ZalsaLocal};
 use crate::{Id, Revision};
 
@@ -135,7 +138,8 @@ where
 
     fn maybe_changed_after_cold(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view, whose layer the memo is claimed, verified and stamped in
+        zalsa: &ZalsaView,
         zalsa_local: &ZalsaLocal,
         db: &C::DbView,
         database_key_index: DatabaseKeyIndex,
@@ -154,10 +158,12 @@ where
         #[allow(clippy::too_many_arguments)]
         fn inner<'db>(
             sync_table: &'db SyncTable,
-            zalsa: &'db Zalsa,
+            // ryo-v2 fork: the view and a slot that reads the layer's chain first
+            zalsa: &'db ZalsaView,
             zalsa_local: &'db ZalsaLocal,
             db: RawDatabase<'db>,
-            memo_slot: MemoSlot<'db>,
+            // ryo-v2 fork: the chain's memo first, then the base slot's
+            memo_slot: FnMemoSlot<'db>,
             database_key_index: DatabaseKeyIndex,
             revision: Revision,
             cycle_recovery_strategy: CycleRecoveryStrategy,
@@ -171,6 +177,11 @@ where
                 ClaimResult::Claimed(guard) => guard,
                 ClaimResult::Running(blocked_on) => {
                     let _ = blocked_on.block_on(zalsa);
+                    // ryo-v2 fork: as in `fetch_cold`, a woken thread under a layer checks the
+                    // tokens of the layer and its ancestors before it retries
+                    if zalsa.layer().is_some() {
+                        zalsa.unwind_if_revision_cancelled(zalsa_local);
+                    }
                     return ColdResult::Retry;
                 }
                 ClaimResult::Cycle { .. } => {
@@ -271,7 +282,8 @@ where
 impl MemoHeader {
     fn maybe_changed_after_hot(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view (stamps and revisions of the handle's layer)
+        zalsa: &ZalsaView,
         database_key_index: DatabaseKeyIndex,
         revision: Revision,
         #[cfg(feature = "detailed-trace")] has_value: bool,
@@ -346,7 +358,8 @@ impl MemoHeader {
     #[inline]
     pub(super) fn shallow_verify_memo(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view (stamps and revisions of the handle's layer)
+        zalsa: &ZalsaView,
         database_key_index: DatabaseKeyIndex,
         #[cfg(feature = "detailed-trace")] has_value: bool,
     ) -> ShallowUpdate {
@@ -355,9 +368,9 @@ impl MemoHeader {
             "{database_key_index:?}: shallow_verify_memo(memo = {memo:#?})",
             memo = self.tracing_debug(has_value)
         );
-        let verified_at = self.verified_at.load();
-        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-        let revision_now = zalsa.unrouted_revision();
+        // ryo-v2 fork: the newest stamp on the chain, and the layer's revision (E1, E3)
+        let verified_at = self.load_verified_at(zalsa);
+        let revision_now = zalsa.current_revision();
 
         if verified_at == revision_now {
             // Already verified.
@@ -371,12 +384,12 @@ impl MemoHeader {
     #[inline(never)]
     fn shallow_verify_memo_cold(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; LOW is the newest layer with writes on the chain (E3)
+        zalsa: &ZalsaView,
         database_key_index: DatabaseKeyIndex,
         verified_at: Revision,
     ) -> ShallowUpdate {
-        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-        let last_changed = zalsa.unrouted_last_changed(self.revisions.durability);
+        let last_changed = zalsa.last_changed_revision(self.revisions.durability);
         crate::tracing::trace!(
             "{database_key_index:?}: check_durability({database_key_index:#?}, last_changed={:?} <= verified_at={:?}) = {:?}",
             last_changed,
@@ -394,11 +407,16 @@ impl MemoHeader {
     #[inline]
     pub(super) fn update_shallow(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer a durability pass records nothing (it is O(1)
+        // again next time), so no stamp is spent on it
+        zalsa: &ZalsaView,
         database_key_index: DatabaseKeyIndex,
         update: ShallowUpdate,
     ) {
-        if let ShallowUpdate::HigherDurability = update {
+        // ryo-v2 fork: not under a layer (see the parameter)
+        if let ShallowUpdate::HigherDurability = update
+            && zalsa.layer().is_none()
+        {
             self.mark_as_verified(zalsa, database_key_index);
             self.mark_outputs_as_verified(zalsa, database_key_index);
         }
@@ -412,7 +430,8 @@ impl MemoHeader {
     #[inline]
     fn validate_may_be_provisional(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view (stamps and revisions of the handle's layer)
+        zalsa: &ZalsaView,
         zalsa_local: &ZalsaLocal,
         database_key_index: DatabaseKeyIndex,
         #[cfg(feature = "detailed-trace")] has_value: bool,
@@ -439,9 +458,12 @@ impl MemoHeader {
             memo = self.tracing_debug(has_value),
         );
 
-        let verified_at = self.verified_at.load();
+        // ryo-v2 fork: as the handle sees it
+        let verified_at = self.load_verified_at(zalsa);
         validate_provisional(
             zalsa,
+            // ryo-v2 fork: the header, whose `verified_final` the handle may or may not write
+            self,
             database_key_index,
             &self.revisions,
             verified_at,
@@ -508,11 +530,17 @@ impl MemoHeader {
                     return VerifyResult::changed();
                 }
 
-                let verified_at = self.verified_at.load();
+                // ryo-v2 fork: as the handle sees it; a deep verify under a layer is counted (S2)
+                let verified_at = self.load_verified_at(zalsa);
+                if let Some(layer) = zalsa.layer() {
+                    layer.count_deep_verify();
+                }
 
                 let result = deep_verify_edges(
                     db,
                     zalsa,
+                    // ryo-v2 fork: the header, whose accumulated inputs may be stored
+                    self,
                     &self.revisions,
                     verified_at,
                     edges,
@@ -581,7 +609,9 @@ fn maybe_changed_after_cold_cycle(
 
 fn deep_verify_edges(
     db: crate::database::RawDatabase,
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view, and the header whose accumulated inputs may be stored
+    zalsa: &ZalsaView,
+    #[allow(unused)] header: &MemoHeader,
     #[allow(unused)] old_revisions: &QueryRevisions,
     old_verified_at: Revision,
     edges: QueryEdges<'_>,
@@ -644,13 +674,12 @@ fn deep_verify_edges(
     // This value is only read once the memo is verified. It's therefore safe
     // to write a non-final value here.
     // ryo-v2 fork: a store into a base memo, refused while the base is frozen; under a layer
-    // unreachable (stub in `fetch`), step 2b
+    // only into a memo the layer owns (an ancestor's or the base's memo is not written, E2)
     #[cfg(feature = "accumulator")]
-    zalsa
-        .fork()
-        .assert_not_frozen("a memo's accumulated inputs");
-    #[cfg(feature = "accumulator")]
-    old_revisions.accumulated_inputs.store(inputs);
+    // ryo-v2 fork: see above
+    if header.may_write(zalsa, "a memo's accumulated inputs") {
+        old_revisions.accumulated_inputs.store(inputs);
+    }
 
     result
 }
@@ -658,7 +687,9 @@ fn deep_verify_edges(
 /// Check if this memo's cycle heads have all been finalized. If so, mark it verified final and
 /// return true, if not return false.
 fn validate_provisional(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view, and the header whose `verified_final` may be stored
+    zalsa: &ZalsaView,
+    header: &MemoHeader,
     database_key_index: DatabaseKeyIndex,
     memo_revisions: &QueryRevisions,
     memo_verified_at: Revision,
@@ -708,9 +739,10 @@ fn validate_provisional(
     // Relaxed is sufficient here because there are no other writes we need to ensure have
     // happened before marking this memo as verified-final.
     // ryo-v2 fork: a store into a base memo, refused while the base is frozen; under a layer
-    // unreachable (stub in `fetch`), step 2b
-    zalsa.fork().assert_not_frozen("a memo's verified_final");
-    memo_revisions.verified_final.store(true, Ordering::Relaxed);
+    // only into a memo the layer owns (the store is a cache: skipping it re-validates later)
+    if header.may_write(zalsa, "a memo's verified_final") {
+        memo_revisions.verified_final.store(true, Ordering::Relaxed);
+    }
     true
 }
 
@@ -718,7 +750,8 @@ fn validate_provisional(
 /// same cycle(s) that we are still executing. If so, it is valid for reuse. This avoids
 /// runaway re-execution of the same queries within a fixpoint iteration.
 fn validate_same_iteration(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view (revision, claims and memos of the handle's layer)
+    zalsa: &ZalsaView,
     zalsa_local: &ZalsaLocal,
     memo_database_key_index: DatabaseKeyIndex,
     memo_verified_at: Revision,
@@ -729,8 +762,8 @@ fn validate_same_iteration(
     // This is an optimization to avoid unnecessary re-execution within the same revision.
     // Don't apply it when verifying memos from past revisions. We want them to re-execute
     // to verify their cycle heads and all participating queries.
-    // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-    if memo_verified_at != zalsa.unrouted_revision() {
+    // ryo-v2 fork: the handle's revision (the layer's)
+    if memo_verified_at != zalsa.current_revision() {
         return false;
     }
 

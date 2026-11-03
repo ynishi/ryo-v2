@@ -378,6 +378,8 @@ pub mod plumbing {
     pub use crate::storage::{HasStorage, Storage};
     pub use crate::table::memo::MemoTableWithTypes;
     pub use crate::tracked_struct::{TrackedStructInDb, update_field};
+    // ryo-v2 fork: the field comparison of `Configuration::fields_changed` (a layer's re-run)
+    pub use crate::tracked_struct::field_changed;
     pub use crate::views::DatabaseDownCaster;
     pub use crate::zalsa::{
         ErasedJar, HasJar, IngredientIndex, JarKind, Zalsa, ZalsaDatabase, register_jar,

@@ -1,4 +1,5 @@
-use self::dependency_graph::DependencyGraph;
+// ryo-v2 fork: a layer keeps a dependency graph of its own (E5), so the type is crate-visible
+pub(crate) use self::dependency_graph::DependencyGraph;
 use crate::durability::Durability;
 use crate::function::{SyncGuard, SyncOwner};
 use crate::key::DatabaseKeyIndex;
@@ -308,6 +309,13 @@ impl Runtime {
         self.revisions[0] = self.revisions[0].max(r);
     }
 
+    // ryo-v2 fork: the graph of a base handle's queries; a layered handle uses its layer's
+    // (`ZalsaView::dependency_graph`, E5)
+    #[inline]
+    pub(crate) fn dependency_graph(&self) -> &Mutex<DependencyGraph> {
+        &self.dependency_graph
+    }
+
     /// Block until `other_id` completes executing `database_key`, or return `BlockResult::Cycle`
     /// immediately in case of a cycle.
     ///
@@ -321,6 +329,8 @@ impl Runtime {
     /// cancelled, so this function will panic with a `Cancelled` value.
     pub(crate) fn block<'a>(
         &'a self,
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        dependency_graph: &'a Mutex<DependencyGraph>,
         database_key: DatabaseKeyIndex,
         other_id: ThreadId,
         query_mutex_guard: SyncGuard<'a>,
@@ -331,7 +341,8 @@ impl Runtime {
             return BlockResult::Cycle;
         }
 
-        let dg = self.dependency_graph.lock();
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        let dg = dependency_graph.lock();
 
         if dg.depends_on(other_id, thread_id) {
             crate::tracing::debug!(
@@ -354,12 +365,15 @@ impl Runtime {
     ///
     /// For this operation to be reasonable, the caller must ensure that the sync table lock on `query` is not released
     /// before this operation completes.
-    pub(super) fn block_transferred(
-        &self,
+    pub(super) fn block_transferred<'a>(
+        &'a self,
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        dependency_graph: &'a Mutex<DependencyGraph>,
         query: DatabaseKeyIndex,
         current_id: ThreadId,
-    ) -> BlockTransferredResult<'_> {
-        let dg = self.dependency_graph.lock();
+    ) -> BlockTransferredResult<'a> {
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        let dg = dependency_graph.lock();
 
         let owner_thread = dg.thread_id_of_transferred_query(query, None);
 
@@ -387,10 +401,13 @@ impl Runtime {
     /// to continue executing.
     pub(crate) fn unblock_queries_blocked_on(
         &self,
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        dependency_graph: &Mutex<DependencyGraph>,
         database_key: DatabaseKeyIndex,
         wait_result: WaitResult,
     ) {
-        self.dependency_graph
+        // ryo-v2 fork: the given graph, not this runtime's own
+        dependency_graph
             .lock()
             .unblock_runtimes_blocked_on(database_key, wait_result);
     }
@@ -405,10 +422,13 @@ impl Runtime {
     #[cold]
     pub(crate) fn unblock_transferred_queries_owned_by(
         &self,
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        dependency_graph: &Mutex<DependencyGraph>,
         database_key: DatabaseKeyIndex,
         wait_result: WaitResult,
     ) {
-        self.dependency_graph
+        // ryo-v2 fork: the given graph, not this runtime's own
+        dependency_graph
             .lock()
             .unblock_runtimes_blocked_on_transferred_queries_owned_by(database_key, wait_result);
     }
@@ -418,8 +438,13 @@ impl Runtime {
     /// If `query` has transferred its lock ownership to another query, this function will remove that transfer,
     /// so that `query` now owns its lock again.
     #[cold]
-    pub(super) fn undo_transfer_lock(&self, query: DatabaseKeyIndex) {
-        self.dependency_graph.lock().undo_transfer_lock(query);
+    pub(super) fn undo_transfer_lock(
+        &self,
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        dependency_graph: &Mutex<DependencyGraph>,
+        query: DatabaseKeyIndex,
+    ) {
+        dependency_graph.lock().undo_transfer_lock(query);
     }
 
     /// Transfers ownership of the lock for `query` to `new_owner_key`.
@@ -429,12 +454,15 @@ impl Runtime {
     /// complete before the lock is transferred, leaving `query` locked forever.
     pub(super) fn transfer_lock(
         &self,
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        dependency_graph: &Mutex<DependencyGraph>,
         query: DatabaseKeyIndex,
         new_owner_key: DatabaseKeyIndex,
         new_owner_id: SyncOwner,
         guard: SyncGuard,
     ) -> bool {
-        let dg = self.dependency_graph.lock();
+        // ryo-v2 fork: the graph of the handle's layer, or this runtime's (E5)
+        let dg = dependency_graph.lock();
         DependencyGraph::transfer_lock(
             dg,
             query,

@@ -7,7 +7,8 @@ use crate::DatabaseKeyIndex;
 use crate::function::ErasedMemo;
 use crate::sync::atomic::{AtomicPtr, Ordering};
 use crate::zalsa::MemoIngredientIndex;
-use crate::zalsa::Zalsa;
+// ryo-v2 fork: removing a memo's outputs takes the handle's view
+use crate::fork::ZalsaView;
 
 /// Adds the registered concrete memo type's vtable without dereferencing the pointer.
 ///
@@ -52,7 +53,8 @@ pub trait Memo: Any + Send + Sync {
 
     /// Removes the outputs that were created when this query ran. This includes
     /// tracked structs and specified queries.
-    fn remove_outputs(&self, zalsa: &Zalsa, executor: DatabaseKeyIndex);
+    // ryo-v2 fork: the view, so that under a layer the outputs are tombstoned in the layer
+    fn remove_outputs(&self, zalsa: &ZalsaView, executor: DatabaseKeyIndex);
 
     /// Returns memory usage information about the memoized value.
     #[cfg(feature = "salsa_unstable")]
@@ -249,7 +251,8 @@ impl Memo for DummyMemo {
         unreachable!("DummyMemo is never stored in a memo table")
     }
 
-    fn remove_outputs(&self, _zalsa: &Zalsa, _executor: DatabaseKeyIndex) {}
+    // ryo-v2 fork: the view (see the trait)
+    fn remove_outputs(&self, _zalsa: &ZalsaView, _executor: DatabaseKeyIndex) {}
 
     #[cfg(feature = "salsa_unstable")]
     fn memory_usage(&self) -> crate::database::MemoInfo {
@@ -429,6 +432,50 @@ impl<'a> MemoTableWithTypes<'a> {
         // acquire load observes its initialization. The caller guarantees that the allocation
         // remains valid for `'a`.
         Some(unsafe { ErasedMemo::from_raw_parts(memo, type_.to_dyn_fn, type_.type_id) })
+    }
+
+    // ryo-v2 fork: calls `f` on every memo of the table, read-only (a layer removing the outputs
+    // of a struct it tombstones). The memos stay alive for the borrow: the table belongs to a
+    // slot of a frozen base, which frees no memo.
+    pub(crate) fn for_each_memo(&self, mut f: impl FnMut(MemoIngredientIndex, &'a dyn Memo)) {
+        let Some(entries) = self.memos.memos.as_slice() else {
+            return;
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(memo) = NonNull::new(entry.atomic_memo.load(Ordering::Acquire)) else {
+                continue;
+            };
+            let Some(type_) = self.types.types.get(index) else {
+                continue;
+            };
+            // SAFETY: `insert` type-checks and release-publishes a pointer to a live memo of the
+            // entry's type; the frozen base keeps it allocated for `'a`.
+            let memo: &'a dyn Memo = unsafe { (type_.to_dyn_fn)(memo).as_ref() };
+            f(MemoIngredientIndex::from_usize(index), memo);
+        }
+    }
+
+    // ryo-v2 fork: feeds every memo's revisions to `hasher` (isolation check, I2); returns the
+    // number of memos. The caller keeps the table's memos alive (no query runs meanwhile).
+    pub(crate) fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) -> usize {
+        let mut count = 0;
+        let Some(entries) = self.memos.memos.as_slice() else {
+            return 0;
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(memo) = NonNull::new(entry.atomic_memo.load(Ordering::Acquire)) else {
+                continue;
+            };
+            let Some(type_) = self.types.types.get(index) else {
+                continue;
+            };
+            // SAFETY: `insert` type-checks and release-publishes a pointer to the memo
+            // allocation's base address paired with `type_`; the caller keeps it alive.
+            let memo = unsafe { ErasedMemo::from_raw_parts(memo, type_.to_dyn_fn, type_.type_id) };
+            crate::function::fork_memo_fingerprint(memo, hasher);
+            count += 1;
+        }
+        count
     }
 
     /// Returns memory usage information about the memos in this table.

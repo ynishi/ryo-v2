@@ -5,9 +5,12 @@ use crate::function::memo::Memo;
 use crate::function::sync::{ClaimResult, Reentrancy};
 use crate::function::{Configuration, IngredientImpl};
 use crate::sync::atomic::AtomicBool;
-use crate::table::memo::MemoSlot;
+// ryo-v2 fork: the memo slot and the view of the handle's layer
+use crate::fork::ZalsaView;
+use crate::function::memo::FnMemoSlot;
 use crate::tracked_struct::TrackedStructInDb;
-use crate::zalsa::{Zalsa, ZalsaDatabase};
+// ryo-v2 fork: `Zalsa` is reached through the view
+use crate::zalsa::ZalsaDatabase;
 use crate::zalsa_local::{OriginAndExtra, QueryOriginRef, QueryRevisions};
 use crate::{DatabaseKeyIndex, Id};
 
@@ -21,11 +24,8 @@ where
     where
         C::Input<'db>: TrackedStructInDb,
     {
+        // ryo-v2 fork: under a layer the specified memo is the layer's
         let (zalsa, zalsa_local) = db.zalsas();
-        // ryo-v2 fork: stub, memos are not routed through a layer yet
-        if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("`specify` (memo routing, step 2b)");
-        }
 
         let (active_query_key, current_deps, cycle_heads) =
             match zalsa_local.active_query_with_cycle_heads() {
@@ -69,8 +69,8 @@ where
         // - a result that is verified in the current revision, because it was set, which will use the set value
         // - a result that is NOT verified and has untracked inputs, which will re-execute (and likely panic)
 
-        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
-        let revision = zalsa.unrouted_revision();
+        // ryo-v2 fork: the handle's revision (the layer's)
+        let revision = zalsa.current_revision();
         let database_key_index = self.database_key_index(key);
         let memo_ingredient_index = self.memo_ingredient_index(zalsa, key);
 
@@ -92,7 +92,8 @@ where
         let old_memo = self.get_memo_from_table_for(zalsa, key, memo_ingredient_index);
 
         if let Some(old_memo) = old_memo
-            && old_memo.header.verified_at.load() == revision
+            // ryo-v2 fork: as the handle sees it
+            && old_memo.header.load_verified_at(zalsa) == revision
             && old_memo.value.is_some()
         {
             // A value produced by another query wins this revision.
@@ -163,10 +164,13 @@ where
 /// Marks the value at `database_key_index` as valid after its assigning `executor` is found green.
 /// Re-executing a green executor would specify the same value again.
 pub(super) fn validate_specified_value(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view and a slot that reads the layer's chain first; the stamp is the
+    // layer's
+    zalsa: &ZalsaView,
     executor: DatabaseKeyIndex,
     database_key_index: DatabaseKeyIndex,
-    memo_slot: MemoSlot<'_>,
+    // ryo-v2 fork: the chain's memo first, then the base slot's
+    memo_slot: FnMemoSlot<'_>,
 ) {
     let Some(memo) = memo_slot.get_erased() else {
         return;
@@ -186,8 +190,11 @@ pub(super) fn validate_specified_value(
 
     header.mark_as_verified(zalsa, database_key_index);
     #[cfg(feature = "accumulator")]
-    header
-        .revisions
-        .accumulated_inputs
-        .store(InputAccumulatedValues::Empty);
+    // ryo-v2 fork: only into a memo the handle may write (an ancestor's or the base's is not)
+    if header.may_write(zalsa, "a memo's accumulated inputs") {
+        header
+            .revisions
+            .accumulated_inputs
+            .store(InputAccumulatedValues::Empty);
+    }
 }

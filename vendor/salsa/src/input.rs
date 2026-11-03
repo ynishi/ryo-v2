@@ -159,7 +159,10 @@ impl<C: Configuration> IngredientImpl<C> {
         // the base and every layer share; without a layer, a frozen base takes no new input
         if let Some(layer) = zalsa.layer() {
             if <C::Singleton as SingletonChoice>::IS_SINGLETON {
-                crate::fork::not_yet_supported("creating a singleton input (step 2b)");
+                zalsa.fork().record_refusal();
+                crate::fork::not_yet_supported(
+                    "creating a singleton input (its index is shared by the base and every layer)",
+                );
             }
             layer.assert_open("an input creation");
             zalsa
@@ -278,7 +281,26 @@ impl<C: Configuration> IngredientImpl<C> {
     }
 
     /// Returns all data corresponding to the input struct.
-    pub fn entries<'db>(&'db self, zalsa: &'db Zalsa) -> impl Iterator<Item = StructEntry<'db, C>> {
+    // ryo-v2 fork: the view; refused (panic) on a layered handle, whose inputs are the base's
+    // slots overlaid by the chain: an enumeration of the base would show the base's values
+    pub fn entries<'db>(
+        &'db self,
+        zalsa: &'db ZalsaView,
+    ) -> impl Iterator<Item = StructEntry<'db, C>> {
+        if zalsa.layer().is_some() {
+            zalsa.fork().record_refusal();
+            crate::fork::not_yet_supported("enumerating input structs");
+        }
+        self.entries_in_base(zalsa)
+    }
+
+    // ryo-v2 fork: the enumeration of a base, for `SalsaStructInDb::entries` (serialization and
+    // memory usage, which a layered handle does not reach: they need exclusive access)
+    #[doc(hidden)]
+    pub fn entries_in_base<'db>(
+        &'db self,
+        zalsa: &'db Zalsa,
+    ) -> impl Iterator<Item = StructEntry<'db, C>> {
         zalsa
             .table()
             .slots_of::<Value<C>>()
@@ -393,7 +415,8 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
 
     unsafe fn maybe_changed_after(
         &self,
-        _zalsa: &crate::zalsa::Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &ZalsaView,
         _db: crate::database::RawDatabase<'_>,
         _input: Id,
         _revision: Revision,
@@ -415,7 +438,8 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
 
     fn flatten_cycle_head_dependencies(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &ZalsaView,
         _id: Id,
         _flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         _seen: &mut FxHashSet<DatabaseKeyIndex>,
@@ -460,7 +484,8 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
     }
 
     fn should_serialize(&self, zalsa: &Zalsa) -> bool {
-        C::PERSIST && self.entries(zalsa).next().is_some()
+        // ryo-v2 fork: serialization has exclusive access to a base
+        C::PERSIST && self.entries_in_base(zalsa).next().is_some()
     }
 
     #[cfg(feature = "persistence")]
@@ -582,6 +607,14 @@ where
     #[inline(always)]
     fn memos_mut(&mut self) -> &mut crate::table::memo::MemoTable {
         &mut self.memos
+    }
+
+    // ryo-v2 fork: every field's revision and durability (isolation check, I2)
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+        for i in 0..C::FIELD_DEBUG_NAMES.len() {
+            hasher.write_usize(self.revisions[i].as_usize());
+            hasher.write_u8(self.durabilities[i].index() as u8);
+        }
     }
 }
 

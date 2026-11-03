@@ -2,7 +2,9 @@ use std::fmt;
 
 use crate::Id;
 use crate::function::VerifyResult;
-use crate::zalsa::{IngredientIndex, Zalsa};
+// ryo-v2 fork: dependency checks and output marks take the handle's view
+use crate::fork::ZalsaView;
+use crate::zalsa::IngredientIndex;
 
 // ANCHOR: DatabaseKeyIndex
 /// An integer that uniquely identifies a particular query instance within the
@@ -36,7 +38,8 @@ impl DatabaseKeyIndex {
     pub(crate) fn maybe_changed_after(
         &self,
         db: crate::database::RawDatabase<'_>,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the dependency is read through the chain
+        zalsa: &ZalsaView,
         last_verified_at: crate::Revision,
     ) -> VerifyResult {
         // SAFETY: The `db` belongs to the ingredient
@@ -49,7 +52,8 @@ impl DatabaseKeyIndex {
         }
     }
 
-    pub(crate) fn remove_stale_output(&self, zalsa: &Zalsa, executor: DatabaseKeyIndex) {
+    // ryo-v2 fork: the view; under a layer the output is tombstoned in the layer
+    pub(crate) fn remove_stale_output(&self, zalsa: &ZalsaView, executor: DatabaseKeyIndex) {
         zalsa
             .lookup_ingredient(self.ingredient_index())
             .remove_stale_output(zalsa, executor, self.key_index())
@@ -57,7 +61,8 @@ impl DatabaseKeyIndex {
 
     pub(crate) fn mark_validated_output(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the mark is the layer's
+        zalsa: &ZalsaView,
         database_key_index: DatabaseKeyIndex,
     ) {
         zalsa

@@ -52,6 +52,30 @@ pub unsafe trait Slot: Any + Send + Sync {
 
     /// Mutably access the [`MemoTable`] for this slot.
     fn memos_mut(&mut self) -> &mut MemoTable;
+
+    // ryo-v2 fork: the memo table of a base slot read under a layer (D11): no lock is taken and
+    // nothing is written; a slot type whose reads are validated checks what the frozen base keeps
+    // (a tracked struct: `updated_at` is not `None`).
+    //
+    // # Safety
+    //
+    // `slot` must be initialized; the base must be frozen, so the slot is not reused or deleted.
+    /// Access the memo table of a slot of a frozen base from a layer (ryo-v2 fork).
+    ///
+    /// # Safety
+    ///
+    /// `slot` must be initialized and its base frozen.
+    unsafe fn memos_in_layer(slot: *const Self) -> *const MemoTable {
+        // SAFETY: Guaranteed by the caller; the frozen base neither reuses nor deletes the slot.
+        unsafe { Self::memos_unchecked(slot) }
+    }
+
+    // ryo-v2 fork: feeds what a layer must not change in this slot (revisions, `updated_at`,
+    // durability) to `hasher`, for the isolation check (I2)
+    /// Hashes the slot's revisions for the fork isolation check (ryo-v2 fork).
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+        let _ = hasher;
+    }
 }
 
 /// [Slot::memos]
@@ -73,6 +97,9 @@ struct SlotVTable {
     memos: SlotMemosFnErased,
     memos_unchecked: SlotMemosUncheckedFnErased,
     memos_mut: SlotMemosMutFnErased,
+    // ryo-v2 fork: [`Slot::memos_in_layer`] and [`Slot::fork_fingerprint`], erased
+    memos_in_layer: SlotMemosUncheckedFnErased,
+    fork_fingerprint: unsafe fn(*const (), &mut dyn std::hash::Hasher),
     /// The type name of what is stored as entries in data.
     type_name: fn() -> &'static str,
     /// A drop impl to call when the own page drops
@@ -110,6 +137,19 @@ impl SlotVTable {
                 // SAFETY: The signatures are ABI-compatible.
                 memos_mut: unsafe {
                     mem::transmute::<SlotMemosMutFn<T>, SlotMemosMutFnErased>(T::memos_mut)
+                },
+                // ryo-v2 fork: erased as `memos_unchecked` is
+                // SAFETY: The signatures are ABI-compatible.
+                memos_in_layer: unsafe {
+                    mem::transmute::<SlotMemosUncheckedFn<T>, SlotMemosUncheckedFnErased>(
+                        T::memos_in_layer,
+                    )
+                },
+                // ryo-v2 fork: the caller passes a pointer to an initialized `T`
+                fork_fingerprint: |slot, hasher| {
+                    // SAFETY: The caller passes a pointer to an initialized slot of this page's
+                    // type `T`.
+                    T::fork_fingerprint(unsafe { &*slot.cast::<T>() }, hasher)
                 },
             }
         }
@@ -383,6 +423,49 @@ impl Table {
         let memos = unsafe { &*(page.slot_vtable.memos_unchecked)(page.get(slot)) };
         // SAFETY: The `Page` keeps the correct memo types.
         unsafe { page.memo_types.attach_memos(memos) }
+    }
+
+    // ryo-v2 fork: the memo table of the base slot `id` as a layer reads it: no lock, no write
+    // (`Slot::memos_in_layer`). Only called through a layered handle, whose base is frozen.
+    pub(crate) fn memos_in_layer(&self, id: Id) -> MemoTableWithTypes<'_> {
+        let (page, slot) = split_id(id);
+        let page = &self.pages[page.0];
+        // SAFETY: `Page::get` checks initialization; the base is frozen while a layer lives, so
+        // the slot is not reused or deleted for the borrow of the table.
+        let memos = unsafe { &*(page.slot_vtable.memos_in_layer)(page.get(slot)) };
+        // SAFETY: The `Page` keeps the correct memo types.
+        unsafe { page.memo_types.attach_memos(memos) }
+    }
+
+    // ryo-v2 fork: the fingerprint of everything a layer must not change in the base (I2): the
+    // number of slots and of memos, and a hash over every slot's revisions and every memo's
+    // `verified_at` and `changed_at`. Reads every slot: the caller (`fork::base_fingerprint`)
+    // checked that the base is frozen, so no slot below `allocated` is written meanwhile except
+    // by atomic stores, and no memo of a slot is inserted, replaced or freed.
+    pub(crate) fn fork_fingerprint(&self) -> crate::fork::BaseFingerprint {
+        use std::hash::Hasher;
+        let mut slots = Vec::new();
+        let mut memos = 0;
+        for (page_index, page) in self.pages.iter() {
+            let len = page.allocated.load(Ordering::Acquire);
+            for slot in 0..len {
+                let mut hasher = rustc_hash::FxHasher::default();
+                let slot_ptr = page.get(SlotIndex::new(slot));
+                // SAFETY: `slot_ptr` points to an initialized slot of the page's type; the base is
+                // frozen (caller), so its non-atomic fields are not written meanwhile.
+                unsafe { (page.slot_vtable.fork_fingerprint)(slot_ptr, &mut hasher) };
+                // SAFETY: The slot is initialized, and the base is frozen (caller), so the slot is
+                // not reused or deleted and its memo table not written.
+                let table = unsafe { &*(page.slot_vtable.memos_unchecked)(slot_ptr) };
+                // SAFETY: The `Page` keeps the correct memo types.
+                let table = unsafe { page.memo_types.attach_memos(table) };
+                let count = table.fork_fingerprint(&mut hasher);
+                hasher.write_usize(count);
+                memos += count;
+                slots.push((page_index, slot, hasher.finish()));
+            }
+        }
+        crate::fork::BaseFingerprint { slots, memos }
     }
 
     /// Get the memo table associated with `id`

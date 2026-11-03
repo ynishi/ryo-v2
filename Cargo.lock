@@ -2223,8 +2223,15 @@ dependencies = [
 name = "ryo-v2-engine"
 version = "0.1.0"
 dependencies = [
+ "ra_ap_base_db",
+ "ra_ap_hir_ty",
+ "ra_ap_ide",
+ "ra_ap_ide_db",
+ "ryo-v2-core",
+ "ryo-v2-ra",
  "salsa",
  "thiserror",
+ "triomphe",
  "trybuild",
 ]
 

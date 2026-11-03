@@ -11,8 +11,8 @@ use hashbrown::hash_table::Entry;
 use thin_vec::ThinVec;
 use tracked_field::FieldIngredientImpl;
 
-// ryo-v2 fork: the entry points take the handle's view
-use crate::fork::ZalsaView;
+// ryo-v2 fork: the entry points take the handle's view; under a layer the layer holds entries
+use crate::fork::{ChainMemo, ChainTracked, Layer, SharedWriteKind, ZalsaView};
 use crate::function::VerifyResult;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::id::{AsId, FromId};
@@ -94,6 +94,17 @@ pub unsafe trait Configuration: Sized + 'static {
         new_fields: Self::Fields<'db>,
     ) -> bool;
 
+    // ryo-v2 fork: `update_fields` without the update, for a re-run under a layer (D11): sets
+    // `changed[i]` for each tracked field `i` (relative index) that differs between `old_fields`
+    // and `new_fields` by the field's own equality, and returns `true` if an identity field
+    // differs. Compares by reference, so the fields need no `Clone`.
+    /// Which tracked fields differ, and whether an identity field differs (ryo-v2 fork).
+    fn fields_changed<'db>(
+        old_fields: &Self::Fields<'db>,
+        new_fields: &Self::Fields<'db>,
+        changed: &mut [bool],
+    ) -> bool;
+
     /// Returns the size of any heap allocations in the output value, in bytes.
     fn heap_size(_value: &Self::Fields<'_>) -> Option<usize> {
         None
@@ -128,6 +139,58 @@ pub fn update_field<T>(
 
     *old_value = new_value;
     true
+}
+
+// ryo-v2 fork: whether a re-created field differs, by the field's equality (`update_field`
+// without the replacement), for `Configuration::fields_changed`
+/// Whether `old_value` and `new_value` differ by `values_equal` (ryo-v2 fork).
+#[doc(hidden)]
+pub fn field_changed<T>(
+    old_value: &T,
+    new_value: &T,
+    values_equal: impl FnOnce(&T, &T) -> bool,
+) -> bool {
+    !values_equal(old_value, new_value)
+}
+
+// ryo-v2 fork: a tracked struct as a layer holds it after its creator re-ran under the layer
+// (D11): the new fields, per tracked field the revision it last changed at, and the durability.
+// Its `updated_at` is the layer's revision (an entry is written only in its own layer).
+pub(crate) struct LayerEntry<C: Configuration> {
+    fields: C::Fields<'static>,
+    revisions: Box<[Revision]>,
+    durability: Durability,
+}
+
+// ryo-v2 fork: a layer's tracked-struct entry, as the struct's type
+fn downcast_entry<C: Configuration>(value: &(dyn std::any::Any + Send + Sync)) -> &LayerEntry<C> {
+    value
+        .downcast_ref::<LayerEntry<C>>()
+        .expect("ryo-v2 fork: a tracked-struct entry has its ingredient's type")
+}
+
+// ryo-v2 fork: the revision of tracked field `relative` in a layer's entry
+pub(crate) fn entry_revision<C: Configuration>(
+    value: &(dyn std::any::Any + Send + Sync),
+    relative: usize,
+) -> Revision {
+    downcast_entry::<C>(value).revisions[relative]
+}
+
+// ryo-v2 fork: retained fields with the database lifetime of the borrow, as upstream's
+// `lock_fields` and `Value::fields` give them
+fn restore_fields<'db, C: Configuration>(fields: &'db C::Fields<'static>) -> &'db C::Fields<'db> {
+    // SAFETY: Guaranteed by `Configuration`; the restored lifetime is bounded by the borrow of
+    // the retained fields.
+    unsafe { std::mem::transmute::<&C::Fields<'static>, &C::Fields<'db>>(fields) }
+}
+
+// ryo-v2 fork: a tracked struct as a layered handle reads it
+enum LayerView<'db, C: Configuration> {
+    /// An entry of a layer of the chain.
+    Entry(&'db LayerEntry<C>),
+    /// The base slot (no layer of the chain re-created the struct); its `updated_at` is `Some`.
+    Base(*const Value<C>),
 }
 
 pub struct JarImpl<C>
@@ -505,15 +568,16 @@ where
 
     pub fn new_struct<'db>(
         &'db self,
-        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        // ryo-v2 fork: the view; under a layer the struct keeps its id and the layer holds its
+        // new fields (`new_struct_in_layer`)
         zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         mut fields: C::Fields<'db>,
     ) -> C::Struct<'db> {
-        // ryo-v2 fork: stub; without a layer, creating or reusing a struct writes the base, refused
-        // while the base is frozen
-        if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("creating a tracked struct (step 2b)");
+        // ryo-v2 fork: under a layer, the layer's entry; without one, creating or reusing a struct
+        // writes the base, refused while the base is frozen
+        if let Some(layer) = zalsa.layer() {
+            return self.new_struct_in_layer(zalsa, layer, zalsa_local, fields);
         }
         zalsa.fork().assert_not_frozen("a tracked-struct creation");
         let identity_hash = IdentityHash {
@@ -565,15 +629,260 @@ where
         FromId::from_id(id)
     }
 
-    fn allocate<'db>(
+    // ryo-v2 fork: `new_struct` under a layer (D11, 4.2). A struct the creator made before (its
+    // id is in the identity map the old memo seeded) keeps its id: the layer gets an entry with
+    // the new fields, the per-field revisions and the durability, computed as `update` does on
+    // the chain's current value; the base slot is not touched. A struct the creator makes anew,
+    // or whose identity fields changed, gets a new slot only the layer reaches (a counted shared
+    // write). The base's free list is never used (its ids keep their generation for every chain).
+    fn new_struct_in_layer<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        zalsa: &'db ZalsaView,
+        layer: &'db Layer,
+        zalsa_local: &'db ZalsaLocal,
+        mut fields: C::Fields<'db>,
+    ) -> C::Struct<'db> {
+        let identity_hash = IdentityHash {
+            ingredient_index: self.ingredient_index,
+            hash: crate::hash::hash(&C::untracked_fields(&fields)),
+        };
+
+        let (current_deps, disambiguator) = zalsa_local.disambiguate(identity_hash);
+
+        let identity = Identity {
+            hash: identity_hash.hash,
+            ingredient_index: identity_hash.ingredient_index,
+            disambiguator,
+        };
+
+        if let Some(id) = zalsa_local.tracked_struct_id(&identity) {
+            crate::tracing::trace!(
+                "Reuse tracked struct {id:?} in a layer",
+                id = self.database_key_index(id)
+            );
+            fields = match self.update_in_layer(zalsa, layer, id, &current_deps, fields) {
+                Ok(id) => return FromId::from_id(id),
+                Err(fields) => fields,
+            };
+        }
+
+        let id = self.allocate_in_layer(zalsa, zalsa_local, &current_deps, fields);
+        crate::tracing::trace!(
+            "Allocated new tracked struct {key:?} in a layer",
+            key = self.database_key_index(id)
+        );
+        zalsa_local.store_tracked_struct_id(identity, id);
+        FromId::from_id(id)
+    }
+
+    // ryo-v2 fork: the re-creation of `id` under `layer`. Upstream's early return for a struct
+    // already updated in this revision applies to the layer's own entry only (and to a slot the
+    // layer allocated): `&` references into it may be live. A struct the layer has no entry for
+    // gets one, even after a read of it in this layer: the entry aliases nothing a reader holds.
+    // `Err` (allocate a new slot) when the identity fields changed, as upstream's new-generation
+    // case, or when the chain tombstoned `id`.
+    fn update_in_layer<'db>(
+        &'db self,
+        zalsa: &'db ZalsaView,
+        layer: &'db Layer,
+        id: Id,
+        current_deps: &Stamp,
+        fields: C::Fields<'db>,
+    ) -> Result<Id, C::Fields<'db>> {
+        let tracked = C::TRACKED_FIELD_INDICES.len();
+        let (old_fields, old_revisions, old_durability): (&C::Fields<'db>, Box<[Revision]>, _) =
+            match layer.find_tracked(id) {
+                ChainTracked::Entry { own: true, .. } => return Ok(id),
+                ChainTracked::Tombstone => return Err(fields),
+                ChainTracked::Entry { value, own: false } => {
+                    let entry = downcast_entry::<C>(value);
+                    (
+                        restore_fields::<C>(&entry.fields),
+                        entry.revisions.clone(),
+                        entry.durability,
+                    )
+                }
+                ChainTracked::None => {
+                    let data = Self::data_raw(zalsa.table(), id);
+                    // SAFETY: `updated_at` is never exclusively borrowed, so borrowing it is sound.
+                    let updated_at = unsafe { (*data).updated_at.load() };
+                    match updated_at {
+                        None => panic!("two concurrent writers to {id:?}, should not be possible"),
+                        // A slot this layer allocated, already at the layer's revision.
+                        Some(r) if r == layer.revision() => return Ok(id),
+                        Some(_) => {}
+                    }
+                    // SAFETY: The frozen base does not write the slot; `updated_at` is `Some`.
+                    let value = unsafe { &*data };
+                    (
+                        restore_fields::<C>(&value.fields),
+                        (0..tracked).map(|i| value.revisions[i].load()).collect(),
+                        value.durability,
+                    )
+                }
+            };
+
+        let mut changed: smallvec::SmallVec<[bool; 8]> = smallvec::smallvec![false; tracked];
+        if C::fields_changed(old_fields, &fields, &mut changed) {
+            return Err(fields);
+        }
+        // As `update`: a changed field gets the creator's `changed_at`; when the creator's
+        // durability is below the struct's, every tracked field does.
+        let lowered = current_deps.durability < old_durability;
+        let revisions: Box<[Revision]> = (0..tracked)
+            .map(|i| {
+                if lowered || changed[i] {
+                    current_deps.changed_at
+                } else {
+                    old_revisions[i]
+                }
+            })
+            .collect();
+        layer.insert_tracked(
+            id,
+            Box::new(LayerEntry::<C> {
+                // SAFETY: Guaranteed by `Configuration` and retained only in this entry.
+                fields: unsafe {
+                    std::mem::transmute::<C::Fields<'db>, C::Fields<'static>>(fields)
+                },
+                revisions,
+                durability: current_deps.durability,
+            }),
+        );
+        Ok(id)
+    }
+
+    // ryo-v2 fork: a new slot under a layer: no free-list reuse (a frozen base's freed ids keep
+    // their generation), counted as a shared write; only the layer that created it reaches it
+    fn allocate_in_layer<'db>(
+        &'db self,
+        zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         current_deps: &Stamp,
         fields: C::Fields<'db>,
     ) -> Id {
-        // ryo-v2 fork: unreachable under a layer (stub in `new_struct`), step 2b
-        let current_revision = zalsa.unrouted_revision();
+        let current_revision = zalsa.current_revision();
+        zalsa
+            .fork()
+            .record_shared_write(SharedWriteKind::SlotAllocation);
+        let (id, _) = zalsa_local.allocate::<Value<C>>(zalsa, self.ingredient_index, |_| Value {
+            updated_at: OptionalAtomicRevision::new(Some(current_revision)),
+            durability: current_deps.durability,
+            revisions: C::new_revisions(current_deps.changed_at),
+            // SAFETY: Guaranteed by `Configuration` and retained only in this tracked value.
+            fields: unsafe { std::mem::transmute::<C::Fields<'db>, C::Fields<'static>>(fields) },
+            // SAFETY: We only ever access the memos of a value that we allocated through
+            // our `MemoTableTypes`.
+            memos: unsafe { MemoTable::new(self.memo_table_types()) },
+        });
+        id
+    }
+
+    // ryo-v2 fork: the struct `id` as `layer`'s chain sees it, read without a lock and without a
+    // write: a layer's entry, else the base slot after one load of its `updated_at`. A tombstoned
+    // or deleted struct panics as upstream's read lock does.
+    fn layer_view<'db>(
+        &'db self,
+        zalsa: &'db ZalsaView,
+        layer: &'db Layer,
+        id: Id,
+    ) -> LayerView<'db, C> {
+        match layer.find_tracked(id) {
+            ChainTracked::Entry { value, .. } => LayerView::Entry(downcast_entry::<C>(value)),
+            ChainTracked::Tombstone => panic!(
+                "write lock taken; value leaked across threads or user functions not deterministic \
+                 (ryo-v2 fork: `{id:?}` was removed in this layer)"
+            ),
+            ChainTracked::None => {
+                let data = Self::data_raw(zalsa.table(), id);
+                // SAFETY: `updated_at` is never exclusively borrowed, so borrowing it is sound.
+                if unsafe { (*data).updated_at.load() }.is_none() {
+                    panic!(
+                        "write lock taken; value leaked across threads or user functions not deterministic"
+                    );
+                }
+                LayerView::Base(data)
+            }
+        }
+    }
+
+    // ryo-v2 fork: the fields, the revision of tracked field `relative` (if any) and the
+    // durability of a struct read under a layer
+    fn layer_fields<'db>(
+        &'db self,
+        zalsa: &'db ZalsaView,
+        layer: &'db Layer,
+        id: Id,
+        relative: Option<usize>,
+    ) -> (&'db C::Fields<'db>, Revision, Durability) {
+        match self.layer_view(zalsa, layer, id) {
+            LayerView::Entry(entry) => (
+                restore_fields::<C>(&entry.fields),
+                relative.map_or(Revision::start(), |i| entry.revisions[i]),
+                entry.durability,
+            ),
+            LayerView::Base(data) => {
+                // SAFETY: `data` is a live slot of the frozen base with `updated_at` `Some`; the
+                // frozen base does not write its fields or revisions.
+                let value = unsafe { &*data };
+                (
+                    restore_fields::<C>(&value.fields),
+                    relative.map_or(Revision::start(), |i| value.revisions[i].load()),
+                    value.durability,
+                )
+            }
+        }
+    }
+
+    // ryo-v2 fork: `remove_stale_output` under a layer: the struct is tombstoned in the layer
+    // and the base slot stays. As upstream's `delete_entity`, the outputs of the memos keyed by
+    // the struct (as the chain sees them) are removed too, recursively, in the layer.
+    fn tombstone_in_layer(&self, zalsa: &ZalsaView, layer: &Layer, id: Id) {
+        if let ChainTracked::Tombstone = layer.find_tracked(id) {
+            return;
+        }
+        zalsa.event(&|| {
+            Event::new(crate::EventKind::DidDiscard {
+                key: self.database_key_index(id),
+            })
+        });
+        let (functions, base_visible) = layer.memo_functions(id);
+        let mut memos: Vec<(&dyn crate::table::memo::Memo, IngredientIndex)> = Vec::new();
+        for function in &functions {
+            if let ChainMemo::Found(memo) = layer.find_memo(*function, id) {
+                memos.push((memo, *function));
+            }
+        }
+        if base_visible {
+            zalsa
+                .table()
+                .memos_in_layer(id)
+                .for_each_memo(|memo_ingredient_index, memo| {
+                    let function = zalsa
+                        .ingredient_index_for_memo(self.ingredient_index, memo_ingredient_index);
+                    if !functions.contains(&function) {
+                        memos.push((memo, function));
+                    }
+                });
+        }
+        layer.tombstone(id);
+        for (memo, function) in memos {
+            let executor = DatabaseKeyIndex::new(function, id);
+            zalsa.event(&|| Event::new(EventKind::DidDiscard { key: executor }));
+            memo.remove_outputs(zalsa, executor);
+        }
+    }
+
+    fn allocate<'db>(
+        &'db self,
+        // ryo-v2 fork: the view of a base handle (a layer allocates in `allocate_in_layer`)
+        zalsa: &'db ZalsaView,
+        zalsa_local: &'db ZalsaLocal,
+        current_deps: &Stamp,
+        fields: C::Fields<'db>,
+    ) -> Id {
+        // ryo-v2 fork: the handle's revision (a base handle's)
+        let current_revision = zalsa.current_revision();
         let value = |_| Value {
             updated_at: OptionalAtomicRevision::new(Some(current_revision)),
             durability: current_deps.durability,
@@ -632,13 +941,14 @@ where
     /// The value at the given `id` must be initialized.
     unsafe fn update<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view of a base handle (a layer re-creates in `update_in_layer`)
+        zalsa: &'db ZalsaView,
         mut id: Id,
         current_deps: &Stamp,
         fields: C::Fields<'db>,
     ) -> Result<Id, C::Fields<'db>> {
         // ryo-v2 fork: an update of a tracked struct is a base write, refused while the base is
-        // frozen; under a layer unreachable (stub in `new_struct`), step 2b
+        // frozen; a layer never reaches here
         zalsa.fork().assert_not_frozen("a tracked-struct update");
         let data_raw = Self::data_raw(zalsa.table(), id);
 
@@ -686,8 +996,8 @@ where
             );
 
             // The value is already read-locked, but we can reuse it safely as per above.
-            // ryo-v2 fork: unreachable under a layer (stub in `new_struct`), step 2b
-            if last_updated_at == Some(zalsa.unrouted_revision()) {
+            // ryo-v2 fork: the handle's revision (a base handle's)
+            if last_updated_at == Some(zalsa.current_revision()) {
                 return Ok(id);
             }
 
@@ -761,8 +1071,8 @@ where
         *durability = current_deps.durability;
         // SAFETY: `updated_at` is never exclusively borrowed, so borrowing it is sound
         // release the lock
-        // ryo-v2 fork: unreachable under a layer (stub in `new_struct`), step 2b
-        let swapped_out = unsafe { (*data_raw).updated_at.swap(Some(zalsa.unrouted_revision())) };
+        // ryo-v2 fork: the handle's revision (a base handle's)
+        let swapped_out = unsafe { (*data_raw).updated_at.swap(Some(zalsa.current_revision())) };
         assert!(
             swapped_out.is_none(),
             "two concurrent writers to {id:?}, should not be possible"
@@ -802,9 +1112,10 @@ where
     /// Using this method on an entity id that MAY be used in the current revision will lead to
     /// unspecified results (but not UB). See [`InternedIngredient::delete_index`] for more
     /// discussion and important considerations.
-    pub(crate) fn delete_entity(&self, zalsa: &Zalsa, id: Id) {
+    // ryo-v2 fork: the view of a base handle (a layer tombstones in `tombstone_in_layer`)
+    pub(crate) fn delete_entity(&self, zalsa: &ZalsaView, id: Id) {
         // ryo-v2 fork: deleting a tracked struct is a base write, refused while the base is
-        // frozen; under a layer unreachable (stub in `fetch`), step 2b
+        // frozen; a layer never reaches here
         zalsa.fork().assert_not_frozen("a tracked-struct deletion");
         zalsa.event(&|| {
             Event::new(crate::EventKind::DidDiscard {
@@ -820,8 +1131,8 @@ where
             None => {
                 panic!("cannot delete write-locked id `{id:?}`; value leaked across threads");
             }
-            // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-            Some(r) if r == zalsa.unrouted_revision() => panic!(
+            // ryo-v2 fork: the handle's revision (a base handle's)
+            Some(r) if r == zalsa.current_revision() => panic!(
                 "cannot delete read-locked id `{id:?}`; value leaked across threads or user functions not deterministic"
             ),
             Some(_) => (),
@@ -843,7 +1154,8 @@ where
     /// # Safety
     ///
     /// The `MemoTable` must belong to a `Value` of the correct type.
-    pub(crate) unsafe fn clear_memos(&self, zalsa: &Zalsa, memo_table: &mut MemoTable, id: Id) {
+    // ryo-v2 fork: the view of a base handle (removing the memos' outputs takes it)
+    pub(crate) unsafe fn clear_memos(&self, zalsa: &ZalsaView, memo_table: &mut MemoTable, id: Id) {
         // SAFETY: The caller guarantees this is the correct types table.
         let table = unsafe { self.memo_table_types.attach_memos_mut(memo_table) };
 
@@ -885,19 +1197,19 @@ where
     /// Used for debugging.
     pub fn leak_fields<'db>(
         &'db self,
-        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        // ryo-v2 fork: the view; under a layer the chain's entry, else the base slot unlocked
         zalsa: &'db ZalsaView,
         s: C::Struct<'db>,
     ) -> &'db C::Fields<'db> {
-        // ryo-v2 fork: stub
-        if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("reading a tracked struct (step 2b)");
-        }
         let id = AsId::as_id(&s);
+        // ryo-v2 fork: under a layer no read lock is taken (the base slot is not written)
+        if let Some(layer) = zalsa.layer() {
+            return self.layer_fields(zalsa, layer, id, None).0;
+        }
         let data = Self::data_raw(zalsa.table(), id);
         // SAFETY: `data` is a valid pointer acquired from the table.
-        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
-        unsafe { self.lock_fields(data, zalsa.unrouted_revision()) }
+        // ryo-v2 fork: the handle's revision (a base handle's)
+        unsafe { self.lock_fields(data, zalsa.current_revision()) }
     }
 
     /// Access to this tracked field.
@@ -906,23 +1218,31 @@ where
     /// The caller is responsible for selecting the appropriate element.
     pub fn tracked_field<'db>(
         &'db self,
-        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        // ryo-v2 fork: the view; under a layer the chain's entry, else the base slot unlocked
         zalsa: &'db ZalsaView,
         zalsa_local: &'db ZalsaLocal,
         s: C::Struct<'db>,
         relative_tracked_index: usize,
     ) -> &'db C::Fields<'db> {
-        // ryo-v2 fork: stub
-        if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("reading a tracked struct (step 2b)");
-        }
         let id = AsId::as_id(&s);
         let field_ingredient_index = self.ingredient_index.successor(relative_tracked_index);
+        // ryo-v2 fork: under a layer the fields, the field's revision and the durability are the
+        // chain's entry's (else the base slot's), read without a lock
+        if let Some(layer) = zalsa.layer() {
+            let (fields, changed_at, durability) =
+                self.layer_fields(zalsa, layer, id, Some(relative_tracked_index));
+            zalsa_local.report_tracked_read_simple(
+                DatabaseKeyIndex::new(field_ingredient_index, id),
+                durability,
+                changed_at,
+            );
+            return fields;
+        }
         let data = Self::data_raw(zalsa.table(), id);
 
         // SAFETY: `data` is a valid pointer acquired from the table.
-        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
-        let fields = unsafe { self.lock_fields(data, zalsa.unrouted_revision()) };
+        // ryo-v2 fork: the handle's revision (a base handle's)
+        let fields = unsafe { self.lock_fields(data, zalsa.current_revision()) };
 
         // SAFETY: We just acquired the read lock (in `Self::fields`), so accessing `revisions` will not be able to alias
         let field_changed_at = unsafe { (&(*data).revisions)[relative_tracked_index].load() };
@@ -943,27 +1263,46 @@ where
     /// The caller is responsible for selecting the appropriate element.
     pub fn untracked_field<'db>(
         &'db self,
-        // ryo-v2 fork: the view; stub, tracked structs are not routed through a layer yet
+        // ryo-v2 fork: the view; under a layer the chain's entry, else the base slot unlocked
         zalsa: &'db ZalsaView,
         s: C::Struct<'db>,
     ) -> &'db C::Fields<'db> {
-        // ryo-v2 fork: stub
-        if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("reading a tracked struct (step 2b)");
-        }
         let id = AsId::as_id(&s);
+        // ryo-v2 fork: under a layer no read lock is taken (the base slot is not written)
+        if let Some(layer) = zalsa.layer() {
+            return self.layer_fields(zalsa, layer, id, None).0;
+        }
         let data = Self::data_raw(zalsa.table(), id);
 
         // Note that we do not need to add a dependency on the tracked struct
         // as IDs that are reused increment their generation, invalidating any
         // dependent queries directly.
         // SAFETY: `data` is a valid pointer acquired from the table.
-        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
-        unsafe { self.lock_fields(data, zalsa.unrouted_revision()) }
+        // ryo-v2 fork: the handle's revision (a base handle's)
+        unsafe { self.lock_fields(data, zalsa.current_revision()) }
     }
 
     /// Returns all data corresponding to the tracked struct.
-    pub fn entries<'db>(&'db self, zalsa: &'db Zalsa) -> impl Iterator<Item = StructEntry<'db, C>> {
+    // ryo-v2 fork: the view; refused (panic) on a layered handle, whose structs are the base's
+    // slots overlaid by the chain
+    pub fn entries<'db>(
+        &'db self,
+        zalsa: &'db ZalsaView,
+    ) -> impl Iterator<Item = StructEntry<'db, C>> {
+        if zalsa.layer().is_some() {
+            zalsa.fork().record_refusal();
+            crate::fork::not_yet_supported("enumerating tracked structs");
+        }
+        self.entries_in_base(zalsa)
+    }
+
+    // ryo-v2 fork: the enumeration of a base, for `SalsaStructInDb::entries` (serialization and
+    // memory usage, which need exclusive access and so no layered handle)
+    #[doc(hidden)]
+    pub fn entries_in_base<'db>(
+        &'db self,
+        zalsa: &'db Zalsa,
+    ) -> impl Iterator<Item = StructEntry<'db, C>> {
         zalsa
             .table()
             .slots_of::<Value<C>>()
@@ -1022,7 +1361,8 @@ where
 
     unsafe fn maybe_changed_after(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &ZalsaView,
         _db: crate::database::RawDatabase<'_>,
         _input: Id,
         _revision: Revision,
@@ -1051,7 +1391,8 @@ where
 
     fn flatten_cycle_head_dependencies(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &ZalsaView,
         _id: Id,
         _flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         _seen: &mut FxHashSet<DatabaseKeyIndex>,
@@ -1061,10 +1402,16 @@ where
 
     fn remove_stale_output(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the struct is tombstoned in the layer
+        zalsa: &ZalsaView,
         _executor: DatabaseKeyIndex,
         stale_output_key: crate::Id,
     ) {
+        // ryo-v2 fork: under a layer a tombstone; the base slot stays for every other chain
+        if let Some(layer) = zalsa.layer() {
+            self.tombstone_in_layer(zalsa, layer, stale_output_key);
+            return;
+        }
         // This method is called when, in prior revisions,
         // `executor` creates a tracked struct `salsa_output_key`,
         // but it did not in the current revision.
@@ -1247,6 +1594,29 @@ where
     #[inline(always)]
     fn memos_mut(&mut self) -> &mut crate::table::memo::MemoTable {
         &mut self.memos
+    }
+
+    // ryo-v2 fork: under a layer no read lock is taken on the base slot: one load of
+    // `updated_at`, which must not be `None` (as `acquire_read_lock` requires); the frozen base
+    // does not delete or reuse the slot
+    unsafe fn memos_in_layer(this: *const Self) -> *const crate::table::memo::MemoTable {
+        // SAFETY: `this` is a valid pointer given the caller obligation
+        if unsafe { (*this).updated_at.load() }.is_none() {
+            panic!(
+                "write lock taken; value leaked across threads or user functions not deterministic"
+            );
+        }
+        // SAFETY: `this` is valid; the frozen base neither deletes nor reuses the slot.
+        unsafe { Self::memos_unchecked(this) }
+    }
+
+    // ryo-v2 fork: `updated_at`, the durability and every field revision (isolation check, I2)
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+        hasher.write_usize(self.updated_at.load().map_or(0, Revision::as_usize));
+        hasher.write_u8(self.durability.index() as u8);
+        for i in 0..C::TRACKED_FIELD_INDICES.len() {
+            hasher.write_usize(self.revisions[i].load().as_usize());
+        }
     }
 }
 

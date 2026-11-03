@@ -338,6 +338,11 @@ path = "tests/lru.rs"
 name = "fork"
 path = "tests/fork.rs"
 
+# ryo-v2 fork: memos, tracked structs, interned values and claims under a layer (D11 step 2b)
+[[test]]
+name = "fork_memos"
+path = "tests/fork_memos.rs"
+
 [[test]]
 name = "manual_registration"
 path = "tests/manual_registration.rs"

@@ -9,7 +9,9 @@ use crate::hash::{FxHashSet, FxIndexSet};
 use crate::plumbing::ZalsaLocal;
 use crate::sync::thread;
 use crate::tracked_struct::Identity;
-use crate::zalsa::{MemoIngredientIndex, Zalsa};
+// ryo-v2 fork: execution reads and writes through the handle's view
+use crate::fork::ZalsaView;
+use crate::zalsa::MemoIngredientIndex;
 use crate::zalsa_local::{ActiveQueryGuard, QueryEdge, QueryEdgeKind, QueryRevisions};
 use crate::{Cancelled, Cycle, tracing};
 use crate::{DatabaseKeyIndex, Event, EventKind, Id};
@@ -106,8 +108,8 @@ where
             id,
             Memo::new(
                 Some(new_value),
-                // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-                zalsa.unrouted_revision(),
+                // ryo-v2 fork: the handle's revision (the layer's)
+                zalsa.current_revision(),
                 completed_query.revisions,
             ),
             memo_ingredient_index,
@@ -135,8 +137,8 @@ where
         let mut last_provisional_memo_opt: Option<&Memo<C>> = None;
 
         let mut last_stale_tracked_ids: Vec<(Identity, Id)> = Vec::new();
-        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-        let current_revision = zalsa.unrouted_revision();
+        // ryo-v2 fork: the handle's revision (the layer's)
+        let current_revision = zalsa.current_revision();
         let cancellation_count = zalsa.runtime().cancellation_count();
         let mut opt_old_memo = opt_old_memo;
         let mut iteration = IterationStamp::initial(cancellation_count);
@@ -146,7 +148,8 @@ where
         // seed the retry, while a memo from an older revision remains useful for backdating and
         // output bookkeeping. Cancellation counts are only comparable within a revision.
         if let Some(old_memo) = opt_old_memo
-            && old_memo.header.verified_at.load() == current_revision
+            // ryo-v2 fork: as the handle sees it
+            && old_memo.header.load_verified_at(zalsa) == current_revision
         {
             match old_memo.header.previous_iteration(
                 database_key_index,
@@ -324,7 +327,8 @@ where
     #[inline]
     fn execute_query<'db>(
         db: &'db C::DbView,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view
+        zalsa: &'db ZalsaView,
         active_query: ActiveQueryGuard<'db>,
         opt_old_header: Option<&MemoHeader>,
     ) -> (C::Output<'db>, ActiveQueryGuard<'db>) {
@@ -397,7 +401,8 @@ impl MemoHeader {
         })
     }
 
-    fn seed_active_query(&self, zalsa: &Zalsa, active_query: &ActiveQueryGuard<'_>) {
+    // ryo-v2 fork: the view
+    fn seed_active_query(&self, zalsa: &ZalsaView, active_query: &ActiveQueryGuard<'_>) {
         // If we already executed this query once, then use the tracked-struct ids from the
         // previous execution as the starting point for the new one.
         active_query.seed_tracked_struct_ids(self.revisions.tracked_struct_ids());
@@ -407,15 +412,16 @@ impl MemoHeader {
         // * ensure that tracked struct created during the previous iteration
         //   (and are owned by the query) are alive even if the query in this iteration no longer creates them.
         // * ensure the final returned memo depends on all inputs from all iterations.
-        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-        if self.may_be_provisional() && self.verified_at.load() == zalsa.unrouted_revision() {
+        // ryo-v2 fork: as the handle sees it
+        if self.may_be_provisional() && self.load_verified_at(zalsa) == zalsa.current_revision() {
             active_query.seed_iteration(&self.revisions);
         }
     }
 }
 
 fn try_complete_query<'db>(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view
+    zalsa: &ZalsaView,
     mut active_query: ActiveQueryGuard<'db>,
     claim_guard: &mut ClaimGuard<'db>,
     iteration: IterationStamp,
@@ -528,7 +534,8 @@ impl Drop for DisableLocalCancellationGuard<'_> {
 /// We could insert a fixpoint initial value here, but it seems unnecessary.
 struct PoisonProvisionalIfPanicking<'a, C: Configuration> {
     ingredient: &'a IngredientImpl<C>,
-    zalsa: &'a Zalsa,
+    // ryo-v2 fork: the view; under a layer the poisoned memo is the layer's
+    zalsa: &'a ZalsaView,
     id: Id,
     memo_ingredient_index: MemoIngredientIndex,
 }
@@ -536,7 +543,8 @@ struct PoisonProvisionalIfPanicking<'a, C: Configuration> {
 impl<'a, C: Configuration> PoisonProvisionalIfPanicking<'a, C> {
     fn new(
         ingredient: &'a IngredientImpl<C>,
-        zalsa: &'a Zalsa,
+        // ryo-v2 fork: the view
+        zalsa: &'a ZalsaView,
         id: Id,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> Self {
@@ -557,8 +565,8 @@ impl<C: Configuration> Drop for PoisonProvisionalIfPanicking<'_, C> {
                 IterationStamp::initial(self.zalsa.runtime().cancellation_count()),
             );
 
-            // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-            let memo = Memo::new(None, self.zalsa.unrouted_revision(), revisions);
+            // ryo-v2 fork: the handle's revision (the layer's)
+            let memo = Memo::new(None, self.zalsa.current_revision(), revisions);
             self.ingredient
                 .insert_memo(self.zalsa, self.id, memo, self.memo_ingredient_index);
         }
@@ -569,7 +577,8 @@ impl<C: Configuration> Drop for PoisonProvisionalIfPanicking<'_, C> {
 ///
 /// That is, any query that's currently blocked on the result computed by this query (claiming it results in a cycle).
 fn outer_cycle(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view (claims of the layer)
+    zalsa: &ZalsaView,
     zalsa_local: &ZalsaLocal,
     cycle_heads: &CycleHeads,
     current_key: DatabaseKeyIndex,
@@ -635,13 +644,15 @@ fn outer_cycle(
 /// when `X` completes (which is the real outermost cycle). That's why we need to resolve all cycle heads
 /// recursively, so that `X` completes with `[B, C, D, E]
 fn collect_all_cycle_heads(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view (the layer's memos)
+    zalsa: &ZalsaView,
     cycle_heads: &mut CycleHeads,
     database_key_index: DatabaseKeyIndex,
     iteration: IterationStamp,
 ) -> (IterationStamp, bool) {
     fn collect_recursive(
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the layer's memos)
+        zalsa: &ZalsaView,
         current_head: DatabaseKeyIndex,
         me: DatabaseKeyIndex,
         query_heads: &CycleHeads,
@@ -850,7 +861,10 @@ fn try_complete_cycle_head(
                 .lookup_ingredient(head.database_key_index.ingredient_index())
                 .as_function()
                 .expect("cycle heads must be function ingredients");
-            if let Some(memo) = function.memo(zalsa, head.database_key_index.key_index()) {
+            if let Some(memo) = function.memo(zalsa, head.database_key_index.key_index())
+                // ryo-v2 fork: only a memo the layer owns is finalized in place (E2)
+                && memo.header().may_write(zalsa, "a memo's verified_final")
+            {
                 memo.header().finalize_cycle_head();
             }
         }
@@ -891,12 +905,13 @@ fn try_complete_cycle_head(
             .lookup_ingredient(head.database_key_index.ingredient_index())
             .as_function()
             .expect("cycle heads must be function ingredients");
-        if let Some(memo) = function.memo(zalsa, head.database_key_index.key_index()) {
+        if let Some(memo) = function.memo(zalsa, head.database_key_index.key_index())
             // ryo-v2 fork: a store into a base memo, refused while the base is frozen; under a
-            // layer unreachable (stub in `fetch`), step 2b
-            zalsa
-                .fork()
-                .assert_not_frozen("a memo's cycle iteration count");
+            // layer only into a memo the layer owns (E2)
+            && memo
+                .header()
+                .may_write(zalsa, "a memo's cycle iteration count")
+        {
             memo.header()
                 .set_cycle_iteration_count(head.database_key_index, iteration);
         }
@@ -936,7 +951,8 @@ thread_local! {
 }
 
 fn complete_cycle_query(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view (the layer's memos)
+    zalsa: &ZalsaView,
     active_query: ActiveQueryGuard<'_>,
     iteration: IterationStamp,
 ) -> CompletedQuery {
@@ -973,7 +989,8 @@ fn complete_cycle_query(
 /// Flattens the dependencies of `head` so that `head`'s origin only depends on finalized queries,
 /// or salsa structs (input, tracked, interned).
 fn flatten_cycle_dependencies(
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view (the layer's memos)
+    zalsa: &ZalsaView,
     direct_input_outputs: &FxIndexSet<QueryEdge>,
     flattened: &mut FxIndexSet<QueryEdge>,
     seen: &mut FxHashSet<DatabaseKeyIndex>,

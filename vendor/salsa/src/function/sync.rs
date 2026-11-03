@@ -4,6 +4,8 @@ use hashbrown::hash_table::{Entry, OccupiedEntry};
 use rustc_hash::FxBuildHasher;
 use std::hash::BuildHasher;
 
+// ryo-v2 fork: claims are keyed by the handle's layer (E5); the view gives the layer
+use crate::fork::{SharedWriteKind, ZalsaView};
 use crate::key::DatabaseKeyIndex;
 use crate::plumbing::ZalsaLocal;
 use crate::runtime::{
@@ -12,7 +14,7 @@ use crate::runtime::{
 use crate::sync::thread::{self};
 use crate::sync::{Mutex, max_parallelism};
 use crate::tracing;
-use crate::zalsa::Zalsa;
+// ryo-v2 fork: `Zalsa` is reached through the view (`ZalsaView`)
 use crate::{Id, IngredientIndex};
 
 pub(crate) type SyncGuard<'me> = crate::sync::MutexGuard<'me, HashTable<SyncState>>;
@@ -49,6 +51,10 @@ pub(crate) enum ClaimResult<'a, Guard = ClaimGuard<'a>> {
 pub(crate) struct SyncState {
     key: Id,
 
+    // ryo-v2 fork: the layer the claim belongs to (0 for a base handle): two layers' claims of
+    // one key are distinct (E5)
+    layer: usize,
+
     /// The thread id that currently owns this query (actively executing it or iterating it as part of a larger cycle).
     id: SyncOwner,
 
@@ -68,6 +74,16 @@ pub(crate) struct SyncState {
     /// and `claimed_twice` is set to `true`. However, t2 won't be able to claim `a` because
     /// it doesn't own `b`.
     claimed_twice: bool,
+}
+
+// ryo-v2 fork: the hash of a claim key; a base handle's (layer 0) is upstream's
+#[inline]
+fn claim_hash(layer: usize, key_index: Id) -> u64 {
+    if layer == 0 {
+        FxBuildHasher.hash_one(key_index)
+    } else {
+        FxBuildHasher.hash_one((layer, key_index))
+    }
 }
 
 impl SyncTable {
@@ -102,18 +118,22 @@ impl SyncTable {
     /// Claims the given key index, or blocks if it is running on another thread.
     pub(crate) fn try_claim<'me>(
         &'me self,
-        zalsa: &'me Zalsa,
+        // ryo-v2 fork: the view, whose layer keys the claim (E5)
+        zalsa: &'me ZalsaView,
         zalsa_local: &'me ZalsaLocal,
         key_index: Id,
         reentrant: Reentrancy,
     ) -> ClaimResult<'me> {
-        let hash = FxBuildHasher.hash_one(key_index);
+        // ryo-v2 fork: claims are keyed by (layer, key)
+        let layer = zalsa.layer_key();
+        let hash = claim_hash(layer, key_index);
         let shard = self.shard_for(hash);
         let mut write = shard.syncs.lock();
         match write.entry(
             hash,
-            |state| state.key == key_index,
-            |state| FxBuildHasher.hash_one(state.key),
+            // ryo-v2 fork: claims are keyed by (layer, key)
+            |state| state.key == key_index && state.layer == layer,
+            |state| claim_hash(state.layer, state.key),
         ) {
             Entry::Occupied(occupied_entry) => {
                 let id = match occupied_entry.get().id {
@@ -145,6 +165,8 @@ impl SyncTable {
                 // not to gate future atomic reads.
                 *anyone_waiting = true;
                 match zalsa.runtime().block(
+                    // ryo-v2 fork: the graph of the handle's layer (E5)
+                    zalsa.dependency_graph(),
                     DatabaseKeyIndex::new(self.ingredient, key_index),
                     id,
                     write,
@@ -154,8 +176,15 @@ impl SyncTable {
                 }
             }
             Entry::Vacant(vacant_entry) => {
+                // ryo-v2 fork: a claim under a layer is a counted shared write of the base's
+                // sync table (E2)
+                if layer != 0 {
+                    zalsa.fork().record_shared_write(SharedWriteKind::SyncClaim);
+                }
                 vacant_entry.insert(SyncState {
                     key: key_index,
+                    // ryo-v2 fork: the claim's layer
+                    layer,
                     id: SyncOwner::Thread(thread::current().id()),
                     anyone_waiting: false,
                     is_transfer_target: false,
@@ -175,13 +204,17 @@ impl SyncTable {
     /// Claims the given key index, or blocks if it is running on another thread.
     pub(crate) fn peek_claim<'me>(
         &'me self,
-        zalsa: &'me Zalsa,
+        // ryo-v2 fork: the view, whose layer keys the claim (E5)
+        zalsa: &'me ZalsaView,
         key_index: Id,
         reentrant: Reentrancy,
     ) -> ClaimResult<'me, ()> {
-        let hash = FxBuildHasher.hash_one(key_index);
+        // ryo-v2 fork: claims are keyed by (layer, key)
+        let layer = zalsa.layer_key();
+        let hash = claim_hash(layer, key_index);
         let mut write = self.shard_for(hash).syncs.lock();
-        match write.find_entry(hash, |state| state.key == key_index) {
+        // ryo-v2 fork: claims are keyed by (layer, key)
+        match write.find_entry(hash, |state| state.key == key_index && state.layer == layer) {
             Ok(occupied_entry) => {
                 let id = match occupied_entry.get().id {
                     SyncOwner::Thread(id) => id,
@@ -206,6 +239,8 @@ impl SyncTable {
                 // not to gate future atomic reads.
                 *anyone_waiting = true;
                 match zalsa.runtime().block(
+                    // ryo-v2 fork: the graph of the handle's layer (E5)
+                    zalsa.dependency_graph(),
                     DatabaseKeyIndex::new(self.ingredient, key_index),
                     id,
                     write,
@@ -222,7 +257,8 @@ impl SyncTable {
     #[inline(never)]
     fn try_claim_transferred<'me>(
         &'me self,
-        zalsa: &'me Zalsa,
+        // ryo-v2 fork: the view, whose layer's graph holds the transfer (E5)
+        zalsa: &'me ZalsaView,
         zalsa_local: &'me ZalsaLocal,
         mut entry: OccupiedEntry<SyncState>,
         shard: &'me SyncShard,
@@ -234,7 +270,8 @@ impl SyncTable {
 
         match zalsa
             .runtime()
-            .block_transferred(database_key_index, thread_id)
+            // ryo-v2 fork: the graph of the handle's layer (E5)
+            .block_transferred(zalsa.dependency_graph(), database_key_index, thread_id)
         {
             BlockTransferredResult::ImTheOwner if reentrant.is_allow() => {
                 let SyncState {
@@ -261,6 +298,8 @@ impl SyncTable {
             BlockTransferredResult::Released => {
                 *entry.get_mut() = SyncState {
                     key: key_index,
+                    // ryo-v2 fork: the claim's layer
+                    layer: zalsa.layer_key(),
                     id: SyncOwner::Thread(thread_id),
                     anyone_waiting: false,
                     is_transfer_target: false,
@@ -281,7 +320,8 @@ impl SyncTable {
     #[inline(never)]
     fn peek_claim_transferred<'me>(
         &'me self,
-        zalsa: &'me Zalsa,
+        // ryo-v2 fork: the view, whose layer's graph holds the transfer (E5)
+        zalsa: &'me ZalsaView,
         mut entry: OccupiedEntry<SyncState>,
         reentrant: Reentrancy,
     ) -> Result<ClaimResult<'me, ()>, Box<BlockOnTransferredOwner<'me>>> {
@@ -291,7 +331,8 @@ impl SyncTable {
 
         match zalsa
             .runtime()
-            .block_transferred(database_key_index, thread_id)
+            // ryo-v2 fork: the graph of the handle's layer (E5)
+            .block_transferred(zalsa.dependency_graph(), database_key_index, thread_id)
         {
             BlockTransferredResult::ImTheOwner if reentrant.is_allow() => {
                 Ok(ClaimResult::Claimed(()))
@@ -311,11 +352,18 @@ impl SyncTable {
     ///
     /// Note: The result of this method will immediately become stale unless the thread owning `key_index`
     /// is currently blocked on this thread (claiming `key_index` from this thread results in a cycle).
-    pub(super) fn mark_as_transfer_target(&self, key_index: Id) -> Option<SyncOwner> {
-        let hash = FxBuildHasher.hash_one(key_index);
+    pub(super) fn mark_as_transfer_target(
+        &self,
+        // ryo-v2 fork: the layer whose claim of `key_index` is meant (E5)
+        layer: usize,
+        key_index: Id,
+    ) -> Option<SyncOwner> {
+        // ryo-v2 fork: claims are keyed by (layer, key)
+        let hash = claim_hash(layer, key_index);
         let mut syncs = self.shard_for(hash).syncs.lock();
         syncs
-            .find_mut(hash, |state| state.key == key_index)
+            // ryo-v2 fork: claims are keyed by (layer, key)
+            .find_mut(hash, |state| state.key == key_index && state.layer == layer)
             .map(|state| {
                 // We set `anyone_waiting` to true because it is used in `ClaimGuard::release`
                 // to exit early if the query doesn't need to release any locks.
@@ -351,14 +399,16 @@ pub enum SyncOwner {
 #[must_use]
 pub(crate) struct ClaimGuard<'me> {
     key_index: Id,
-    zalsa: &'me Zalsa,
+    // ryo-v2 fork: the view, whose layer keys the claim (E5)
+    zalsa: &'me ZalsaView,
     shard: &'me SyncShard,
     mode: ReleaseMode,
     zalsa_local: &'me ZalsaLocal,
 }
 
 impl<'me> ClaimGuard<'me> {
-    pub(crate) const fn zalsa(&self) -> &'me Zalsa {
+    // ryo-v2 fork: the view, whose layer the claimed query runs in
+    pub(crate) const fn zalsa(&self) -> &'me ZalsaView {
         self.zalsa
     }
 
@@ -376,7 +426,14 @@ impl<'me> ClaimGuard<'me> {
 
     #[inline]
     fn hash(&self) -> u64 {
-        FxBuildHasher.hash_one(self.key_index)
+        // ryo-v2 fork: claims are keyed by (layer, key)
+        claim_hash(self.zalsa.layer_key(), self.key_index)
+    }
+
+    // ryo-v2 fork: whether a sync-table entry is this guard's claim (same key, same layer)
+    #[inline]
+    fn is_mine(&self, state: &SyncState) -> bool {
+        state.key == self.key_index && state.layer == self.zalsa.layer_key()
     }
 
     #[cold]
@@ -385,11 +442,16 @@ impl<'me> ClaimGuard<'me> {
         let hash = self.hash();
         let mut syncs = self.shard.syncs.lock();
         let state = syncs
-            .find_entry(hash, |state| state.key == self.key_index)
+            // ryo-v2 fork: claims are keyed by (layer, key)
+            .find_entry(hash, |state| self.is_mine(state))
             .expect("key claimed twice?")
             .remove()
             .0;
-        let result = if self.zalsa_local.should_trigger_local_cancellation() {
+        // ryo-v2 fork: a cancelled ancestor layer stops this layer's queries as cancelled too
+        let result = if self
+            .zalsa
+            .should_trigger_local_cancellation(self.zalsa_local)
+        {
             WaitResult::Cancelled
         } else {
             WaitResult::Panicked
@@ -417,15 +479,24 @@ impl<'me> ClaimGuard<'me> {
 
         let runtime = self.zalsa.runtime();
         let database_key_index = self.database_key_index();
+        // ryo-v2 fork: the graph of the handle's layer (E5)
+        let dependency_graph = self.zalsa.dependency_graph();
 
         if claimed_twice {
-            runtime.undo_transfer_lock(database_key_index);
+            // ryo-v2 fork: in the layer's graph
+            runtime.undo_transfer_lock(dependency_graph, database_key_index);
         }
 
-        runtime.unblock_queries_blocked_on(database_key_index, wait_result);
+        // ryo-v2 fork: in the layer's graph
+        runtime.unblock_queries_blocked_on(dependency_graph, database_key_index, wait_result);
 
         if is_transfer_target {
-            runtime.unblock_transferred_queries_owned_by(database_key_index, wait_result);
+            // ryo-v2 fork: in the layer's graph
+            runtime.unblock_transferred_queries_owned_by(
+                dependency_graph,
+                database_key_index,
+                wait_result,
+            );
         }
     }
 
@@ -434,7 +505,8 @@ impl<'me> ClaimGuard<'me> {
     fn release_self(&self) {
         let hash = self.hash();
         let mut syncs = self.shard.syncs.lock();
-        let Ok(mut state) = syncs.find_entry(hash, |state| state.key == self.key_index) else {
+        // ryo-v2 fork: claims are keyed by (layer, key)
+        let Ok(mut state) = syncs.find_entry(hash, |state| self.is_mine(state)) else {
             panic!("key should only be claimed/released once");
         };
 
@@ -460,13 +532,15 @@ impl<'me> ClaimGuard<'me> {
             .as_function()
             .expect("lock owners must be function ingredients")
             .sync_table()
-            .mark_as_transfer_target(new_owner.key_index())
+            // ryo-v2 fork: the new owner's claim in this guard's layer (E5)
+            .mark_as_transfer_target(self.zalsa.layer_key(), new_owner.key_index())
         else {
             self.release(
                 self.shard
                     .syncs
                     .lock()
-                    .find_entry(hash, |state| state.key == self.key_index)
+                    // ryo-v2 fork: claims are keyed by (layer, key)
+                    .find_entry(hash, |state| self.is_mine(state))
                     .expect("key should only be claimed/released once")
                     .remove()
                     .0,
@@ -486,15 +560,21 @@ impl<'me> ClaimGuard<'me> {
         let SyncState {
             id, claimed_twice, ..
         } = syncs
-            .find_mut(hash, |state| state.key == self.key_index)
+            // ryo-v2 fork: claims are keyed by (layer, key)
+            .find_mut(hash, |state| self.is_mine(state))
             .expect("key should only be claimed/released once");
 
         *id = SyncOwner::Transferred;
         *claimed_twice = false;
 
-        self.zalsa
-            .runtime()
-            .transfer_lock(self_key, new_owner, new_owner_thread_id, syncs)
+        self.zalsa.runtime().transfer_lock(
+            // ryo-v2 fork: the graph of the handle's layer (E5)
+            self.zalsa.dependency_graph(),
+            self_key,
+            new_owner,
+            new_owner_thread_id,
+            syncs,
+        )
     }
 
     /// Drops the claim on the memo.
@@ -515,7 +595,8 @@ impl<'me> ClaimGuard<'me> {
                 let hash = self.hash();
                 let mut syncs = self.shard.syncs.lock();
                 let state = syncs
-                    .find_entry(hash, |state| state.key == self.key_index)
+                    // ryo-v2 fork: claims are keyed by (layer, key)
+                    .find_entry(hash, |state| self.is_mine(state))
                     .expect("key should only be claimed/released once")
                     .remove()
                     .0;

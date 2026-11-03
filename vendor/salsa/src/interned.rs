@@ -14,8 +14,8 @@ use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 
 use crate::durability::{AtomicDurability, Durability};
-// ryo-v2 fork: the entry points take the handle's view
-use crate::fork::ZalsaView;
+// ryo-v2 fork: the entry points take the handle's view; a layer's shared writes are counted
+use crate::fork::{SharedWriteKind, SkippedWriteKind, ZalsaView};
 use crate::function::VerifyResult;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::id::{AsId, FromId};
@@ -427,16 +427,15 @@ where
         C::Fields<'db>: HashEqLike<Key>,
         Key: Lookup<C::Fields<'db>>,
     {
-        // ryo-v2 fork: stub, interned values are not routed through a layer yet
+        // ryo-v2 fork: under a layer, `intern_id_in_layer`; without one, interning stores
+        // revisions and may insert, a base write, refused while the base is frozen
         if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("interning a value (step 2b)");
+            return self.intern_id_in_layer(zalsa, zalsa_local, key);
         }
-        // ryo-v2 fork: interning stores revisions and may insert, a base write, refused while the
-        // base is frozen
         zalsa.fork().assert_not_frozen("interning a value");
         // Record the current revision as active.
-        // ryo-v2 fork: unreachable under a layer (stub above), step 2b
-        let current_revision = zalsa.unrouted_revision();
+        // ryo-v2 fork: the handle's revision (a base handle's)
+        let current_revision = zalsa.current_revision();
         if C::REVISIONS != IMMORTAL {
             self.revision_queue.record(current_revision);
         }
@@ -621,6 +620,115 @@ where
         slot.new_id
     }
 
+    // ryo-v2 fork: `intern_id` under a layer (D11, E2, E7). An existing value gets its
+    // `last_interned_at` raised to the layer's revision (a counted shared write; it only raises
+    // the value's last use); its durability is not raised, no revision is recorded in the revision
+    // queue, and no LRU entry moves. A new value is inserted into the shard (a counted shared
+    // write: content-keyed, so every layer interning the same content gets the same id) as an
+    // immortal value, never in the LRU. While the base is frozen no slot is reused, so a read
+    // records no dependency edge, only the revision (as a non-reusable value does upstream).
+    fn intern_id_in_layer<'db, Key>(
+        &'db self,
+        zalsa: &'db ZalsaView,
+        zalsa_local: &'db ZalsaLocal,
+        key: Key,
+    ) -> crate::Id
+    where
+        Key: Hash,
+        C::Fields<'db>: HashEqLike<Key>,
+        Key: Lookup<C::Fields<'db>>,
+    {
+        let current_revision = zalsa.current_revision();
+        if C::REVISIONS != IMMORTAL {
+            zalsa
+                .fork()
+                .record_skipped_write(SkippedWriteKind::RevisionQueue);
+        }
+
+        let hash = self.hasher.hash_one(&key);
+        let shard_index = self.shard(hash);
+        // SAFETY: `shard_index` is guaranteed to be in-bounds for `self.shards`.
+        let shard = unsafe { &mut *self.shards.get_unchecked(shard_index).lock() };
+
+        // SAFETY: We hold the lock for the shard containing the value.
+        let eq = |value: &ValueKey| unsafe { Self::value_eq(value.value::<C>(), &key) };
+
+        if let Some(value) = shard.key_map.find(hash, eq) {
+            // SAFETY: Values remain allocated for the lifetime of the database.
+            let value = unsafe { value.value::<C>() };
+
+            // SAFETY: We hold the lock for the shard containing the value.
+            let id = unsafe { *value.lru.id.get() };
+
+            // Under the shard lock, so the load and the store do not interleave with another.
+            if value.lru.last_interned_at.load() < current_revision {
+                value.lru.last_interned_at.store(current_revision);
+                zalsa
+                    .fork()
+                    .record_shared_write(SharedWriteKind::LastInternedAt);
+                zalsa.event(&|| {
+                    Event::new(EventKind::DidValidateInternedValue {
+                        key: self.database_key_index(id),
+                        revision: current_revision,
+                    })
+                });
+            }
+
+            if let Some((_, stamp)) = zalsa_local.active_query()
+                && stamp.durability > value.durability.load()
+            {
+                zalsa
+                    .fork()
+                    .record_skipped_write(SkippedWriteKind::InternedDurability);
+            }
+
+            zalsa_local.report_tracked_read_revision(current_revision);
+            return id;
+        }
+
+        let last_interned_at = zalsa_local
+            .active_query()
+            .map(|_| current_revision)
+            .unwrap_or(Revision::max());
+
+        let (id, value) = zalsa_local.allocate(zalsa, self.ingredient_index, |id| Value::<C> {
+            shard: shard_index as u16,
+            lru: LruEntry {
+                link: LinkedListLink::new(),
+                id: UnsafeCell::new(id),
+                last_interned_at: AtomicRevision::new(last_interned_at),
+            },
+            // SAFETY: We call `from_internal_data` to restore the correct lifetime before access.
+            fields: UnsafeCell::new(unsafe { self.to_internal_data(key.into_owned()) }),
+            // SAFETY: We only ever access the memos of a value that we allocated through
+            // our `MemoTableTypes`.
+            memos: UnsafeCell::new(unsafe { MemoTable::new(self.memo_table_types()) }),
+            // Immortal: never in the LRU, never reused, also after a thaw.
+            durability: AtomicDurability::new(Durability::MAX),
+        });
+        zalsa
+            .fork()
+            .record_shared_write(SharedWriteKind::SlotAllocation);
+        zalsa
+            .fork()
+            .record_shared_write(SharedWriteKind::InternedInsert);
+
+        // SAFETY: We hold this ingredient's shard lock, and `value` is the live, stable value that
+        // we just allocated in that shard.
+        unsafe { self.insert_value(shard, hash, value) };
+
+        zalsa_local.report_tracked_read_revision(current_revision);
+
+        zalsa.event(&|| {
+            Event::new(EventKind::DidInternValue {
+                key: self.database_key_index(id),
+                revision: current_revision,
+            })
+        });
+
+        id
+    }
+
     /// The cold path for interning a value, allocating a new slot.
     ///
     /// Returns `true` if the current thread interned the value.
@@ -628,7 +736,8 @@ where
     fn intern_id_cold<'db, Key>(
         &'db self,
         key: Key,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view of a base handle (a layer interns in `intern_id_in_layer`)
+        zalsa: &ZalsaView,
         zalsa_local: &ZalsaLocal,
         shard: &mut IngredientShard,
         shard_index: usize,
@@ -639,8 +748,8 @@ where
         C::Fields<'db>: HashEqLike<Key>,
         Key: Lookup<C::Fields<'db>>,
     {
-        // ryo-v2 fork: unreachable under a layer (stub in `intern_id`), step 2b
-        let current_revision = zalsa.unrouted_revision();
+        // ryo-v2 fork: the handle's revision (a base handle's)
+        let current_revision = zalsa.current_revision();
 
         // Record the durability of the current query on the interned value.
         let (durability, last_interned_at) = zalsa_local
@@ -835,7 +944,8 @@ where
     ///
     /// `memo_table` must belong to the value identified by `id` in this ingredient. The caller
     /// must have exclusive access to the table.
-    pub(crate) unsafe fn clear_memos(&self, zalsa: &Zalsa, memo_table: &mut MemoTable, id: Id) {
+    // ryo-v2 fork: the view of a base handle (removing the memos' outputs takes it)
+    pub(crate) unsafe fn clear_memos(&self, zalsa: &ZalsaView, memo_table: &mut MemoTable, id: Id) {
         /// Clears the given memo table without depending on `C`.
         ///
         /// # Safety
@@ -844,7 +954,8 @@ where
         /// have been created with `memo_table_types`. The caller must have exclusive access to the
         /// table.
         unsafe fn inner(
-            zalsa: &Zalsa,
+            // ryo-v2 fork: the view of a base handle
+            zalsa: &ZalsaView,
             ingredient_index: IngredientIndex,
             memo_table_types: &MemoTableTypes,
             memo_table: &mut MemoTable,
@@ -934,10 +1045,14 @@ where
 
     /// Lookup the data for an interned value based on its ID.
     #[inline]
-    pub fn data<'db>(&'db self, zalsa: &'db Zalsa, id: Id) -> &'db C::Fields<'db> {
+    // ryo-v2 fork: the view; under a layer the validation is not needed: no slot is reused while
+    // the base is frozen (E7), and a layer's reads need not have raised `last_interned_at`
+    pub fn data<'db>(&'db self, zalsa: &'db ZalsaView, id: Id) -> &'db C::Fields<'db> {
         let value = zalsa.table().get::<Value<C>>(id);
-        // ryo-v2 fork: under a layer the generated getters stop at the stub in `fields`, step 2b
-        value.assert_validated(zalsa.unrouted_revision());
+        // ryo-v2 fork: see above
+        if zalsa.layer().is_none() {
+            value.assert_validated(zalsa.current_revision());
+        }
 
         debug_assert_eq!(
             id,
@@ -957,11 +1072,8 @@ where
     ///
     /// Note that this is not "leaking" since no dependency edge is required.
     #[inline]
-    // ryo-v2 fork: the view, so that a layered handle stops at the stub
+    // ryo-v2 fork: the view (see `data`)
     pub fn fields<'db>(&'db self, zalsa: &'db ZalsaView, s: C::Struct<'db>) -> &'db C::Fields<'db> {
-        if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("reading an interned value (step 2b)");
-        }
         self.data(zalsa, AsId::as_id(&s))
     }
 
@@ -1012,8 +1124,9 @@ where
                 value
                     .lru
                     .last_interned_at
-                    // ryo-v2 fork: entries are read through the base `Zalsa`, not a layer
-                    .store(last_interned_at.max(zalsa.unrouted_revision()));
+                    // ryo-v2 fork: the base's own revision: enumeration takes the base `Zalsa`
+                    // and is refused while the base is frozen, so no layer reaches here
+                    .store(last_interned_at.max(zalsa.base_revision()));
                 // SAFETY: We hold the lock for the shard containing the value.
                 unsafe { *value.lru.id.get() }
             } else {
@@ -1118,20 +1231,32 @@ where
 
     unsafe fn maybe_changed_after(
         &self,
-        zalsa: &crate::zalsa::Zalsa,
+        // ryo-v2 fork: the view; under a layer only `last_interned_at` is raised (a counted
+        // shared write), and the revision queue is not written
+        zalsa: &ZalsaView,
         _db: crate::database::RawDatabase<'_>,
         input: Id,
         _revision: Revision,
     ) -> VerifyResult {
         // Record the current revision as active.
-        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b; the stores below are
-        // base writes, refused while the base is frozen
-        zalsa
-            .fork()
-            .assert_not_frozen("an interned value marked as read");
-        let current_revision = zalsa.unrouted_revision();
+        // ryo-v2 fork: without a layer the stores below are base writes, refused while the base
+        // is frozen
+        let layered = zalsa.layer().is_some();
+        if !layered {
+            zalsa
+                .fork()
+                .assert_not_frozen("an interned value marked as read");
+        }
+        let current_revision = zalsa.current_revision();
         if C::REVISIONS != IMMORTAL {
-            self.revision_queue.record(current_revision);
+            // ryo-v2 fork: not under a layer (E2)
+            if layered {
+                zalsa
+                    .fork()
+                    .record_skipped_write(SkippedWriteKind::RevisionQueue);
+            } else {
+                self.revision_queue.record(current_revision);
+            }
         }
 
         let value = zalsa.table().get::<Value<C>>(input);
@@ -1148,7 +1273,19 @@ where
         }
 
         // Validate the value for the current revision to avoid reuse.
-        value.lru.last_interned_at.store(current_revision);
+        // ryo-v2 fork: under a layer raised only from below (a sibling of a higher revision may
+        // have raised it already), and counted. The load and the store are not under the shard
+        // lock, so two layers racing here may leave the lower of their two revisions; that is
+        // harmless: no slot is reused while frozen (E7), and after a thaw every layer revision is
+        // below the base's (E6), whichever one is left
+        if !layered {
+            value.lru.last_interned_at.store(current_revision);
+        } else if value.lru.last_interned_at.load() < current_revision {
+            value.lru.last_interned_at.store(current_revision);
+            zalsa
+                .fork()
+                .record_shared_write(SharedWriteKind::LastInternedAt);
+        }
 
         zalsa.event(&|| {
             let index = self.database_key_index(input);
@@ -1184,7 +1321,8 @@ where
 
     fn flatten_cycle_head_dependencies(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &ZalsaView,
         id: Id,
         flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         _seen: &mut FxHashSet<DatabaseKeyIndex>,
@@ -1297,6 +1435,12 @@ where
     #[inline(always)]
     fn memos_mut(&mut self) -> &mut crate::table::memo::MemoTable {
         self.memos.get_mut()
+    }
+
+    // ryo-v2 fork: the durability, which a layer never raises (isolation check, I2);
+    // `last_interned_at` is a shared write and is left out
+    fn fork_fingerprint(&self, hasher: &mut dyn std::hash::Hasher) {
+        hasher.write_u8(self.durability.load().index() as u8);
     }
 }
 

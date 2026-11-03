@@ -20,20 +20,26 @@
 //! holds the base it descends from, and every operation that combines a base and a layer is a
 //! method of the layer, so no call can pair a layer with another base.
 //!
-//! Step 2a of stage 2: the Engine is bound to any salsa database through [`EngineDb`] (a file
-//! input with a text); the binding to rust-analyzer's database comes with step 2b, because a
-//! query on a layered handle panics ("not yet supported under a layer") until salsa routes memos
-//! through layers. Input reads and writes through layers work now.
+//! Stage 2: the Engine is bound to any salsa database through [`EngineDb`] (a file input with a
+//! text), and implements it for rust-analyzer's `RootDatabase`: a fork is a `RootDatabase` handle
+//! with a layer; a modified file keeps its `FileText` input and gets its new text in the layer;
+//! a created file takes the vacant path of rust-analyzer's `Files` map (a new input under the
+//! layer, no write lock on the base). Tracked functions, tracked structs and interned values run
+//! under a layer, with their memos, stamps and re-created structs held by the layer.
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::Hash;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use ra_ap_base_db::{FileId, FileText, SourceDatabase};
+use ra_ap_ide_db::RootDatabase;
 use salsa::Revision;
-use salsa::fork::{self, Layer};
+use salsa::fork::{self, BaseFingerprint, Layer, SharedWrites, SkippedWrites};
 use salsa::plumbing::HasStorage;
 
 /// What the Engine needs of a database: a salsa database with a file input whose text a layer
@@ -48,6 +54,49 @@ pub trait EngineDb: salsa::Database + HasStorage + Clone + 'static {
     /// Sets the text of `file` in the layer this handle carries
     /// (`salsa::fork::set_input_field`).
     fn set_file_text_in_layer(&self, file: Self::File, text: Arc<str>);
+
+    /// Creates `file`, which the database does not know, with `text`, as an input created under
+    /// the layer this handle carries (a counted shared write of the base). Takes no write lock:
+    /// it never waits for another handle.
+    fn create_file_in_layer(&mut self, file: Self::File, text: Arc<str>);
+}
+
+/// rust-analyzer's database: a file is a `vfs::FileId`, its text the `FileText` input that
+/// `Files` maps it to.
+impl EngineDb for RootDatabase {
+    type File = FileId;
+
+    fn file_text(&self, file: FileId) -> Arc<str> {
+        Arc::from(&**SourceDatabase::file_text(self, file).text(self))
+    }
+
+    fn set_file_text_in_layer(&self, file: FileId, text: Arc<str>) {
+        let input = SourceDatabase::file_text(self, file);
+        let text = triomphe::Arc::<str>::from(&*text);
+        fork::set_input_field::<FileText, _>(self, input, 0, |fields| fields.0 = text);
+    }
+
+    fn create_file_in_layer(&mut self, file: FileId, text: Arc<str>) {
+        // The vacant entry of `Files` creates the input (`FileText::new`) and inserts it into the
+        // map, which every handle of the base shares (a listed shared write, D11 E2). An occupied
+        // entry would run a setter, which panics on a layered handle instead of waiting.
+        SourceDatabase::set_file_text(self, file, &text);
+    }
+}
+
+/// What the layers of a base did to it: the listed shared writes, the base writes they reached
+/// and did not make, the refused writes (each a panic, which a caller may have caught), and the
+/// fingerprint of what the base keeps (D11, I2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Isolation {
+    /// The shared writes of the listed kinds.
+    pub shared: SharedWrites,
+    /// The base writes reached and not made.
+    pub skipped: SkippedWrites,
+    /// The writes to the frozen base that were refused. 0 is the isolation gate.
+    pub refused: usize,
+    /// The base's memos, revisions and `updated_at`s, slot by slot.
+    pub fingerprint: BaseFingerprint,
 }
 
 /// Why an Engine operation refused.
@@ -57,6 +106,12 @@ pub enum EngineError {
     /// of the base, or another handle of the base. The operation changed nothing and did not wait.
     #[error("a database handle or layer that must be gone is still alive")]
     InUse,
+    /// A write into an open layer whose database was already lent ([`OpenLayer::db`]): a layer
+    /// has one revision, and a query that ran on it, in salsa or in a cache outside it keyed by
+    /// the layer's revision (rust-analyzer's trait solver), would look current after the write.
+    /// The layer changed nothing; write into a child of it once it is sealed.
+    #[error("a write into a layer whose database was already lent")]
+    Lent,
 }
 
 /// The references to a layer that its own open layer holds: the open layer's and its
@@ -71,11 +126,19 @@ struct Base<Db: EngineDb> {
     root: Arc<Node<Db::File>>,
     /// The base's revision at the freeze.
     revision: Revision,
+    /// The files a layer of this base created. The input a creation makes is shared by every
+    /// layer of the base, so a later creation of the same file, in a sibling or a descendant,
+    /// sets the text of that input in its own layer instead of creating it again.
+    created: Mutex<HashSet<Db::File>>,
 }
 
 impl<Db: EngineDb> Base<Db> {
     fn lock(&self) -> MutexGuard<'_, Db> {
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn created(&self) -> MutexGuard<'_, HashSet<Db::File>> {
+        self.created.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A handle of the base carrying `layer`.
@@ -123,6 +186,7 @@ impl Engine {
                     files: Vec::new(),
                 }),
                 revision,
+                created: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -155,6 +219,24 @@ impl<Db: EngineDb> Frozen<Db> {
         self.base.revision
     }
 
+    /// What the layers did to the base so far (D11, I2). Reads every slot of the base: call it
+    /// with no query running on a layer.
+    ///
+    /// # Contract
+    /// - C1: after layers diagnosed rust-analyzer diagnostics, `refused` is 0, the shared writes
+    ///   are of the listed kinds only, and every slot of the base fingerprinted at the freeze is
+    ///   unchanged.
+    ///   tested: tests/v2.rs v2_layers_diagnose_as_their_flat_check
+    pub fn isolation(&self) -> Isolation {
+        let db = self.base.lock();
+        Isolation {
+            shared: fork::shared_writes(&*db),
+            skipped: fork::skipped_writes(&*db),
+            refused: fork::refused_writes(&*db),
+            fingerprint: fork::base_fingerprint(&*db),
+        }
+    }
+
     /// Thaws the base and gives the database back, its revision raised above every layer
     /// revision handed out, when no layer of it and no other handle of it lives. Otherwise
     /// returns the frozen base with [`EngineError::InUse`] at once, changing nothing.
@@ -163,7 +245,12 @@ impl<Db: EngineDb> Frozen<Db> {
             Ok(base) => base,
             Err(base) => return Err((Frozen { base }, EngineError::InUse)),
         };
-        let Base { db, root, revision } = base;
+        let Base {
+            db,
+            root,
+            revision,
+            created,
+        } = base;
         let mut db = db.into_inner().unwrap_or_else(PoisonError::into_inner);
         match fork::try_thaw(&mut db) {
             Ok(_) => Ok(db),
@@ -173,6 +260,7 @@ impl<Db: EngineDb> Frozen<Db> {
                         db: Mutex::new(db),
                         root,
                         revision,
+                        created,
                     }),
                 },
                 EngineError::InUse,
@@ -182,6 +270,13 @@ impl<Db: EngineDb> Frozen<Db> {
 }
 
 /// A layer that takes writes: made by [`SealedLayer::child`], ended by [`OpenLayer::seal`].
+///
+/// The order the Engine allows is: every write first ([`OpenLayer::write`],
+/// [`OpenLayer::create`]), then the queries, through the database [`OpenLayer::db`] lends. Once
+/// `db` was called the layer takes no further write ([`EngineError::Lent`]), and while a clone of
+/// its database lives no write either ([`EngineError::InUse`]). A query that ran on a layer, in
+/// salsa or in a cache outside it keyed by the layer's revision, therefore never sees the layer
+/// change under it.
 ///
 /// # Contract
 /// - C1: the Engine's API hands out no owned database handle: `db` lends a `LayerDb` guard of an
@@ -201,12 +296,21 @@ impl<Db: EngineDb> Frozen<Db> {
 ///   tested: tests/layers.rs seal_refuses_while_a_db_clone_lives
 ///   tested: tests/layers.rs thaw_refuses_instead_of_waiting
 ///   tested: tests/layers.rs a_clone_escaping_read_is_refused
+/// - C4: writes come before queries. `write` and `create` with a clone of the layer's database
+///   alive return `InUse` and do not wait, so no query escaped through the guard runs alongside
+///   a write; after `db` was called they return `Lent`; either way the layer is unchanged. A
+///   write that still reaches the layer after a query ran in it, past these checks (through
+///   salsa's fork API), panics.
+///   tested: tests/layers.rs a_write_refuses_while_a_db_clone_lives
+///   tested: tests/layers.rs a_write_after_the_database_was_lent_is_refused
 pub struct OpenLayer<Db: EngineDb> {
     base: Arc<Base<Db>>,
     parent: Arc<Node<Db::File>>,
     layer: Arc<Layer>,
     db: Box<Db>,
     files: Vec<Db::File>,
+    /// Whether `db` was called: from then on the layer takes no write (C4).
+    lent: AtomicBool,
 }
 
 impl<Db: EngineDb> fmt::Debug for OpenLayer<Db> {
@@ -221,22 +325,76 @@ impl<Db: EngineDb> fmt::Debug for OpenLayer<Db> {
 impl<Db: EngineDb> OpenLayer<Db> {
     /// Lends the layer's database: a handle whose reads resolve through this layer and its
     /// ancestors. The guard borrows the layer, so the layer cannot be sealed while it lives.
+    /// From the first call on, the layer takes no write ([`EngineError::Lent`]).
     pub fn db(&self) -> LayerDb<'_, Db> {
+        self.lent.store(true, Ordering::Release);
         LayerDb { db: &self.db }
     }
 
-    /// Sets the text of `file` in this layer.
+    /// Refuses a write: `InUse` with a clone of the layer's database alive, `Lent` once `db`
+    /// was called (C4).
+    fn check_writable(&self) -> Result<(), EngineError> {
+        if Arc::strong_count(&self.layer) != OWN_REFERENCES {
+            return Err(EngineError::InUse);
+        }
+        if self.lent.load(Ordering::Acquire) {
+            return Err(EngineError::Lent);
+        }
+        Ok(())
+    }
+
+    /// Sets the text of `file` in this layer. Refused, with the layer unchanged, while a clone
+    /// of its database lives (`InUse`) or once its database was lent (`Lent`).
     ///
     /// # Contract
     /// - C1: after `write(file, text)` the layer, its children and reads of it see `text` for
     ///   `file`, while the base, the parent and a sibling keep their texts; `files` of the sealed
     ///   layer lists `file` once, however often it was written.
     ///   tested: tests/layers.rs a_write_is_seen_by_its_chain_only
-    pub fn write(&mut self, file: Db::File, text: impl Into<Arc<str>>) {
+    pub fn write(&mut self, file: Db::File, text: impl Into<Arc<str>>) -> Result<(), EngineError> {
+        self.check_writable()?;
         self.db.set_file_text_in_layer(file, text.into());
         if !self.files.contains(&file) {
             self.files.push(file);
         }
+        Ok(())
+    }
+
+    /// Creates `file`, which the database does not know, with `text` in this layer, without a
+    /// write lock on the base. Refused as [`OpenLayer::write`] is (C4 of the type).
+    ///
+    /// # Contract
+    /// - C1: with another handle of the base alive the call returns (it never waits), and the
+    ///   layer and its children read `text` for `file`.
+    ///   tested: tests/ra.rs creating_a_file_in_a_layer_never_waits
+    /// - C2: two layers of one base that create the same file, siblings or a layer and its
+    ///   descendant, each read their own text for it; neither panics.
+    ///   tested: tests/ra.rs two_layers_create_the_same_file
+    ///
+    /// A file created by a layer stays in the base's file map after a thaw (rust-analyzer's
+    /// `Files` is shared by every handle); creating it again under a later freeze is a write of
+    /// a known file, which panics on a layered handle: use [`OpenLayer::write`] for it.
+    pub fn create(&mut self, file: Db::File, text: impl Into<Arc<str>>) -> Result<(), EngineError> {
+        self.check_writable()?;
+        let text = text.into();
+        // The registry's lock is held over the creation, so two layers creating the same file
+        // at once do not both take the vacant path.
+        let mut created = self.base.created();
+        if created.insert(file) {
+            self.db.create_file_in_layer(file, text);
+        } else {
+            drop(created);
+            self.db.set_file_text_in_layer(file, text);
+        }
+        if !self.files.contains(&file) {
+            self.files.push(file);
+        }
+        Ok(())
+    }
+
+    /// The layer's own counters (memos, stamps, deep verifies, tracked-struct entries).
+    pub fn stats(&self) -> fork::LayerStats {
+        self.layer.stats()
     }
 
     /// The layer's revision: unique in the process, above its parent's and the base's.
@@ -256,6 +414,7 @@ impl<Db: EngineDb> OpenLayer<Db> {
             layer,
             db,
             files,
+            lent: _,
         } = self;
         drop(db);
         layer.seal();
@@ -320,6 +479,7 @@ impl<Db: EngineDb> SealedLayer<Db> {
             layer,
             db: Box::new(db),
             files: Vec::new(),
+            lent: AtomicBool::new(false),
         }
     }
 
@@ -358,5 +518,10 @@ impl<Db: EngineDb> SealedLayer<Db> {
     /// The layer's revision: unique in the process, above its parent's and the base's.
     pub fn revision(&self) -> Revision {
         self.node.layer.revision()
+    }
+
+    /// The layer's own counters (memos, stamps, deep verifies, tracked-struct entries).
+    pub fn stats(&self) -> fork::LayerStats {
+        self.node.layer.stats()
     }
 }

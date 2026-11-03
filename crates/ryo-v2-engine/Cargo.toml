@@ -17,8 +17,19 @@ workspace = true
 [dependencies]
 salsa = { workspace = true, features = ["fork"] }
 thiserror.workspace = true
+# The Engine is bound to rust-analyzer's database (D11, stage 2): a fork is a `RootDatabase`
+# handle with a layer, and a file text is written into the layer's `FileText` input.
+ra_ap_base_db.workspace = true
+ra_ap_ide_db.workspace = true
+# rust-analyzer keeps file texts as `triomphe::Arc<str>`.
+triomphe.workspace = true
 
 [dev-dependencies]
 # The test databases use salsa's macros; both features are among those rust-analyzer enables.
 salsa = { workspace = true, features = ["fork", "macros", "inventory"] }
 trybuild = "1.0.116"
+# The differential gate (V2) loads sessions and runs the flat reference check through the adapter.
+ryo-v2-ra.workspace = true
+ryo-v2-core.workspace = true
+ra_ap_ide.workspace = true
+ra_ap_hir_ty.workspace = true

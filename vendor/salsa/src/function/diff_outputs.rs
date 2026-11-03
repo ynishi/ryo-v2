@@ -1,7 +1,8 @@
 use crate::active_query::CompletedQuery;
 use crate::function::memo::MemoHeader;
 use crate::hash::FxIndexSet;
-use crate::zalsa::Zalsa;
+// ryo-v2 fork: stale outputs are removed through the handle's view
+use crate::fork::ZalsaView;
 use crate::zalsa_local::{QueryOriginRef, output_edges};
 use crate::{DatabaseKeyIndex, Event, EventKind};
 
@@ -10,7 +11,8 @@ impl MemoHeader {
     /// was generated before but is not generated now.
     pub(super) fn diff_outputs(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer stale outputs are tombstoned in the layer
+        zalsa: &ZalsaView,
         key: DatabaseKeyIndex,
         completed_query: &CompletedQuery,
     ) {
@@ -45,7 +47,8 @@ impl MemoHeader {
     }
 }
 
-fn report_stale_output(zalsa: &Zalsa, key: DatabaseKeyIndex, output: DatabaseKeyIndex) {
+// ryo-v2 fork: the view; under a layer the output is tombstoned in the layer
+fn report_stale_output(zalsa: &ZalsaView, key: DatabaseKeyIndex, output: DatabaseKeyIndex) {
     zalsa.event(&|| {
         Event::new(EventKind::WillDiscardStaleOutput {
             execute_key: key,

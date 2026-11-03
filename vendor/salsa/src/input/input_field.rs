@@ -8,6 +8,8 @@ use crate::input::{Configuration, IngredientImpl, Value};
 use crate::sync::Arc;
 use crate::table::memo::MemoTableTypes;
 use crate::zalsa::{IngredientIndex, JarKind, Zalsa};
+// ryo-v2 fork: a field's revision is read through the handle's layer
+use crate::fork::ZalsaView;
 use crate::zalsa_local::QueryEdge;
 use crate::{DatabaseKeyIndex, Id, Revision};
 
@@ -41,6 +43,11 @@ where
     fn database_key_index(&self, id: Id) -> DatabaseKeyIndex {
         DatabaseKeyIndex::new(self.index, id)
     }
+
+    // ryo-v2 fork: the input struct's ingredient (`new` takes the successor `field_index`)
+    fn input_ingredient_index(&self) -> IngredientIndex {
+        IngredientIndex::new(self.index.as_u32() - 1 - self.field_index as u32)
+    }
 }
 
 impl<C> Ingredient for FieldIngredientImpl<C>
@@ -57,11 +64,19 @@ where
 
     unsafe fn maybe_changed_after(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the field's revision is the chain's (E1)
+        zalsa: &ZalsaView,
         _db: crate::database::RawDatabase<'_>,
         input: Id,
         revision: Revision,
     ) -> VerifyResult {
+        // ryo-v2 fork: the newest revision of the field on the layer's chain, else the slot's
+        if let Some(entry) = zalsa
+            .layer()
+            .and_then(|layer| layer.input::<C>(self.input_ingredient_index(), input))
+        {
+            return VerifyResult::changed_if(entry.revisions[self.field_index] > revision);
+        }
         let value = <IngredientImpl<C>>::data(zalsa, input);
         VerifyResult::changed_if(value.revisions[self.field_index] > revision)
     }
@@ -85,7 +100,8 @@ where
 
     fn flatten_cycle_head_dependencies(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &ZalsaView,
         id: Id,
         flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         _seen: &mut FxHashSet<crate::DatabaseKeyIndex>,

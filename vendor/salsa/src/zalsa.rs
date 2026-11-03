@@ -9,10 +9,10 @@ use rustc_hash::FxHashMap;
 use crate::fork::{ForkState, ZalsaView};
 use crate::hash::TypeIdHasher;
 use crate::ingredient::{Ingredient, Jar};
-use crate::plumbing::SalsaStructInDb;
+// ryo-v2 fork: `SalsaStructInDb` is used by `ZalsaView::memo_table_for`
 use crate::runtime::Runtime;
 use crate::table::Table;
-use crate::table::memo::MemoTableWithTypes;
+// ryo-v2 fork: `MemoTableWithTypes` is used by `ZalsaView::memo_table_for`
 use crate::views::Views;
 use crate::zalsa_local::ZalsaLocal;
 use crate::{Database, Durability, Id, Revision};
@@ -262,12 +262,8 @@ impl Zalsa {
         self.runtime.table_mut()
     }
 
-    /// Returns the [`MemoTable`][] for the salsa struct with the given id
-    pub(crate) fn memo_table_for<T: SalsaStructInDb>(&self, id: Id) -> MemoTableWithTypes<'_> {
-        // SAFETY: We are supplying the correct current revision.
-        // ryo-v2 fork: memo tables are not routed through a layer yet (step 2b)
-        unsafe { T::memo_table(self, id, self.unrouted_revision()) }
-    }
+    // ryo-v2 fork: `memo_table_for` is `ZalsaView::memo_table_for`, which reads a base slot
+    // under a layer without taking its read lock
 
     /// Returns the ingredient at the given index, or panics if it is out-of-bounds.
     #[inline]

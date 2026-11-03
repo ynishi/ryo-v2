@@ -39,6 +39,10 @@ impl EngineDb for Db {
     fn set_file_text_in_layer(&self, file: FileText, text: Arc<str>) {
         salsa::fork::set_input_field::<FileText, _>(self, file, 0, |fields| fields.0 = text);
     }
+
+    fn create_file_in_layer(&mut self, _file: FileText, _text: Arc<str>) {
+        unreachable!("a file of this test database is an input created by the test")
+    }
 }
 
 #[salsa::tracked(returns(copy))]
@@ -78,8 +82,8 @@ fn a_write_is_seen_by_its_chain_only() {
     let root = frozen.root();
 
     let mut f = root.child();
-    f.write(file, "f1");
-    f.write(file, "f2");
+    f.write(file, "f1").expect("f is writable");
+    f.write(file, "f2").expect("f is writable");
     assert_eq!(&*f.db().file_text(file), "f2");
     let sibling = root.child();
     assert_eq!(&*sibling.db().file_text(file), "a");
@@ -101,7 +105,7 @@ fn seal_refuses_while_a_db_clone_lives() {
     let (db, file) = base();
     let frozen = Engine::freeze(db);
     let mut open = frozen.root().child();
-    open.write(file, "b");
+    open.write(file, "b").expect("the layer is writable");
     let clone = Db::clone(&open.db());
 
     let (open, error) = within_timeout(move || refused(open.seal()));
@@ -114,11 +118,65 @@ fn seal_refuses_while_a_db_clone_lives() {
 }
 
 #[test]
+fn a_write_refuses_while_a_db_clone_lives() {
+    // A clone escaped through the guard could run a query while the layer is written: the
+    // write refuses at once and changes nothing, for `write` and `create` alike.
+    let (db, file) = base();
+    let frozen = Engine::freeze(db);
+    let mut open = frozen.root().child();
+    open.write(file, "b").expect("the layer is writable");
+    let clone = Db::clone(&open.db());
+
+    let (open, error) = within_timeout(move || {
+        let mut open = open;
+        let error = open.write(file, "c").expect_err("a clone lives");
+        (open, error)
+    });
+    assert_eq!(error, EngineError::InUse);
+    let mut open = open;
+    assert_eq!(open.create(file, "d"), Err(EngineError::InUse));
+    assert_eq!(&*clone.file_text(file), "b");
+    assert_eq!(&*open.db().file_text(file), "b");
+
+    drop(clone);
+    let sealed = open.seal().expect("the clone is gone");
+    assert_eq!(&*sealed.text(file), "b");
+    assert_eq!(sealed.files(), vec![file]);
+}
+
+#[test]
+fn a_write_after_the_database_was_lent_is_refused() {
+    // Writes come before queries: once `db` lent the layer's database (a query, or trait
+    // solving outside salsa keyed by the layer's revision, may have run), the layer takes no
+    // write, even with the guard and every clone gone.
+    let (db, file) = base();
+    let frozen = Engine::freeze(db);
+    let mut open = frozen.root().child();
+    open.write(file, "b").expect("no database lent yet");
+    assert_eq!(length(&*open.db(), file), 1);
+    assert_eq!(open.write(file, "cc"), Err(EngineError::Lent));
+    assert_eq!(open.create(file, "dd"), Err(EngineError::Lent));
+    assert_eq!(&*open.db().file_text(file), "b");
+    assert_eq!(length(&*open.db(), file), 1);
+
+    // Lending alone refuses too, with no query run.
+    let mut fresh = frozen.root().child();
+    let _ = fresh.db();
+    assert_eq!(fresh.write(file, "e"), Err(EngineError::Lent));
+
+    // The write goes into a child once the layer is sealed.
+    let sealed = open.seal().expect("no clone alive");
+    let mut child = sealed.child();
+    child.write(file, "cc").expect("a new layer is writable");
+    assert_eq!(length(&*child.db(), file), 2);
+}
+
+#[test]
 fn a_clone_escaping_read_is_refused() {
     let (db, file) = base();
     let frozen = Engine::freeze(db);
     let mut open = frozen.root().child();
-    open.write(file, "b");
+    open.write(file, "b").expect("the layer is writable");
     let sealed = open.seal().unwrap();
 
     let mut escaped = None;
@@ -164,7 +222,9 @@ fn refreeze_after_base_writes_keeps_layers_above_the_base() {
     assert_eq!(length(&db, file), 1);
     let frozen = Engine::freeze(db);
     let mut first = frozen.root().child();
-    first.write(file, "in a layer");
+    first
+        .write(file, "in a layer")
+        .expect("the layer is writable");
     let first_revision = first.revision();
     drop(first);
     let mut db = frozen.thaw().unwrap();
@@ -180,7 +240,7 @@ fn refreeze_after_base_writes_keeps_layers_above_the_base() {
     assert_eq!(frozen.base_revision(), base_revision);
     let mut layer = frozen.root().child();
     assert!(layer.revision() > base_revision);
-    layer.write(file, "eeee");
+    layer.write(file, "eeee").expect("the layer is writable");
     // Every memo of the base was verified at or before the base's revision; the layer's write
     // is newer than that, so it invalidates them in the layer.
     let db = layer.db();

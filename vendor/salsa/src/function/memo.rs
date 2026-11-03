@@ -11,15 +11,73 @@ use crate::key::DatabaseKeyIndex;
 use crate::revision::AtomicRevision;
 use crate::sync::atomic::Ordering;
 use crate::table::memo::{DummyMemo, MemoSlot, MemoTableWithTypesMut, ToDynMemo};
-use crate::zalsa::{MemoIngredientIndex, Zalsa};
+// ryo-v2 fork: memo reads, stamps and inserts route through the handle's layer
+use crate::fork::{ChainMemo, Layer, ZalsaView};
+use crate::table::memo::MemoEntryType;
+use crate::zalsa::{IngredientIndex, MemoIngredientIndex, Zalsa};
 use crate::zalsa_local::{QueryOriginRef, QueryRevisions};
 use crate::{Cancelled, Event, EventKind, Id, Revision};
+
+// ryo-v2 fork: a memo a layer holds, as the configuration's memo type
+pub(super) fn downcast_layer_memo<C: Configuration>(
+    memo: &dyn crate::table::memo::Memo,
+) -> &Memo<C> {
+    let memo: &dyn std::any::Any = memo;
+    memo.downcast_ref::<Memo<C>>()
+        .expect("ryo-v2 fork: a layer's memo has its function's memo type")
+}
+
+// ryo-v2 fork: a type-erased handle of a memo a layer holds (a layer stores memos as `dyn Memo`)
+fn erase_layer_memo<C: Configuration>(memo: &dyn crate::table::memo::Memo) -> ErasedMemo<'_> {
+    let memo = downcast_layer_memo::<C>(memo);
+    // SAFETY: `memo` is a whole `Memo<C>` allocation (a layer boxes each memo), so the pointer is
+    // its base address with provenance over the allocation, valid for shared access for the
+    // borrow; `to_dyn_fn` and the `TypeId` are those of `Memo<C>`.
+    unsafe {
+        ErasedMemo::from_raw_parts(
+            std::ptr::NonNull::from(memo).cast::<DummyMemo>(),
+            MemoEntryType::to_dyn_fn::<Memo<C>>(),
+            std::any::TypeId::of::<Memo<C>>(),
+        )
+    }
+}
+
+// ryo-v2 fork: a memo slot as a handle sees it: under a layer the chain first (newest layer
+// first, stopping at a tombstone of the id), then the base slot.
+pub(crate) struct FnMemoSlot<'db> {
+    base: MemoSlot<'db>,
+    layer: Option<LayerSlot<'db>>,
+}
+
+// ryo-v2 fork: the layer part of a `FnMemoSlot`
+struct LayerSlot<'db> {
+    layer: &'db Layer,
+    function: IngredientIndex,
+    id: Id,
+    erase: for<'m> fn(&'m dyn crate::table::memo::Memo) -> ErasedMemo<'m>,
+}
+
+impl<'db> FnMemoSlot<'db> {
+    // ryo-v2 fork: the memo of the slot as the handle sees it
+    #[inline]
+    pub(crate) fn get_erased(&self) -> Option<ErasedMemo<'db>> {
+        if let Some(slot) = &self.layer {
+            match slot.layer.find_memo(slot.function, slot.id) {
+                ChainMemo::Found(memo) => return Some((slot.erase)(memo)),
+                ChainMemo::Hidden => return None,
+                ChainMemo::NotInLayers => {}
+            }
+        }
+        self.base.get_erased()
+    }
+}
 
 impl<C: Configuration> IngredientImpl<C> {
     /// Inserts the memo for the given key; (atomically) overwrites and returns any previously existing memo
     pub(super) fn insert_memo_into_table_for(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view of a base handle (`insert_memo` routes a layer's memos)
+        zalsa: &ZalsaView,
         id: Id,
         memo: NonNull<Memo<C>>,
         memo_ingredient_index: MemoIngredientIndex,
@@ -34,10 +92,19 @@ impl<C: Configuration> IngredientImpl<C> {
     /// become outdated if other threads store into the `memo_map`.
     pub(super) fn get_memo_from_table_for<'db>(
         &self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; under a layer the chain's memos come first (E1)
+        zalsa: &'db ZalsaView,
         id: Id,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> Option<&'db Memo<C>> {
+        // ryo-v2 fork: the newest memo on the layer's chain, unless the chain tombstoned `id`
+        if let Some(layer) = zalsa.layer() {
+            match layer.find_memo(self.index, id) {
+                ChainMemo::Found(memo) => return Some(downcast_layer_memo::<C>(memo)),
+                ChainMemo::Hidden => return None,
+                ChainMemo::NotInLayers => {}
+            }
+        }
         let memo = zalsa
             .memo_table_for::<C::SalsaStruct<'_>>(id)
             .get(memo_ingredient_index)?;
@@ -45,19 +112,52 @@ impl<C: Configuration> IngredientImpl<C> {
         Some(unsafe { memo.as_ref() })
     }
 
-    pub(super) fn memo_slot<'db>(
+    // ryo-v2 fork: the base table's memo, for the paths with exclusive access to a base
+    // (serialization), which no layer reaches
+    pub(super) fn get_memo_from_base_table_for<'db>(
         &self,
         zalsa: &'db Zalsa,
         id: Id,
         memo_ingredient_index: MemoIngredientIndex,
-    ) -> MemoSlot<'db> {
+    ) -> Option<&'db Memo<C>> {
+        // SAFETY: We are supplying the base's current revision.
+        let memo = unsafe {
+            <C::SalsaStruct<'_> as crate::salsa_struct::SalsaStructInDb>::memo_table(
+                zalsa,
+                id,
+                zalsa.base_revision(),
+            )
+        }
+        .get(memo_ingredient_index)?;
+        // SAFETY: The memo table owns this allocation for at least `'db`.
+        Some(unsafe { memo.as_ref() })
+    }
+
+    pub(super) fn memo_slot<'db>(
+        &self,
+        // ryo-v2 fork: the view; under a layer the slot reads the chain first (E1)
+        zalsa: &'db ZalsaView,
+        id: Id,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) -> FnMemoSlot<'db> {
         // SAFETY: The table stores 'static memos (to support `Any`), but the memos remain valid
         // for `'db` because dropping them is delayed until the end of the revision.
-        unsafe {
+        // ryo-v2 fork: the base slot, read after the layer's chain
+        let base = unsafe {
             MemoSlot::new(
                 zalsa.memo_table_for::<C::SalsaStruct<'_>>(id),
                 memo_ingredient_index,
             )
+        };
+        // ryo-v2 fork: a layered handle's slot reads the chain, then the base slot
+        FnMemoSlot {
+            base,
+            layer: zalsa.layer().map(|layer| LayerSlot {
+                layer: &**layer,
+                function: self.index,
+                id,
+                erase: erase_layer_memo::<C>,
+            }),
         }
     }
 
@@ -268,22 +368,88 @@ impl MemoHeader {
     /// The caller is responsible to update the memo's `accumulated` state if their accumulated
     /// values have changed since.
     #[inline]
-    pub(super) fn mark_as_verified(&self, zalsa: &Zalsa, database_key_index: DatabaseKeyIndex) {
+    // ryo-v2 fork: the view; under a layer a memo of the layer is stamped in its header (it is
+    // already at the layer's revision), any other memo in the layer's stamp map
+    pub(super) fn mark_as_verified(&self, zalsa: &ZalsaView, database_key_index: DatabaseKeyIndex) {
         zalsa.event(&|| {
             Event::new(EventKind::DidValidateMemoizedValue {
                 database_key: database_key_index,
             })
         });
 
-        // ryo-v2 fork: a stamp is a base write, refused while the base is frozen; under a layer
-        // unreachable (stub in `fetch`), step 2b
-        zalsa.fork().assert_not_frozen("a memo's verified_at");
-        self.verified_at.store(zalsa.unrouted_revision());
+        // ryo-v2 fork: under a layer, a stamp of the layer (E1, E2); without one a stamp is a
+        // base write, refused while the base is frozen
+        match zalsa.layer() {
+            Some(layer) => {
+                if self.verified_at.load() != layer.revision() {
+                    layer.stamp(self.address());
+                }
+            }
+            None => {
+                zalsa.fork().assert_not_frozen("a memo's verified_at");
+                self.verified_at.store(zalsa.current_revision());
+            }
+        }
+    }
+
+    // ryo-v2 fork: the key of the memo's stamps in a layer: the header's address, stable while
+    // the base is frozen (base memos are freed only at a new base revision) and while the layer
+    // that owns it lives (its descendants hold it). A layer's stamps are read only under the
+    // freeze it was made in (`fork::set_layer` refuses a layer of an earlier freeze), so an
+    // address the base freed and reused after a thaw never meets a stale stamp
+    #[inline]
+    fn address(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
+    // ryo-v2 fork: the revision the memo was last verified at, as the handle sees it: under a
+    // layer the newest stamp on the chain, else the header's own. A memo the layer owns carries
+    // the layer's revision in its header (every memo is created at the handle's current
+    // revision, and a layer's revision is above every revision of its ancestors and base)
+    #[inline]
+    pub(super) fn load_verified_at(&self, zalsa: &ZalsaView) -> Revision {
+        let own = self.verified_at.load();
+        match zalsa.layer() {
+            Some(layer) if own != layer.revision() => layer.stamp_of(self.address()).unwrap_or(own),
+            _ => own,
+        }
+    }
+
+    // ryo-v2 fork: whether the handle may store into this memo's header (`verified_final`,
+    // accumulated inputs, cycle-iteration counts, cycle heads): without a layer as upstream,
+    // refused (panic) while the base is frozen; under a layer only a memo the layer owns, so an
+    // ancestor's or the base's memo is never written (E2). `false` means: skip the store.
+    #[inline]
+    pub(super) fn may_write(&self, zalsa: &ZalsaView, what: &str) -> bool {
+        match zalsa.layer() {
+            Some(layer) => {
+                if self.verified_at.load() == layer.revision() {
+                    layer.assert_open(what);
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                zalsa.fork().assert_not_frozen(what);
+                true
+            }
+        }
+    }
+
+    // ryo-v2 fork: whether this memo was created by the handle's layer (always, without a layer)
+    #[inline]
+    pub(super) fn is_owned(&self, zalsa: &ZalsaView) -> bool {
+        match zalsa.layer() {
+            Some(layer) => self.verified_at.load() == layer.revision(),
+            None => true,
+        }
     }
 
     pub(super) fn mark_outputs_as_verified(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view, whose layer the outputs are marked in
+        zalsa: &ZalsaView,
         database_key_index: DatabaseKeyIndex,
     ) {
         for output in self.revisions.origin().outputs() {
@@ -320,7 +486,8 @@ impl MemoHeader {
         }
     }
 
-    pub(super) fn remove_outputs(&self, zalsa: &Zalsa, executor: DatabaseKeyIndex) {
+    // ryo-v2 fork: the view, whose layer the outputs are removed in (tombstoned)
+    pub(super) fn remove_outputs(&self, zalsa: &ZalsaView, executor: DatabaseKeyIndex) {
         for stale_output in self.revisions.origin().outputs() {
             stale_output.remove_stale_output(zalsa, executor);
         }
@@ -372,7 +539,8 @@ impl<C: Configuration> crate::table::memo::Memo for Memo<C> {
         self.value.is_some()
     }
 
-    fn remove_outputs(&self, zalsa: &Zalsa, executor: DatabaseKeyIndex) {
+    // ryo-v2 fork: the view, whose layer the outputs are removed in (tombstoned)
+    fn remove_outputs(&self, zalsa: &ZalsaView, executor: DatabaseKeyIndex) {
         self.header.remove_outputs(zalsa, executor);
     }
 
@@ -534,13 +702,15 @@ pub(super) enum TryClaimHeadsResult {
 
 /// Iterator to try claiming the transitive cycle heads of a memo.
 pub(super) struct TryClaimCycleHeadsIter<'a> {
-    zalsa: &'a Zalsa,
+    // ryo-v2 fork: the view, whose layer the heads are claimed and read in
+    zalsa: &'a ZalsaView,
 
     cycle_heads: CycleHeadsIterator<'a>,
 }
 
 impl<'a> TryClaimCycleHeadsIter<'a> {
-    pub(super) fn new(zalsa: &'a Zalsa, cycle_heads: &'a CycleHeads) -> Self {
+    // ryo-v2 fork: the view, whose layer the heads are claimed and read in
+    pub(super) fn new(zalsa: &'a ZalsaView, cycle_heads: &'a CycleHeads) -> Self {
         Self {
             zalsa,
 
@@ -589,8 +759,8 @@ impl Iterator for TryClaimCycleHeadsIter<'_> {
                         iteration,
                         verified_at,
                     } => {
-                        // ryo-v2 fork: unreachable under a layer (stub in `fetch`), step 2b
-                        if verified_at == self.zalsa.unrouted_revision()
+                        // ryo-v2 fork: the handle's revision (the layer's)
+                        if verified_at == self.zalsa.current_revision()
                             && iteration.cancellation_count()
                                 == self.zalsa.runtime().cancellation_count()
                         {
@@ -686,7 +856,8 @@ mod _memory_usage {
             unimplemented!()
         }
 
-        fn id_to_input(_: &Zalsa, _: Id) -> Self::Input<'_> {
+        // ryo-v2 fork: the view (see the trait)
+        fn id_to_input(_: &crate::fork::ZalsaView, _: Id) -> Self::Input<'_> {
             unimplemented!()
         }
 

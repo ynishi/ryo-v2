@@ -18,8 +18,11 @@ use crate::plumbing::{self, MemoIngredientMap};
 use crate::salsa_struct::SalsaStructInDb;
 use crate::sync::Arc;
 use crate::table::Table;
-use crate::table::memo::{MemoSlot, MemoTableTypes};
+// ryo-v2 fork: the memo slot is `memo::FnMemoSlot`, built by `memo_slot`
+use crate::table::memo::MemoTableTypes;
 use crate::views::DatabaseDownCaster;
+// ryo-v2 fork: memo reads and writes take the handle's view
+use crate::fork::ZalsaView;
 use crate::zalsa::{IngredientIndex, JarKind, MemoIngredientIndex, Zalsa};
 use crate::zalsa_local::QueryEdge;
 use crate::{Cycle, Id, Revision};
@@ -84,7 +87,8 @@ pub unsafe trait Configuration: Any {
 
     /// Convert from the id used internally to the value that execute is expecting.
     /// This is a no-op if the input to the function is a salsa struct.
-    fn id_to_input(zalsa: &Zalsa, key: Id) -> Self::Input<'_>;
+    // ryo-v2 fork: the view, so that an interned key is read as the handle's layer sees it
+    fn id_to_input(zalsa: &ZalsaView, key: Id) -> Self::Input<'_>;
 
     /// Returns the size of any heap allocations in the output value, in bytes.
     fn heap_size(_value: &Self::Output<'_>) -> Option<usize> {
@@ -172,7 +176,8 @@ impl<'db> FunctionIngredientRef<'db> {
         Self { ingredient }
     }
 
-    pub(crate) fn memo(&self, zalsa: &'db Zalsa, input: Id) -> Option<ErasedMemo<'db>> {
+    // ryo-v2 fork: the view; under a layer the chain's memo
+    pub(crate) fn memo(&self, zalsa: &'db ZalsaView, input: Id) -> Option<ErasedMemo<'db>> {
         self.ingredient.memo(zalsa, input)
     }
 
@@ -188,7 +193,8 @@ impl<'db> FunctionIngredientRef<'db> {
     /// Returns `None` if `input` doesn't exist.
     pub(crate) fn provisional_status(
         &self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; under a layer the chain's memo and its stamped `verified_at`
+        zalsa: &'db ZalsaView,
         input: Id,
     ) -> Option<ProvisionalStatus<'db>> {
         self.ingredient.provisional_status(zalsa, input)
@@ -196,7 +202,8 @@ impl<'db> FunctionIngredientRef<'db> {
 }
 
 pub(crate) trait FunctionIngredient: Send + Sync {
-    fn memo<'db>(&'db self, zalsa: &'db Zalsa, input: Id) -> Option<ErasedMemo<'db>>;
+    // ryo-v2 fork: the view; under a layer the chain's memo
+    fn memo<'db>(&'db self, zalsa: &'db ZalsaView, input: Id) -> Option<ErasedMemo<'db>>;
 
     fn sync_table(&self) -> &SyncTable;
 
@@ -208,7 +215,8 @@ pub(crate) trait FunctionIngredient: Send + Sync {
     /// Returns `None` if `input` doesn't exist.
     fn provisional_status<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; under a layer the chain's memo and its stamped `verified_at`
+        zalsa: &'db ZalsaView,
         input: Id,
     ) -> Option<ProvisionalStatus<'db>>;
 }
@@ -327,17 +335,23 @@ where
 
     fn insert_memo<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; under a layer the memo goes into the layer (E2, E9)
+        zalsa: &'db ZalsaView,
         id: Id,
         mut memo: memo::Memo<C>,
         memo_ingredient_index: MemoIngredientIndex,
     ) -> &'db memo::Memo<C> {
-        // ryo-v2 fork: a memo insert into a table slot is a base write, refused while the base is
-        // frozen; under a layer unreachable (stub in `fetch`), step 2b
-        zalsa.fork().assert_not_frozen("a memo insert");
         if let Some(tracked_struct_ids) = memo.header.revisions.tracked_struct_ids_mut() {
             tracked_struct_ids.shrink_to_fit();
         }
+        // ryo-v2 fork: under a layer the memo is the layer's (it keeps every memo it replaces
+        // until it is dropped); without one a memo insert into a table slot is a base write,
+        // refused while the base is frozen
+        if let Some(layer) = zalsa.layer() {
+            let stored = layer.insert_memo(self.index, id, Box::new(memo));
+            return memo::downcast_layer_memo::<C>(stored);
+        }
+        zalsa.fork().assert_not_frozen("a memo insert");
 
         // We convert to a `NonNull` here as soon as possible because we are going to alias
         // into the `Box`, which is a `noalias` type.
@@ -374,17 +388,10 @@ impl<C> FunctionIngredient for IngredientImpl<C>
 where
     C: Configuration,
 {
-    fn memo<'db>(&'db self, zalsa: &'db Zalsa, input: Id) -> Option<ErasedMemo<'db>> {
-        // SAFETY: `self` is borrowed for `'db`, so `deleted_entries` retains every allocation
-        // observed in this slot for that lifetime.
-        let memo_slot = unsafe {
-            MemoSlot::new(
-                zalsa.memo_table_for::<C::SalsaStruct<'_>>(input),
-                self.memo_ingredient_index(zalsa, input),
-            )
-        };
-
-        memo_slot.get_erased()
+    // ryo-v2 fork: the view; under a layer the chain's memo (`memo_slot` reads it)
+    fn memo<'db>(&'db self, zalsa: &'db ZalsaView, input: Id) -> Option<ErasedMemo<'db>> {
+        self.memo_slot(zalsa, input, self.memo_ingredient_index(zalsa, input))
+            .get_erased()
     }
 
     fn sync_table(&self) -> &SyncTable {
@@ -398,7 +405,8 @@ where
     /// heads).
     fn provisional_status<'db>(
         &'db self,
-        zalsa: &'db Zalsa,
+        // ryo-v2 fork: the view; under a layer the chain's memo and its stamped `verified_at`
+        zalsa: &'db ZalsaView,
         input: Id,
     ) -> Option<ProvisionalStatus<'db>> {
         let memo =
@@ -407,11 +415,13 @@ where
         if memo.value.is_none() && memo.header.may_be_provisional() {
             return Some(ProvisionalStatus::Poisoned {
                 iteration: memo.header.revisions.iteration(),
-                verified_at: memo.header.verified_at.load(),
+                // ryo-v2 fork: as the handle sees it
+                verified_at: memo.header.load_verified_at(zalsa),
             });
         }
 
-        Some(memo.header.provisional_status())
+        // ryo-v2 fork: as the handle sees it
+        Some(memo.header.provisional_status(zalsa))
     }
 }
 
@@ -429,7 +439,8 @@ where
 
     unsafe fn maybe_changed_after(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's); the db's own view is used below
+        _zalsa: &ZalsaView,
         db: RawDatabase<'_>,
         input: Id,
         revision: Revision,
@@ -463,7 +474,8 @@ where
 
     fn flatten_cycle_head_dependencies(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the chain's memos
+        zalsa: &ZalsaView,
         id: Id,
         flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         seen: &mut FxHashSet<DatabaseKeyIndex>,
@@ -480,7 +492,8 @@ where
 
     fn mark_validated_output(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the stamp is the layer's
+        zalsa: &ZalsaView,
         executor: DatabaseKeyIndex,
         output_key: crate::Id,
     ) {
@@ -492,7 +505,8 @@ where
 
     fn remove_stale_output(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's); nothing is written
+        _zalsa: &ZalsaView,
         _executor: DatabaseKeyIndex,
         _stale_output_key: crate::Id,
     ) {
@@ -561,7 +575,8 @@ where
             let memo_ingredient_index = self.memo_ingredient_indices.get(entry.ingredient_index());
 
             let memo =
-                self.get_memo_from_table_for(zalsa, entry.key_index(), memo_ingredient_index);
+                // ryo-v2 fork: serialization has exclusive access to a base; no layer is read
+                self.get_memo_from_base_table_for(zalsa, entry.key_index(), memo_ingredient_index);
 
             if memo.is_some_and(|memo| memo.should_serialize()) {
                 return true;
@@ -638,7 +653,8 @@ unsafe fn collect_minimum_serialized_edges(
 
 fn flatten_cycle_head_dependencies(
     ingredient: &dyn FunctionIngredient,
-    zalsa: &Zalsa,
+    // ryo-v2 fork: the view; under a layer the chain's memos
+    zalsa: &ZalsaView,
     database_key_index: DatabaseKeyIndex,
     cycle_recovery_strategy: CycleRecoveryStrategy,
     flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
@@ -696,10 +712,21 @@ fn flatten_cycle_head_dependencies(
     }
 }
 
+// ryo-v2 fork: feeds a memo's revisions to `hasher` (isolation check, I2)
+pub(crate) fn fork_memo_fingerprint(memo: ErasedMemo<'_>, hasher: &mut dyn std::hash::Hasher) {
+    let header = memo.header();
+    hasher.write_usize(header.verified_at.load().as_usize());
+    hasher.write_usize(header.revisions.changed_at.as_usize());
+    hasher.write_u8(header.revisions.durability.index() as u8);
+    hasher.write_u8(u8::from(memo.has_value()));
+}
+
 impl memo::MemoHeader {
-    fn provisional_status(&self) -> ProvisionalStatus<'_> {
+    // ryo-v2 fork: the view; `verified_at` as the handle sees it
+    fn provisional_status(&self, zalsa: &ZalsaView) -> ProvisionalStatus<'_> {
         let iteration = self.revisions.iteration();
-        let verified_at = self.verified_at.load();
+        // ryo-v2 fork: as the handle sees it
+        let verified_at = self.load_verified_at(zalsa);
 
         if self.revisions.verified_final.load(Ordering::Relaxed) {
             ProvisionalStatus::Final {
@@ -783,7 +810,8 @@ mod persistence {
                         .memo_ingredient_indices
                         .get(entry.ingredient_index());
 
-                    let memo = ingredient.get_memo_from_table_for(
+                    // ryo-v2 fork: serialization has exclusive access to a base
+                    let memo = ingredient.get_memo_from_base_table_for(
                         zalsa,
                         entry.key_index(),
                         memo_ingredient_index,
@@ -803,7 +831,8 @@ mod persistence {
                     .memo_ingredient_indices
                     .get(entry.ingredient_index());
 
-                let memo = ingredient.get_memo_from_table_for(
+                // ryo-v2 fork: serialization has exclusive access to a base
+                let memo = ingredient.get_memo_from_base_table_for(
                     zalsa,
                     entry.key_index(),
                     memo_ingredient_index,

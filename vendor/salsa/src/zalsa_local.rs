@@ -50,6 +50,10 @@ pub struct ZalsaLocal {
     // ryo-v2 fork: whether `cancelled` is a layer's token, shared by every handle of the layer
     // (src/fork/); `uncancel` then leaves it as it is
     layer_token: bool,
+
+    // ryo-v2 fork: whether this handle disabled cancellation (fixpoint iteration). Kept per
+    // handle, not as a bit of `cancelled`, which a layer's handles share
+    cancellation_disabled: std::cell::Cell<bool>,
 }
 
 /// A cancellation token that can be used to cancel a query computation for a specific local `Database`.
@@ -71,6 +75,8 @@ impl CancellationToken {
     }
 
     #[inline]
+    // ryo-v2 fork: unused, the disabled bit is per handle (`ZalsaLocal::cancellation_disabled`)
+    #[allow(dead_code)]
     fn set_cancellation_disabled(&self, disabled: bool) -> bool {
         let previous_disabled_bit = if disabled {
             self.0.fetch_or(Self::DISABLED_MASK, Ordering::Relaxed)
@@ -80,6 +86,8 @@ impl CancellationToken {
         previous_disabled_bit & Self::DISABLED_MASK != 0
     }
 
+    // ryo-v2 fork: unused, the disabled bit is per handle (`ZalsaLocal::cancellation_disabled`)
+    #[allow(dead_code)]
     fn should_trigger_local_cancellation(&self) -> bool {
         self.0.load(Ordering::Relaxed) == Self::CANCELLED_MASK
     }
@@ -97,6 +105,8 @@ impl ZalsaLocal {
             cancelled: CancellationToken::default(),
             // ryo-v2 fork: a handle's own token, as upstream
             layer_token: false,
+            // ryo-v2 fork: per handle
+            cancellation_disabled: std::cell::Cell::new(false),
         }
     }
 
@@ -118,7 +128,7 @@ impl ZalsaLocal {
 
     // ryo-v2 fork: read by `ZalsaView::unwind_if_revision_cancelled` for an ancestor's token
     pub(crate) fn is_cancellation_disabled(&self) -> bool {
-        self.cancelled.0.load(Ordering::Relaxed) & CancellationToken::DISABLED_MASK != 0
+        self.cancellation_disabled.get()
     }
 
     pub(crate) fn record_unfilled_pages(&mut self, table: &Table) {
@@ -504,7 +514,9 @@ impl ZalsaLocal {
 
     #[inline]
     pub fn should_trigger_local_cancellation(&self) -> bool {
-        self.cancelled.should_trigger_local_cancellation()
+        // ryo-v2 fork: the disabled bit is the handle's own (a layer's token is shared by every
+        // handle of the layer, and one handle's fixpoint iteration must not disable the others')
+        self.cancelled.is_cancelled() && !self.cancellation_disabled.get()
     }
 
     #[cold]
@@ -519,7 +531,8 @@ impl ZalsaLocal {
 
     #[inline]
     pub(crate) fn set_cancellation_disabled(&self, was_disabled: bool) -> bool {
-        self.cancelled.set_cancellation_disabled(was_disabled)
+        // ryo-v2 fork: the disabled bit is the handle's own, not the (possibly shared) token's
+        self.cancellation_disabled.replace(was_disabled)
     }
 }
 

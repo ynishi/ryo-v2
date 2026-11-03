@@ -182,6 +182,41 @@ fn a_layer_of_another_base_is_refused() {
 }
 
 #[test]
+fn a_layer_of_an_earlier_freeze_is_refused() {
+    // A layer that outlived a thaw keeps stamps keyed by addresses of memos the thawed base may
+    // free and reuse, and memos verified against the base before the thaw: after a refreeze it
+    // cannot be set on a handle, nor can a child of it.
+    let mut db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let old = fork::root_layer(&db);
+    old.seal();
+    fork::try_thaw(&mut db).expect("the base is the only handle");
+    file.set_text(&mut db).to("after thaw".to_owned());
+    fork::freeze(&db);
+    let mut handle = db.clone();
+    let message = panic_message(|| fork::set_layer(&mut handle, old.clone()));
+    assert!(message.contains("earlier freeze"), "{message}");
+    let child = fork::child_layer(&old);
+    let mut handle = db.clone();
+    let message = panic_message(|| fork::set_layer(&mut handle, child));
+    assert!(message.contains("earlier freeze"), "{message}");
+    // A layer of the new freeze is accepted.
+    let fresh = fork::root_layer(&db);
+    assert_eq!(layered(&db, &fresh).zalsa().current_revision(), fresh.revision());
+}
+
+#[test]
+fn a_base_fingerprint_needs_a_frozen_base() {
+    let db = Db::default();
+    File::new(&db, "base".to_owned());
+    let message = panic_message(|| {
+        fork::base_fingerprint(&db);
+    });
+    assert!(message.contains("needs a frozen base"), "{message}");
+}
+
+#[test]
 fn an_input_created_under_a_layer_is_a_counted_shared_write() {
     let db = Db::default();
     fork::freeze(&db);
@@ -201,16 +236,30 @@ fn length(db: &dyn Database, file: File) -> usize {
 static LENGTH_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
-fn a_tracked_function_under_a_layer_is_not_yet_supported() {
+fn a_tracked_function_runs_in_its_layer() {
     let db = Db::default();
     let file = File::new(&db, "base".to_owned());
+    assert_eq!(length(&db, file), 4);
+    let runs = LENGTH_RUNS.load(Ordering::SeqCst);
     fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    // A write-free layer reads the base memo as valid without re-running it.
+    let read_only = fork::root_layer(&db);
+    assert_eq!(length(&layered(&db, &read_only), file), 4);
+    assert_eq!(LENGTH_RUNS.load(Ordering::SeqCst), runs);
+
     let layer = fork::root_layer(&db);
     let layer_db = layered(&db, &layer);
-    let message = panic_message(|| {
-        length(&layer_db, file);
-    });
-    assert!(message.contains("not yet supported under a layer"), "{message}");
+    write(&layer_db, file, "in the layer");
+    assert_eq!(length(&layer_db, file), 12);
+    assert_eq!(LENGTH_RUNS.load(Ordering::SeqCst), runs + 1);
+    assert_eq!(layer.stats().memos, 1);
+    // The base keeps its memo, and nothing of the base changed.
+    assert_eq!(length(&db, file), 4);
+    drop(layer_db);
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+    assert_eq!(fork::refused_writes(&db), 0);
 }
 
 #[salsa::tracked(returns(copy))]
@@ -320,7 +369,7 @@ fn a_singleton_input_under_a_layer_is_not_yet_supported() {
     let message = panic_message(|| {
         Config::new(&layer_db, 1);
     });
-    assert!(message.contains("not yet supported under a layer"), "{message}");
+    assert!(message.contains("not supported under a layer"), "{message}");
     assert!(Config::try_get(&db).is_none());
 }
 

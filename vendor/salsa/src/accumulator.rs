@@ -103,7 +103,8 @@ impl<A: Accumulator> Ingredient for IngredientImpl<A> {
 
     unsafe fn maybe_changed_after(
         &self,
-        _zalsa: &crate::zalsa::Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &crate::fork::ZalsaView,
         _db: crate::database::RawDatabase<'_>,
         _input: Id,
         _revision: Revision,
@@ -139,7 +140,8 @@ impl<A: Accumulator> Ingredient for IngredientImpl<A> {
 
     fn flatten_cycle_head_dependencies(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &crate::fork::ZalsaView,
         _id: Id,
         _flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         _seen: &mut FxHashSet<DatabaseKeyIndex>,

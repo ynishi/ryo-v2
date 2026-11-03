@@ -15,7 +15,8 @@ type QueryDependents = FxHashMap<DatabaseKeyIndex, SmallVec<[ThreadId; 4]>>;
 type TransferredDependents = FxHashMap<DatabaseKeyIndex, SmallSet<DatabaseKeyIndex, 4>>;
 
 #[derive(Debug, Default)]
-pub(super) struct DependencyGraph {
+// ryo-v2 fork: crate-visible, a layer keeps one of its own (E5)
+pub(crate) struct DependencyGraph {
     /// A `(K -> V)` pair in this map indicates that the runtime
     /// `K` is blocked on some query executing in the runtime `V`.
     /// This encodes a graph that must be acyclic (or else deadlock

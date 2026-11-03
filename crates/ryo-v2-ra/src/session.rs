@@ -217,6 +217,34 @@ impl RaSession {
     pub fn pending_audit(&self) -> Vec<RelPath> {
         self.edited_since_audit.iter().cloned().collect()
     }
+
+    /// Takes the session's database out, leaving an empty one in its place, for the fork
+    /// Engine's tests (D11, stage 2), which freeze it and diagnose layers over it with
+    /// [`RaAnalyzer::diagnose_database`](crate::RaAnalyzer::diagnose_database). Until
+    /// [`RaSession::return_database`] gives it back, nothing but `diagnose_database` may be used
+    /// on the session.
+    ///
+    /// # Contract
+    /// - C1: the database returned after the Engine thaws it diagnoses as before it was lent.
+    ///   tested: ryo-v2-engine tests/v2.rs v2_layers_diagnose_as_their_flat_check
+    #[doc(hidden)]
+    pub fn lend_database(&mut self) -> ra_ap_ide_db::RootDatabase {
+        std::mem::take(self.host.raw_database_mut())
+    }
+
+    /// Puts back a database taken with [`RaSession::lend_database`].
+    #[doc(hidden)]
+    pub fn return_database(&mut self, db: ra_ap_ide_db::RootDatabase) {
+        *self.host.raw_database_mut() = db;
+    }
+
+    /// The `FileId` of the load-time file `path`, if it is one.
+    #[doc(hidden)]
+    pub fn file_id(&self, path: &RelPath) -> Option<FileId> {
+        self.files
+            .iter()
+            .find_map(|(id, rel)| (rel == path).then_some(*id))
+    }
 }
 
 /// Relative path of `path` under `root`, as a [`RelPath`].

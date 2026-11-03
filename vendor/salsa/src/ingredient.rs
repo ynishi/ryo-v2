@@ -8,6 +8,8 @@ use crate::sync::Arc;
 use crate::table::Table;
 use crate::table::memo::MemoTableTypes;
 use crate::zalsa::{IngredientIndex, JarKind, Zalsa, transmute_data_mut_ptr, transmute_data_ptr};
+// ryo-v2 fork: the methods that read or write through a layer take the handle's view
+use crate::fork::ZalsaView;
 use crate::zalsa_local::QueryEdge;
 use crate::{DatabaseKeyIndex, Id, Revision};
 
@@ -45,7 +47,8 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     /// The passed in database needs to be the same one that the ingredient was created with.
     unsafe fn maybe_changed_after(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the value is read through the chain (E1)
+        zalsa: &ZalsaView,
         db: RawDatabase<'_>,
         input: Id,
         revision: Revision,
@@ -80,7 +83,8 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     /// Invoked when the value `output_key` should be marked as valid in the current revision.
     /// This occurs because the value for `executor`, which generated it, was marked as valid
     /// in the current revision.
-    fn mark_validated_output(&self, zalsa: &Zalsa, executor: DatabaseKeyIndex, output_key: Id) {
+    // ryo-v2 fork: the view; under a layer the mark is the layer's
+    fn mark_validated_output(&self, zalsa: &ZalsaView, executor: DatabaseKeyIndex, output_key: Id) {
         let _ = (zalsa, executor, output_key);
         unreachable!("only tracked struct and function ingredients can have validatable outputs")
     }
@@ -89,7 +93,13 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     /// revision, but was NOT output in the current revision.
     ///
     /// This hook is used to clear out the stale value so others cannot read it.
-    fn remove_stale_output(&self, zalsa: &Zalsa, executor: DatabaseKeyIndex, stale_output_key: Id) {
+    // ryo-v2 fork: the view; under a layer the stale value is tombstoned in the layer
+    fn remove_stale_output(
+        &self,
+        zalsa: &ZalsaView,
+        executor: DatabaseKeyIndex,
+        stale_output_key: Id,
+    ) {
         let _ = (zalsa, executor, stale_output_key);
         unreachable!("only tracked struct ingredients can have stale outputs")
     }
@@ -142,7 +152,8 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     /// See `cycle_dependency_order_different_entry_queries` and `cycle_left_recursive_query`.
     fn flatten_cycle_head_dependencies(
         &self,
-        zalsa: &Zalsa,
+        // ryo-v2 fork: the view; under a layer the chain's memos
+        zalsa: &ZalsaView,
         id: Id,
         flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         seen: &mut FxHashSet<DatabaseKeyIndex>,

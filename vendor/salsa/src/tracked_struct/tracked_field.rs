@@ -7,6 +7,8 @@ use crate::sync::Arc;
 use crate::table::memo::MemoTableTypes;
 use crate::tracked_struct::{Configuration, Value};
 use crate::zalsa::{IngredientIndex, JarKind, Zalsa};
+// ryo-v2 fork: a field's revision is read through the handle's layer
+use crate::fork::{ChainTracked, ZalsaView};
 use crate::zalsa_local::QueryEdge;
 use crate::{DatabaseKeyIndex, Id};
 
@@ -62,11 +64,24 @@ where
 
     unsafe fn maybe_changed_after(
         &self,
-        zalsa: &crate::zalsa::Zalsa,
+        // ryo-v2 fork: the view; under a layer the field's revision is the chain's (E1)
+        zalsa: &ZalsaView,
         _db: crate::database::RawDatabase<'_>,
         input: Id,
         revision: crate::Revision,
     ) -> VerifyResult {
+        // ryo-v2 fork: the revision of the layer's entry, else the base slot's; a struct the
+        // chain tombstoned has changed
+        if let Some(layer) = zalsa.layer() {
+            match layer.find_tracked(input) {
+                ChainTracked::Entry { value, .. } => {
+                    let changed_at = super::entry_revision::<C>(value, self.field_index);
+                    return VerifyResult::changed_if(changed_at > revision);
+                }
+                ChainTracked::Tombstone => return VerifyResult::changed(),
+                ChainTracked::None => {}
+            }
+        }
         let data = <super::IngredientImpl<C>>::data_raw(zalsa.table(), input);
         let field_changed_at = unsafe { (&(*data).revisions)[self.field_index].load() };
         VerifyResult::changed_if(field_changed_at > revision)
@@ -85,7 +100,8 @@ where
 
     fn flatten_cycle_head_dependencies(
         &self,
-        _zalsa: &Zalsa,
+        // ryo-v2 fork: the view (the trait's)
+        _zalsa: &ZalsaView,
         id: Id,
         flattened_input_outputs: &mut FxIndexSet<QueryEdge>,
         _seen: &mut FxHashSet<crate::DatabaseKeyIndex>,

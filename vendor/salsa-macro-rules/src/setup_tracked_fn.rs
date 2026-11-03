@@ -364,7 +364,8 @@ macro_rules! setup_tracked_fn {
                     $($cycle_recovery_fn)*(db, cycle, last_provisional_value, value, $($input_id),*)
                 }
 
-                fn id_to_input<$db_lt>(zalsa: &$db_lt $zalsa::Zalsa, key: ::salsa::Id) -> Self::Input<$db_lt> {
+                // ryo-v2 fork: the view, so that an interned key is read as the handle's layer sees it
+                fn id_to_input<$db_lt>(zalsa: &$db_lt $zalsa::ZalsaView, key: ::salsa::Id) -> Self::Input<$db_lt> {
                     $zalsa::macro_if! {
                         if $needs_interner {
                             $Configuration::intern_ingredient_(zalsa).data(zalsa, key).clone()

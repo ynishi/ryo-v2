@@ -16,11 +16,8 @@ where
     where
         A: accumulator::Accumulator,
     {
+        // ryo-v2 fork: under a layer the memos are read through the chain (`fetch`, `memo`)
         let (zalsa, zalsa_local) = db.zalsas();
-        // ryo-v2 fork: stub, memos are not routed through a layer yet
-        if zalsa.layer().is_some() {
-            crate::fork::not_yet_supported("reading accumulated values (memo routing, step 2b)");
-        }
 
         // NOTE: We don't have a precise way to track accumulated values at present,
         // so we report any read of them as an untracked read.
