@@ -140,6 +140,16 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         _ = table;
     }
 
+    // ryo-v2 fork: called in place of `reset_for_new_revision` at the new revision of a thaw
+    // (`Zalsa::fork_new_revision_at_thaw`), on the ingredients that require a reset. Not called by
+    // upstream code paths; the default is the full reset, so an ingredient that does not override
+    // it resets at a thaw as at any new revision.
+    /// Resets for the new revision of a thaw (ryo-v2 fork): by default
+    /// [`Ingredient::reset_for_new_revision`]; a tracked function evicts no LRU value (E8).
+    fn fork_reset_at_thaw(&mut self, table: &mut Table) {
+        self.reset_for_new_revision(table);
+    }
+
     fn memo_table_types(&self) -> &Arc<MemoTableTypes>;
 
     fn memo_table_types_mut(&mut self) -> &mut Arc<MemoTableTypes>;

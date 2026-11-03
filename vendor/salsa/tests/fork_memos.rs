@@ -964,6 +964,47 @@ fn shared_writes_under_a_layer_are_the_listed_ones() {
     assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
 }
 
+// ---------------------------------------------------------------------------------------------
+// LRU at a thaw (E8)
+
+#[salsa::tracked(lru = 2, returns(copy))]
+fn thaw_lru_len(db: &dyn Database, file: File) -> usize {
+    THAW_LRU_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static THAW_LRU_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_thaw_evicts_nothing() {
+    let mut db = Db::default();
+    let files: Vec<File> = (0..8).map(|n| File::new(&db, "x".repeat(n))).collect();
+    let read_all = |db: &Db| {
+        for (n, &file) in files.iter().enumerate() {
+            assert_eq!(thaw_lru_len(db, file), n);
+        }
+    };
+    // Eight values for an LRU of two: the base keeps them all until its next new revision.
+    read_all(&db);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8);
+    fork::freeze(&db);
+
+    // A layer reads every value from the base and records no LRU use.
+    let layer = fork::root_layer(&db);
+    read_all(&layered(&db, &layer));
+    drop(layer);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8);
+
+    // The thaw is a new base revision, and it evicts nothing: every value is still there.
+    fork::try_thaw(&mut db).expect("no other handle is alive");
+    read_all(&db);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8, "the thaw evicted a value");
+
+    // The base's own next new revision evicts as upstream does, down to the LRU's capacity.
+    db.synthetic_write(Durability::LOW);
+    read_all(&db);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8 + 6);
+}
+
 #[salsa::tracked(returns(copy))]
 fn sealed_len(db: &dyn Database, file: File) -> usize {
     file.text(db).len()

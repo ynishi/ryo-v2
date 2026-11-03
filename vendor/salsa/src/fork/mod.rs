@@ -44,6 +44,12 @@
 //! - a layer's cancellation is final: no handle's `attach` scope resets the shared token;
 //! - a layer of another base, or of an earlier freeze of this one, cannot be set on a handle;
 //! - a layered input write is refused for a field whose durability is above `LOW`.
+//!
+//! LRU (E8): layers record no LRU use, so a layer evicts nothing and the base's LRU keeps the
+//! order of the base's own reads. The base evicts nothing while frozen, nor at the new revision
+//! of a [thaw](try_thaw): a value evicted there would be recomputed, and never written back, by
+//! every layer of a later freeze. Its values therefore grow only through its own queries; the
+//! base's own next new revision (a setter, `synthetic_write`) evicts as upstream does.
 
 mod owned;
 mod store;
@@ -967,7 +973,8 @@ pub struct ThawRefused {
 /// Thaws the frozen base of `db` when `db` is its only live handle: reserves a revision above
 /// every layer revision handed out and above the base's own, in one step on the layer revision
 /// counter (so no layer, made before or after, of any base, has it), moves the base to it
-/// ([`Zalsa::advance_revision_past`]), and lifts the frozen flag. Returns the new base revision.
+/// ([`Zalsa::advance_revision_past`], which evicts no LRU value: E8), and lifts the frozen flag.
+/// Returns the new base revision.
 /// With any other handle alive it returns [`ThawRefused`] at once and changes nothing: it never
 /// waits.
 ///
@@ -1040,12 +1047,12 @@ pub fn set_input_field<C, Db>(
 
 impl Zalsa {
     /// Moves the current revision to `max(current, r) + 1` and runs what a new revision runs on
-    /// the ingredients ([`Zalsa::new_revision`]), without touching the last-changed revision of
-    /// any durability: no base input changed. Used at thaw with `r` the highest layer revision,
-    /// so the base's next state shares its revision with no layer.
+    /// the ingredients ([`Zalsa::new_revision`]) except LRU eviction (E8), without touching the
+    /// last-changed revision of any durability: no base input changed. Used at thaw with `r` the
+    /// highest layer revision, so the base's next state shares its revision with no layer.
     pub fn advance_revision_past(&mut self, r: Revision) -> Revision {
         self.runtime_mut().raise_current_revision(r);
-        self.new_revision()
+        self.fork_new_revision_at_thaw()
     }
 
     /// Runs [`Ingredient::fork_thaw`](crate::ingredient::Ingredient::fork_thaw) on every

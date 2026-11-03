@@ -531,6 +531,14 @@ where
         self.deleted_entries.clear();
     }
 
+    // ryo-v2 fork: at a thaw the base evicts no LRU value (E8): layers record no LRU use, so
+    // the LRU's order is the base's own and a value evicted here would be recomputed, and never
+    // written back, by every later layer. The LRU keeps its entries, and the base's next own new
+    // revision evicts as upstream does. The deleted memos are freed as at any new revision.
+    fn fork_reset_at_thaw(&mut self, _table: &mut Table) {
+        self.deleted_entries.clear();
+    }
+
     fn debug_name(&self) -> &'static str {
         C::DEBUG_NAME
     }

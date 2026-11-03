@@ -15,6 +15,11 @@
 //!   ([`SealedLayer::read`]).
 //! - [`Frozen::thaw`] gives the database back once no layer and no other handle of it lives.
 //!
+//! LRU (salsa fork, E8): the base evicts no LRU value while frozen nor at the thaw, and layers
+//! record no LRU use. A value the base evicted would be recomputed, and never written back, by
+//! every layer of each later freeze, so across a session the base's values grow only through
+//! its own queries (the baseline, audits); the base's own next write evicts as upstream does.
+//!
 //! Sealing is a type: only an open layer lends a database, only a sealed layer has children and
 //! reads, and an open layer is consumed by its seal. The base brand is structural: every layer
 //! holds the base it descends from, and every operation that combines a base and a layer is a
