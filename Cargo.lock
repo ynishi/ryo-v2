@@ -2266,6 +2266,7 @@ dependencies = [
  "ra_ap_syntax",
  "ra_ap_vfs",
  "ryo-v2-core",
+ "serde",
  "serde_json",
  "thiserror",
  "triomphe",

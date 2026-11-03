@@ -9,18 +9,15 @@
 //! that fails is an error of the run.
 
 mod apply;
-mod bench;
 mod blueprint_json;
-mod proc;
 mod resolution_json;
 mod search;
 mod search_json;
-mod stacked;
 
 use anyhow::Result;
-use bench::BenchArgs;
 use clap::{Parser, Subcommand};
 use ryo_v2_core::domain::{Scope, TextRange};
+use ryo_v2_host::bench::{self, BenchArgs};
 use std::path::PathBuf;
 use std::process::ExitCode;
 

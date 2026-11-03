@@ -12,6 +12,7 @@ mod duplicate;
 mod expand;
 mod field_bounds;
 mod fork;
+mod memory;
 mod rev_deps;
 mod session;
 mod stack;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 pub use assess::SyntaxAssessor;
 pub use diagnostics::GapDetector;
 pub use fork::RaFork;
+pub use memory::{IngredientRow, MemoRow, MemoryReport};
 pub use session::{DetectorPanic, ExpanderPanic, RaSession};
 pub use stack::RaStack;
 

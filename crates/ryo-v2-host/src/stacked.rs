@@ -16,6 +16,9 @@ pub enum Point<'a> {
     ParentDiagnosed,
     /// A repeat is about to write the variant's level.
     BeforeWrite,
+    /// The variant's level has been written (its new revision begun) and is about to be
+    /// diagnosed.
+    AfterWrite,
     /// The variant's level has been diagnosed (or its diagnosis failed).
     AfterDiagnose,
     /// The variant's level is about to be popped.
@@ -31,6 +34,7 @@ impl Point<'_> {
         match self {
             Point::ParentDiagnosed => "ParentDiagnosed",
             Point::BeforeWrite => "BeforeWrite",
+            Point::AfterWrite => "AfterWrite",
             Point::AfterDiagnose => "AfterDiagnose",
             Point::BeforePop => "BeforePop",
             Point::AfterPop(_) => "AfterPop",
@@ -40,6 +44,16 @@ impl Point<'_> {
 
 /// The hook of [`stacked_series`]: it observes a point and may end the series with a failed read.
 pub type Hook<'h> = dyn FnMut(Point<'_>) -> Result<(), ProcError> + 'h;
+
+/// The edits of `edits` that `parent` does not already make: what a variant writes as a level on
+/// top of the parent's level (a variant file at the parent's text is not one).
+pub fn own_edits(parent: &[Edit], edits: &[Edit]) -> Vec<Edit> {
+    edits
+        .iter()
+        .filter(|e| !parent.contains(e))
+        .cloned()
+        .collect()
+}
 
 /// The diagnosis of the top level at `scope`, and the files a check of the edits that take the
 /// base to its state covers (`Stacked::files_of`).
@@ -66,9 +80,10 @@ fn diagnose_top<A: Stacked>(
 /// # Contract
 /// - C1: the one procedure of the stacked mode for every binary of the host: it opens the fork,
 ///   writes the parent as a level, diagnoses it and calls the hook at ParentDiagnosed; per repeat
-///   it writes the variant as a level on the parent's level, diagnoses it, pops it, and calls the
-///   hook at BeforeWrite, AfterDiagnose, BeforePop and AfterPop in that order; then it releases
-///   the fork. The hook observes and never changes the session.
+///   it calls the hook at BeforeWrite, writes the variant as a level on the parent's level, calls
+///   it at AfterWrite, diagnoses the level, calls it at AfterDiagnose and BeforePop, pops the
+///   level and calls it at AfterPop, in that order; then it releases the fork. The hook observes
+///   and never changes the session.
 ///   tested: stacked::tests::probe_and_bench_run_the_same_order
 ///   tested: stacked::tests::a_stacked_verdict_is_formed_as_the_search_forms_it
 /// - C2: a hook error (a failed read of `/proc`) ends the series with that error; the fork is
@@ -152,6 +167,8 @@ fn levels<A: Stacked>(
         // A refused write pushes no level, so there is nothing to pop.
         a.write(s, f, variant)
             .context("write the variant as a level")?;
+        // A hook error here leaves the level on the fork; the release reverts it.
+        call(hook, Point::AfterWrite, None)?;
         let diagnosed = diagnose_top(a, s, f, scope);
         // A hook error here leaves the level on the fork; the release reverts it.
         call(hook, Point::AfterDiagnose, diagnosed.as_ref().err())?;
@@ -300,6 +317,7 @@ mod tests {
         match point {
             Point::ParentDiagnosed => "ParentDiagnosed",
             Point::BeforeWrite => "BeforeWrite",
+            Point::AfterWrite => "AfterWrite",
             Point::AfterDiagnose => "AfterDiagnose",
             Point::BeforePop => "BeforePop",
             Point::AfterPop(_) => "AfterPop",
@@ -423,6 +441,7 @@ mod tests {
                 [
                     "BeforeWrite",
                     "write(a.rs)",
+                    "AfterWrite",
                     "diagnose",
                     "AfterDiagnose",
                     "BeforePop",
@@ -436,7 +455,7 @@ mod tests {
         assert_eq!(bench, want);
         assert_eq!(probe, bench);
         assert_eq!(rss.len(), 3);
-        assert_eq!(readings.len(), 1 + 4 * 2);
+        assert_eq!(readings.len(), 1 + 5 * 2);
         // The bench's own hook, the one `bench::run` passes, through the same series: the same
         // order, one recorded run per repeat, each with its VmRSS, and the parent's VmRSS.
         let (real, runs, rss_runs, rss_parent) = crate::bench::with_bench_hook(2, run_logged);

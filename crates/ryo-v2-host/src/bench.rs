@@ -5,8 +5,9 @@
 //! that the parent does not already make, written as a level on top of the parent's level of one
 //! `Stacked` fork, by `stacked::stacked_series`.
 //!
-//! Memory is read through `proc.rs`: a failed read is an error of the run, so the host runs on
-//! Linux only.
+//! Memory and CPU time are read through `proc.rs`: a failed read is an error of the run, so the
+//! host runs on Linux only. With `--on` every run also prints its process CPU ms, its wall ms
+//! and its core occupancy ([`occupancy`]).
 
 use crate::proc::{self, ProcError};
 use crate::stacked::{self, Point};
@@ -21,6 +22,7 @@ use ryo_v2_core::infra::overlay::overlay_edits;
 use ryo_v2_ra::{RaAnalyzer, RaConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Arguments of one bench invocation.
 pub struct BenchArgs {
@@ -68,6 +70,45 @@ struct RunStats {
     revert_ms: u64,
     revert_ok: Option<bool>,
     rss_kb: Option<u64>,
+    /// The run's CPU and wall time; measured with `--on` only.
+    usage: Option<Usage>,
+}
+
+/// The process CPU time and the wall time of one run, from its write to the end of its revert.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Usage {
+    cpu_ms: u64,
+    wall_ms: f64,
+}
+
+/// A run's start: the process CPU ms and the instant.
+type Start = (u64, Instant);
+
+/// Reads the CPU time of this process: `proc::cpu_ms`, or a failing reader in a test.
+type CpuReader = fn() -> Result<u64, ProcError>;
+
+/// Starts measuring a run's usage.
+fn start(cpu: CpuReader) -> Result<Start, ProcError> {
+    Ok((cpu()?, Instant::now()))
+}
+
+/// The usage of a run started at `started`, ending now.
+fn finish(cpu: CpuReader, (cpu0, t0): Start) -> Result<Usage, ProcError> {
+    let cpu1 = cpu()?;
+    Ok(Usage {
+        cpu_ms: cpu1.saturating_sub(cpu0),
+        wall_ms: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// The core occupancy of a run: the share of `threads` cores its process kept busy.
+///
+/// # Contract
+/// - C1: a check's occupancy is its process CPU ms over its wall ms times the configured threads;
+///   a failed CPU read is an error of the run, not a missing value.
+///   tested: bench::tests::occupancy_is_cpu_over_wall_times_threads
+pub fn occupancy(cpu_ms: u64, wall_ms: f64, threads: usize) -> f64 {
+    cpu_ms as f64 / (wall_ms * threads as f64)
 }
 
 /// The result of one run: its events, and its verdict unless the revert failed.
@@ -83,6 +124,7 @@ struct Series {
     check_ms: Vec<u64>,
     revert_ms: Vec<u64>,
     rss_kb: Vec<u64>,
+    occupancy: Vec<f64>,
 }
 
 /// Where a series is printed: its variant, scope and mode, and the number of repeats.
@@ -94,9 +136,13 @@ struct Heading<'a> {
     mode: &'a str,
     n_edits: usize,
     repeat: u32,
+    /// The session's diagnostic threads with `--on`, where each run's usage is measured;
+    /// `None` without it.
+    threads: Option<usize>,
 }
 
-fn scope_name(scope: Scope) -> &'static str {
+/// The scope's name, as the bench prints it.
+pub fn scope_name(scope: Scope) -> &'static str {
     match scope {
         Scope::Affected => "affected",
         Scope::Workspace => "workspace",
@@ -148,24 +194,36 @@ fn read_events(events: Vec<Event>) -> RunStats {
                 stats.revert_ok = revert_ok;
             }
             Event::Memory { rss_kb } => stats.rss_kb = Some(rss_kb),
-            Event::Loaded { .. } => {}
+            Event::Indexed { .. } | Event::Loaded { .. } => {}
         }
     }
     stats
 }
 
-/// One `verify` of `edits` from the base.
+/// One `verify` of `edits` from the base; with `measure`, its usage from before the `verify`
+/// to after it.
 fn rebuilt_once<A: Analyzer>(
     analyzer: &A,
     session: &mut A::Session,
     observer: &RecordingObserver,
     edits: &[Edit],
     scope: Scope,
+    measure: bool,
 ) -> Result<Once> {
     observer.take();
+    let started = if measure {
+        Some(start(proc::cpu_ms)?)
+    } else {
+        None
+    };
     let result = verify(analyzer, session, edits, scope);
+    let usage = match started {
+        Some(s) => Some(finish(proc::cpu_ms, s)?),
+        None => None,
+    };
     sample_memory(observer)?;
-    let stats = read_events(observer.take());
+    let mut stats = read_events(observer.take());
+    stats.usage = usage;
     let verdict = match result {
         Ok(v) => Some(v),
         Err(AnalyzerError::RevertMismatch) => None,
@@ -189,6 +247,10 @@ struct StackedRecord<'a> {
     runs: u32,
     /// The VmRSS after the parent's level, once it is diagnosed.
     rss_parent: Option<u64>,
+    /// The CPU reader of the repeats' usage, measured when the heading has threads.
+    cpu: CpuReader,
+    /// The start of the current repeat's usage.
+    started: Option<Start>,
 }
 
 impl StackedRecord<'_> {
@@ -198,14 +260,22 @@ impl StackedRecord<'_> {
                 self.rss_parent = Some(proc::vm_rss_kb()?);
                 self.observer.take();
             }
-            // A repeat's events are those from its write on.
+            // A repeat's events are those from its write on, and so is its usage.
             Point::BeforeWrite => {
                 self.observer.take();
+                if self.heading.threads.is_some() {
+                    self.started = Some(start(self.cpu)?);
+                }
             }
-            Point::AfterDiagnose | Point::BeforePop => {}
+            Point::AfterWrite | Point::AfterDiagnose | Point::BeforePop => {}
             Point::AfterPop(verdict) => {
+                let usage = match self.started.take() {
+                    Some(s) => Some(finish(self.cpu, s)?),
+                    None => None,
+                };
                 sample_memory(self.observer)?;
-                let stats = read_events(self.observer.take());
+                let mut stats = read_events(self.observer.take());
+                stats.usage = usage;
                 self.runs += 1;
                 record(
                     self.heading,
@@ -236,6 +306,7 @@ pub(crate) fn with_bench_hook<R>(
         mode: " mode stacked",
         n_edits: 1,
         repeat,
+        threads: Some(1),
     };
     let mut series = Series::default();
     let mut rec = StackedRecord {
@@ -244,6 +315,8 @@ pub(crate) fn with_bench_hook<R>(
         series: &mut series,
         runs: 0,
         rss_parent: None,
+        cpu: proc::cpu_ms,
+        started: None,
     };
     let out = f(&mut |point| rec.observe(point));
     let rss_parent = rec.rss_parent;
@@ -286,6 +359,7 @@ fn record(
         mode,
         n_edits,
         repeat: total,
+        threads,
     } = *heading;
     let ok = match stats.revert_ok {
         Some(b) => b.to_string(),
@@ -295,8 +369,20 @@ fn record(
         v.new_errors.errors.len() + v.new_errors.unmapped.len()
     });
     let rss_txt = stats.rss_kb.map_or("-".to_string(), |k| k.to_string());
+    // Additive: the columns of a run without `--on` end the line as before.
+    let usage_txt = match (threads, stats.usage) {
+        (Some(t), Some(u)) => {
+            let occ = occupancy(u.cpu_ms, u.wall_ms, t);
+            series.occupancy.push(occ);
+            format!(
+                " cpu_ms {} wall_ms {:.0} occupancy {occ:.2}",
+                u.cpu_ms, u.wall_ms
+            )
+        }
+        _ => String::new(),
+    };
     println!(
-        "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}",
+        "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}{usage_txt}",
         stats.scope_files, stats.total_files, stats.check_ms, stats.revert_ms,
     );
     if i == 1
@@ -332,6 +418,9 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     let rss_after_load = proc::vm_rss_kb().context("read the RSS after load")?;
     for event in observer.take() {
         match event {
+            Event::Indexed { load_ms, files } => {
+                eprintln!("[indexed] {load_ms} ms, {files} local files");
+            }
             Event::Loaded {
                 load_ms,
                 baseline_ms,
@@ -359,6 +448,8 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         }
         None => None,
     };
+    // With `--on` each run's usage is measured against the session's diagnostic threads.
+    let threads = parent.as_ref().map(|_| session.threads());
     let modes: &[Mode] = if parent.is_some() {
         &[Mode::Rebuilt, Mode::Stacked]
     } else {
@@ -381,11 +472,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         // at the parent's text not being one (stacked).
         let (child, own) = match &parent {
             Some(parent) => {
-                let own: Vec<Edit> = edits
-                    .iter()
-                    .filter(|e| !parent.contains(e))
-                    .cloned()
-                    .collect();
+                let own = stacked::own_edits(parent, &edits);
                 if own.is_empty() {
                     println!("{name}: SKIP (no edits vs the --on parent)");
                     continue;
@@ -412,6 +499,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     mode: &mode_txt,
                     n_edits: child.len(),
                     repeat: args.repeat,
+                    threads,
                 };
                 let (reverted, extra) = match (mode, &parent) {
                     (Mode::Stacked, Some(parent)) => {
@@ -422,6 +510,8 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                             series: &mut series,
                             runs: 0,
                             rss_parent: None,
+                            cpu: proc::cpu_ms,
+                            started: None,
                         };
                         let reverted = stacked::stacked_series(
                             &analyzer,
@@ -444,7 +534,14 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     }
                     _ => {
                         let reverted = repeat(&heading, &mut series, || {
-                            rebuilt_once(&analyzer, &mut session, &observer, &child, scope)
+                            rebuilt_once(
+                                &analyzer,
+                                &mut session,
+                                &observer,
+                                &child,
+                                scope,
+                                threads.is_some(),
+                            )
                         })?;
                         (reverted, mode_txt.clone())
                     }
@@ -497,8 +594,19 @@ fn print_summary(
         let max = s.rss_kb.iter().max().copied().unwrap_or(0);
         format!("{}/{}/{max}", s.rss_kb[0], s.rss_kb[s.rss_kb.len() - 1])
     };
+    // Additive, with `--on`: the median occupancy of the warm runs (the first run alone when
+    // there is no warm one).
+    let warm_occupancy = if s.occupancy.len() > 1 {
+        &s.occupancy[1..]
+    } else {
+        &s.occupancy[..]
+    };
+    let occ_txt = match median(warm_occupancy) {
+        Some(m) => format!(" warm_occupancy_median {m:.2}"),
+        None => String::new(),
+    };
     println!(
-        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}",
+        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt}",
         s.check_ms[0],
         triple(warm_check),
         triple(warm_revert),
@@ -520,6 +628,14 @@ pub fn summarize(xs: &[u64]) -> Option<(u64, u64, u64)> {
     let mut v = xs.to_vec();
     v.sort_unstable();
     Some((v[0], v[(v.len() - 1) / 2], v[v.len() - 1]))
+}
+
+/// The median of `xs`, the lower one for an even count, as [`summarize`] takes it. None when
+/// empty.
+pub fn median(xs: &[f64]) -> Option<f64> {
+    let mut v = xs.to_vec();
+    v.sort_unstable_by(f64::total_cmp);
+    v.get(v.len().checked_sub(1)? / 2).copied()
 }
 
 /// Least-squares slope of xs against 0..n (per step); 0.0 when n < 2.
@@ -574,6 +690,95 @@ mod tests {
         assert!(leak_suspect(&[100, 110, 120, 130, 140]));
         assert!(!leak_suspect(&[100, 101, 100, 101, 100]));
         assert!(!leak_suspect(&[100, 110, 120, 130]));
+    }
+
+    /// A CPU read that fails, as `proc::cpu_ms` does where `/proc/self/stat` is absent.
+    fn failed_cpu() -> Result<u64, ProcError> {
+        Err(ProcError::Read {
+            file: PathBuf::from("/proc/self/stat"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        })
+    }
+
+    #[test]
+    fn occupancy_is_cpu_over_wall_times_threads() {
+        // 400 CPU ms in 100 wall ms on 8 threads: half the cores.
+        assert_eq!(occupancy(400, 100.0, 8), 0.5);
+        assert_eq!(occupancy(100, 100.0, 1), 1.0);
+        assert_eq!(occupancy(0, 50.0, 4), 0.0);
+
+        // The bench's hook with threads: a repeat's line gets its usage, the series its
+        // occupancy, and the figure is CPU over wall times threads.
+        let observer = RecordingObserver::default();
+        let heading = Heading {
+            name: "fake",
+            scope: "affected",
+            mode: " mode stacked",
+            n_edits: 1,
+            repeat: 1,
+            threads: Some(2),
+        };
+        let mut series = Series::default();
+        let mut rec = StackedRecord {
+            observer: &observer,
+            heading: &heading,
+            series: &mut series,
+            runs: 0,
+            rss_parent: None,
+            cpu: proc::cpu_ms,
+            started: None,
+        };
+        rec.observe(Point::BeforeWrite).unwrap();
+        let mut x = 0u64;
+        for _ in 0..2_000_000 {
+            x = std::hint::black_box(x.wrapping_add(1));
+        }
+        rec.observe(Point::AfterDiagnose).unwrap();
+        rec.observe(Point::BeforePop).unwrap();
+        rec.observe(Point::AfterPop(None)).unwrap();
+        assert_eq!(series.occupancy.len(), 1);
+        assert!(series.occupancy[0] >= 0.0 && series.occupancy[0].is_finite());
+
+        // A failed CPU read at the start or the end of a repeat is the hook's error, so it ends
+        // the series; no occupancy is recorded for that repeat.
+        for fail_at_end in [false, true] {
+            let mut series = Series::default();
+            let mut rec = StackedRecord {
+                observer: &observer,
+                heading: &heading,
+                series: &mut series,
+                runs: 0,
+                rss_parent: None,
+                cpu: if fail_at_end {
+                    proc::cpu_ms
+                } else {
+                    failed_cpu
+                },
+                started: None,
+            };
+            let begun = rec.observe(Point::BeforeWrite);
+            let ended = if fail_at_end {
+                begun.unwrap();
+                rec.cpu = failed_cpu;
+                rec.observe(Point::AfterPop(None))
+            } else {
+                begun
+            };
+            match ended {
+                Err(e @ ProcError::Read { .. }) => {
+                    assert!(e.to_string().contains("/proc/self/stat"), "{e}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(series.occupancy.is_empty());
+        }
+    }
+
+    #[test]
+    fn median_is_the_lower_middle() {
+        assert_eq!(median(&[0.3, 0.1, 0.2]), Some(0.2));
+        assert_eq!(median(&[0.4, 0.1, 0.3, 0.2]), Some(0.2));
+        assert_eq!(median(&[]), None);
     }
 
     #[test]

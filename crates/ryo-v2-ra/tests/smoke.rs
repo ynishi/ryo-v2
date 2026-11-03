@@ -54,6 +54,37 @@ fn rel(s: &str) -> RelPath {
 }
 
 #[test]
+fn indexed_comes_before_loaded() {
+    let (a, obs) = analyzer();
+    a.load(&corpus("base/extract-trait-multicrate"))
+        .expect("load fixture");
+    let events = obs.take();
+    let indexed: Vec<(usize, u64, usize)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            Event::Indexed { load_ms, files } => Some((i, *load_ms, *files)),
+            _ => None,
+        })
+        .collect();
+    let loaded: Vec<(usize, u64, usize)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            Event::Loaded { load_ms, files, .. } => Some((i, *load_ms, *files)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(indexed.len(), 1, "{events:?}");
+    assert_eq!(loaded.len(), 1, "{events:?}");
+    let ((at_indexed, load_ms, files), (at_loaded, loaded_ms, loaded_files)) =
+        (indexed[0], loaded[0]);
+    assert!(at_indexed < at_loaded, "{events:?}");
+    assert_eq!((load_ms, files), (loaded_ms, loaded_files));
+    assert!(files > 0);
+}
+
+#[test]
 fn broken01_detected_and_valid_passes() {
     let (a, obs) = analyzer();
     let mut s = a
