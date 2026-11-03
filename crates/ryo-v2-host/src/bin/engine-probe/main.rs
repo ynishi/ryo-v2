@@ -6,6 +6,9 @@
 //!
 //! The counting allocator makes every allocation slower, so no time figure of this binary stands
 //! for the engine's speed; `bench`, on the system allocator, gives those.
+//!
+//! `--engine` runs the forks on layers of the fork Engine (`RaConfig.engine`, D11) instead of the
+//! stacked undo log; the report's `backend` key names the backend.
 
 mod alloc;
 
@@ -13,6 +16,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use ryo_v2_core::domain::Scope;
 use ryo_v2_host::engine_probe::{self, BenchMedian, ProbeArgs};
+use ryo_v2_ra::Backend;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -51,6 +55,10 @@ struct Cli {
     /// Where the JSON report is written.
     #[arg(long, value_name = "OUT")]
     report: PathBuf,
+    /// Run the forks on layers of the fork Engine instead of the stacked undo log; the report's
+    /// `backend` key says `engine` (`undo-log` without it).
+    #[arg(long)]
+    engine: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -111,6 +119,7 @@ fn run() -> Result<()> {
         },
         idle: cli.idle,
         bench_medians: cli.bench_median,
+        backend: Backend::of_engine(cli.engine),
     };
     let report = engine_probe::run(&args, &COUNTING)?;
     engine_probe::write_report(&report, &cli.report)
@@ -151,6 +160,7 @@ mod tests {
         assert_eq!(cli.variants, [PathBuf::from("/v1"), PathBuf::from("/v2")]);
         assert_eq!(cli.on, Some(PathBuf::from("/p")));
         assert_eq!((cli.repeat, cli.idle), (20, true));
+        assert!(!cli.engine);
         assert_eq!(
             cli.bench_median,
             [BenchMedian {
@@ -172,5 +182,30 @@ mod tests {
         ] {
             assert!(parse_bench_median(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn cli_parses_engine() {
+        let cli = Cli::try_parse_from([
+            "engine-probe",
+            "/b",
+            "--on",
+            "/p",
+            "/v",
+            "--engine",
+            "--report",
+            "/o/probe.json",
+        ])
+        .unwrap();
+        assert!(cli.engine);
+        assert_eq!(cli.variants, [PathBuf::from("/v")]);
+        assert_eq!(Backend::of_engine(cli.engine), Backend::Engine);
+        // Without a parent too: the load and its phases alone, on the Engine.
+        let alone = Cli::try_parse_from(["engine-probe", "/b", "--engine", "--report", "/o"]);
+        assert!(alone.unwrap().engine);
+        // A flag, not an option with a value.
+        assert!(
+            Cli::try_parse_from(["engine-probe", "/b", "--engine=yes", "--report", "/o"]).is_err()
+        );
     }
 }

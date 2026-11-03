@@ -96,6 +96,91 @@ impl Default for RaConfig {
     }
 }
 
+impl RaConfig {
+    /// This configuration with its forks on `backend`: `engine` is true exactly for
+    /// [`Backend::Engine`].
+    pub fn with_backend(self, backend: Backend) -> RaConfig {
+        RaConfig {
+            engine: backend == Backend::Engine,
+            ..self
+        }
+    }
+
+    /// The backend `engine` selects.
+    pub fn backend(&self) -> Backend {
+        Backend::of_engine(self.engine)
+    }
+}
+
+/// The backend the forks run on, as [`RaConfig::engine`] selects it (D11): the stacked undo log,
+/// the default, or layers of the fork Engine. The one name of the backend for the measurement
+/// commands (`ryo-v2 bench`, `engine-probe`, `search-recall run`) and their reports.
+///
+/// # Contract
+/// - C1: its name, `undo-log` or `engine`, is the value it serializes as and the word a bench
+///   summary line ends with after ` backend `; it is the Engine exactly when `RaConfig.engine`
+///   is true (`RaConfig::with_backend`, `RaConfig::backend`).
+///   tested: tests::backend_names_itself_one_way
+///   tested: ryo-v2-host bench::tests::summary_line_ends_with_the_backend
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Backend {
+    /// The stacked undo log on the one database (`RaConfig.engine` false).
+    #[default]
+    UndoLog,
+    /// Layers of the fork Engine over a frozen base (`RaConfig.engine` true).
+    Engine,
+}
+
+impl Backend {
+    /// The backend of `RaConfig.engine` = `engine`, or of an `--engine` flag.
+    pub fn of_engine(engine: bool) -> Backend {
+        if engine {
+            Backend::Engine
+        } else {
+            Backend::UndoLog
+        }
+    }
+
+    /// The name a summary or header line prints and a report holds.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::UndoLog => "undo-log",
+            Backend::Engine => "engine",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_names_itself_one_way() {
+        assert_eq!(Backend::default(), Backend::UndoLog);
+        assert_eq!(RaConfig::default().backend(), Backend::UndoLog);
+        for (flag, b, name) in [
+            (false, Backend::UndoLog, "undo-log"),
+            (true, Backend::Engine, "engine"),
+        ] {
+            assert_eq!(Backend::of_engine(flag), b);
+            assert_eq!(b.name(), name);
+            assert_eq!(serde_json::to_value(b).unwrap(), serde_json::json!(name));
+            let config = RaConfig::default().with_backend(b);
+            assert_eq!(config.engine, flag);
+            assert_eq!(config.backend(), b);
+            // The other fields are kept.
+            let custom = RaConfig {
+                proc_macro: false,
+                threads: Some(3),
+                ..RaConfig::default()
+            }
+            .with_backend(b);
+            assert_eq!((custom.proc_macro, custom.threads), (false, Some(3)));
+        }
+    }
+}
+
 /// The rust-analyzer implementation of the `Analyzer` port.
 pub struct RaAnalyzer {
     pub(crate) config: RaConfig,

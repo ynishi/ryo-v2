@@ -7,7 +7,8 @@
 //!   directory (`ryo-rs`, a verification repository used as a large sample). Cases go to `--out`, by default `corpus/search/<ws>`; an `--out` with a
 //!   `target` component is refused.
 //! - `search-recall run <cases-dir> [--limit N] [--beam N] [--exhaustive] [--outer-check]
-//!   [--outer-sample N] [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro]`
+//!   [--outer-sample N] [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro]
+//!   [--engine]`
 //!
 //! `run` loads one session per workspace, runs every case of it with the production assert
 //! sampling (a diagnostic re-assert every 50th check, decision D2 in SEARCH_LEDGER.md) and prints the recall table.
@@ -19,6 +20,8 @@
 //! run; refused without `--outer-check`) on the top N of each decision's ranking; the report
 //! names the sample. The time of that outer check is reported apart and left out of trigger 4,
 //! which also judges only runs within the default budget (decision D4 in SEARCH_LEDGER.md).
+//! `--engine` runs the forks on layers of the fork Engine (`RaConfig.engine`, D11) instead of
+//! the stacked undo log; the header line and the report's `backend` key name the backend.
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -40,9 +43,9 @@ use ryo_v2_oracle::search_recall::{
     ContainedPanics, DecisionRow, OuterSample, PlantedCase, Report, RunInfo, markdown,
     outer_sample, parse_outer_sample, run_case, terminal,
 };
-use ryo_v2_ra::{RaAnalyzer, RaConfig, SyntaxAssessor};
+use ryo_v2_ra::{Backend, RaAnalyzer, RaConfig, SyntaxAssessor};
 
-const USAGE: &str = "usage: search-recall gen <ws> [--kinds a,b|all] [--seeds N] [--pairs N] [--base PATH] [--out DIR]\n       search-recall run <cases-dir> [--limit N] [--beam N] [--exhaustive] [--outer-check] [--outer-sample N] [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro]";
+const USAGE: &str = "usage: search-recall gen <ws> [--kinds a,b|all] [--seeds N] [--pairs N] [--base PATH] [--out DIR]\n       search-recall run <cases-dir> [--limit N] [--beam N] [--exhaustive] [--outer-check] [--outer-sample N] [--assert-every N] [--report FILE] [--markdown FILE] [--no-proc-macro] [--engine]";
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -258,8 +261,27 @@ fn outer_new_errors(
     Ok(coded.chain(codeless).collect())
 }
 
-fn run(root: &str, rest: &[String]) -> Result<()> {
-    let m = Materials::find().context("find materials")?;
+/// The options of `search-recall run`, as [`parse_run_args`] reads them.
+#[derive(Debug, PartialEq, Eq)]
+struct RunArgs {
+    limit: Option<usize>,
+    exhaustive: bool,
+    beam: Option<u16>,
+    /// `--outer-check` was given.
+    outer: bool,
+    /// The candidates the outer check measures: `Off` without `--outer-check`.
+    sample: OuterSample,
+    assert_every: Option<NonZeroU32>,
+    report: Option<PathBuf>,
+    md: Option<PathBuf>,
+    proc_macro: bool,
+    /// The backend of the forks: the fork Engine with `--engine`, else the undo log.
+    backend: Backend,
+}
+
+/// Reads the options of `search-recall run` after its cases dir; `proc_macro` is the default of
+/// the proc-macro server (the materials' setting), which `--no-proc-macro` turns off.
+fn parse_run_args(rest: &[String], proc_macro: bool) -> Result<RunArgs> {
     let mut limit: Option<usize> = None;
     let mut exhaustive = false;
     let mut beam: Option<u16> = None;
@@ -268,7 +290,8 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
     let mut assert_every = NonZeroU32::new(ASSERT_REVERT_EVERY);
     let mut report: Option<PathBuf> = None;
     let mut md: Option<PathBuf> = None;
-    let mut proc_macro = m.proc_macro;
+    let mut proc_macro = proc_macro;
+    let mut backend = Backend::UndoLog;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         let mut value = |name: &str| -> Result<&String> {
@@ -296,6 +319,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
             "--report" => report = Some(PathBuf::from(value("--report")?)),
             "--markdown" => md = Some(PathBuf::from(value("--markdown")?)),
             "--no-proc-macro" => proc_macro = false,
+            "--engine" => backend = Backend::Engine,
             other => bail!("unknown argument {other:?}"),
         }
     }
@@ -305,6 +329,34 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         (true, None) => OuterSample::All,
         (true, Some(n)) => OuterSample::Top(n),
     };
+    Ok(RunArgs {
+        limit,
+        exhaustive,
+        beam,
+        outer,
+        sample,
+        assert_every,
+        report,
+        md,
+        proc_macro,
+        backend,
+    })
+}
+
+fn run(root: &str, rest: &[String]) -> Result<()> {
+    let m = Materials::find().context("find materials")?;
+    let RunArgs {
+        limit,
+        exhaustive,
+        beam,
+        outer,
+        sample,
+        assert_every,
+        report,
+        md,
+        proc_macro,
+        backend,
+    } = parse_run_args(rest, m.proc_macro)?;
     let mut cases = PlantedCase::load_all(Path::new(root), &m.corpus).context("load cases")?;
     if let Some(n) = limit {
         cases.truncate(n);
@@ -323,13 +375,14 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         budget.beam = b;
     }
     println!(
-        "search-recall: {} cases, beam {}, max_expand {}, proc-macro {}, assert every {}{}",
+        "search-recall: {} cases, beam {}, max_expand {}, proc-macro {}, assert every {}{}, backend {}",
         cases.len(),
         budget.beam,
         budget.max_expand,
         if proc_macro { "on" } else { "off" },
         assert_every.map_or_else(|| "never".to_string(), |n| n.to_string()),
-        if exhaustive { ", exhaustive" } else { "" }
+        if exhaustive { ", exhaustive" } else { "" },
+        backend.name()
     );
 
     let started = Instant::now();
@@ -355,8 +408,9 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                 gap_detectors: true,
                 assert_revert_every: assert_every,
                 cfg_test: true,
-                engine: false,
-            },
+                ..RaConfig::default()
+            }
+            .with_backend(backend),
             clock.clone(),
             observer.clone(),
         )
@@ -468,7 +522,14 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
-    let triggers = RunInfo::of_run(budget, started.elapsed(), outer_ms, sample, rss_kb());
+    let triggers = RunInfo::of_run(
+        budget,
+        started.elapsed(),
+        outer_ms,
+        sample,
+        rss_kb(),
+        backend,
+    );
     let mut text = terminal(&rows, triggers);
     if outer {
         text.push_str(&outer_counts.summary(sample));
@@ -489,4 +550,83 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn run_args_default_to_the_undo_log() {
+        let got = parse_run_args(&[], true).unwrap();
+        assert_eq!(
+            got,
+            RunArgs {
+                limit: None,
+                exhaustive: false,
+                beam: None,
+                outer: false,
+                sample: OuterSample::Off,
+                assert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
+                report: None,
+                md: None,
+                proc_macro: true,
+                backend: Backend::UndoLog,
+            }
+        );
+    }
+
+    #[test]
+    fn run_args_parse_engine_with_the_other_options() {
+        let got = parse_run_args(
+            &args(&[
+                "--engine",
+                "--limit",
+                "3",
+                "--beam",
+                "2",
+                "--outer-check",
+                "--outer-sample",
+                "4",
+                "--assert-every",
+                "0",
+                "--report",
+                "/o/r.json",
+                "--markdown",
+                "/o/r.md",
+                "--no-proc-macro",
+            ]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(got.backend, Backend::Engine);
+        assert!(RaConfig::default().with_backend(got.backend).engine);
+        assert_eq!((got.limit, got.beam, got.outer), (Some(3), Some(2), true));
+        assert_eq!(got.sample, OuterSample::Top(NonZeroUsize::new(4).unwrap()));
+        assert_eq!(got.assert_every, None);
+        assert_eq!(got.report, Some(PathBuf::from("/o/r.json")));
+        assert_eq!(got.md, Some(PathBuf::from("/o/r.md")));
+        assert!(!got.proc_macro);
+        // `--engine` takes no value: the next word is read as an option of its own.
+        let after = parse_run_args(&args(&["--engine", "--exhaustive"]), false).unwrap();
+        assert_eq!((after.backend, after.exhaustive), (Backend::Engine, true));
+        assert!(parse_run_args(&args(&["--engine", "x"]), false).is_err());
+    }
+
+    #[test]
+    fn run_args_refuse_what_they_refused_before() {
+        for bad in [
+            &["--beam", "0"][..],
+            &["--outer-sample", "2"][..],
+            &["--outer-check", "--outer-sample", "0"][..],
+            &["--limit"][..],
+            &["--backend", "engine"][..],
+        ] {
+            assert!(parse_run_args(&args(bad), true).is_err(), "{bad:?}");
+        }
+    }
 }

@@ -8,6 +8,10 @@
 //! Memory and CPU time are read through `proc.rs`: a failed read is an error of the run, so the
 //! host runs on Linux only. With `--on` every run also prints its process CPU ms, its wall ms
 //! and its core occupancy ([`occupancy`]).
+//!
+//! With `--engine` the forks run on layers of the fork Engine (`RaConfig.engine`, D11) instead
+//! of the stacked undo log; every summary line ends with ` backend engine` or ` backend undo-log`
+//! ([`Backend`]).
 
 use crate::proc::{self, ProcError};
 use crate::stacked::{self, Point};
@@ -19,7 +23,7 @@ use ryo_v2_core::domain::{Edit, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{RaAnalyzer, RaConfig};
+use ryo_v2_ra::{Backend, RaAnalyzer, RaConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,6 +45,8 @@ pub struct BenchArgs {
     pub proc_macro: bool,
     /// Whether to re-diagnose after the revert and compare with the baseline.
     pub assert_revert: bool,
+    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
+    pub backend: Backend,
 }
 
 /// How a child is brought to its state.
@@ -410,7 +416,8 @@ pub fn run(args: &BenchArgs) -> Result<()> {
             proc_macro: args.proc_macro,
             assert_revert: args.assert_revert,
             ..RaConfig::default()
-        },
+        }
+        .with_backend(args.backend),
         Arc::new(MonotonicClock::new()),
         observer.clone(),
     );
@@ -546,7 +553,15 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                         (reverted, mode_txt.clone())
                     }
                 };
-                print_summary(&name, sname, &mode_txt, &extra, &series, &mut worst);
+                print_summary(
+                    &name,
+                    sname,
+                    &mode_txt,
+                    &extra,
+                    args.backend,
+                    &series,
+                    &mut worst,
+                );
                 if !reverted {
                     fail_infra += 1;
                     break 'scopes;
@@ -567,19 +582,40 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     Ok(())
 }
 
-/// Prints the summary line of a series; `mode` is added to the label of the worst check, `extra`
-/// ends the line.
+/// Prints the summary line of a series; `mode` is added to the label of the worst check.
 fn print_summary(
     name: &str,
     sname: &str,
     mode: &str,
     extra: &str,
+    backend: Backend,
     s: &Series,
     worst: &mut Option<(u64, String)>,
 ) {
+    let Some(line) = summary_line(name, sname, extra, backend, s) else {
+        return;
+    };
+    println!("{line}");
+    // Without warm runs (n == 1) the first (cold) check stands in.
+    let basis = summarize(&s.check_ms[1..]).map_or(s.check_ms[0], |(_, med, _)| med);
+    if worst.as_ref().is_none_or(|(w, _)| basis > *w) {
+        *worst = Some((basis, format!("{name} [{sname}]{mode}")));
+    }
+}
+
+/// The summary line of a series, `None` for a series without runs: `extra` and the warm
+/// occupancy follow the figures, and ` backend <name>` ends the line, so that runs on the two
+/// backends can be told apart.
+fn summary_line(
+    name: &str,
+    sname: &str,
+    extra: &str,
+    backend: Backend,
+    s: &Series,
+) -> Option<String> {
     let n = s.check_ms.len();
     if n == 0 {
-        return;
+        return None;
     }
     let warm_check = &s.check_ms[1..];
     let warm_revert = &s.revert_ms[1..];
@@ -605,19 +641,15 @@ fn print_summary(
         Some(m) => format!(" warm_occupancy_median {m:.2}"),
         None => String::new(),
     };
-    println!(
-        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt}",
+    Some(format!(
+        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt} backend {}",
         s.check_ms[0],
         triple(warm_check),
         triple(warm_revert),
         slope(warm_rss),
         leak_suspect(warm_rss),
-    );
-    // Without warm runs (n == 1) the first (cold) check stands in.
-    let basis = summarize(warm_check).map_or(s.check_ms[0], |(_, med, _)| med);
-    if worst.as_ref().is_none_or(|(w, _)| basis > *w) {
-        *worst = Some((basis, format!("{name} [{sname}]{mode}")));
-    }
+        backend.name(),
+    ))
 }
 
 /// (min, median, max); the median is the lower one for an even count (sorted[(n-1)/2]). None when empty.
@@ -772,6 +804,43 @@ mod tests {
             }
             assert!(series.occupancy.is_empty());
         }
+    }
+
+    /// `ryo_v2_ra::Backend` C1: the word a summary line ends with.
+    #[test]
+    fn summary_line_ends_with_the_backend() {
+        let series = Series {
+            check_ms: vec![10, 20],
+            revert_ms: vec![1, 2],
+            rss_kb: Vec::new(),
+            occupancy: Vec::new(),
+        };
+        // Without `--on` and `--engine`: the line of a bench before the backend was named, and
+        // ` backend undo-log` after it.
+        assert_eq!(
+            summary_line("v", "affected", "", Backend::UndoLog, &series).unwrap(),
+            "summary v [affected] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
+             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false backend undo-log"
+        );
+        // With `--on`: the backend follows the mode, the parent's level and the occupancy.
+        let stacked = Series {
+            occupancy: vec![0.5, 0.25],
+            ..series
+        };
+        assert_eq!(
+            summary_line(
+                "v",
+                "workspace",
+                " mode stacked rss_kb_after_parent_level 5",
+                Backend::Engine,
+                &stacked
+            )
+            .unwrap(),
+            "summary v [workspace] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
+             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false mode stacked \
+             rss_kb_after_parent_level 5 warm_occupancy_median 0.25 backend engine"
+        );
+        assert!(summary_line("v", "affected", "", Backend::Engine, &Series::default()).is_none());
     }
 
     #[test]

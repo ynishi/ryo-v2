@@ -18,6 +18,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ryo_v2_core::domain::{Scope, TextRange};
 use ryo_v2_host::bench::{self, BenchArgs};
+use ryo_v2_ra::Backend;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -64,6 +65,10 @@ enum Command {
         /// variant written as a level on top of the parent's level of one fork).
         #[arg(long, value_name = "PARENT")]
         on: Option<PathBuf>,
+        /// Run the forks on layers of the fork Engine instead of the stacked undo log; every
+        /// summary line ends with ` backend engine` (` backend undo-log` without it).
+        #[arg(long)]
+        engine: bool,
     },
     /// Verify BLUEPRINTS against the workspace and print the Resolution as JSON (a dry run: nothing is written).
     Apply {
@@ -181,6 +186,7 @@ fn run() -> Result<ExitCode> {
             no_proc_macro,
             no_assert_revert,
             on,
+            engine,
         } => {
             let (base, variants) = match large {
                 Some(path) => {
@@ -217,6 +223,7 @@ fn run() -> Result<ExitCode> {
                 scopes,
                 proc_macro: !no_proc_macro,
                 assert_revert: !no_assert_revert,
+                backend: Backend::of_engine(engine),
             })
             .map(|()| ExitCode::SUCCESS)
         }
@@ -268,6 +275,29 @@ mod tests {
             _ => panic!("not bench"),
         }
         assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--on"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_bench_engine() {
+        let engine = |args: &[&str]| match Cli::try_parse_from(args)
+            .map_err(|e| e.to_string())
+            .expect("parses")
+            .command
+        {
+            Command::Bench { engine, .. } => engine,
+            _ => panic!("not bench"),
+        };
+        assert!(!engine(&["ryo-v2", "bench", "/b", "/v"]));
+        assert!(engine(&["ryo-v2", "bench", "/b", "/v", "--engine"]));
+        assert!(engine(&[
+            "ryo-v2", "bench", "/b", "/v", "--on", "/p", "--repeat", "2", "--engine"
+        ]));
+        assert!(engine(&["ryo-v2", "bench", "--large", "/x", "--engine"]));
+        // A flag, not an option with a value; and not a flag of the other commands.
+        assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--engine=true"]).is_err());
+        assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--engine"]).is_err());
+        // No second command for the Engine: `--engine` is how a bench runs on it.
+        assert!(Cli::try_parse_from(["ryo-v2", "bench-cow", "/b", "/v"]).is_err());
     }
 
     #[test]

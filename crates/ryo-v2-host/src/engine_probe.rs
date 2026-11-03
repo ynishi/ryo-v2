@@ -18,7 +18,7 @@ use ryo_v2_core::app::ports::{Analyzer, Event, Observer};
 use ryo_v2_core::domain::Scope;
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{IngredientRow, MemoRow, MemoryReport, RaAnalyzer, RaConfig, RaSession};
+use ryo_v2_ra::{Backend, IngredientRow, MemoRow, MemoryReport, RaAnalyzer, RaConfig, RaSession};
 use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
@@ -82,14 +82,18 @@ pub struct ProbeArgs {
     pub idle: bool,
     /// The bench's medians to state the overhead against.
     pub bench_medians: Vec<BenchMedian>,
+    /// The backend of the forks (`RaConfig.engine`); the report names it.
+    pub backend: Backend,
 }
 
 /// What one probe run measured, written as JSON to `--report`.
 ///
 /// # Contract
-/// - C1: the report holds exactly the fields of `ProbeReport` (machine, phases, composition,
-///   checks, overhead), one `checks` entry per diagnosed level with h0, hW, h1, h2, h3, delta,
-///   freed at write, freed at pop and the probe's wall ms; memory in GiB.
+/// - C1: the report holds exactly the fields of `ProbeReport` (backend, machine, phases,
+///   composition, checks, overhead), one `checks` entry per diagnosed level with h0, hW, h1, h2,
+///   h3, delta, freed at write, freed at pop and the probe's wall ms; memory in GiB. backend,
+///   the first key, is the run's [`ryo_v2_ra::Backend`] by name, `"undo-log"` or `"engine"`, so that two
+///   runs can be told apart.
 ///   tested: engine_probe::tests::report_json_keeps_its_keys_and_values
 /// - C2: a check's freed at write is h0 - hW (what the new revision of the level's write frees),
 ///   its delta h1 - hW (what the diagnosis allocates and keeps after that write) and its freed at
@@ -100,6 +104,8 @@ pub struct ProbeArgs {
 ///   tested: engine_probe::tests::a_failed_proc_read_is_an_error
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProbeReport {
+    /// The backend the forks ran on (`--engine`).
+    pub backend: Backend,
     /// The machine the run measured on.
     pub machine: Machine,
     /// P0 before load, P1 at `Event::Indexed`, P2 at `Event::Loaded`, P3 after the last check.
@@ -463,7 +469,8 @@ pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeRepor
             proc_macro: true,
             assert_revert: true,
             ..RaConfig::default()
-        },
+        }
+        .with_backend(args.backend),
         Arc::new(MonotonicClock::new()),
         observer.clone(),
     );
@@ -535,6 +542,7 @@ pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeRepor
     phases.push(phase("P3", gauge, rss)?);
     compositions.push(composition(&mut session, "P3")?);
     Ok(ProbeReport {
+        backend: args.backend,
         machine: Machine {
             ram_gib,
             cores,
@@ -634,6 +642,7 @@ mod tests {
     #[test]
     fn report_json_keeps_its_keys_and_values() {
         let report = ProbeReport {
+            backend: Backend::UndoLog,
             machine: Machine {
                 ram_gib: 64.0,
                 cores: 16,
@@ -677,8 +686,27 @@ mod tests {
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(
             keys(&v),
-            set(&["machine", "phases", "composition", "checks", "overhead"])
+            set(&[
+                "backend",
+                "machine",
+                "phases",
+                "composition",
+                "checks",
+                "overhead"
+            ])
         );
+        assert_eq!(v["backend"], json!("undo-log"));
+        let text = serde_json::to_string(&report).unwrap();
+        assert!(text.starts_with(r#"{"backend":"undo-log","#), "{text}");
+        // A run on the Engine differs in that key alone.
+        let mut engine = serde_json::to_value(ProbeReport {
+            backend: Backend::Engine,
+            ..report.clone()
+        })
+        .unwrap();
+        assert_eq!(engine["backend"], json!("engine"));
+        engine["backend"] = json!("undo-log");
+        assert_eq!(engine, v);
         assert_eq!(
             v["machine"],
             json!({"ram_gib": 64.0, "cores": 16, "threads": 16, "idle": true})
