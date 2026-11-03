@@ -17,7 +17,7 @@ mod search_json;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use ryo_v2_core::domain::{Scope, TextRange};
-use ryo_v2_host::bench::{self, BenchArgs};
+use ryo_v2_host::bench::{self, BenchArgs, DepthArgs};
 use ryo_v2_ra::Backend;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -43,7 +43,7 @@ enum Command {
         #[arg(required_unless_present = "large")]
         base: Option<PathBuf>,
         /// Overlay dirs; each .rs that differs from (or is missing in) BASE is an edit.
-        #[arg(required_unless_present = "large")]
+        #[arg(required_unless_present_any = ["large", "depth_sweep"])]
         variants: Vec<PathBuf>,
         /// Large mode: BASE = PATH, VARIANTS = corpus/body-01 corpus/body-02 corpus/body-03 (relative to the cwd).
         #[arg(long, value_name = "PATH", conflicts_with_all = ["base", "variants"])]
@@ -69,6 +69,30 @@ enum Command {
         /// summary line ends with ` backend engine` (` backend undo-log` without it).
         #[arg(long)]
         engine: bool,
+        /// Measure stacks of these depths instead of VARIANTS: per depth K, write K levels on one
+        /// fork (level k appends `fn __ryo_depth_<k>() -> u32 { <k> }` to a workspace file),
+        /// diagnose the top level `--repeat` times and pop back. A comma-separated list, each >= 1.
+        #[arg(
+            long,
+            value_name = "DEPTHS",
+            value_delimiter = ',',
+            num_args = 1,
+            value_parser = clap::value_parser!(u32).range(1..),
+            conflicts_with_all = ["variants", "on", "large"],
+        )]
+        depth_sweep: Vec<u32>,
+        /// With `--depth-sweep`: the number of workspace files (in path order) the levels rotate
+        /// over, so that depth is not the growth of one file [default: 1].
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "depth_sweep",
+            // clap waives a missing `requires` target that conflicts with a present argument,
+            // so the conflicts of `--depth-sweep` are repeated here.
+            conflicts_with_all = ["variants", "on", "large"],
+            value_parser = clap::value_parser!(u32).range(1..),
+        )]
+        depth_files: Option<u32>,
     },
     /// Verify BLUEPRINTS against the workspace and print the Resolution as JSON (a dry run: nothing is written).
     Apply {
@@ -187,7 +211,28 @@ fn run() -> Result<ExitCode> {
             no_assert_revert,
             on,
             engine,
+            depth_sweep,
+            depth_files,
         } => {
+            let scopes = match scope {
+                ScopeArg::Affected => vec![Scope::Affected],
+                ScopeArg::Workspace => vec![Scope::Workspace],
+                ScopeArg::Both => vec![Scope::Affected, Scope::Workspace],
+            };
+            if !depth_sweep.is_empty() {
+                return bench::run_depth_sweep(&DepthArgs {
+                    base: base
+                        .ok_or_else(|| anyhow::anyhow!("BASE is required with --depth-sweep"))?,
+                    depths: depth_sweep,
+                    files: depth_files.unwrap_or(1),
+                    repeat,
+                    scopes,
+                    proc_macro: !no_proc_macro,
+                    assert_revert: !no_assert_revert,
+                    backend: Backend::of_engine(engine),
+                })
+                .map(|()| ExitCode::SUCCESS);
+            }
             let (base, variants) = match large {
                 Some(path) => {
                     let variants: Vec<PathBuf> =
@@ -209,11 +254,6 @@ fn run() -> Result<ExitCode> {
                     base.ok_or_else(|| anyhow::anyhow!("BASE is required without --large"))?,
                     variants,
                 ),
-            };
-            let scopes = match scope {
-                ScopeArg::Affected => vec![Scope::Affected],
-                ScopeArg::Workspace => vec![Scope::Workspace],
-                ScopeArg::Both => vec![Scope::Affected, Scope::Workspace],
             };
             bench::run(&BenchArgs {
                 base,
@@ -298,6 +338,89 @@ mod tests {
         assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--engine"]).is_err());
         // No second command for the Engine: `--engine` is how a bench runs on it.
         assert!(Cli::try_parse_from(["ryo-v2", "bench-cow", "/b", "/v"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_bench_depth_sweep() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args)
+            .map_err(|e| e.to_string())
+            .expect("parses")
+            .command
+        {
+            Command::Bench {
+                base,
+                variants,
+                depth_sweep,
+                depth_files,
+                engine,
+                repeat,
+                ..
+            } => (base, variants, depth_sweep, depth_files, engine, repeat),
+            _ => panic!("not bench"),
+        };
+        let (base, variants, depths, files, engine, repeat) = parse(&[
+            "ryo-v2",
+            "bench",
+            "/b",
+            "--depth-sweep",
+            "1,5,10,20",
+            "--repeat",
+            "3",
+        ]);
+        assert_eq!(base, Some(PathBuf::from("/b")));
+        assert!(variants.is_empty());
+        assert_eq!(depths, vec![1, 5, 10, 20]);
+        assert_eq!((files, engine, repeat), (None, false, 3));
+        let (_, _, depths, files, engine, _) = parse(&[
+            "ryo-v2",
+            "bench",
+            "/b",
+            "--depth-sweep",
+            "2",
+            "--depth-files",
+            "3",
+            "--engine",
+        ]);
+        assert_eq!((depths, files, engine), (vec![2], Some(3), true));
+        // Without it a bench still needs its variants, and keeps parsing as before.
+        let (_, variants, depths, files, _, _) = parse(&["ryo-v2", "bench", "/b", "/v"]);
+        assert_eq!((variants.len(), depths.len(), files), (1, 0, None));
+        assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b"]).is_err());
+        // A depth is at least 1; a list, not a range.
+        for bad in ["0", "1,0", "x", "1-5"] {
+            assert!(
+                Cli::try_parse_from(["ryo-v2", "bench", "/b", "--depth-sweep", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        // Not with variants, `--on` or `--large`; `--depth-files` only with it, and >= 1.
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--depth-sweep", "1"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "bench", "/b", "--depth-sweep", "1", "--on", "/p"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "bench", "--large", "/x", "--depth-sweep", "1"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--depth-files", "2"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "--depth-files", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ryo-v2",
+                "bench",
+                "/b",
+                "--depth-sweep",
+                "1",
+                "--depth-files",
+                "0"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

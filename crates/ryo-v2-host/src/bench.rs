@@ -12,14 +12,18 @@
 //! With `--engine` the forks run on layers of the fork Engine (`RaConfig.engine`, D11) instead
 //! of the stacked undo log; every summary line ends with ` backend engine` or ` backend undo-log`
 //! ([`Backend`]).
+//!
+//! With `--depth-sweep` ([`run_depth_sweep`]) it measures how a diagnosis of the top level grows
+//! with the depth of a stack: per depth K, K one-file levels written on one fork by
+//! `stacked::depth_series`, the top level diagnosed `--repeat` times, and the levels popped.
 
 use crate::proc::{self, ProcError};
-use crate::stacked::{self, Point};
+use crate::stacked::{self, DepthPoint, Point};
 use anyhow::{Context, Result};
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Event, Observer, Verifier};
 use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::search::compose;
-use ryo_v2_core::domain::{Edit, Scope, Verdict};
+use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
@@ -408,20 +412,26 @@ fn record(
     }
 }
 
-/// Loads `args.base` once and runs every variant; prints the fixed output format.
-pub fn run(args: &BenchArgs) -> Result<()> {
+/// Builds the analyzer of a bench on `backend`, loads `base` once and prints the load's lines to
+/// stderr.
+fn load(
+    base: &std::path::Path,
+    proc_macro: bool,
+    assert_revert: bool,
+    backend: Backend,
+) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
     let observer = Arc::new(RecordingObserver::default());
     let analyzer = RaAnalyzer::new(
         RaConfig {
-            proc_macro: args.proc_macro,
-            assert_revert: args.assert_revert,
+            proc_macro,
+            assert_revert,
             ..RaConfig::default()
         }
-        .with_backend(args.backend),
+        .with_backend(backend),
         Arc::new(MonotonicClock::new()),
         observer.clone(),
     );
-    let mut session = analyzer.load(&args.base)?;
+    let session = analyzer.load(base)?;
     let rss_after_load = proc::vm_rss_kb().context("read the RSS after load")?;
     for event in observer.take() {
         match event {
@@ -443,6 +453,17 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         }
     }
     eprintln!("[rss] {rss_after_load} kB after load");
+    Ok((analyzer, observer, session))
+}
+
+/// Loads `args.base` once and runs every variant; prints the fixed output format.
+pub fn run(args: &BenchArgs) -> Result<()> {
+    let (analyzer, observer, mut session) = load(
+        &args.base,
+        args.proc_macro,
+        args.assert_revert,
+        args.backend,
+    )?;
 
     let parent = match &args.on {
         Some(dir) => {
@@ -578,6 +599,237 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     }
     if fail_infra > 0 {
         anyhow::bail!("{fail_infra} variant(s) failed revert assertion");
+    }
+    Ok(())
+}
+
+/// Arguments of one `bench --depth-sweep` invocation.
+pub struct DepthArgs {
+    /// The workspace to load.
+    pub base: PathBuf,
+    /// The depths to measure, in order: each is the number of levels of one stack.
+    pub depths: Vec<u32>,
+    /// The number of workspace files the levels rotate over.
+    pub files: u32,
+    /// Diagnoses of the top level per depth.
+    pub repeat: u32,
+    /// Scopes to diagnose, in order.
+    pub scopes: Vec<Scope>,
+    /// Whether to start the proc-macro server.
+    pub proc_macro: bool,
+    /// Whether every level's write is sampled for the re-assert at its pop.
+    pub assert_revert: bool,
+    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
+    pub backend: Backend,
+}
+
+/// What the hook of one depth series measured; durations in microseconds, by wall clock.
+#[derive(Default)]
+struct DepthRecord {
+    /// The number of levels of the series.
+    depth: usize,
+    /// The number of diagnoses of the series.
+    repeat: u32,
+    /// The start of the port call in progress.
+    started: Option<Instant>,
+    write_us: Vec<u64>,
+    check_us: Vec<u64>,
+    pop_us: Vec<u64>,
+    /// The scope files and findings of each diagnosis.
+    diagnosed: Vec<(usize, usize)>,
+    /// The VmRSS once every level is written.
+    rss_after_stack: Option<u64>,
+    /// The VmRSS after the last diagnosis, before the first pop.
+    rss_after_diagnose: Option<u64>,
+}
+
+impl DepthRecord {
+    fn elapsed_us(&mut self) -> u64 {
+        self.started
+            .take()
+            .map_or(0, |t| t.elapsed().as_micros() as u64)
+    }
+
+    /// Times each write, diagnosis and pop between its points, and reads VmRSS with the strict
+    /// reader once the stack is written and once it is diagnosed; a failed read ends the series.
+    fn observe(&mut self, point: DepthPoint<'_>) -> Result<(), ProcError> {
+        match point {
+            DepthPoint::BeforeWrite(_)
+            | DepthPoint::BeforeDiagnose(_)
+            | DepthPoint::BeforePop(_) => self.started = Some(Instant::now()),
+            DepthPoint::AfterWrite(k) => {
+                let us = self.elapsed_us();
+                self.write_us.push(us);
+                if k == self.depth {
+                    self.rss_after_stack = Some(proc::vm_rss_kb()?);
+                }
+            }
+            DepthPoint::AfterDiagnose(r, found) => {
+                let us = self.elapsed_us();
+                self.check_us.push(us);
+                self.diagnosed
+                    .push((found.files.len(), found.findings.len()));
+                if r == self.repeat {
+                    self.rss_after_diagnose = Some(proc::vm_rss_kb()?);
+                }
+            }
+            DepthPoint::AfterPop(_) => {
+                let us = self.elapsed_us();
+                self.pop_us.push(us);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Microseconds as milliseconds with three decimals.
+fn ms(us: u64) -> String {
+    format!("{}.{:03}", us / 1000, us % 1000)
+}
+
+/// (min/median/max) of microseconds in milliseconds, `-` when empty.
+fn triple_ms(us: &[u64]) -> String {
+    match summarize(us) {
+        Some((a, b, c)) => format!("{}/{}/{}", ms(a), ms(b), ms(c)),
+        None => "-".to_string(),
+    }
+}
+
+/// The summary line of one depth: the first diagnosis of the top level, the warm ones (from the
+/// second on) as min/median/max, the writes and pops per level as min/median/max and in total,
+/// the VmRSS after the stack is written and after it is diagnosed, and the last diagnosis'
+/// scope files and findings; ` backend <name>` ends it.
+///
+/// # Contract
+/// - C1: one line per depth and scope, `summary depth-sweep [<scope>] depth <K> files <N>
+///   n=<R>` followed by the figures in the order above, ending with ` backend <name>`; a figure
+///   without a value (no warm diagnosis, no read) prints `-`.
+///   tested: bench::tests::depth_summary_line_ends_with_the_backend
+fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backend) -> String {
+    let first = rec.check_us.first().map_or("-".to_string(), |&us| ms(us));
+    let warm = rec.check_us.get(1..).unwrap_or(&[]);
+    let opt = |x: Option<u64>| x.map_or("-".to_string(), |k| k.to_string());
+    let (scope_files, findings) = rec
+        .diagnosed
+        .last()
+        .map_or(("-".to_string(), "-".to_string()), |(s, f)| {
+            (s.to_string(), f.to_string())
+        });
+    format!(
+        "summary depth-sweep [{sname}] depth {} files {files} n={} first_check_ms {first} \
+         warm_check_ms {} write_ms_per_level {} write_ms_total {} pop_ms_per_level {} \
+         pop_ms_total {} rss_kb_after_stack {} rss_kb_after_diagnose {} scope_files \
+         {scope_files} findings {findings} backend {}",
+        rec.depth,
+        rec.check_us.len(),
+        triple_ms(warm),
+        triple_ms(&rec.write_us),
+        ms(rec.write_us.iter().sum()),
+        triple_ms(&rec.pop_us),
+        ms(rec.pop_us.iter().sum()),
+        opt(rec.rss_after_stack),
+        opt(rec.rss_after_diagnose),
+        backend.name(),
+    )
+}
+
+/// The `.rs` files under `dir`, relative to `root`, in path order; `target` and hidden dirs are
+/// not walked.
+fn rs_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<RelPath>) -> Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("read {}", dir.display()))?;
+    entries.sort();
+    for path in entries {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if name != "target" && !name.starts_with('.') {
+                rs_files(root, &path, out)?;
+            }
+        } else if name.ends_with(".rs")
+            && let Ok(rel) = path.strip_prefix(root)
+            && let Some(rel) = rel.to_str()
+            && let Ok(rel) = RelPath::parse(&rel.replace(std::path::MAIN_SEPARATOR, "/"))
+        {
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+/// Loads `args.base` once and, per scope and depth K, writes K levels on one fork with
+/// `stacked::depth_series` (the levels of `stacked::depth_levels` over the first `args.files`
+/// files of the workspace that the session indexed, in path order), diagnoses the top level
+/// `args.repeat` times and pops back; prints a line per diagnosis and a summary per depth.
+pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
+    let (analyzer, _observer, mut session) = load(
+        &args.base,
+        args.proc_macro,
+        args.assert_revert,
+        args.backend,
+    )?;
+    let mut paths = Vec::new();
+    rs_files(&args.base, &args.base, &mut paths)?;
+    let files: Vec<(RelPath, String)> = paths
+        .into_iter()
+        .filter_map(|p| analyzer.text(&session, &p).map(|t| (p, t)))
+        .take(args.files as usize)
+        .collect();
+    if files.len() < args.files as usize {
+        anyhow::bail!(
+            "--depth-files {}: the workspace has {} indexed .rs files",
+            args.files,
+            files.len()
+        );
+    }
+    let names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
+    eprintln!("[depth-sweep] levels rotate over {}", names.join(", "));
+    let mut fail_infra = 0usize;
+    'scopes: for &scope in &args.scopes {
+        let sname = scope_name(scope);
+        for &depth in &args.depths {
+            let levels = stacked::depth_levels(&files, depth as usize);
+            let mut rec = DepthRecord {
+                depth: levels.len(),
+                repeat: args.repeat,
+                ..DepthRecord::default()
+            };
+            let name = format!("depth {depth}");
+            let reverted = stacked::depth_series(
+                &analyzer,
+                &mut session,
+                &name,
+                &levels,
+                scope,
+                args.repeat,
+                &mut |point| rec.observe(point),
+            )?;
+            for (i, (&us, &(scope_files, findings))) in
+                rec.check_us.iter().zip(&rec.diagnosed).enumerate()
+            {
+                println!(
+                    "depth {depth} [{sname}] {}/{}: check_ms {} scope_files {scope_files} findings {findings}",
+                    i + 1,
+                    args.repeat,
+                    ms(us),
+                );
+            }
+            println!(
+                "{}",
+                depth_summary_line(sname, args.files, &rec, args.backend)
+            );
+            if !reverted {
+                fail_infra += 1;
+                break 'scopes;
+            }
+        }
+    }
+    if fail_infra > 0 {
+        anyhow::bail!("{fail_infra} depth series failed revert");
     }
     Ok(())
 }
@@ -841,6 +1093,65 @@ mod tests {
              rss_kb_after_parent_level 5 warm_occupancy_median 0.25 backend engine"
         );
         assert!(summary_line("v", "affected", "", Backend::Engine, &Series::default()).is_none());
+    }
+
+    /// `depth_summary_line` C1.
+    #[test]
+    fn depth_summary_line_ends_with_the_backend() {
+        let rec = DepthRecord {
+            depth: 2,
+            repeat: 3,
+            write_us: vec![1500, 2500],
+            check_us: vec![9000, 4000, 3000],
+            pop_us: vec![250, 750],
+            diagnosed: vec![(3, 0), (3, 0), (3, 1)],
+            rss_after_stack: Some(100),
+            rss_after_diagnose: Some(120),
+            ..DepthRecord::default()
+        };
+        assert_eq!(
+            depth_summary_line("affected", 1, &rec, Backend::Engine),
+            "summary depth-sweep [affected] depth 2 files 1 n=3 first_check_ms 9.000 \
+             warm_check_ms 3.000/3.000/4.000 write_ms_per_level 1.500/1.500/2.500 \
+             write_ms_total 4.000 pop_ms_per_level 0.250/0.250/0.750 pop_ms_total 1.000 \
+             rss_kb_after_stack 100 rss_kb_after_diagnose 120 scope_files 3 findings 1 \
+             backend engine"
+        );
+        let empty = DepthRecord::default();
+        let line = depth_summary_line("workspace", 2, &empty, Backend::UndoLog);
+        assert!(line.contains("first_check_ms - warm_check_ms -"), "{line}");
+        assert!(line.contains("rss_kb_after_stack - "), "{line}");
+        assert!(line.ends_with(" backend undo-log"), "{line}");
+    }
+
+    /// The depth hook times between the points and reads VmRSS with the strict reader.
+    #[test]
+    fn depth_record_times_each_call_and_reads_rss_at_the_top() {
+        let mut rec = DepthRecord {
+            depth: 2,
+            repeat: 1,
+            ..DepthRecord::default()
+        };
+        let found = ryo_v2_core::domain::ScopedFindings::default();
+        for point in [
+            DepthPoint::BeforeWrite(1),
+            DepthPoint::AfterWrite(1),
+            DepthPoint::BeforeWrite(2),
+            DepthPoint::AfterWrite(2),
+            DepthPoint::BeforeDiagnose(1),
+            DepthPoint::AfterDiagnose(1, &found),
+            DepthPoint::BeforePop(2),
+            DepthPoint::AfterPop(2),
+            DepthPoint::BeforePop(1),
+            DepthPoint::AfterPop(1),
+        ] {
+            rec.observe(point).unwrap();
+        }
+        assert_eq!(
+            (rec.write_us.len(), rec.check_us.len(), rec.pop_us.len()),
+            (2, 1, 2)
+        );
+        assert!(rec.rss_after_stack.is_some() && rec.rss_after_diagnose.is_some());
     }
 
     #[test]

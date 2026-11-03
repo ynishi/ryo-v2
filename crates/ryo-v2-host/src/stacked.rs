@@ -110,6 +110,13 @@ pub fn stacked_series<A: Stacked>(
         a, s, &mut f, parent, variant, scope, repeat, &baseline, hook,
     );
     let released = a.release(s, f);
+    settle(name, ran, released)
+}
+
+/// The outcome of a series from what its levels returned (`ran`) and what the release of its fork
+/// returned: the series' error wins over the release's, which is printed; a failed release after
+/// a revert failure, or a release whose parent level did not revert, counts as a revert failure.
+fn settle(name: &str, ran: Result<bool>, released: Result<(), CheckError>) -> Result<bool> {
     let reverted = match ran {
         Ok(reverted) => reverted,
         Err(e) => {
@@ -203,6 +210,151 @@ fn call(hook: &mut Hook<'_>, point: Point<'_>, pending: Option<&CheckError>) -> 
             None => e.context(format!("the hook at {at}")),
         }
     })
+}
+
+/// A point of [`depth_series`] at which its hook is called. Levels and diagnoses count from 1.
+#[derive(Clone, Copy, Debug)]
+pub enum DepthPoint<'a> {
+    /// Level `k` is about to be written.
+    BeforeWrite(usize),
+    /// Level `k` has been written.
+    AfterWrite(usize),
+    /// Diagnosis `r` of the top level is about to run.
+    BeforeDiagnose(u32),
+    /// Diagnosis `r` of the top level has run, with its findings.
+    AfterDiagnose(u32, &'a ScopedFindings),
+    /// Level `k`, the top one, is about to be popped.
+    BeforePop(usize),
+    /// Level `k` has been popped and reverted to the level below.
+    AfterPop(usize),
+}
+
+impl DepthPoint<'_> {
+    /// The point's name, for the error of a hook that fails at it.
+    pub fn name(self) -> &'static str {
+        match self {
+            DepthPoint::BeforeWrite(_) => "BeforeWrite",
+            DepthPoint::AfterWrite(_) => "AfterWrite",
+            DepthPoint::BeforeDiagnose(_) => "BeforeDiagnose",
+            DepthPoint::AfterDiagnose(..) => "AfterDiagnose",
+            DepthPoint::BeforePop(_) => "BeforePop",
+            DepthPoint::AfterPop(_) => "AfterPop",
+        }
+    }
+}
+
+/// The hook of [`depth_series`]: it observes a point and may end the series with a failed read.
+pub type DepthHook<'h> = dyn FnMut(DepthPoint<'_>) -> Result<(), ProcError> + 'h;
+
+/// The levels of a depth series of `depth` levels over `files` (each a path and its base text).
+/// Level k appends `fn __ryo_depth_<k>() -> u32 { <k> }` to file `(k - 1) % files.len()` and is
+/// written as that file's composed text so far, so that every level is one edit of one input.
+/// No `files`, no level.
+///
+/// # Contract
+/// - C1: level k is one write of file `(k - 1) % files.len()` whose text is that file's base text
+///   with the functions of every level up to k on that file appended in order; a level never
+///   repeats the text of the level below.
+///   tested: stacked::tests::depth_levels_compose_one_edit_per_level
+pub fn depth_levels(files: &[(RelPath, String)], depth: usize) -> Vec<Vec<Edit>> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let mut texts: Vec<String> = files.iter().map(|(_, t)| t.clone()).collect();
+    (1..=depth)
+        .map(|k| {
+            let i = (k - 1) % files.len();
+            let text = &mut texts[i];
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&format!("\nfn __ryo_depth_{k}() -> u32 {{\n    {k}\n}}\n"));
+            vec![Edit::write(files[i].0.clone(), text.clone())]
+        })
+        .collect()
+}
+
+/// One depth series on a fork of `a`: writes each of `levels` as a level on the one before,
+/// diagnoses the top level `repeat` times at `scope`, then pops the levels from the top. The fork
+/// is released at the end, whatever happened. Returns whether every pop and the release
+/// reverted; the pops stop at the first that did not revert. `name` labels what is printed to
+/// stderr.
+///
+/// It shares the port calls of [`stacked_series`] (`fork`, `write`, `diagnose`, `pop`,
+/// `release`) and its handling of a failed release; only the shape of the stack differs.
+///
+/// # Contract
+/// - C1: it opens the fork; per level k it calls the hook at BeforeWrite(k), writes the level and
+///   calls it at AfterWrite(k); per diagnosis r it calls it at BeforeDiagnose(r), diagnoses the
+///   top level and calls it at AfterDiagnose(r); per level k from the top it calls it at
+///   BeforePop(k), pops and calls it at AfterPop(k); then it releases the fork. So K levels are
+///   written in order and K are popped in the reverse order. The hook observes and never changes
+///   the session.
+///   tested: stacked::tests::a_depth_series_writes_k_levels_and_pops_k_in_order
+/// - C2: a hook error, a refused write or a failed diagnosis ends the series with that error and
+///   the fork is still released; a pop that does not revert ends the pops and the series returns
+///   `Ok(false)`.
+///   tested: stacked::tests::a_depth_series_stops_at_a_failure_and_releases
+pub fn depth_series<A: Stacked>(
+    a: &A,
+    s: &mut A::Session,
+    name: &str,
+    levels: &[Vec<Edit>],
+    scope: Scope,
+    repeat: u32,
+    hook: &mut DepthHook<'_>,
+) -> Result<bool> {
+    let mut f = a.fork(s).context("open the fork")?;
+    let ran = depth_levels_on(a, s, &mut f, levels, scope, repeat, hook);
+    let released = a.release(s, f);
+    settle(name, ran, released)
+}
+
+/// The levels of [`depth_series`] on the live fork `f`; the fork is the caller's to release.
+fn depth_levels_on<A: Stacked>(
+    a: &A,
+    s: &mut A::Session,
+    f: &mut A::Fork,
+    levels: &[Vec<Edit>],
+    scope: Scope,
+    repeat: u32,
+    hook: &mut DepthHook<'_>,
+) -> Result<bool> {
+    for (i, edits) in levels.iter().enumerate() {
+        let k = i + 1;
+        depth_call(hook, DepthPoint::BeforeWrite(k))?;
+        // A refused write pushes no level; the release reverts those below.
+        a.write(s, f, edits)
+            .with_context(|| format!("write level {k}"))?;
+        depth_call(hook, DepthPoint::AfterWrite(k))?;
+    }
+    for r in 1..=repeat {
+        depth_call(hook, DepthPoint::BeforeDiagnose(r))?;
+        let found = a
+            .diagnose(s, f, scope)
+            .with_context(|| format!("diagnose the top level ({r}/{repeat})"))?;
+        depth_call(hook, DepthPoint::AfterDiagnose(r, &found))?;
+    }
+    for k in (1..=levels.len()).rev() {
+        depth_call(hook, DepthPoint::BeforePop(k))?;
+        match a.pop(s, f) {
+            Ok(true) => {}
+            Ok(false) => anyhow::bail!("pop level {k}: the fork had no level"),
+            Err(e @ CheckError::RevertMismatch { .. }) => {
+                eprintln!("REVERT-MISMATCH popping level {k}: {e}");
+                return Ok(false);
+            }
+            Err(e) => return Err(e).with_context(|| format!("pop level {k}")),
+        }
+        depth_call(hook, DepthPoint::AfterPop(k))?;
+    }
+    Ok(true)
+}
+
+/// Calls `hook` at `point`; its error ends the series, named with the point.
+fn depth_call(hook: &mut DepthHook<'_>, point: DepthPoint<'_>) -> Result<()> {
+    let at = point.name();
+    hook(point).map_err(|e| anyhow::Error::from(e).context(format!("the hook at {at}")))
 }
 
 #[cfg(test)]
@@ -576,5 +728,161 @@ mod tests {
             a.log.take(),
             ["fork", "write(p.rs)", "diagnose", "release"].map(String::from)
         );
+    }
+
+    #[test]
+    fn depth_levels_compose_one_edit_per_level() {
+        let files = [
+            (rel("a.rs"), "fn a() {}".to_owned()),
+            (rel("b.rs"), String::new()),
+        ];
+        let levels = depth_levels(&files, 3);
+        assert_eq!(levels.len(), 3);
+        assert!(levels.iter().all(|l| l.len() == 1), "one edit per level");
+        let paths: Vec<String> = levels.iter().map(|l| l[0].path.to_string()).collect();
+        assert_eq!(paths, ["a.rs", "b.rs", "a.rs"]);
+        let text = |k: usize| levels[k - 1][0].new_text.clone().unwrap();
+        let f = |k: usize| format!("\nfn __ryo_depth_{k}() -> u32 {{\n    {k}\n}}\n");
+        assert_eq!(text(1), format!("fn a() {{}}\n{}", f(1)));
+        assert_eq!(text(2), f(2));
+        // Level 3 is the composed text of a.rs: level 1's function, then its own.
+        assert_eq!(text(3), format!("{}{}", text(1), f(3)));
+        // On one file every level changes it from the level below.
+        let one = depth_levels(&files[..1], 4);
+        for w in one.windows(2) {
+            assert_ne!(w[0][0].new_text, w[1][0].new_text);
+            assert!(
+                w[1][0]
+                    .new_text
+                    .as_deref()
+                    .unwrap()
+                    .starts_with(w[0][0].new_text.as_deref().unwrap())
+            );
+        }
+        assert!(depth_levels(&[], 3).is_empty());
+    }
+
+    /// The log of one depth series on `a`, with every point the hook sees between the port calls.
+    fn depth_logged(
+        a: &FakeStack,
+        levels: &[Vec<Edit>],
+        repeat: u32,
+    ) -> (Result<bool>, Vec<String>) {
+        let result = depth_series(
+            a,
+            &mut (),
+            "fake",
+            levels,
+            Scope::Affected,
+            repeat,
+            &mut |point| {
+                let k = match point {
+                    DepthPoint::BeforeWrite(k)
+                    | DepthPoint::AfterWrite(k)
+                    | DepthPoint::BeforePop(k)
+                    | DepthPoint::AfterPop(k) => k.to_string(),
+                    DepthPoint::BeforeDiagnose(r) | DepthPoint::AfterDiagnose(r, _) => {
+                        r.to_string()
+                    }
+                };
+                a.note(format!("{}({k})", point.name()));
+                Ok(())
+            },
+        );
+        (result, a.log.take())
+    }
+
+    #[test]
+    fn a_depth_series_writes_k_levels_and_pops_k_in_order() {
+        let a = FakeStack::default();
+        let files = [
+            (rel("a.rs"), String::new()),
+            (rel("b.rs"), String::new()),
+            (rel("c.rs"), String::new()),
+        ];
+        let levels = depth_levels(&files, 3);
+        let (result, log) = depth_logged(&a, &levels, 2);
+        assert!(result.unwrap());
+        let want = [
+            "fork",
+            "BeforeWrite(1)",
+            "write(a.rs)",
+            "AfterWrite(1)",
+            "BeforeWrite(2)",
+            "write(b.rs)",
+            "AfterWrite(2)",
+            "BeforeWrite(3)",
+            "write(c.rs)",
+            "AfterWrite(3)",
+            "BeforeDiagnose(1)",
+            "diagnose",
+            "AfterDiagnose(1)",
+            "BeforeDiagnose(2)",
+            "diagnose",
+            "AfterDiagnose(2)",
+            "BeforePop(3)",
+            "pop",
+            "AfterPop(3)",
+            "BeforePop(2)",
+            "pop",
+            "AfterPop(2)",
+            "BeforePop(1)",
+            "pop",
+            "AfterPop(1)",
+            "release",
+        ]
+        .map(String::from);
+        assert_eq!(log, want);
+        assert!(a.levels.borrow().is_empty());
+        // The levels written are the levels given, in order.
+        let (_, log) = depth_logged(&a, &depth_levels(&files[..1], 2), 1);
+        let writes = log.iter().filter(|e| e.starts_with("write(")).count();
+        let pops = log.iter().filter(|e| e.as_str() == "pop").count();
+        assert_eq!((writes, pops), (2, 2));
+    }
+
+    #[test]
+    fn a_depth_series_stops_at_a_failure_and_releases() {
+        let files = [(rel("a.rs"), String::new())];
+        let levels = depth_levels(&files, 2);
+        // A failed diagnosis of the top level: no pop, the release reverts the levels.
+        let a = FakeStack {
+            fail_top_diagnose: true,
+            ..FakeStack::default()
+        };
+        let (result, log) = depth_logged(&a, &levels, 3);
+        assert!(result.is_err());
+        assert!(!log.iter().any(|e| e == "pop"), "{log:?}");
+        assert_eq!(log.last().map(String::as_str), Some("release"));
+        // A pop that does not revert ends the pops: the series is a revert failure.
+        let a = FakeStack {
+            mismatch_pop: true,
+            ..FakeStack::default()
+        };
+        let (result, log) = depth_logged(&a, &levels, 1);
+        assert!(!result.unwrap());
+        assert_eq!(log.iter().filter(|e| e.as_str() == "pop").count(), 1);
+        assert_eq!(log.last().map(String::as_str), Some("release"));
+        // A hook error ends the series with it; the fork is still released.
+        let a = FakeStack::default();
+        let result = depth_series(
+            &a,
+            &mut (),
+            "fake",
+            &levels,
+            Scope::Affected,
+            1,
+            &mut |point| match point {
+                DepthPoint::AfterWrite(2) => Err(failed_read()),
+                _ => Ok(()),
+            },
+        );
+        let e = result.unwrap_err();
+        assert!(
+            matches!(e.downcast_ref(), Some(ProcError::Read { .. })),
+            "{e:#}"
+        );
+        assert!(format!("{e:#}").contains("AfterWrite"));
+        assert_eq!(a.log.take().last().map(String::as_str), Some("release"));
     }
 }
