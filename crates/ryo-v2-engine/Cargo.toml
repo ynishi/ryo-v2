@@ -14,6 +14,11 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# The walk counters of salsa's fork layer on `LayerStats` (doc-hidden fields), for measurements
+# only: a timed build runs without it.
+fork-probe = ["salsa/fork-probe"]
+
 [dependencies]
 salsa = { workspace = true, features = ["fork"] }
 thiserror.workspace = true

@@ -19,7 +19,12 @@
 //!   one in its parent's view (no lock), whatever the depth of the chain;
 //! - the memos of the queries it ran (re-runs, fixpoint iterations), in its own store; a memo of
 //!   an ancestor or of the base that the layer verified gets a *stamp* in the layer, so siblings
-//!   never see it. A base memo is valid in a layer by salsa's own revision test on the chain;
+//!   never see it. A base memo is valid in a layer by salsa's own revision test on the chain.
+//!   A sealed layer that gets a child (or a lookup on a handle of it) builds a *chain view* of
+//!   the memos, tombstones and tracked-struct entries (module `flat`): per key the entry the walk
+//!   over the chain would find, so a memo or tracked lookup under a layer is at most four map
+//!   probes (the layer's own, then its parent's view), whatever the depth. Stamps are still
+//!   looked up layer by layer;
 //! - for a tracked struct the layer re-created, an entry with the new fields, per-field revisions,
 //!   durability and its own `updated_at` (the layer's revision); the struct keeps its id. A stale
 //!   struct is tombstoned in the layer, never deleted from the base;
@@ -34,6 +39,23 @@
 //!
 //! A handle without a layer behaves as upstream salsa.
 //!
+//! # Invariants (E1–E9)
+//!
+//! This table is the source of truth for the fork's invariants; any other text that numbers them
+//! differently is stale against it. Every change to the fork is checked against it.
+//!
+//! | # | Invariant |
+//! |---|---|
+//! | E1 | Every read resolves through the chain, reaching the reader explicitly through the handle (its [`ZalsaView`]), never through a thread-local |
+//! | E2 | Only the listed shared writes ([`SharedWrites`]) reach the base |
+//! | E3 | Revisions strictly increase along a chain, starting above the base (the counter is raised at every [`freeze`]); `LOW`'s `last_changed` is the newest written layer of the chain, `MEDIUM`'s and `HIGH`'s are the base's |
+//! | E4 | The base is frozen while any layer lives (no `zalsa_mut`) |
+//! | E5 | Claims, blocked threads and cycle-head transfers are keyed by layer |
+//! | E6 | Every layer's `(nonce, revision)` is unique, also against the base after a [thaw](try_thaw), in and out of queries |
+//! | E7 | No base slot, and no slot of a live layer, is reused while frozen; only a slot given back by a dropped layer of the same freeze is taken again (module `owned`) |
+//! | E8 | No LRU eviction or use recording |
+//! | E9 | A layer with a child takes no insert, from any path: an input, a memo, a stamp, a tracked-struct entry, a tombstone, an interned insert or a layer-owned tracked slot; a layer is sealed only while no handle carries it, so a sealed layer is quiescent |
+//!
 //! Invariants enforced here, each a panic in release builds too:
 //!
 //! - a handle with a layer never takes `zalsa_mut` (a setter, `synthetic_write`, LRU eviction,
@@ -43,8 +65,12 @@
 //!   no `verified_at`, `verified_final`, accumulated-inputs or cycle-iteration store on a base
 //!   memo, no tracked-struct update or deletion in place, no interned durability, revision-queue
 //!   or LRU write, no slot reuse, from any handle;
-//! - a sealed layer takes no write (an input, a memo, a stamp, a tracked-struct entry or a
-//!   tombstone), and only a sealed layer gets a child;
+//! - a sealed layer takes no write (an input, a memo, a stamp, a tracked-struct entry, a
+//!   tombstone, an interned insert or a layer-owned tracked slot; the last two are counted in
+//!   [`refused_writes`]), and only a sealed layer gets a child;
+//! - [`Layer::seal`] refuses ([`SealRefused`]) while a database handle carries the layer, so no
+//!   query is in flight on a sealed layer and no insert that passed its check before the seal
+//!   lands after it (E9);
 //! - a layer's cancellation is final: no handle's `attach` scope resets the shared token;
 //! - a layer of another base, or of an earlier freeze of this one, cannot be set on a handle;
 //! - a layered input write is refused for a field whose durability is above `LOW`.
@@ -55,16 +81,18 @@
 //! every layer of a later freeze. Its values therefore grow only through its own queries; the
 //! base's own next new revision (a setter, `synthetic_write`) evicts as upstream does.
 
+mod flat;
 mod owned;
 mod store;
 mod view;
 
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
+use self::flat::{FlatChain, ViewMemo};
 pub(crate) use self::owned::LayerFreeList;
 use self::owned::{OwnedSlots, SlotCounters};
 use self::store::Sharded;
@@ -344,17 +372,133 @@ pub struct LayerStats {
     pub tracked_entries: usize,
     /// Tracked structs this layer tombstoned.
     pub tombstones: usize,
+    /// The memo keys of this sealed layer's chain view (one per key the layer or an ancestor
+    /// computed that no newer tombstone hides); 0 while the layer has no view: an open layer, or a
+    /// sealed one that got no child and no lookup.
+    pub flat_memos: usize,
+    /// The tracked-struct ids of the view (entries and tombstones), as `flat_memos`.
+    pub flat_tracked: usize,
+    /// The ids the view hides (tombstoned by a layer of the chain), as `flat_memos`.
+    pub flat_hidden: usize,
+    /// The heap bytes of the view this layer built, from the capacity of its maps; 0 when it
+    /// shares its parent's view (it holds no memo, tracked entry or tombstone of its own) or has
+    /// none. The sum over the layers of a stack is what the stack's views cost (gate M2-view).
+    pub flat_bytes: usize,
+    /// Under `fork-probe`: the memo and tracked maps probed by memo lookups on this layer's
+    /// chain (`find_memo`), summed over every lookup made through a handle of this layer.
+    #[cfg(feature = "fork-probe")]
+    #[doc(hidden)]
+    pub chain_memo_probes: usize,
+    /// Under `fork-probe`: the tracked maps and views probed by tracked-struct lookups
+    /// (`find_tracked`) on this layer's chain.
+    #[cfg(feature = "fork-probe")]
+    #[doc(hidden)]
+    pub chain_tracked_probes: usize,
+    /// Under `fork-probe`: the layers visited by stamp lookups (`stamp_of`).
+    #[cfg(feature = "fork-probe")]
+    #[doc(hidden)]
+    pub stamp_visits: usize,
+    /// Under `fork-probe`: the walks over the ancestors' cancellation tokens.
+    #[cfg(feature = "fork-probe")]
+    #[doc(hidden)]
+    pub cancel_walks: usize,
+    /// Under `fork-probe`: the distinct memo keys the layers of the chain hold (a walk over the
+    /// chain at the call; an upper bound of `flat_memos`, without the removals of tombstones).
+    #[cfg(feature = "fork-probe")]
+    #[doc(hidden)]
+    pub chain_unique_memo_keys: usize,
+    /// Under `fork-probe`: the distinct tracked-struct ids the layers of the chain hold an entry
+    /// or a tombstone for (a walk; the value of `flat_tracked`).
+    #[cfg(feature = "fork-probe")]
+    #[doc(hidden)]
+    pub chain_unique_tracked_ids: usize,
+    /// Under `fork-probe`: the distinct ids the layers of the chain tombstoned (a walk; an upper
+    /// bound of `flat_hidden`).
+    #[cfg(feature = "fork-probe")]
+    #[doc(hidden)]
+    pub chain_unique_tombstoned_ids: usize,
 }
 
-/// One write on top of a parent: a revision, the parent chain, a sealed flag, a cancellation
-/// token, the input values it set, the memos it computed, its stamps, its tracked-struct entries
-/// and its dependency graph.
+/// Why [`Layer::seal`] refused: a database handle carries the layer, so a query on it may be in
+/// flight (E9). The layer is open and unchanged.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SealRefused {
+    /// The live handles that carry the layer.
+    pub handles: usize,
+}
+
+impl std::fmt::Display for SealRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ryo-v2 fork: a layer cannot be sealed while {} handle(s) carry it",
+            self.handles
+        )
+    }
+}
+
+impl std::error::Error for SealRefused {}
+
+/// The states of a layer (`Layer::state`): it takes writes only while open; a seal passes
+/// through `SEALING`, from which it goes back to `OPEN` when a handle carries the layer.
+const OPEN: u8 = 0;
+const SEALING: u8 = 1;
+const SEALED: u8 = 2;
+
+/// The counters of `fork-probe`, counted on the reading layer, so that no cache line is shared
+/// across layers. Without the feature the type is empty and counting is a no-op.
+#[derive(Default)]
+struct Probe {
+    #[cfg(feature = "fork-probe")]
+    memo_probes: AtomicUsize,
+    #[cfg(feature = "fork-probe")]
+    tracked_probes: AtomicUsize,
+    #[cfg(feature = "fork-probe")]
+    stamp_visits: AtomicUsize,
+    #[cfg(feature = "fork-probe")]
+    cancel_walks: AtomicUsize,
+}
+
+/// What a `fork-probe` counter counts.
+#[derive(Copy, Clone)]
+enum ProbeKind {
+    MemoProbes,
+    TrackedProbes,
+    StampVisits,
+    CancelWalks,
+}
+
+impl Probe {
+    #[inline(always)]
+    fn add(&self, _kind: ProbeKind, _n: usize) {
+        #[cfg(feature = "fork-probe")]
+        {
+            let counter = match _kind {
+                ProbeKind::MemoProbes => &self.memo_probes,
+                ProbeKind::TrackedProbes => &self.tracked_probes,
+                ProbeKind::StampVisits => &self.stamp_visits,
+                ProbeKind::CancelWalks => &self.cancel_walks,
+            };
+            counter.fetch_add(_n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One write on top of a parent: a revision, the parent chain, a state (open, sealing, sealed),
+/// a cancellation token, the input values it set, the memos it computed, its stamps, its
+/// tracked-struct entries and its dependency graph.
 pub struct Layer {
     /// The epoch of the freeze of the base this layer was made under (`ForkState::epoch`).
     base: u64,
     revision: Revision,
-    parent: Option<Arc<Layer>>,
-    sealed: AtomicBool,
+    /// The layers below this one, the root layer first and the parent last: the one source of
+    /// the chain ([`Layer::parent`], [`Layer::chain`]). Its length is the layer's depth.
+    ancestors: Box<[Arc<Layer>]>,
+    /// `OPEN`, `SEALING` or `SEALED` (see [`Layer::seal`]).
+    state: AtomicU8,
+    /// The live database handles that carry this layer (`ZalsaView` counts them): a seal is
+    /// refused while one lives.
+    handles: AtomicUsize,
     written: AtomicBool,
     /// Whether a query wrote into the layer (a memo, stamp, entry or tombstone).
     queried: AtomicBool,
@@ -370,6 +514,10 @@ pub struct Layer {
     /// The flattened view of the chain's inputs, set once by [`Layer::seal`] (before the sealed
     /// flag) and never changed: a set view means the layer takes no input write.
     flat_inputs: OnceLock<Arc<FlatInputs>>,
+    /// The chain view of memos, tombstones and tracked entries ([`FlatChain`]), built at most
+    /// once, on a sealed layer only: when it gets its first child, or at the first lookup on a
+    /// handle of it ([`Layer::flat_view`]). A leaf never builds one.
+    flat: OnceLock<Arc<FlatChain>>,
     /// Append-only: an entry stays until the layer is dropped. Tracked-struct entries.
     values: boxcar::Vec<Box<dyn Any + Send + Sync>>,
     /// `(function ingredient, id)` to the index of the newest memo in `memo_values`.
@@ -392,6 +540,8 @@ pub struct Layer {
     stamp_count: AtomicUsize,
     tracked_count: AtomicUsize,
     tombstone_count: AtomicUsize,
+    /// The `fork-probe` counters (empty without the feature).
+    probe: Probe,
     /// The accounting of layer-owned slots of the base (shared with `ForkState`).
     slot_counters: Arc<SlotCounters>,
     /// The table slots this layer owns, given back when it drops.
@@ -409,7 +559,7 @@ impl std::fmt::Debug for Layer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Layer")
             .field("revision", &self.revision)
-            .field("parent", &self.parent.as_ref().map(|p| p.revision))
+            .field("parent", &self.parent().map(|p| p.revision))
             .field("sealed", &self.is_sealed())
             .field("written", &self.has_writes())
             .finish_non_exhaustive()
@@ -432,13 +582,23 @@ impl Drop for Layer {
 
 impl Layer {
     fn new(base: u64, slot_counters: Arc<SlotCounters>, parent: Option<Arc<Layer>>) -> Arc<Layer> {
+        let ancestors: Box<[Arc<Layer>]> = match parent {
+            Some(parent) => {
+                let mut ancestors = Vec::with_capacity(parent.ancestors.len() + 1);
+                ancestors.extend(parent.ancestors.iter().cloned());
+                ancestors.push(parent);
+                ancestors.into_boxed_slice()
+            }
+            None => Box::default(),
+        };
         Arc::new(Layer {
             slot_counters,
             owned: Mutex::new(OwnedSlots::default()),
             base,
             revision: next_layer_revision(),
-            parent,
-            sealed: AtomicBool::new(false),
+            ancestors,
+            state: AtomicU8::new(OPEN),
+            handles: AtomicUsize::new(0),
             written: AtomicBool::new(false),
             queried: AtomicBool::new(false),
             write: Mutex::new(()),
@@ -446,6 +606,7 @@ impl Layer {
             inputs: Mutex::new(FxHashMap::default()),
             input_values: boxcar::Vec::new(),
             flat_inputs: OnceLock::new(),
+            flat: OnceLock::new(),
             values: boxcar::Vec::new(),
             memos: Sharded::new(),
             memo_values: boxcar::Vec::new(),
@@ -458,6 +619,7 @@ impl Layer {
             stamp_count: AtomicUsize::new(0),
             tracked_count: AtomicUsize::new(0),
             tombstone_count: AtomicUsize::new(0),
+            probe: Probe::default(),
         })
     }
 
@@ -468,21 +630,106 @@ impl Layer {
 
     /// The parent layer, `None` for a layer directly on the base.
     pub fn parent(&self) -> Option<&Arc<Layer>> {
-        self.parent.as_ref()
+        self.ancestors.last()
+    }
+
+    /// The number of layers below this one (0 for a layer directly on the base).
+    #[inline]
+    pub(crate) fn depth(&self) -> usize {
+        self.ancestors.len()
+    }
+
+    /// The layer of this chain at `depth`: this one at its own depth, else an ancestor.
+    #[inline]
+    fn resolve(&self, depth: usize) -> &Layer {
+        if depth == self.depth() {
+            self
+        } else {
+            &self.ancestors[depth]
+        }
+    }
+
+    /// The memo at `index` of this layer's store.
+    #[inline]
+    fn memo_at(&self, index: usize) -> &dyn ErasedMemoTrait {
+        &**self
+            .memo_values
+            .get(index)
+            .expect("ryo-v2 fork: a memo index names a pushed memo")
+    }
+
+    /// The tracked-struct entry at `index` of this layer's store.
+    #[inline]
+    fn value_at(&self, index: usize) -> &(dyn Any + Send + Sync) {
+        &**self
+            .values
+            .get(index)
+            .expect("ryo-v2 fork: a tracked entry index names a pushed value")
+    }
+
+    /// The chain view of this sealed layer, built on the first call from the parent's view and
+    /// the layer's own entries. A sealed layer takes no insert and no handle carried it at the
+    /// seal (E9), so the view is complete and never changes.
+    fn flat_view(&self) -> &Arc<FlatChain> {
+        assert!(
+            self.is_sealed(),
+            "ryo-v2 fork: a chain view is built only for a sealed layer"
+        );
+        self.flat
+            .get_or_init(|| FlatChain::build(self, self.parent().map(|p| p.flat_view())))
     }
 
     /// Whether the layer is sealed: it takes no further write and may have children.
     pub fn is_sealed(&self) -> bool {
-        self.sealed.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == SEALED
     }
 
-    /// Seals the layer. Idempotent. Waits for an input write in progress on the layer, so a
-    /// write either completes before the seal or is refused after it, and builds the layer's
-    /// flattened input view from its own entries and its parent's view.
-    pub fn seal(&self) {
+    /// The live database handles that carry this layer, clones included.
+    pub fn handles(&self) -> usize {
+        self.handles.load(Ordering::SeqCst)
+    }
+
+    /// Counts a database handle that carries this layer (`ZalsaView`).
+    #[inline]
+    pub(crate) fn add_handle(&self) {
+        self.handles.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Counts a dropped database handle that carried this layer.
+    #[inline]
+    pub(crate) fn remove_handle(&self) {
+        self.handles.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Seals the layer: from here on it takes no write and may have children. Idempotent on a
+    /// sealed layer. Waits for an input write in progress on the layer, so a write either
+    /// completes before the seal or is refused after it, and builds the layer's flattened input
+    /// view from its own entries and its parent's view.
+    ///
+    /// Refused while a database handle carries the layer: a query of that handle may have passed
+    /// a write check before the seal and land its insert after it, which a view of the sealed
+    /// layer would miss. The layer is then open and unchanged (no view built), and a write that
+    /// saw it sealing in between was refused and counted, nothing more.
+    ///
+    /// Why no insert lands after the seal (every load and store below is `SeqCst`, and so are
+    /// the handle count's updates): a handle counted before the load of the count makes the seal
+    /// refuse; one counted after it was counted after the store of `SEALING`, so every write
+    /// check of that handle sees the layer not open, and refuses. Queries run only through
+    /// handles.
+    pub fn seal(&self) -> Result<(), SealRefused> {
         let _write = self.write.lock();
+        if self.state.load(Ordering::SeqCst) == SEALED {
+            return Ok(());
+        }
+        self.state.store(SEALING, Ordering::SeqCst);
+        let handles = self.handles.load(Ordering::SeqCst);
+        if handles != 0 {
+            self.state.store(OPEN, Ordering::SeqCst);
+            return Err(SealRefused { handles });
+        }
         self.flat_inputs.get_or_init(|| self.flatten_inputs());
-        self.sealed.store(true, Ordering::Release);
+        self.state.store(SEALED, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The flattened input view of this layer: the parent's view (empty for a root layer) with
@@ -490,7 +737,7 @@ impl Layer {
     /// that did copies the parent's map (one entry per input set on the chain, each an `Arc`).
     /// Runs under the write lock, so the own entries are complete.
     fn flatten_inputs(&self) -> Arc<FlatInputs> {
-        let parent = self.parent.as_ref().map(|p| p.sealed_inputs());
+        let parent = self.parent().map(|p| p.sealed_inputs());
         let own = self.inputs.lock();
         if own.is_empty() {
             return parent.cloned().unwrap_or_default();
@@ -529,20 +776,57 @@ impl Layer {
         self.token.clone()
     }
 
-    /// What this layer did so far.
+    /// What this layer did so far. Under `fork-probe` it also walks the chain for the distinct
+    /// keys its layers hold (see the fields), which costs a pass over every layer's maps.
     pub fn stats(&self) -> LayerStats {
-        LayerStats {
+        let mut stats = LayerStats {
             deep_verifies: self.deep_verifies.load(Ordering::Relaxed),
             memos: self.memo_count.load(Ordering::Relaxed),
             stamps: self.stamp_count.load(Ordering::Relaxed),
             tracked_entries: self.tracked_count.load(Ordering::Relaxed),
             tombstones: self.tombstone_count.load(Ordering::Relaxed),
+            ..LayerStats::default()
+        };
+        if let Some(view) = self.flat.get() {
+            stats.flat_memos = view.memo_count();
+            stats.flat_tracked = view.tracked_count();
+            stats.flat_hidden = view.hidden_count();
+            let shared = self
+                .parent()
+                .and_then(|p| p.flat.get())
+                .is_some_and(|p| Arc::ptr_eq(p, view));
+            stats.flat_bytes = if shared { 0 } else { view.bytes() };
         }
+        #[cfg(feature = "fork-probe")]
+        {
+            let mut memo_keys = rustc_hash::FxHashSet::default();
+            let mut tracked_ids = rustc_hash::FxHashSet::default();
+            let mut tombstoned = rustc_hash::FxHashSet::default();
+            for layer in self.chain() {
+                layer.memos.for_each(|key, _| {
+                    memo_keys.insert(*key);
+                });
+                layer.tracked.for_each(|id, slot| {
+                    tracked_ids.insert(*id);
+                    if let TrackedSlot::Tombstone = slot {
+                        tombstoned.insert(*id);
+                    }
+                });
+            }
+            stats.chain_memo_probes = self.probe.memo_probes.load(Ordering::Relaxed);
+            stats.chain_tracked_probes = self.probe.tracked_probes.load(Ordering::Relaxed);
+            stats.stamp_visits = self.probe.stamp_visits.load(Ordering::Relaxed);
+            stats.cancel_walks = self.probe.cancel_walks.load(Ordering::Relaxed);
+            stats.chain_unique_memo_keys = memo_keys.len();
+            stats.chain_unique_tracked_ids = tracked_ids.len();
+            stats.chain_unique_tombstoned_ids = tombstoned.len();
+        }
+        stats
     }
 
-    /// The layers of the chain, this one first, then its ancestors.
+    /// The layers of the chain, this one first, then its ancestors from the parent down.
     pub(crate) fn chain(&self) -> impl Iterator<Item = &Layer> {
-        std::iter::successors(Some(self), |l| l.parent.as_deref())
+        std::iter::once(self).chain(self.ancestors.iter().rev().map(|l| &**l))
     }
 
     /// The key of this layer's claims: its revision, unique in the process and never 0 (the key
@@ -567,7 +851,15 @@ impl Layer {
 
     /// Records slot `id` of `shard` of `list`'s ingredient as owned by this layer: given back
     /// when it drops. `reused` when it was taken again from the free list.
+    ///
+    /// Backstop of E9 (the callers refuse a sealed layer first, with `refuse_if_sealed`): panics
+    /// on a sealed layer. It does not panic while a seal is only being tried (`SEALING`), which a
+    /// live handle, and so this caller's, makes the seal undo.
     pub(crate) fn own_slot(&self, list: &Arc<LayerFreeList>, shard: u16, id: Id, reused: bool) {
+        assert!(
+            !self.is_sealed(),
+            "ryo-v2 fork: a sealed layer took a layer-owned slot"
+        );
         self.owned.lock().insert(list, shard, id);
         SlotCounters::add(&self.slot_counters.owned, 1);
         if reused {
@@ -587,7 +879,8 @@ impl Layer {
 
     /// Whether an ancestor's token (not this layer's own) was cancelled.
     pub(crate) fn ancestor_cancelled(&self) -> bool {
-        self.chain().skip(1).any(|l| l.token.is_cancelled())
+        self.probe.add(ProbeKind::CancelWalks, 1);
+        self.ancestors.iter().any(|l| l.token.is_cancelled())
     }
 
     /// The dependency graph of this layer's blocked threads and transfers.
@@ -614,7 +907,7 @@ impl Layer {
                         .input_values
                         .get(index)
                         .expect("ryo-v2 fork: an input entry index names a pushed value"),
-                    None => &**self.parent.as_ref()?.sealed_inputs().get(&key)?,
+                    None => &**self.parent()?.sealed_inputs().get(&key)?,
                 }
             }
         };
@@ -667,20 +960,43 @@ impl Layer {
 
     /// The memo of `function` for `id` on the chain: the newest layer that holds one, unless a
     /// layer below it and above the memo tombstoned `id`.
+    ///
+    /// A sealed layer reads its chain view; an open one its own memo and tracked maps (under
+    /// their locks), then its parent's view (no lock). At most four map probes, whatever the
+    /// depth; the result is the walk's over the chain (`flat.rs`).
     pub(crate) fn find_memo(&self, function: IngredientIndex, id: Id) -> ChainMemo<'_> {
-        for layer in self.chain() {
-            if let Some(index) = layer.memos.get(&(function, id)) {
-                let memo = layer
-                    .memo_values
-                    .get(index)
-                    .expect("ryo-v2 fork: a memo index names a pushed memo");
-                return ChainMemo::Found(&**memo);
+        let key = (function, id);
+        let mut probes = 0;
+        let found = 'find: {
+            let holder: &Layer = if self.is_sealed() {
+                self
+            } else {
+                probes += 1;
+                if let Some(index) = self.memos.get(&key) {
+                    break 'find ChainMemo::Found(self.memo_at(index));
+                }
+                probes += 1;
+                if let Some(TrackedSlot::Tombstone) = self.tracked.get(&id) {
+                    break 'find ChainMemo::Hidden;
+                }
+                match self.parent() {
+                    Some(parent) => parent,
+                    None => break 'find ChainMemo::NotInLayers,
+                }
+            };
+            let (seen, n) = holder.flat_view().memo(&key);
+            probes += n;
+            match seen {
+                ViewMemo::Found(at) => {
+                    let index = at.index().expect("ryo-v2 fork: a memo reference is no tombstone");
+                    ChainMemo::Found(holder.resolve(at.depth()).memo_at(index))
+                }
+                ViewMemo::Hidden => ChainMemo::Hidden,
+                ViewMemo::Miss => ChainMemo::NotInLayers,
             }
-            if let Some(TrackedSlot::Tombstone) = layer.tracked.get(&id) {
-                return ChainMemo::Hidden;
-            }
-        }
-        ChainMemo::NotInLayers
+        };
+        self.probe.add(ProbeKind::MemoProbes, probes);
+        found
     }
 
     /// Stores `memo` as this layer's memo of `function` for `id`, replacing an older one of the
@@ -731,7 +1047,13 @@ impl Layer {
     /// The newest stamp on the chain of the memo whose header is at `address`.
     #[inline]
     pub(crate) fn stamp_of(&self, address: usize) -> Option<Revision> {
-        self.chain().find_map(|layer| layer.stamps.get(&address))
+        let mut visits = 0;
+        let stamp = self.chain().find_map(|layer| {
+            visits += 1;
+            layer.stamps.get(&address)
+        });
+        self.probe.add(ProbeKind::StampVisits, visits);
+        stamp
     }
 
     /// Stamps the memo whose header is at `address` (a memo of an ancestor or of the base) as
@@ -751,24 +1073,45 @@ impl Layer {
     }
 
     /// The tracked struct `id` as the chain sees it.
+    ///
+    /// As [`Layer::find_memo`]: a sealed layer reads its chain view; an open one its own tracked
+    /// map, then its parent's view. At most two map probes, whatever the depth.
     pub(crate) fn find_tracked(&self, id: Id) -> ChainTracked<'_> {
-        for layer in self.chain() {
-            match layer.tracked.get(&id) {
-                Some(TrackedSlot::Entry(index)) => {
-                    let value = layer
-                        .values
-                        .get(index)
-                        .expect("ryo-v2 fork: a tracked entry index names a pushed value");
-                    return ChainTracked::Entry {
-                        value: &**value,
-                        own: std::ptr::eq(layer, self),
-                    };
+        let mut probes = 0;
+        let found = 'find: {
+            let holder: &Layer = if self.is_sealed() {
+                self
+            } else {
+                probes += 1;
+                match self.tracked.get(&id) {
+                    Some(TrackedSlot::Entry(index)) => {
+                        break 'find ChainTracked::Entry {
+                            value: self.value_at(index),
+                            own: true,
+                        };
+                    }
+                    Some(TrackedSlot::Tombstone) => break 'find ChainTracked::Tombstone,
+                    None => {}
                 }
-                Some(TrackedSlot::Tombstone) => return ChainTracked::Tombstone,
-                None => {}
+                match self.parent() {
+                    Some(parent) => parent,
+                    None => break 'find ChainTracked::None,
+                }
+            };
+            probes += 1;
+            match holder.flat_view().tracked(id) {
+                Some(at) => match at.index() {
+                    Some(index) => ChainTracked::Entry {
+                        value: holder.resolve(at.depth()).value_at(index),
+                        own: at.depth() == self.depth(),
+                    },
+                    None => ChainTracked::Tombstone,
+                },
+                None => ChainTracked::None,
             }
-        }
-        ChainTracked::None
+        };
+        self.probe.add(ProbeKind::TrackedProbes, probes);
+        found
     }
 
     /// Stores `entry` as this layer's entry of the tracked struct `id`. Panics on a sealed layer.
@@ -796,13 +1139,33 @@ impl Layer {
         self.tombstone_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Panics if the layer is sealed: `what` names the write that reached it.
+    /// Panics if the layer is not open (sealed, or being sealed): `what` names the write that
+    /// reached it.
     #[track_caller]
     pub(crate) fn assert_open(&self, what: &str) {
-        if self.is_sealed() {
-            panic!("ryo-v2 fork: write to a sealed layer ({what})");
+        if self.state.load(Ordering::SeqCst) != OPEN {
+            sealed_layer_write(what);
         }
     }
+
+    /// As [`Layer::assert_open`], for a write that would otherwise leave a trace before any
+    /// later check (an interned insert, a layer-owned tracked slot): the refusal is counted in
+    /// `fork`'s [`refused_writes`] first, so a caller that catches the panic cannot hide it (I2).
+    /// Called before anything is changed.
+    #[track_caller]
+    pub(crate) fn refuse_if_sealed(&self, fork: &ForkState, what: &str) {
+        if self.state.load(Ordering::SeqCst) != OPEN {
+            fork.record_refusal();
+            sealed_layer_write(what);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn sealed_layer_write(what: &str) -> ! {
+    panic!("ryo-v2 fork: write to a sealed layer ({what})")
 }
 
 /// Panics: `what` is not routed through a layer, and a layered handle reached it.
@@ -877,6 +1240,8 @@ pub fn child_layer(parent: &Arc<Layer>) -> Arc<Layer> {
         parent.is_sealed(),
         "ryo-v2 fork: only a sealed layer gets a child"
     );
+    // The child's lookups read the parent's chain view: built here, once, for its first child.
+    parent.flat_view();
     Layer::new(
         parent.base,
         Arc::clone(&parent.slot_counters),

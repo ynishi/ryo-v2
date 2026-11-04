@@ -296,7 +296,23 @@ fn run_gate(base: &str, dir: &Path, sequences: &[(&'static str, Vec<Level>)]) ->
                 .expect("no clone escapes the read");
             let read = read.unwrap_or_else(|e| panic!("{at}: {e:?}"));
             assert_eq!(&read, flat, "{at}: read");
-            assert_eq!(layer.stats(), before, "{at}: the sealed layer took nothing");
+            // What a layer takes: memos, stamps, deep verifies, tracked entries, tombstones. The
+            // read's child may build the layer's chain view (`flat_*`), a cache of the chain, on
+            // its first lookup.
+            let took = |s: &salsa::fork::LayerStats| {
+                (
+                    s.memos,
+                    s.stamps,
+                    s.deep_verifies,
+                    s.tracked_entries,
+                    s.tombstones,
+                )
+            };
+            assert_eq!(
+                took(&layer.stats()),
+                took(&before),
+                "{at}: the sealed layer took nothing"
+            );
             assert_eq!(deep_verifies, 0, "{at}: the read child deep-verified");
         }
     }

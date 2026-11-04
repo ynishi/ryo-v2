@@ -33,6 +33,16 @@ impl Deref for ZalsaView {
     }
 }
 
+/// A view with a layer was counted as a handle of it ([`ZalsaView::set_layer`],
+/// [`ZalsaView::clone_for_handle`]): [`Layer::seal`] refuses while one lives.
+impl Drop for ZalsaView {
+    fn drop(&mut self) {
+        if let Some(layer) = &self.layer {
+            layer.remove_handle();
+        }
+    }
+}
+
 impl ZalsaView {
     pub(crate) fn new(zalsa: Zalsa) -> Self {
         ZalsaView {
@@ -44,7 +54,13 @@ impl ZalsaView {
     /// A copy of the view for a clone of its handle (`StorageHandle::clone`), keeping the layer.
     /// Not `Clone`: a copy outside a handle would hold the `Arc<Zalsa>` uncounted by the handle
     /// count, so `zalsa_mut` and thaw could not take it back.
+    ///
+    /// A copy with a layer counts as one more handle of the layer ([`Layer::handles`]); a base
+    /// handle's copy touches no layer counter, so its cost is upstream's.
     pub(crate) fn clone_for_handle(&self) -> Self {
+        if let Some(layer) = &self.layer {
+            layer.add_handle();
+        }
         ZalsaView {
             zalsa_impl: Arc::clone(&self.zalsa_impl),
             layer: self.layer.clone(),
@@ -56,7 +72,10 @@ impl ZalsaView {
         &mut self.zalsa_impl
     }
 
+    /// Sets `layer` on a view that has none; the view counts as a handle of it until it drops.
     pub(crate) fn set_layer(&mut self, layer: Arc<Layer>) {
+        debug_assert!(self.layer.is_none());
+        layer.add_handle();
         self.layer = Some(layer);
     }
 

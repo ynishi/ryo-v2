@@ -2929,6 +2929,34 @@ fn a_sealed_level_diagnoses_through_a_read_child_on() {
 }
 
 #[test]
+fn level_stats_has_a_row_per_engine_level() {
+    common::both(level_stats_has_a_row_per_engine_level_on);
+}
+
+fn level_stats_has_a_row_per_engine_level_on() {
+    let (a, _) = analyzer(false);
+    let (_f, mut s) = loaded_w("stack_level_stats", &a);
+    let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+    assert!(s.level_stats().is_empty());
+    a.write(&mut s, &mut fork, &[w_edit("c/src/lib.rs", &err_fn("l1"))])
+        .expect("L1");
+    a.write(&mut s, &mut fork, &[w_edit("a/src/lib.rs", &err_fn("l2"))])
+        .expect("L2");
+    a.diagnose(&s, &fork, Scope::Affected).expect("diagnose");
+    let rows = s.level_stats();
+    if common::engine() {
+        // Level 1 ran no query; the top level holds its diagnosis.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].memos, 0);
+        assert!(rows[1].memos > 0, "{rows:?}");
+    } else {
+        assert!(rows.is_empty(), "the undo log has no layers");
+    }
+    a.release(&mut s, fork).expect("release");
+    assert!(s.level_stats().is_empty());
+}
+
+#[test]
 fn a_base_write_with_a_live_layer_is_fork_in_use() {
     common::engine_only(a_base_write_with_a_live_layer_is_fork_in_use_on);
 }

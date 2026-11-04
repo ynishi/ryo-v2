@@ -52,6 +52,9 @@ detailed-trace = []
 # ryo-v2 fork: the fork layer (src/fork/). Its routing is always compiled (every handle goes
 # through it); the feature makes its API public as `salsa::fork` and turns on `tests/fork.rs`.
 fork = []
+# ryo-v2 fork: per-layer walk counters on `fork::LayerStats` (doc-hidden fields) for the tests and
+# measurements of the fork Engine's chain reads; off in every timed and released build
+fork-probe = ["fork"]
 inventory = ["dep:inventory"]
 macros = ["dep:salsa-macros"]
 persistence = [
@@ -342,6 +345,13 @@ path = "tests/fork.rs"
 [[test]]
 name = "fork_memos"
 path = "tests/fork_memos.rs"
+
+# ryo-v2 fork: the walk counters of `fork-probe` on deep chains (D11, the chain views); a second run of
+# `just salsa-upstream` builds it
+[[test]]
+name = "fork_probe"
+path = "tests/fork_probe.rs"
+required-features = ["fork", "fork-probe", "inventory", "macros"]
 
 [[test]]
 name = "manual_registration"

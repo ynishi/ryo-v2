@@ -12,7 +12,7 @@
 
 use crate::bench::{label_of, scope_name, summarize};
 use crate::proc::{self, ProcError};
-use crate::stacked::{self, Point};
+use crate::stacked::{self, DepthPoint, Point};
 use anyhow::{Context, Result};
 use ryo_v2_core::app::ports::{Analyzer, Event, Observer};
 use ryo_v2_core::domain::Scope;
@@ -557,13 +557,395 @@ pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeRepor
 }
 
 /// Writes `report` as pretty JSON to `out`.
-pub fn write_report(report: &ProbeReport, out: &std::path::Path) -> Result<()> {
+pub fn write_report<R: Serialize>(report: &R, out: &std::path::Path) -> Result<()> {
     let file = std::fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
     let mut w = std::io::BufWriter::new(file);
     serde_json::to_writer_pretty(&mut w, report)
         .with_context(|| format!("write {}", out.display()))?;
     w.flush()
         .with_context(|| format!("write {}", out.display()))
+}
+
+/// Arguments of one `engine-probe --depth` run.
+#[derive(Debug, Clone)]
+pub struct DepthProbeArgs {
+    /// The workspace to load.
+    pub base: PathBuf,
+    /// The levels of the stack.
+    pub depth: u32,
+    /// The number of workspace files the levels rotate over (as `bench --depth-files`).
+    pub files: u32,
+    /// Scopes to diagnose, in order: one stack per scope.
+    pub scopes: Vec<Scope>,
+    /// Whether the person running it kept the machine otherwise idle.
+    pub idle: bool,
+    /// The backend of the forks; only the Engine has layer counters.
+    pub backend: Backend,
+}
+
+/// What one `engine-probe --depth` run measured, written as JSON to `--report`: the memory of a
+/// stack of `depth` levels, each written on the one below and diagnosed once before the next is
+/// written (the search's shape, `stacked::DepthShape::EveryLevel`), with the counters of each
+/// level's layer.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DepthReport {
+    /// The backend the forks ran on.
+    pub backend: Backend,
+    /// The machine the run measured on.
+    pub machine: Machine,
+    /// The levels of each stack.
+    pub depth: u32,
+    /// The files the levels rotate over.
+    pub files: Vec<String>,
+    /// One stack per scope, in order.
+    pub series: Vec<DepthSeries>,
+}
+
+/// One stack of a [`DepthReport`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DepthSeries {
+    /// The scope its levels were diagnosed at.
+    pub scope: &'static str,
+    /// The live heap once every level is written and diagnosed, less the live heap before the
+    /// fork: what the stack holds.
+    pub stack_heap_bytes: i64,
+    /// One entry per level, the lowest first.
+    pub levels: Vec<DepthLevel>,
+    /// Under `fork-probe`: the bytes a flattened chain view of each sealed level would take
+    /// (the chain-view design, one view per sealed level that holds a memo, a tracked entry or a tombstone;
+    /// the others share their parent's), from the chain's distinct keys
+    /// ([`projected_view_bytes`]), summed over the stack. `None` without the feature or the
+    /// Engine.
+    pub projected_view_bytes: Option<u64>,
+    /// `projected_view_bytes` as a percentage of `stack_heap_bytes`.
+    pub projected_view_share_pct: Option<f64>,
+    /// The bytes of the chain views the stack's layers built (`LayerStats::flat_bytes`, a shared
+    /// view counted once), summed over the stack: the cost gate M2-view bounds. `None` on the
+    /// undo log.
+    pub view_bytes: Option<u64>,
+    /// `view_bytes` as a percentage of `stack_heap_bytes` (gate M2-view:
+    /// at most [`M2_VIEW_MAX_SHARE_PCT`] at depth 20).
+    pub view_share_pct: Option<f64>,
+}
+
+/// Gate M2-view of the chain views (D11): the chain views of a depth-20 stack on ryo-rs take at most this
+/// percentage of the stack's live heap. Fixed with stage 1 from stage 0's measurement (a
+/// projected 4.2 %, from about 9.2k distinct memo keys per chain at every depth; stage 1
+/// measured 4.05 %, 6.45 MB of 159 MB); a larger share asks for the K = 2 checkpoint view
+/// instead. `engine-probe --depth` fails a run above it.
+pub const M2_VIEW_MAX_SHARE_PCT: f64 = 15.0;
+
+/// One level of a [`DepthSeries`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DepthLevel {
+    /// The level, from 1.
+    pub level: usize,
+    /// The live heap after its diagnosis less the live heap before its write.
+    pub heap_delta_bytes: i64,
+    /// The wall ms of its diagnosis (with the counting allocator's overhead).
+    pub check_ms: f64,
+    /// Its layer's counters, read once every level is written and diagnosed; `None` on the undo
+    /// log.
+    pub stats: Option<LevelCounters>,
+}
+
+/// The counters of one level's layer ([`ryo_v2_ra::LayerStats`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LevelCounters {
+    /// Whether the layer is sealed (every level but the top).
+    pub sealed: bool,
+    /// Memos inserted into the layer.
+    pub memos: usize,
+    /// Stamps it put on memos below it.
+    pub stamps: usize,
+    /// Tracked-struct entries it holds.
+    pub tracked_entries: usize,
+    /// Tracked structs it tombstoned.
+    pub tombstones: usize,
+    /// Deep verifications run under it.
+    pub deep_verifies: usize,
+    /// The memo keys of its chain view (0 without a view: the top level).
+    pub flat_memos: usize,
+    /// The tracked ids of its chain view.
+    pub flat_tracked: usize,
+    /// The hidden ids of its chain view.
+    pub flat_hidden: usize,
+    /// The bytes of the view it built (0 when it shares its parent's, or has none).
+    pub flat_bytes: usize,
+    /// Under `fork-probe`: the distinct memo keys, tracked ids and tombstoned ids of its chain,
+    /// and the bytes a view of them would take.
+    pub chain: Option<ChainCounts>,
+}
+
+/// The `fork-probe` counts of one level's chain.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChainCounts {
+    /// Distinct memo keys the chain's layers hold.
+    pub unique_memo_keys: usize,
+    /// Distinct tracked-struct ids the chain's layers hold an entry or tombstone for.
+    pub unique_tracked_ids: usize,
+    /// Distinct ids the chain's layers tombstoned.
+    pub unique_tombstoned_ids: usize,
+    /// [`projected_view_bytes`] of the counts above when the level is sealed and holds an
+    /// entry of its own, else 0 (no view, or its parent's shared).
+    pub projected_view_bytes: u64,
+}
+
+/// The bytes of a `hashbrown` table (std's `HashMap`/`HashSet`) of `n` entries of `entry` bytes
+/// grown by insertion: its buckets are the least power of two from 4 whose capacity (one less
+/// than the buckets below 8, 7/8 of them from 8) holds `n`; one entry and one control byte per
+/// bucket, plus 16 trailing control bytes. 0 for no entry (no allocation).
+pub fn table_bytes(n: usize, entry: usize) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let capacity = |buckets: usize| {
+        if buckets < 8 {
+            buckets - 1
+        } else {
+            buckets / 8 * 7
+        }
+    };
+    let mut buckets = 4usize;
+    while capacity(buckets) < n {
+        buckets *= 2;
+    }
+    (buckets * entry + buckets + 16) as u64
+}
+
+/// The entry sizes of the chain view (`fork/flat.rs`): a memo key `(IngredientIndex, Id)` of
+/// 12 bytes with an 8-byte reference, a tracked id (8 bytes) with a reference, a hidden id.
+pub const VIEW_MEMO_ENTRY: usize = 20;
+/// See [`VIEW_MEMO_ENTRY`].
+pub const VIEW_TRACKED_ENTRY: usize = 16;
+/// See [`VIEW_MEMO_ENTRY`].
+pub const VIEW_HIDDEN_ENTRY: usize = 8;
+
+/// The bytes of a chain view holding `memo_keys`, `tracked_ids` and `hidden_ids` entries.
+pub fn projected_view_bytes(memo_keys: usize, tracked_ids: usize, hidden_ids: usize) -> u64 {
+    table_bytes(memo_keys, VIEW_MEMO_ENTRY)
+        + table_bytes(tracked_ids, VIEW_TRACKED_ENTRY)
+        + table_bytes(hidden_ids, VIEW_HIDDEN_ENTRY)
+}
+
+/// `part` as a percentage of `whole`, `None` when `whole` is not positive.
+fn share_pct(part: u64, whole: i64) -> Option<f64> {
+    (whole > 0).then(|| part as f64 * 100.0 / whole as f64)
+}
+
+/// The counters of the layer of level `level` of `of` levels, as a report row.
+fn level_counters(level: usize, of: usize, stats: &ryo_v2_ra::LayerStats) -> LevelCounters {
+    let sealed = level < of;
+    #[cfg(feature = "fork-probe")]
+    let chain = {
+        let own = stats.memos + stats.tracked_entries + stats.tombstones > 0;
+        Some(ChainCounts {
+            unique_memo_keys: stats.chain_unique_memo_keys,
+            unique_tracked_ids: stats.chain_unique_tracked_ids,
+            unique_tombstoned_ids: stats.chain_unique_tombstoned_ids,
+            projected_view_bytes: if sealed && own {
+                projected_view_bytes(
+                    stats.chain_unique_memo_keys,
+                    stats.chain_unique_tracked_ids,
+                    stats.chain_unique_tombstoned_ids,
+                )
+            } else {
+                0
+            },
+        })
+    };
+    #[cfg(not(feature = "fork-probe"))]
+    let chain = None;
+    LevelCounters {
+        sealed,
+        memos: stats.memos,
+        stamps: stats.stamps,
+        tracked_entries: stats.tracked_entries,
+        tombstones: stats.tombstones,
+        deep_verifies: stats.deep_verifies,
+        flat_memos: stats.flat_memos,
+        flat_tracked: stats.flat_tracked,
+        flat_hidden: stats.flat_hidden,
+        flat_bytes: stats.flat_bytes,
+        chain,
+    }
+}
+
+/// The series of one stack from its readings: `heap` per level the live heap before its write
+/// and after its diagnosis, `check_ms` per level, `stack_heap_bytes` and the level counters.
+///
+/// # Contract
+/// - C1: a level's `heap_delta_bytes` is its after-diagnosis reading less its before-write one;
+///   `projected_view_bytes` is the sum of the levels' `chain.projected_view_bytes`, which is 0
+///   for the top (open) level and for a sealed level with no own memo, tracked entry or
+///   tombstone; its share is of `stack_heap_bytes`; with no chain counts both are `None`.
+///   `view_bytes` is the sum of the levels' `flat_bytes`, with its share of `stack_heap_bytes`;
+///   with no layer counters (the undo log) both are `None`.
+///   tested: engine_probe::tests::a_depth_series_sums_the_views_of_sealed_levels
+pub fn depth_series_of(
+    scope: &'static str,
+    heap: &[(u64, u64)],
+    check_ms: &[f64],
+    stack_heap_bytes: i64,
+    stats: &[ryo_v2_ra::LayerStats],
+) -> DepthSeries {
+    let of = heap.len();
+    let levels: Vec<DepthLevel> = heap
+        .iter()
+        .enumerate()
+        .map(|(i, &(before, after))| DepthLevel {
+            level: i + 1,
+            heap_delta_bytes: after as i64 - before as i64,
+            check_ms: check_ms.get(i).copied().unwrap_or(0.0),
+            stats: stats.get(i).map(|s| level_counters(i + 1, of, s)),
+        })
+        .collect();
+    let projected: Option<u64> = levels
+        .iter()
+        .map(|l| {
+            l.stats
+                .as_ref()
+                .and_then(|s| s.chain.as_ref())
+                .map(|c| c.projected_view_bytes)
+        })
+        .sum();
+    let view: Option<u64> = (!stats.is_empty()).then(|| {
+        levels
+            .iter()
+            .filter_map(|l| l.stats.as_ref())
+            .map(|s| s.flat_bytes as u64)
+            .sum()
+    });
+    DepthSeries {
+        scope,
+        stack_heap_bytes,
+        projected_view_bytes: projected,
+        projected_view_share_pct: projected.and_then(|p| share_pct(p, stack_heap_bytes)),
+        view_bytes: view,
+        view_share_pct: view.and_then(|v| share_pct(v, stack_heap_bytes)),
+        levels,
+    }
+}
+
+/// Gate M2-view on a [`DepthReport`]: every series whose views were measured keeps their share of
+/// the stack's heap at or below `max_pct`.
+///
+/// # Contract
+/// - C1: `Err` naming the scope, the share and `max_pct` when a series' `view_share_pct` exceeds
+///   `max_pct`; `Ok` when every measured share is at or below it, and for a series without a
+///   measure (the undo log).
+///   tested: engine_probe::tests::the_view_share_gate_fails_above_its_ceiling
+pub fn check_view_share(report: &DepthReport, max_pct: f64) -> Result<()> {
+    for series in &report.series {
+        if let Some(share) = series.view_share_pct {
+            anyhow::ensure!(
+                share <= max_pct,
+                "gate M2-view: the chain views of the depth-{} stack [{}] take {share:.2} % of its \
+                 heap, above {max_pct} %",
+                report.depth,
+                series.scope
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Loads `args.base` and, per scope, stacks `args.depth` levels on one fork (the levels of
+/// `stacked::depth_levels` over the first `args.files` indexed files), each diagnosed once right
+/// after its write, reads the counting allocator at every point and the layers' counters before
+/// the pops, and pops back.
+pub fn run_depth(args: &DepthProbeArgs, gauge: &'static dyn HeapGauge) -> Result<DepthReport> {
+    let ram_gib = kb_gib(proc::mem_total_kb()?);
+    let cores = std::thread::available_parallelism()
+        .context("the available parallelism")?
+        .get();
+    let (analyzer, _observer, mut session) =
+        crate::bench::load(&args.base, true, false, args.backend)?;
+    let files = crate::bench::depth_files(&analyzer, &session, &args.base, args.files)?;
+    let names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
+    eprintln!("[depth-probe] levels rotate over {}", names.join(", "));
+    let levels = stacked::depth_levels(&files, args.depth as usize);
+    let mut series = Vec::new();
+    for &scope in &args.scopes {
+        let mut heap: Vec<(u64, u64)> = Vec::new();
+        let mut check_ms: Vec<f64> = Vec::new();
+        let mut started: Option<std::time::Instant> = None;
+        let mut stacked_at: u64 = 0;
+        let mut stats = Vec::new();
+        let before_fork = gauge.live_bytes();
+        let reverted = stacked::depth_series(
+            &analyzer,
+            &mut session,
+            &format!("depth {}", args.depth),
+            &levels,
+            scope,
+            stacked::DepthShape::EveryLevel,
+            &mut |point| {
+                match point {
+                    DepthPoint::BeforeWrite(_) => heap.push((gauge.live_bytes(), 0)),
+                    DepthPoint::BeforeDiagnose(_) => started = Some(std::time::Instant::now()),
+                    DepthPoint::AfterDiagnose(..) => {
+                        check_ms.push(
+                            started
+                                .take()
+                                .map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0),
+                        );
+                        if let Some(last) = heap.last_mut() {
+                            last.1 = gauge.live_bytes();
+                        }
+                    }
+                    DepthPoint::AfterWrite(_)
+                    | DepthPoint::BeforePop(_)
+                    | DepthPoint::AfterPop(_) => {}
+                }
+                Ok(())
+            },
+            &mut |s| {
+                stacked_at = gauge.live_bytes();
+                stats = s.level_stats();
+            },
+        )?;
+        anyhow::ensure!(
+            reverted,
+            "depth {} [{}]: a level did not revert",
+            args.depth,
+            scope_name(scope)
+        );
+        let one = depth_series_of(
+            scope_name(scope),
+            &heap,
+            &check_ms,
+            stacked_at as i64 - before_fork as i64,
+            &stats,
+        );
+        eprintln!(
+            "[depth-probe] [{}] depth {} stack_heap_bytes {} view_bytes {} view_share_pct {} \
+             projected_view_bytes {} projected_view_share_pct {}",
+            one.scope,
+            args.depth,
+            one.stack_heap_bytes,
+            one.view_bytes.map_or("-".to_owned(), |b| b.to_string()),
+            one.view_share_pct
+                .map_or("-".to_owned(), |p| format!("{p:.2}")),
+            one.projected_view_bytes
+                .map_or("-".to_owned(), |b| b.to_string()),
+            one.projected_view_share_pct
+                .map_or("-".to_owned(), |p| format!("{p:.2}")),
+        );
+        series.push(one);
+    }
+    Ok(DepthReport {
+        backend: args.backend,
+        machine: Machine {
+            ram_gib,
+            cores,
+            threads: session.threads(),
+            idle: args.idle,
+        },
+        depth: args.depth,
+        files: names,
+        series,
+    })
 }
 
 #[cfg(test)]
@@ -597,6 +979,119 @@ mod tests {
         live: AtomicU64::new(0),
         peak: AtomicU64::new(0),
     };
+
+    /// `table_bytes`: the buckets std's `HashMap` takes when grown by insertion.
+    #[test]
+    fn table_bytes_follows_the_growth_of_a_std_map() {
+        assert_eq!(table_bytes(0, 20), 0);
+        for n in [1usize, 3, 4, 7, 8, 14, 15, 28, 29, 1000, 9000] {
+            let mut map: std::collections::HashMap<u64, u64> = Default::default();
+            for i in 0..n as u64 {
+                map.insert(i, i);
+            }
+            let capacity = map.capacity();
+            let buckets = if capacity < 8 {
+                capacity + 1
+            } else {
+                capacity / 7 * 8
+            };
+            assert_eq!(
+                table_bytes(n, 20),
+                (buckets * 20 + buckets + 16) as u64,
+                "{n} entries"
+            );
+        }
+        assert_eq!(
+            projected_view_bytes(1, 1, 1),
+            (4 * 20 + 20) + (4 * 16 + 20) + (4 * 8 + 20)
+        );
+    }
+
+    /// `depth_series_of` C1.
+    #[test]
+    fn a_depth_series_sums_the_views_of_sealed_levels() {
+        let level = |memos: usize, keys: usize, flat_bytes: usize| {
+            let mut s = ryo_v2_ra::LayerStats::default();
+            s.memos = memos;
+            s.flat_memos = if flat_bytes > 0 { keys } else { 0 };
+            s.flat_bytes = flat_bytes;
+            #[cfg(feature = "fork-probe")]
+            {
+                s.chain_unique_memo_keys = keys;
+            }
+            s
+        };
+        // Level 1 holds memos; level 2 none (it shares level 1's view); level 3 is the open top.
+        let stats = [level(5, 5, 120), level(0, 5, 0), level(9, 12, 0)];
+        let heap = [(100, 300), (300, 310), (310, 1000)];
+        let series = depth_series_of("affected", &heap, &[1.0, 2.0, 3.0], 1000, &stats);
+        let deltas: Vec<i64> = series.levels.iter().map(|l| l.heap_delta_bytes).collect();
+        assert_eq!(deltas, [200, 10, 690]);
+        let sealed: Vec<bool> = series
+            .levels
+            .iter()
+            .map(|l| l.stats.as_ref().unwrap().sealed)
+            .collect();
+        assert_eq!(sealed, [true, true, false]);
+        #[cfg(feature = "fork-probe")]
+        {
+            let one = projected_view_bytes(5, 0, 0);
+            assert_eq!(series.projected_view_bytes, Some(one));
+            assert_eq!(
+                series.projected_view_share_pct,
+                Some(one as f64 * 100.0 / 1000.0)
+            );
+        }
+        #[cfg(not(feature = "fork-probe"))]
+        assert_eq!(
+            (series.projected_view_bytes, series.projected_view_share_pct),
+            (None, None)
+        );
+        // The views measured: the one level 1 built.
+        assert_eq!(
+            (series.view_bytes, series.view_share_pct),
+            (Some(120), Some(12.0))
+        );
+        // On the undo log there are no counters.
+        let undo = depth_series_of("affected", &heap, &[1.0, 2.0, 3.0], 1000, &[]);
+        assert!(undo.levels.iter().all(|l| l.stats.is_none()));
+        assert_eq!(undo.projected_view_bytes, None);
+        assert_eq!((undo.view_bytes, undo.view_share_pct), (None, None));
+    }
+
+    /// `check_view_share` C1, and the ceiling fixed with stage 1 of the chain views.
+    #[test]
+    fn the_view_share_gate_fails_above_its_ceiling() {
+        assert_eq!(M2_VIEW_MAX_SHARE_PCT, 15.0);
+        let with = |share: Option<f64>| DepthReport {
+            backend: Backend::Engine,
+            machine: Machine {
+                ram_gib: 1.0,
+                cores: 1,
+                threads: 1,
+                idle: false,
+            },
+            depth: 20,
+            files: Vec::new(),
+            series: vec![DepthSeries {
+                scope: "affected",
+                stack_heap_bytes: 100,
+                levels: Vec::new(),
+                projected_view_bytes: None,
+                projected_view_share_pct: None,
+                view_bytes: share.map(|s| s as u64),
+                view_share_pct: share,
+            }],
+        };
+        assert!(check_view_share(&with(Some(15.0)), M2_VIEW_MAX_SHARE_PCT).is_ok());
+        assert!(check_view_share(&with(None), M2_VIEW_MAX_SHARE_PCT).is_ok());
+        let e = check_view_share(&with(Some(15.5)), M2_VIEW_MAX_SHARE_PCT).unwrap_err();
+        let e = e.to_string();
+        assert!(
+            e.contains("M2-view") && e.contains("[affected]") && e.contains("15.50 %"),
+            "{e}"
+        );
+    }
 
     /// 5 GiB of RSS, far from every heap reading of the tests.
     fn fake_rss() -> Result<u64, ProcError> {

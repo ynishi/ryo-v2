@@ -25,7 +25,7 @@ use ra_ap_ide_db::RootDatabase;
 use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
 use ryo_v2_core::domain::{Edit, RelPath};
-use ryo_v2_engine::{Engine, EngineError, Frozen, Isolation, OpenLayer, SealedLayer};
+use ryo_v2_engine::{Engine, EngineError, Frozen, Isolation, LayerStats, OpenLayer, SealedLayer};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Mutex, PoisonError};
 use triomphe::Arc as TriArc;
@@ -91,6 +91,29 @@ impl LevelLayer {
         };
         self.state = state;
         sealed
+    }
+}
+
+impl RaSession {
+    /// The counters of each level's layer of the live fork on the Engine, the lowest level first
+    /// (the top level's layer may still be open); empty with no fork on the Engine, whose levels
+    /// are undo-log levels with no layer. Reads counters only, runs no query, changes nothing.
+    ///
+    /// # Contract
+    /// - C1: on the Engine, one row per level, in level order; a level whose top layer ran its
+    ///   diagnosis has memos, and a level below the top that ran none has none. On the undo log
+    ///   it is empty.
+    ///   tested: tests/stack.rs level_stats_has_a_row_per_engine_level
+    pub fn level_stats(&self) -> Vec<LayerStats> {
+        self.stack
+            .iter()
+            .filter_map(|level| level.layer.as_ref())
+            .filter_map(|layer| match &layer.state {
+                LayerState::Open(open) => Some(open.stats()),
+                LayerState::Sealed(sealed) => Some(sealed.stats()),
+                LayerState::Taken => None,
+            })
+            .collect()
     }
 }
 

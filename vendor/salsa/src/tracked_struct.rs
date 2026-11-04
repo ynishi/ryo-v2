@@ -773,6 +773,9 @@ where
         current_deps: &Stamp,
         fields: C::Fields<'db>,
     ) -> Id {
+        // ryo-v2 fork: a sealed layer takes no layer-owned slot (E9); refused (counted) before a
+        // slot is taken
+        layer.refuse_if_sealed(zalsa.fork(), "a layer-owned tracked-struct slot");
         let current_revision = zalsa.current_revision();
         let value = |_| Value {
             updated_at: OptionalAtomicRevision::new(Some(current_revision)),

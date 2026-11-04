@@ -51,6 +51,9 @@ use salsa::Revision;
 use salsa::fork::{self, BaseFingerprint, Layer, LayerSlots, SharedWrites, SkippedWrites};
 use salsa::plumbing::HasStorage;
 
+/// A layer's own counters, as [`OpenLayer::stats`] and [`SealedLayer::stats`] return them.
+pub use salsa::fork::LayerStats;
+
 /// What the Engine needs of a database: a salsa database with a file input whose text a layer
 /// can set.
 pub trait EngineDb: salsa::Database + HasStorage + Clone + 'static {
@@ -211,7 +214,11 @@ impl Engine {
     fn freeze_unchecked<Db: EngineDb>(db: Db) -> Frozen<Db> {
         let revision = fork::freeze(&db);
         let root = fork::root_layer(&db);
-        root.seal();
+        // salsa refuses a seal only while a database handle carries the layer; this one was made
+        // here and no handle was given it.
+        if let Err(refused) = root.seal() {
+            unreachable!("ryo-v2-engine: a new root layer has no database handle ({refused})");
+        }
         Frozen {
             base: Arc::new(Base {
                 db: Mutex::new(db),
@@ -450,7 +457,7 @@ impl<Db: EngineDb> OpenLayer<Db> {
     }
 
     /// The layer's own counters (memos, stamps, deep verifies, tracked-struct entries).
-    pub fn stats(&self) -> fork::LayerStats {
+    pub fn stats(&self) -> LayerStats {
         self.layer.stats()
     }
 
@@ -472,6 +479,10 @@ impl<Db: EngineDb> OpenLayer<Db> {
 
     /// Seals the layer: it takes no further write and may have children. With a clone of its
     /// database alive it returns the open layer with [`EngineError::InUse`] at once.
+    ///
+    /// The layer's own database is dropped first: salsa seals a layer only while no database
+    /// handle carries it (so no query on it is in flight, E9), and refuses otherwise; that
+    /// refusal is `InUse` too, with the layer open and a new database of it lent as before.
     pub fn seal(self) -> Result<SealedLayer<Db>, (OpenLayer<Db>, EngineError)> {
         if Arc::strong_count(&self.layer) != OWN_REFERENCES {
             return Err((self, EngineError::InUse));
@@ -482,10 +493,23 @@ impl<Db: EngineDb> OpenLayer<Db> {
             layer,
             db,
             files,
-            lent: _,
+            lent,
         } = self;
         drop(db);
-        layer.seal();
+        if layer.seal().is_err() {
+            let db = Box::new(base.handle(&layer));
+            return Err((
+                OpenLayer {
+                    base,
+                    parent,
+                    layer,
+                    db,
+                    files,
+                    lent,
+                },
+                EngineError::InUse,
+            ));
+        }
         Ok(SealedLayer {
             base,
             node: Arc::new(Node {
@@ -589,7 +613,7 @@ impl<Db: EngineDb> SealedLayer<Db> {
     }
 
     /// The layer's own counters (memos, stamps, deep verifies, tracked-struct entries).
-    pub fn stats(&self) -> fork::LayerStats {
+    pub fn stats(&self) -> LayerStats {
         self.node.layer.stats()
     }
 }

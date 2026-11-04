@@ -721,6 +721,11 @@ where
             return id;
         }
 
+        // ryo-v2 fork: a sealed layer takes no interned insert (E9): a value it inserted after a
+        // child interned the same content would match in the child's chain too, so the child
+        // could get another id for it. Refused (counted) before anything is changed; the shard
+        // guard unwinds without poisoning.
+        layer.refuse_if_sealed(zalsa.fork(), "an interned insert");
         let last_interned_at = zalsa_local
             .active_query()
             .map(|_| current_revision)

@@ -15,10 +15,12 @@
 //!
 //! With `--depth-sweep` ([`run_depth_sweep`]) it measures how a diagnosis of the top level grows
 //! with the depth of a stack: per depth K, K one-file levels written on one fork by
-//! `stacked::depth_series`, the top level diagnosed `--repeat` times, and the levels popped.
+//! `stacked::depth_series`, the top level diagnosed `--repeat` times, and the levels popped. On
+//! the Engine it also prints, per level, the counters of the level's layer
+//! ([`level_stats_line`]), with the walk counters of `fork-probe` when built with that feature.
 
 use crate::proc::{self, ProcError};
-use crate::stacked::{self, DepthPoint, Point};
+use crate::stacked::{self, DepthPoint, DepthShape, Point};
 use anyhow::{Context, Result};
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Event, Observer, Verifier};
 use ryo_v2_core::app::verify::verify;
@@ -27,7 +29,7 @@ use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{Backend, RaAnalyzer, RaConfig};
+use ryo_v2_ra::{Backend, LayerStats, RaAnalyzer, RaConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -414,7 +416,7 @@ fn record(
 
 /// Builds the analyzer of a bench on `backend`, loads `base` once and prints the load's lines to
 /// stderr.
-fn load(
+pub(crate) fn load(
     base: &std::path::Path,
     proc_macro: bool,
     assert_revert: bool,
@@ -733,9 +735,54 @@ fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backe
     )
 }
 
+/// The line of one level of a stack on the fork Engine: its layer's counters
+/// (`RaSession::level_stats`), read once every level is written and diagnosed, before the pops.
+///
+/// # Contract
+/// - C1: `level <label> level <k>` followed by `memos`, `stamps`, `tracked_entries`,
+///   `tombstones`, `deep_verifies`, `flat_memos`, `flat_tracked`, `flat_hidden` and
+///   `flat_bytes` (the layer's chain view), each a name and its value; built with the `fork-probe`
+///   feature it goes on with `chain_memo_probes`, `chain_tracked_probes`, `stamp_visits`,
+///   `cancel_walks`, `chain_unique_memo_keys`, `chain_unique_tracked_ids` and
+///   `chain_unique_tombstoned_ids`.
+///   tested: bench::tests::a_level_line_names_each_counter
+pub(crate) fn level_stats_line(label: &str, k: usize, stats: &LayerStats) -> String {
+    #[allow(unused_mut)]
+    let mut line = format!(
+        "level {label} level {k} memos {} stamps {} tracked_entries {} tombstones {} \
+         deep_verifies {} flat_memos {} flat_tracked {} flat_hidden {} flat_bytes {}",
+        stats.memos,
+        stats.stamps,
+        stats.tracked_entries,
+        stats.tombstones,
+        stats.deep_verifies,
+        stats.flat_memos,
+        stats.flat_tracked,
+        stats.flat_hidden,
+        stats.flat_bytes,
+    );
+    #[cfg(feature = "fork-probe")]
+    line.push_str(&format!(
+        " chain_memo_probes {} chain_tracked_probes {} stamp_visits {} cancel_walks {} \
+         chain_unique_memo_keys {} chain_unique_tracked_ids {} chain_unique_tombstoned_ids {}",
+        stats.chain_memo_probes,
+        stats.chain_tracked_probes,
+        stats.stamp_visits,
+        stats.cancel_walks,
+        stats.chain_unique_memo_keys,
+        stats.chain_unique_tracked_ids,
+        stats.chain_unique_tombstoned_ids,
+    ));
+    line
+}
+
 /// The `.rs` files under `dir`, relative to `root`, in path order; `target` and hidden dirs are
 /// not walked.
-fn rs_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<RelPath>) -> Result<()> {
+pub(crate) fn rs_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<RelPath>,
+) -> Result<()> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("read {}", dir.display()))?
         .map(|e| e.map(|e| e.path()))
@@ -761,6 +808,30 @@ fn rs_files(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<RelPath
     Ok(())
 }
 
+/// The first `n` `.rs` files of the workspace at `base` that `session` indexed, in path order,
+/// with their texts: the files the levels of a depth series rotate over. Fewer is an error.
+pub(crate) fn depth_files(
+    analyzer: &RaAnalyzer,
+    session: &ryo_v2_ra::RaSession,
+    base: &std::path::Path,
+    n: u32,
+) -> Result<Vec<(RelPath, String)>> {
+    let mut paths = Vec::new();
+    rs_files(base, base, &mut paths)?;
+    let files: Vec<(RelPath, String)> = paths
+        .into_iter()
+        .filter_map(|p| analyzer.text(session, &p).map(|t| (p, t)))
+        .take(n as usize)
+        .collect();
+    if files.len() < n as usize {
+        anyhow::bail!(
+            "--depth-files {n}: the workspace has {} indexed .rs files",
+            files.len()
+        );
+    }
+    Ok(files)
+}
+
 /// Loads `args.base` once and, per scope and depth K, writes K levels on one fork with
 /// `stacked::depth_series` (the levels of `stacked::depth_levels` over the first `args.files`
 /// files of the workspace that the session indexed, in path order), diagnoses the top level
@@ -772,20 +843,7 @@ pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
         args.assert_revert,
         args.backend,
     )?;
-    let mut paths = Vec::new();
-    rs_files(&args.base, &args.base, &mut paths)?;
-    let files: Vec<(RelPath, String)> = paths
-        .into_iter()
-        .filter_map(|p| analyzer.text(&session, &p).map(|t| (p, t)))
-        .take(args.files as usize)
-        .collect();
-    if files.len() < args.files as usize {
-        anyhow::bail!(
-            "--depth-files {}: the workspace has {} indexed .rs files",
-            args.files,
-            files.len()
-        );
-    }
+    let files = depth_files(&analyzer, &session, &args.base, args.files)?;
     let names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
     eprintln!("[depth-sweep] levels rotate over {}", names.join(", "));
     let mut fail_infra = 0usize;
@@ -799,14 +857,16 @@ pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
                 ..DepthRecord::default()
             };
             let name = format!("depth {depth}");
+            let mut level_stats = Vec::new();
             let reverted = stacked::depth_series(
                 &analyzer,
                 &mut session,
                 &name,
                 &levels,
                 scope,
-                args.repeat,
+                DepthShape::Top(args.repeat),
                 &mut |point| rec.observe(point),
+                &mut |s| level_stats = s.level_stats(),
             )?;
             for (i, (&us, &(scope_files, findings))) in
                 rec.check_us.iter().zip(&rec.diagnosed).enumerate()
@@ -822,6 +882,10 @@ pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
                 "{}",
                 depth_summary_line(sname, args.files, &rec, args.backend)
             );
+            let label = format!("depth-sweep [{sname}] depth {}", rec.depth);
+            for (i, stats) in level_stats.iter().enumerate() {
+                println!("{}", level_stats_line(&label, i + 1, stats));
+            }
             if !reverted {
                 fail_infra += 1;
                 break 'scopes;
@@ -1056,6 +1120,36 @@ mod tests {
             }
             assert!(series.occupancy.is_empty());
         }
+    }
+
+    /// `level_stats_line` C1.
+    #[test]
+    fn a_level_line_names_each_counter() {
+        let mut stats = LayerStats::default();
+        stats.memos = 5;
+        stats.stamps = 4;
+        stats.tracked_entries = 3;
+        stats.tombstones = 2;
+        stats.deep_verifies = 1;
+        stats.flat_memos = 9;
+        stats.flat_tracked = 8;
+        stats.flat_hidden = 7;
+        stats.flat_bytes = 600;
+        let line = level_stats_line("depth-sweep [affected] depth 2", 1, &stats);
+        let head = "level depth-sweep [affected] depth 2 level 1 memos 5 stamps 4 \
+                    tracked_entries 3 tombstones 2 deep_verifies 1 flat_memos 9 \
+                    flat_tracked 8 flat_hidden 7 flat_bytes 600";
+        #[cfg(not(feature = "fork-probe"))]
+        assert_eq!(line, head);
+        #[cfg(feature = "fork-probe")]
+        assert_eq!(
+            line,
+            format!(
+                "{head} chain_memo_probes 0 chain_tracked_probes 0 stamp_visits 0 \
+                 cancel_walks 0 chain_unique_memo_keys 0 chain_unique_tracked_ids 0 \
+                 chain_unique_tombstoned_ids 0"
+            )
+        );
     }
 
     /// `ryo_v2_ra::Backend` C1: the word a summary line ends with.

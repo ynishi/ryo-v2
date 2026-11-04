@@ -28,6 +28,8 @@ pub use assess::SyntaxAssessor;
 pub use diagnostics::GapDetector;
 pub use fork::RaFork;
 pub use memory::{IngredientRow, MemoRow, MemoryReport};
+/// A layer's own counters on the fork Engine ([`RaSession::level_stats`]).
+pub use ryo_v2_engine::LayerStats;
 pub use session::{DetectorPanic, ExpanderPanic, RaSession};
 pub use stack::RaStack;
 

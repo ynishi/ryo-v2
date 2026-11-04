@@ -46,7 +46,7 @@ fn write(db: &Db, file: File, text: &str) {
 fn sealed_child(db: &Db, parent: &Arc<Layer>, file: File, text: &str) -> Arc<Layer> {
     let child = fork::child_layer(parent);
     write(&layered(db, &child), file, text);
-    child.seal();
+    child.seal().expect("no handle carries the layer");
     child
 }
 
@@ -136,7 +136,7 @@ fn a_read_child_does_no_deep_verify() {
     write(&layered(&db, &parent), c, "changed");
     assert_eq!(read_child_sum(&layered(&db, &parent), a, b), 5);
     assert!(parent.stats().deep_verifies > 0);
-    parent.seal();
+    parent.seal().expect("no handle carries the layer");
 
     // A write-free child inherits the parent's LOW revision: everything the parent verified is
     // shallow-valid in it, with no deep verify and no stamp.
@@ -621,7 +621,7 @@ fn a_layer_interned_value_is_seen_by_its_chain_only() {
     let file = File::new(&db, "base".to_owned());
     fork::freeze(&db);
     let root = fork::root_layer(&db);
-    root.seal();
+    root.seal().expect("no handle carries the layer");
 
     let parent = sealed_child(&db, &root, file, "word");
     let parent_word = {
@@ -636,8 +636,8 @@ fn a_layer_interned_value_is_seen_by_its_chain_only() {
     let open = fork::child_layer(&parent);
     let open_db = layered(&db, &open);
     let in_parent = word_of(&open_db, "word");
-    open.seal();
     drop(open_db);
+    open.seal().expect("no handle carries the layer");
     // A descendant finds its ancestor's value; a sibling of the ancestor does not.
     let child = fork::child_layer(&open);
     let child_db = layered(&db, &child);
@@ -809,7 +809,8 @@ fn fork_cycle_iterates_inside_the_layer() {
     assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
 
     // A child of the sealed layer reads the final memos.
-    layer.seal();
+    drop(layer_db);
+    layer.seal().expect("no handle carries the layer");
     let child = fork::child_layer(&layer);
     assert_eq!(climb_a(&layered(&db, &child), target), flat_climb(7));
     assert_eq!(child.stats().memos, 0);
@@ -1018,13 +1019,200 @@ fn an_insert_on_a_sealed_layer_panics() {
     let layer = fork::root_layer(&db);
     let layer_db = layered(&db, &layer);
     write(&layer_db, file, "in the layer");
-    // A handle past the types: the layer is sealed while a handle of it lives.
-    layer.seal();
+    // The layer is sealed with no handle carrying it; a handle made after it, past the types,
+    // runs a query.
+    drop(layer_db);
+    layer.seal().expect("no handle carries the layer");
+    let layer_db = layered(&db, &layer);
     let message = panic_message(|| {
         sealed_len(&layer_db, file);
     });
     assert!(message.contains("write to a sealed layer"), "{message}");
     assert_eq!(layer.stats().memos, 0);
+}
+
+#[test]
+fn a_sealed_parent_intern_after_a_childs_intern_is_refused() {
+    let db = Db::default();
+    let known = word_of(&db, "known");
+    fork::freeze(&db);
+    let parent = fork::root_layer(&db);
+    parent.seal().expect("no handle carries the layer");
+    let child = fork::child_layer(&parent);
+    let child_db = layered(&db, &child);
+    let in_child = word_of(&child_db, "fresh");
+    let refused = fork::refused_writes(&db);
+    let inserts = fork::shared_writes(&db).interned_inserts;
+    let owned = fork::layer_slots(&db).owned;
+
+    // A handle of the sealed parent misses the child's value (its chain does not see it). An
+    // insert would be a value of the parent, which the child's chain matches as well, so a lookup
+    // in the child could return it instead of the child's own: it is refused and counted.
+    let parent_db = layered(&db, &parent);
+    let message = panic_message(|| {
+        word_of(&parent_db, "fresh");
+    });
+    assert!(
+        message.contains("write to a sealed layer (an interned insert)"),
+        "{message}"
+    );
+    assert_eq!(fork::refused_writes(&db), refused + 1);
+    assert_eq!(fork::shared_writes(&db).interned_inserts, inserts);
+    assert_eq!(fork::layer_slots(&db).owned, owned);
+    // The child still gets its own id.
+    assert_eq!(word_of(&child_db, "fresh"), in_child);
+    // A hit on a value the parent's chain sees stays allowed (it only raises its last use).
+    assert_eq!(word_of(&parent_db, "known"), known);
+    assert_eq!(fork::refused_writes(&db), refused + 1);
+}
+
+#[test]
+fn a_new_identity_tracked_struct_on_a_sealed_layer_is_refused() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    write(&layered(&db, &layer), file, "only in the layer");
+    layer.seal().expect("no handle carries the layer");
+    let refused = fork::refused_writes(&db);
+    let allocations = fork::shared_writes(&db).slot_allocations;
+
+    // A query on a handle of the sealed layer creates a struct with a new identity: the slot it
+    // would take is refused before it is taken, and counted.
+    let sealed_db = layered(&db, &layer);
+    let message = panic_message(|| {
+        make_named(&sealed_db, file);
+    });
+    assert!(
+        message.contains("write to a sealed layer (a layer-owned tracked-struct slot)"),
+        "{message}"
+    );
+    assert_eq!(fork::refused_writes(&db), refused + 1);
+    assert_eq!(fork::shared_writes(&db).slot_allocations, allocations);
+    assert_eq!(fork::layer_slots(&db).owned, 0);
+    // A child of the layer creates it in a slot it owns.
+    let child = fork::child_layer(&layer);
+    let child_db = layered(&db, &child);
+    assert_eq!(named(&child_db, file).1, "only in the layer");
+    assert_eq!(fork::layer_slots(&db).owned, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The chain view of a sealed layer (D11, `fork/flat.rs`)
+
+#[salsa::tracked(returns(copy))]
+fn view_len(db: &dyn Database, file: File) -> usize {
+    VIEW_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static VIEW_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_query_on_a_sealed_layer_handle_builds_its_view() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    write(&layer_db, file, "abc");
+    assert_eq!(view_len(&layer_db, file), 3);
+    drop(layer_db);
+    layer.seal().expect("no handle carries the layer");
+    // A sealed leaf has no view until something looks a memo up in it.
+    assert_eq!(layer.stats().flat_memos, 0);
+
+    // A handle of the sealed layer finds the layer's own memo through the layer's view, built
+    // on that lookup; nothing is inserted.
+    let sealed_db = layered(&db, &layer);
+    assert_eq!(view_len(&sealed_db, file), 3);
+    let stats = layer.stats();
+    assert_eq!((stats.flat_memos, stats.memos, stats.stamps), (1, 1, 0));
+    assert!(stats.flat_bytes > 0);
+}
+
+#[salsa::tracked(returns(copy))]
+fn item_len<'db>(db: &'db dyn Database, item: Item<'db>) -> usize {
+    ITEM_LEN_RUNS.fetch_add(1, Ordering::SeqCst);
+    item.value(db).len()
+}
+static ITEM_LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_tombstone_hides_older_memos_through_a_view() {
+    let db = Db::default();
+    let flag = Flag::new(&db, true);
+    let item = maybe_item(&db, flag).expect("created");
+    fork::freeze(&db);
+
+    // The oldest layer computes a memo keyed by the struct.
+    let old = fork::root_layer(&db);
+    assert_eq!(item_len(&layered(&db, &old), item), 4);
+    old.seal().expect("no handle carries the layer");
+    // Its child no longer creates the struct: the struct is tombstoned there.
+    let gone = fork::child_layer(&old);
+    let gone_db = layered(&db, &gone);
+    fork::set_input_field::<Flag, _>(&gone_db, flag, 0, |fields| fields.0 = false);
+    assert_eq!(maybe_item(&gone_db, flag), None);
+    assert_eq!(gone.stats().tombstones, 1);
+    drop(gone_db);
+    gone.seal().expect("no handle carries the layer");
+
+    // Below the tombstone the old memo is not found: the function runs again, and its read of
+    // the struct panics as a read of a deleted struct does.
+    let runs = ITEM_LEN_RUNS.load(Ordering::SeqCst);
+    let below = fork::child_layer(&gone);
+    let message = panic_message(|| {
+        item_len(&layered(&db, &below), item);
+    });
+    assert!(message.contains("write lock taken"), "{message}");
+    assert_eq!(ITEM_LEN_RUNS.load(Ordering::SeqCst), runs + 1);
+    let stats = gone.stats();
+    assert_eq!((stats.flat_hidden, stats.flat_tracked), (1, 1));
+    // A sibling of the tombstoning layer still finds the old memo, and runs nothing.
+    let sibling = fork::child_layer(&old);
+    assert_eq!(item_len(&layered(&db, &sibling), item), 4);
+    assert_eq!(ITEM_LEN_RUNS.load(Ordering::SeqCst), runs + 1);
+    assert_eq!(old.stats().flat_hidden, 0);
+}
+
+#[salsa::tracked(returns(copy))]
+fn sibling_len(db: &dyn Database, file: File) -> usize {
+    SIBLING_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static SIBLING_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn siblings_share_a_view_and_keep_their_own_memos() {
+    let db = Db::default();
+    let (a, b) = (File::new(&db, "a".to_owned()), File::new(&db, "b".to_owned()));
+    fork::freeze(&db);
+    let parent = fork::root_layer(&db);
+    assert_eq!(sibling_len(&layered(&db, &parent), a), 1);
+    parent.seal().expect("no handle carries the layer");
+
+    // Two siblings, each with its own text of `b` and its own memo for it.
+    let sibling = |text: &str| {
+        let layer = fork::child_layer(&parent);
+        let layer_db = layered(&db, &layer);
+        write(&layer_db, b, text);
+        assert_eq!(sibling_len(&layer_db, b), text.len());
+        drop(layer_db);
+        layer.seal().expect("no handle carries the layer");
+        layer
+    };
+    let (one, three) = (sibling("x"), sibling("yyy"));
+    let runs = SIBLING_RUNS.load(Ordering::SeqCst);
+    for (layer, len) in [(&one, 1), (&three, 3)] {
+        let child_db = layered(&db, &fork::child_layer(layer));
+        assert_eq!(sibling_len(&child_db, b), len);
+        assert_eq!(sibling_len(&child_db, a), 1);
+        // Each sibling's view holds the parent's memo and its own.
+        assert_eq!(layer.stats().flat_memos, 2);
+    }
+    // Every memo came from a view: nothing ran again.
+    assert_eq!(SIBLING_RUNS.load(Ordering::SeqCst), runs);
+    assert_eq!(parent.stats().flat_memos, 1);
 }
 
 #[salsa::tracked(returns(copy))]
@@ -1040,7 +1228,7 @@ fn reading_the_parent_does_not_change_a_childs_result() {
     assert_eq!(parent_child_len(&db, a, b), 11);
     fork::freeze(&db);
     let root = fork::root_layer(&db);
-    root.seal();
+    root.seal().expect("no handle carries the layer");
     let parent = sealed_child(&db, &root, a, "aaa");
     let child = fork::child_layer(&parent);
     let child_db = layered(&db, &child);
@@ -1079,7 +1267,7 @@ fn a_waiter_stops_when_an_ancestor_is_cancelled() {
     GATE.get_or_init(|| Barrier::new(2));
     fork::freeze(&db);
     let root = fork::root_layer(&db);
-    root.seal();
+    root.seal().expect("no handle carries the layer");
     let child = sealed_child(&db, &root, file, "in the child");
     let read = fork::child_layer(&child);
     let (runner, waiter) = (layered(&db, &read), layered(&db, &read));
