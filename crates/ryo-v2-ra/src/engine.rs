@@ -14,9 +14,13 @@
 //! on it until it is popped. The session is poisoned only when the base was written (a write the
 //! frozen base refused, or a fingerprint of the base that changed) or the isolation check could
 //! not run.
+//!
+//! The vfs only gains entries while the base is frozen: a file a layer creates keeps its vfs
+//! entry until the thaw, whatever happens to the layer, so that no layer's end takes away an
+//! entry another state over the same base was given (a path created again gets the same id).
 
 use crate::diagnostics::panic_message;
-use crate::fork::{self, Action, Level, RevertFailure};
+use crate::fork::{self, Action, LayerState, Level, RevertFailure};
 use crate::session::RaSession;
 use crate::{DbWritePanic, RaAnalyzer};
 use ra_ap_base_db::{SourceRoot, SourceRootId};
@@ -26,6 +30,7 @@ use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{AnalyzerError, Event};
 use ryo_v2_core::domain::{Edit, RelPath};
 use ryo_v2_engine::{Engine, EngineError, Frozen, Isolation, LayerStats, OpenLayer, SealedLayer};
+use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Mutex, PoisonError};
 use triomphe::Arc as TriArc;
@@ -38,18 +43,21 @@ pub(crate) struct EngineBase {
     /// The isolation of the base when the fork's first sampled write was made: every later
     /// sampled check compares the base with it.
     sampled_from: Option<Isolation>,
+    /// Every path given a vfs entry as a created file since the freeze; the thaw drops them.
+    pub(crate) vfs_created: BTreeSet<RelPath>,
 }
 
 /// The layer of a level, open until a write pushes the next level on it.
 pub(crate) struct LevelLayer {
-    state: LayerState,
+    handle: Handle,
     /// The panic that poisoned the layer, if one did.
     poisoned: Mutex<Option<String>>,
     /// Whether the write of the level was sampled: its `pop` checks the isolation of the base.
     sampled: bool,
 }
 
-enum LayerState {
+/// The Engine handle of a level's layer.
+enum Handle {
     Open(OpenLayer<RootDatabase>),
     Sealed(SealedLayer<RootDatabase>),
     /// Only inside [`LevelLayer::seal`], which always puts the layer back.
@@ -79,17 +87,17 @@ impl LevelLayer {
 
     /// Seals the layer (once) and returns it as a parent for the next level.
     fn seal(&mut self) -> Result<SealedLayer<RootDatabase>, AnalyzerError> {
-        let (state, sealed) = match std::mem::replace(&mut self.state, LayerState::Taken) {
-            LayerState::Sealed(sealed) => (LayerState::Sealed(sealed.clone()), Ok(sealed)),
-            LayerState::Open(open) => match open.seal() {
-                Ok(sealed) => (LayerState::Sealed(sealed.clone()), Ok(sealed)),
+        let (handle, sealed) = match std::mem::replace(&mut self.handle, Handle::Taken) {
+            Handle::Sealed(sealed) => (Handle::Sealed(sealed.clone()), Ok(sealed)),
+            Handle::Open(open) => match open.seal() {
+                Ok(sealed) => (Handle::Sealed(sealed.clone()), Ok(sealed)),
                 // A clone of the layer's database outlived a diagnosis: the layer stays open
                 // and nothing is pushed on it.
-                Err((open, _)) => (LayerState::Open(open), Err(AnalyzerError::ForkInUse)),
+                Err((open, _)) => (Handle::Open(open), Err(AnalyzerError::ForkInUse)),
             },
-            LayerState::Taken => (LayerState::Taken, Err(lost("a level lost its layer"))),
+            Handle::Taken => (Handle::Taken, Err(lost("a level lost its layer"))),
         };
-        self.state = state;
+        self.handle = handle;
         sealed
     }
 }
@@ -108,10 +116,10 @@ impl RaSession {
         self.stack
             .iter()
             .filter_map(|level| level.layer.as_ref())
-            .filter_map(|layer| match &layer.state {
-                LayerState::Open(open) => Some(open.stats()),
-                LayerState::Sealed(sealed) => Some(sealed.stats()),
-                LayerState::Taken => None,
+            .filter_map(|layer| match &layer.handle {
+                Handle::Open(open) => Some(open.stats()),
+                Handle::Sealed(sealed) => Some(sealed.stats()),
+                Handle::Taken => None,
             })
             .collect()
     }
@@ -153,6 +161,7 @@ pub(crate) fn freeze(s: &mut RaSession) -> Result<(), AnalyzerError> {
                 frozen,
                 refused_at_freeze,
                 sampled_from: None,
+                vfs_created: BTreeSet::new(),
             });
             Ok(())
         }
@@ -164,15 +173,17 @@ pub(crate) fn freeze(s: &mut RaSession) -> Result<(), AnalyzerError> {
 }
 
 /// Drops every level left, checks that the fork's layers never wrote the base (I2: no write the
-/// frozen base refused), thaws the base and puts its database back into `host`. A base that was
-/// written, or that cannot be thawed, poisons the session and is the failure.
+/// frozen base refused), thaws the base and puts its database back into `host`, and drops the
+/// vfs entries of every file created while it was frozen. A base that was written, or that
+/// cannot be thawed, poisons the session and is the failure.
 fn thaw(s: &mut RaSession) -> Result<(), RevertFailure> {
-    for level in std::mem::take(&mut s.stack) {
-        fork::drop_created(s, &level);
-    }
-    let Some(base) = s.frozen.take() else {
+    s.stack.clear();
+    let Some(mut base) = s.frozen.take() else {
         return Ok(());
     };
+    for rel in std::mem::take(&mut base.vfs_created) {
+        fork::vfs_drop(s, &rel);
+    }
     s.created_in_db.extend(base.frozen.created_files());
     let refused = base
         .frozen
@@ -221,10 +232,10 @@ pub(crate) fn with_top_host<R>(
                     "the level is poisoned by a panic in its layer: {msg}"
                 )));
             }
-            match &layer.state {
-                LayerState::Open(open) => Ok(on(&open.db())),
-                LayerState::Sealed(sealed) => sealed.read(on).map_err(engine_error),
-                LayerState::Taken => Err(lost("a level lost its layer")),
+            match &layer.handle {
+                Handle::Open(open) => Ok(on(&open.db())),
+                Handle::Sealed(sealed) => sealed.read(on).map_err(engine_error),
+                Handle::Taken => Err(lost("a level lost its layer")),
             }
         }
     }
@@ -234,7 +245,7 @@ pub(crate) fn with_top_host<R>(
 /// poisoned. A panic in a throwaway child poisons only the child, which is gone.
 pub(crate) fn poison_top_if_open(s: &RaSession, msg: &str) {
     if let Some(layer) = s.stack.last().and_then(|l| l.layer.as_ref())
-        && matches!(layer.state, LayerState::Open(_))
+        && matches!(layer.handle, Handle::Open(_))
     {
         layer.set_poison(msg);
     }
@@ -246,11 +257,11 @@ pub(crate) fn top_text(s: &RaSession, id: FileId) -> Result<String, AnalyzerErro
     let top = s.stack.last().map(layer_of).transpose()?;
     let base = base(s)?;
     catch_unwind(AssertUnwindSafe(|| {
-        let text = match top.map(|layer| &layer.state) {
+        let text = match top.map(|layer| &layer.handle) {
             None => base.frozen.root().text(id),
-            Some(LayerState::Open(open)) => open.text(id),
-            Some(LayerState::Sealed(sealed)) => sealed.text(id),
-            Some(LayerState::Taken) => return Err(lost("a level lost its layer")),
+            Some(Handle::Open(open)) => open.text(id),
+            Some(Handle::Sealed(sealed)) => sealed.text(id),
+            Some(Handle::Taken) => return Err(lost("a level lost its layer")),
         };
         Ok(text.to_string())
     }))
@@ -283,7 +294,8 @@ pub(crate) fn push_level(
             "the level below is poisoned by a panic in its layer: {msg}"
         )));
     }
-    let actions = fork::resolve(s, edits)?;
+    let (pure, _) = fork::resolve_pure_at_top(s, edits);
+    let actions = fork::complete_on_session(s, pure)?;
     if sampled {
         let base = s
             .frozen
@@ -293,6 +305,7 @@ pub(crate) fn push_level(
             base.sampled_from = Some(base.frozen.isolation());
         }
     }
+    let below = fork::top_state(s).cloned();
     let parent = match s.stack.last_mut() {
         Some(top) => top
             .layer
@@ -304,10 +317,10 @@ pub(crate) fn push_level(
     let mut child = parent.child();
     drop(parent);
 
-    let mut level = Level::new(edited);
+    let mut state = LayerState::new(edited, below);
     let inject = a.db_write_panic == Some(DbWritePanic::Write);
     let written = catch_unwind(AssertUnwindSafe(|| {
-        write_actions(s, &mut level, &mut child, actions, inject)
+        write_actions(&mut state, &mut child, actions, inject)
     }));
     let failed = match written {
         Ok(Ok(())) => None,
@@ -316,28 +329,30 @@ pub(crate) fn push_level(
     };
     if let Some(e) = failed {
         drop(child);
-        fork::drop_created(s, &level);
         return Err(e);
     }
 
-    fork::finish_level(s, &mut level);
-    level.layer = Some(LevelLayer {
-        state: LayerState::Open(child),
+    let parent_state = state.parent.clone();
+    let live_below = parent_state
+        .as_deref()
+        .map_or(s.files.as_slice(), |p| p.live.as_slice());
+    fork::finish_level(live_below, &s.rev_deps, &mut state);
+    let layer = LevelLayer {
+        handle: Handle::Open(child),
         poisoned: Mutex::new(None),
         sampled,
-    });
-    level.write_ms = a.clock.now_ms().saturating_sub(write_started_ms);
-    s.stack.push(level);
+    };
+    let write_ms = a.clock.now_ms().saturating_sub(write_started_ms);
+    s.stack.push(Level::layered(state, layer, write_ms));
     Ok(())
 }
 
 /// Writes the resolved actions into `child`, recording created, revived and deleted files in
-/// `level` as each is made. `inject` makes the write panic first (the test hook
+/// `state` as each is made. `inject` makes the write panic first (the test hook
 /// `DbWritePanic::Write`). A deleted file loses its text and leaves its source root, as on the
 /// undo log; a created or revived file enters the source root of its sibling or its own.
 fn write_actions(
-    s: &mut RaSession,
-    level: &mut Level,
+    state: &mut LayerState,
     child: &mut OpenLayer<RootDatabase>,
     actions: Vec<Action>,
     inject: bool,
@@ -349,35 +364,38 @@ fn write_actions(
     for action in actions {
         match action {
             Action::Modify { id, new, .. } => child.write(id, new).map_err(engine_error)?,
-            Action::Delete { id, rel, below } => level.deleted.push((id, rel, below)),
+            Action::Delete { id, rel, below } => state.deleted.push((id, rel, below)),
             Action::Create { .. } | Action::Revive { .. } => added.push(action),
         }
     }
     for action in added {
         match action {
-            Action::Create { rel, new } => {
-                let sibling = fork::sibling_file(s, &rel)?;
+            Action::Create {
+                id,
+                rel,
+                new,
+                path,
+                sibling,
+            } => {
                 let root_id = child.source_root_of(sibling);
-                let (id, path) = fork::vfs_create(s, &rel, &new)?;
-                level.created.push((id, rel));
+                state.created.push((id, rel));
                 let root = fork::root_with(&child.source_root(root_id), Some((id, path)), None);
                 child.set_source_root(root_id, root).map_err(engine_error)?;
                 child
                     .create_in_root(id, new, root_id)
                     .map_err(engine_error)?;
             }
-            Action::Revive { id, rel, new } => {
-                let path = s.vfs.file_path(id).clone();
+            Action::Revive { id, rel, new, path } => {
                 let root_id = child.source_root_of(id);
                 let root = fork::root_with(&child.source_root(root_id), Some((id, path)), None);
                 child.set_source_root(root_id, root).map_err(engine_error)?;
                 child.write(id, new).map_err(engine_error)?;
-                level.revived.push((id, rel));
+                state.revived.push((id, rel));
             }
             Action::Modify { .. } | Action::Delete { .. } => {}
         }
     }
-    for (id, _, _) in &level.deleted {
+    for (id, _, _) in &state.deleted {
         let root_id: SourceRootId = child.source_root_of(*id);
         let root: TriArc<SourceRoot> =
             fork::root_with(&child.source_root(root_id), None, Some(*id));
@@ -415,8 +433,7 @@ pub(crate) fn pop_level(a: &RaAnalyzer, s: &mut RaSession) -> Result<bool, Rever
     };
     let t = a.clock.now_ms();
     let sampled = level.layer.as_ref().is_some_and(|l| l.sampled);
-    fork::drop_created(s, &level);
-    let edited = level.edited.clone();
+    let edited = level.state.edited.clone();
     drop(level);
     let revert_ok = if sampled {
         match base_kept(a, s) {

@@ -260,6 +260,24 @@ impl RaSession {
             .then(|| ryo_v2_engine::counters(self.host.raw_database()))
     }
 
+    /// Drains the changes the session's vfs has queued and returns how many there were; for the
+    /// tests that every vfs write of a fork drains its change (nothing else reads them).
+    #[doc(hidden)]
+    pub fn take_vfs_changes(&mut self) -> usize {
+        self.vfs.take_changes().len()
+    }
+
+    /// Whether the session's vfs holds a file at `path` (as a created file has while it is
+    /// registered); for the tests of when a created file leaves the vfs.
+    #[doc(hidden)]
+    pub fn vfs_has(&self, path: &RelPath) -> bool {
+        let abs = ra_ap_vfs::AbsPathBuf::assert_utf8(self.root.join(path.as_str()));
+        matches!(
+            self.vfs.file_id(&ra_ap_vfs::VfsPath::from(abs)),
+            Some((_, ra_ap_vfs::FileExcluded::No))
+        )
+    }
+
     /// The `FileId` of the load-time file `path`, if it is one.
     #[doc(hidden)]
     pub fn file_id(&self, path: &RelPath) -> Option<FileId> {

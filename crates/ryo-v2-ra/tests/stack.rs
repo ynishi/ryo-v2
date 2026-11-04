@@ -3058,3 +3058,54 @@ fn a_panic_in_a_layer_poisons_only_that_layer_on() {
     assert_eq!(sibling, flat);
     assert_eq!(s.fork_counters().map(|c| c.refused), Some(0), "I2");
 }
+
+#[test]
+fn vfs_changes_are_drained() {
+    common::both(vfs_changes_are_drained_on);
+}
+
+/// Every vfs write of a fork drains the change the vfs queues for it (nothing reads them), and a
+/// created file leaves the vfs when its level is popped on the undo log, and only at the thaw on
+/// the Engine, where the vfs only gains entries while the base is frozen.
+fn vfs_changes_are_drained_on() {
+    let (a, _) = analyzer(false);
+    let (_f, mut s) = loaded("stack_vfs_drained", &a);
+    let extra = rel("src/extra.rs");
+    s.take_vfs_changes();
+
+    let mut fork = Stacked::fork(&a, &mut s).expect("fork");
+    a.write(
+        &mut s,
+        &mut fork,
+        &[
+            Edit::write(lib(), format!("{UNRESOLVED_LIB}pub mod extra;\n")),
+            Edit::write(extra.clone(), "pub fn extra() {}\n"),
+        ],
+    )
+    .expect("the write that creates a file");
+    assert!(s.vfs_has(&extra));
+    assert_eq!(s.take_vfs_changes(), 0, "after the create");
+
+    // A refused write that would have created the file again adds no change either.
+    let refused = a.write(
+        &mut s,
+        &mut fork,
+        &[
+            Edit::write(rel("src/other.rs"), "pub fn other() {}\n"),
+            Edit::delete(rel("src/never.rs")),
+        ],
+    );
+    assert!(
+        matches!(refused, Err(CheckError::Edit { .. })),
+        "{refused:?}"
+    );
+    assert!(!s.vfs_has(&rel("src/other.rs")));
+    assert_eq!(s.take_vfs_changes(), 0, "after the refusal");
+
+    assert!(a.pop(&mut s, &mut fork).expect("pop"));
+    assert_eq!(s.vfs_has(&extra), common::engine(), "after the pop");
+    assert_eq!(s.take_vfs_changes(), 0, "after the pop");
+    a.release(&mut s, fork).expect("release");
+    assert!(!s.vfs_has(&extra), "after the release");
+    assert_eq!(s.take_vfs_changes(), 0, "after the release");
+}
