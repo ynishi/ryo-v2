@@ -484,6 +484,169 @@ pub trait Expander {
     ) -> Result<Vec<Blueprint>, ExpandError>;
 }
 
+/// The identity of a job of a [`Forks`] session. The adapter numbers them, and the ids of one
+/// session increase in submission order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct JobId(u64);
+
+impl JobId {
+    /// The id the adapter numbered `n`.
+    pub fn new(n: u64) -> JobId {
+        JobId(n)
+    }
+
+    /// The id's number.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// A job of a [`Forks`] session that ran to its end: its layer, which later jobs may write on
+/// top of, and its diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked<L> {
+    /// The job's layer: the state of its parent with the job's edits written on top.
+    pub layer: L,
+    /// The diagnosis of the job's scope on that layer.
+    pub findings: ScopedFindings,
+}
+
+/// What [`Forks::next`] gives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Next<L> {
+    /// The job ran: its layer and diagnosis, or why its check could not finish. An error here
+    /// reaches the job's Blueprint only.
+    Done(JobId, Result<Checked<L>, CheckError>),
+    /// The caller withdrew the job (`Forks::cancel` returned true), or the session withdrew it
+    /// when it was poisoned: no layer, and no fact about its Blueprint. (The jobs `Forks::close`
+    /// withdraws are not delivered: `next` is refused after it.)
+    Withdrawn(JobId),
+    /// The timeout passed with jobs in flight.
+    Pending,
+    /// No job is in flight or undelivered; given at once.
+    Idle,
+}
+
+/// A [`Verifier`] whose forks run side by side: layers over the session's frozen base, any
+/// number alive at once, each job checked on a pool of workers (D11, stage 3b).
+///
+/// `open` freezes the base and gives its root as a Layer. A job (`submit`) writes its edits on
+/// top of a Layer, resolved against that Layer's state as `Stacked::write` resolves them against
+/// the top level, diagnoses its scope there, and finishes as a new Layer. `next` gives the
+/// outcomes in the order the jobs finish. A job's parent is always a finished Layer, never one in
+/// flight; siblings are jobs on one parent. `cancel` withdraws a job. `close` ends the pool and
+/// thaws the base.
+///
+/// `open`, `submit`, `next`, `cancel` and `close` take the session mutably: the session belongs to
+/// one thread, while the jobs run on the workers. The reads take it shared.
+///
+/// A withdrawal is no fact about a Blueprint, so it is `Next::Withdrawn`, never a [`CheckError`];
+/// a `CheckError::Cancelled` inside a `Done` means the check could not finish although nobody
+/// withdrew it. The errors of a call reach the session: `ForkInUse` for a Layer of another
+/// session, an id that is unknown or already delivered, forks that are not open, and the
+/// operations refused below; `Poisoned` for a poisoned session.
+///
+/// While forks are open the reads of [`Verifier`] describe the base, as `Stacked` C3 says.
+///
+/// # Contract
+/// - C1: until `close`, every accepted `submit` yields exactly one `Done` or `Withdrawn` with its
+///   id, ids increasing in submission order; edits are resolved at submit, and a refused edit is a
+///   `Done` with `Edit` and no layer, never an `Err` of `submit`.
+///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
+///   tested: ryo-v2-engine tests/jobs.rs one_outcome_per_submit
+/// - C2: the layer of a `Done` diagnoses as its flat composition: at `Scope::Workspace` its
+///   findings are what `Verifier::check` gives for the edits that take the base to its state,
+///   and at `Scope::Affected` its files are the job's scope with the findings that check gives on
+///   them, whatever ran beside it.
+///   tested: app::ports::tests::a_done_layer_diagnoses_as_its_flat_composition_for_the_fake
+///   tested: ryo-v2-engine tests/jobs.rs results_do_not_depend_on_the_width
+/// - C3: `cancel` returning true makes the job's outcome `Withdrawn`, never a `Done`, and leaves
+///   the parent and every other job as they were; a job that already finished is not withdrawn
+///   (false), and its outcome is what it produced.
+///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
+///   tested: ryo-v2-engine tests/jobs.rs cancel_true_is_always_withdrawn
+///   tested: ryo-v2-engine tests/jobs.rs cancel_leaves_parent_and_siblings
+/// - C4: at most `width` jobs run at once, an expansion's read jobs among them; with T the
+///   adapter's threads, `width` is at most `max(1, T - 1)` when the caller works between its
+///   calls and at most T when it only waits in `next`, and a job's diagnosis uses that share
+///   divided by `width`, rounded down, and at least one thread.
+///   tested: ryo-v2-engine tests/jobs.rs width_and_job_threads_fit_the_budget
+///   tested: ryo-v2-engine tests/jobs.rs a_read_job_counts_in_the_width
+/// - C5: a Layer whose base is not this session's is `ForkInUse` before anything else, the
+///   poison included, and changes nothing.
+///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
+/// - C6: while forks are open, `Verifier::check`, `Stacked::fork` and `RevertAudit::audit_revert`
+///   are `ForkInUse`, `Expander::expand` is `ExpandError::Session` with `ForkInUse`, and a second
+///   `open` is `ForkInUse`; none of them changes anything.
+///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
+/// - C7: a write the frozen base refused poisons the session and withdraws every job not yet
+///   delivered: `next` gives their `Withdrawn`, then `Poisoned`. The full isolation check of the
+///   base runs only while no job runs, so under continuous load only at `close`.
+///   tested: app::ports::tests::a_refused_base_write_poisons_the_fake
+/// - C8: `close` withdraws every job, joins the workers and checks the isolation of the base;
+///   with a Layer still held it is `ForkInUse`, the base stays frozen and only `layer_files`,
+///   `layer_text`, the reads of `Verifier` and `close` are allowed, until a `close` after the
+///   last Layer is dropped thaws the base. A caller that keeps a Layer keeps the base frozen.
+///   tested: app::ports::tests::a_refused_close_can_be_retried_on_the_fake
+/// - C9: `open` on an adapter whose forks write into the session's one database (the undo-log
+///   backend) is `ForkInUse`: forks need the Engine backend.
+///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
+pub trait Forks: Verifier {
+    /// A finished job's layer, or the base's root: what a job writes on top of. Holding one
+    /// keeps the base frozen (C8).
+    type Layer: Clone + Send;
+
+    /// Freezes the session's base and gives its root. A session with forks open, or with a
+    /// `Stacked` fork live, is `ForkInUse`; a poisoned one is `Poisoned`.
+    fn open(&self, s: &mut Self::Session) -> Result<Self::Layer, CheckError>;
+
+    /// The jobs that run at once (C4).
+    fn width(&self, s: &Self::Session) -> usize;
+
+    /// Resolves `edits` against `parent`'s state and queues a job that writes them on top of it
+    /// and diagnoses `scope` there (C1).
+    fn submit(
+        &self,
+        s: &mut Self::Session,
+        parent: &Self::Layer,
+        edits: &[Edit],
+        scope: Scope,
+    ) -> Result<JobId, CheckError>;
+
+    /// The next outcome, waiting at most `timeout` for one while jobs are in flight. `timeout`
+    /// bounds this wait only; a job's own time limit starts when a worker starts it.
+    fn next(
+        &self,
+        s: &mut Self::Session,
+        timeout: std::time::Duration,
+    ) -> Result<Next<Self::Layer>, CheckError>;
+
+    /// Withdraws `job` if it has not finished (C3). An id that is unknown or already delivered
+    /// is `ForkInUse`.
+    fn cancel(&self, s: &mut Self::Session, job: JobId) -> Result<bool, CheckError>;
+
+    /// The files a one-level `Verifier::check` at `scope` covers for the edits that take the base
+    /// to `layer`'s state, sorted, as `Stacked::files_of` gives them for a top level. (Not named
+    /// `files_of`: an adapter implements `Stacked` too, and one name would need a qualified call.)
+    fn layer_files(
+        &self,
+        s: &Self::Session,
+        layer: &Self::Layer,
+        scope: Scope,
+    ) -> Result<Vec<RelPath>, CheckError>;
+
+    /// The text of `path` at `layer`; `Ok(None)` when `path` is not a file of that state.
+    fn layer_text(
+        &self,
+        s: &Self::Session,
+        layer: &Self::Layer,
+        path: &RelPath,
+    ) -> Result<Option<String>, CheckError>;
+
+    /// Ends the forks: withdraws every job, joins the pool, checks the base and thaws it (C8).
+    fn close(&self, s: &mut Self::Session) -> Result<(), CheckError>;
+}
+
 /// Measures what a child changed, from the texts alone.
 pub trait Assessor {
     /// `before[i]` and `after[i]` are the same path: the parent's and the child's whole text.
@@ -607,9 +770,677 @@ pub trait Analyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{ErrorCode, FindingCode};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn rel(s: &str) -> RelPath {
         RelPath::parse(s).unwrap()
+    }
+
+    /// A fake [`Forks`] that keeps the port's clauses with no analyzer: a state is a map of
+    /// texts, a file whose text contains `error` has one finding, and a job finishes at the
+    /// first `next` after its submit, the newest delivered first (completion out of submission
+    /// order). It is the test double of the port's consumers, and checks that the clauses fit
+    /// together.
+    struct FakeForks {
+        /// Whether its forks are layers of a frozen base (the Engine backend), or would write
+        /// into the session's one database (the undo-log backend).
+        engine: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct FakeLayer {
+        session: u64,
+        texts: BTreeMap<RelPath, String>,
+        /// A clone of the session's `held`: the Layers alive.
+        held: Arc<()>,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum Open {
+        No,
+        Yes,
+        /// A `close` was refused because a Layer was held.
+        Closing,
+    }
+
+    struct FakeSession {
+        id: u64,
+        base: BTreeMap<RelPath, String>,
+        open: Open,
+        stacked_live: bool,
+        poisoned: bool,
+        next_id: u64,
+        /// Accepted jobs not delivered, with the outcome they will have and whether they
+        /// finished.
+        in_flight: BTreeMap<JobId, (bool, Result<Checked<FakeLayer>, CheckError>)>,
+        /// Outcomes known at once (refused edits, withdrawals), delivered first.
+        ready: VecDeque<Next<FakeLayer>>,
+        held: Arc<()>,
+        /// The next `next` finds a write the frozen base refused.
+        refused_write: bool,
+    }
+
+    impl FakeSession {
+        fn new(id: u64, base: &[(&str, &str)]) -> FakeSession {
+            FakeSession {
+                id,
+                base: base
+                    .iter()
+                    .map(|(p, t)| (rel(p), (*t).to_owned()))
+                    .collect(),
+                open: Open::No,
+                stacked_live: false,
+                poisoned: false,
+                next_id: 0,
+                in_flight: BTreeMap::new(),
+                ready: VecDeque::new(),
+                held: Arc::new(()),
+                refused_write: false,
+            }
+        }
+
+        fn layer(&self, texts: BTreeMap<RelPath, String>) -> FakeLayer {
+            FakeLayer {
+                session: self.id,
+                texts,
+                held: Arc::clone(&self.held),
+            }
+        }
+
+        fn layers_held(&self) -> usize {
+            Arc::strong_count(&self.held) - 1
+        }
+
+        fn refuse_while_open(&self) -> Result<(), CheckError> {
+            match self.open {
+                Open::No => Ok(()),
+                Open::Yes | Open::Closing => Err(CheckError::ForkInUse),
+            }
+        }
+
+        fn withdraw_all(&mut self) {
+            for id in std::mem::take(&mut self.in_flight).into_keys() {
+                self.ready.push_back(Next::Withdrawn(id));
+            }
+        }
+    }
+
+    /// `state` with `edits` written on top; deleting a path that is not a file of it is `Edit`.
+    fn written(
+        state: &BTreeMap<RelPath, String>,
+        edits: &[Edit],
+    ) -> Result<BTreeMap<RelPath, String>, CheckError> {
+        let mut state = state.clone();
+        for edit in edits {
+            match &edit.new_text {
+                Some(text) => {
+                    state.insert(edit.path.clone(), text.clone());
+                }
+                None => {
+                    if state.remove(&edit.path).is_none() {
+                        return Err(CheckError::Edit {
+                            path: edit.path.clone(),
+                            reason: "not a file of this state".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    /// The files of a diagnosis at `scope` of `state`, reached by `edits`.
+    fn scope_files(
+        state: &BTreeMap<RelPath, String>,
+        edits: &[Edit],
+        scope: Scope,
+    ) -> Vec<RelPath> {
+        match scope {
+            Scope::Workspace => state.keys().cloned().collect(),
+            Scope::Affected => {
+                let mut files: Vec<RelPath> = edits
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .filter(|p| state.contains_key(p))
+                    .collect();
+                files.sort();
+                files.dedup();
+                files
+            }
+        }
+    }
+
+    fn diagnose(state: &BTreeMap<RelPath, String>, files: Vec<RelPath>) -> ScopedFindings {
+        let findings = files
+            .iter()
+            .filter(|p| state[*p].contains("error"))
+            .map(|p| Finding {
+                code: FindingCode::Rustc(ErrorCode::parse("E0599").unwrap()),
+                message: "fake".to_owned(),
+                path: p.clone(),
+                line: 1,
+            })
+            .collect();
+        ScopedFindings {
+            files,
+            findings,
+            unseen_at: BTreeMap::new(),
+        }
+    }
+
+    /// The edits that take `base` to `state`.
+    fn edits_to(base: &BTreeMap<RelPath, String>, state: &BTreeMap<RelPath, String>) -> Vec<Edit> {
+        let mut edits: Vec<Edit> = state
+            .iter()
+            .filter(|(p, t)| base.get(*p) != Some(*t))
+            .map(|(p, t)| Edit::write(p.clone(), t.clone()))
+            .collect();
+        edits.extend(
+            base.keys()
+                .filter(|p| !state.contains_key(*p))
+                .map(|p| Edit {
+                    path: p.clone(),
+                    new_text: None,
+                }),
+        );
+        edits.sort_by(|a, b| a.path.cmp(&b.path));
+        edits
+    }
+
+    impl Verifier for FakeForks {
+        type Session = FakeSession;
+        fn text(&self, s: &FakeSession, path: &RelPath) -> Option<String> {
+            s.base.get(path).cloned()
+        }
+        fn facts(&self, _: &FakeSession, _: &RelPath) -> FileFacts {
+            FileFacts {
+                is_build_script: false,
+                in_proc_macro_crate: false,
+            }
+        }
+        fn baseline(&self, _: &FakeSession) -> Vec<Finding> {
+            Vec::new()
+        }
+        fn provenance(&self, _: &FakeSession) -> Provenance {
+            Provenance::new("fake", "0", BTreeMap::new(), BTreeMap::new()).unwrap()
+        }
+        fn blind_classes(&self) -> BTreeSet<UnseenClass> {
+            BTreeSet::from(crate::app::ALWAYS_BLIND)
+        }
+        fn check(
+            &self,
+            s: &mut FakeSession,
+            edits: &[Edit],
+            scope: Scope,
+        ) -> Result<ScopedFindings, CheckError> {
+            s.refuse_while_open()?;
+            let state = written(&s.base, edits)?;
+            Ok(diagnose(&state, scope_files(&state, edits, scope)))
+        }
+    }
+
+    impl RevertAudit for FakeForks {
+        fn audit_revert(&self, s: &mut FakeSession) -> Result<(), CheckError> {
+            s.refuse_while_open()
+        }
+    }
+
+    /// Only `fork` and `release` do anything: the fake's stacked forks are here to be refused.
+    impl Stacked for FakeForks {
+        type Fork = ();
+        fn fork(&self, s: &mut FakeSession) -> Result<(), CheckError> {
+            s.refuse_while_open()?;
+            s.stacked_live = true;
+            Ok(())
+        }
+        fn write(&self, _: &mut FakeSession, _: &mut (), _: &[Edit]) -> Result<(), CheckError> {
+            Ok(())
+        }
+        fn levels(&self, _: &FakeSession, _: &()) -> Result<usize, CheckError> {
+            Ok(0)
+        }
+        fn fork_text(
+            &self,
+            _: &FakeSession,
+            _: &(),
+            _: &RelPath,
+        ) -> Result<Option<String>, CheckError> {
+            Ok(None)
+        }
+        fn diagnose(
+            &self,
+            _: &FakeSession,
+            _: &(),
+            _: Scope,
+        ) -> Result<ScopedFindings, CheckError> {
+            Ok(ScopedFindings::default())
+        }
+        fn files_of(&self, _: &FakeSession, _: &(), _: Scope) -> Result<Vec<RelPath>, CheckError> {
+            Ok(Vec::new())
+        }
+        fn pop(&self, _: &mut FakeSession, _: &mut ()) -> Result<bool, CheckError> {
+            Ok(false)
+        }
+        fn release(&self, s: &mut FakeSession, _: ()) -> Result<(), CheckError> {
+            s.stacked_live = false;
+            Ok(())
+        }
+    }
+
+    impl Expander for FakeForks {
+        type Session = FakeSession;
+        fn expand(
+            &self,
+            s: &mut FakeSession,
+            _: &[Edit],
+            _: &[Target],
+            _: usize,
+        ) -> Result<Vec<Blueprint>, ExpandError> {
+            s.refuse_while_open().map_err(ExpandError::Session)?;
+            Ok(Vec::new())
+        }
+    }
+
+    impl Forks for FakeForks {
+        type Layer = FakeLayer;
+
+        fn open(&self, s: &mut FakeSession) -> Result<FakeLayer, CheckError> {
+            if !self.engine || s.stacked_live {
+                return Err(CheckError::ForkInUse);
+            }
+            s.refuse_while_open()?;
+            if s.poisoned {
+                return Err(CheckError::Poisoned("fake".to_owned()));
+            }
+            s.open = Open::Yes;
+            Ok(s.layer(s.base.clone()))
+        }
+
+        fn width(&self, _: &FakeSession) -> usize {
+            4
+        }
+
+        fn submit(
+            &self,
+            s: &mut FakeSession,
+            parent: &FakeLayer,
+            edits: &[Edit],
+            scope: Scope,
+        ) -> Result<JobId, CheckError> {
+            if parent.session != s.id || s.open != Open::Yes {
+                return Err(CheckError::ForkInUse);
+            }
+            if s.poisoned {
+                return Err(CheckError::Poisoned("fake".to_owned()));
+            }
+            let id = JobId::new(s.next_id);
+            s.next_id += 1;
+            match written(&parent.texts, edits) {
+                Err(refused) => s.ready.push_back(Next::Done(id, Err(refused))),
+                Ok(state) => {
+                    let findings = diagnose(&state, scope_files(&state, edits, scope));
+                    let layer = s.layer(state);
+                    s.in_flight
+                        .insert(id, (false, Ok(Checked { layer, findings })));
+                }
+            }
+            Ok(id)
+        }
+
+        fn next(&self, s: &mut FakeSession, _: Duration) -> Result<Next<FakeLayer>, CheckError> {
+            if s.open != Open::Yes {
+                return Err(CheckError::ForkInUse);
+            }
+            if std::mem::take(&mut s.refused_write) {
+                s.poisoned = true;
+                s.withdraw_all();
+            }
+            if let Some(next) = s.ready.pop_front() {
+                return Ok(next);
+            }
+            if s.poisoned {
+                return Err(CheckError::Poisoned(
+                    "a write of the frozen base".to_owned(),
+                ));
+            }
+            for (finished, _) in s.in_flight.values_mut() {
+                *finished = true;
+            }
+            match s.in_flight.pop_last() {
+                Some((id, (_, outcome))) => Ok(Next::Done(id, outcome)),
+                None => Ok(Next::Idle),
+            }
+        }
+
+        fn cancel(&self, s: &mut FakeSession, job: JobId) -> Result<bool, CheckError> {
+            if s.open != Open::Yes {
+                return Err(CheckError::ForkInUse);
+            }
+            match s.in_flight.get(&job) {
+                // Known and not delivered, but already finished (a refused edit) or withdrawn.
+                None if s.ready.iter().any(|next| {
+                    matches!(next,
+                    Next::Done(id, _) | Next::Withdrawn(id) if *id == job)
+                }) =>
+                {
+                    Ok(false)
+                }
+                None => Err(CheckError::ForkInUse),
+                Some((true, _)) => Ok(false),
+                Some((false, _)) => {
+                    s.in_flight.remove(&job);
+                    s.ready.push_back(Next::Withdrawn(job));
+                    Ok(true)
+                }
+            }
+        }
+
+        fn layer_files(
+            &self,
+            s: &FakeSession,
+            layer: &FakeLayer,
+            scope: Scope,
+        ) -> Result<Vec<RelPath>, CheckError> {
+            if layer.session != s.id || s.open == Open::No {
+                return Err(CheckError::ForkInUse);
+            }
+            let edits = edits_to(&s.base, &layer.texts);
+            Ok(scope_files(&layer.texts, &edits, scope))
+        }
+
+        fn layer_text(
+            &self,
+            s: &FakeSession,
+            layer: &FakeLayer,
+            path: &RelPath,
+        ) -> Result<Option<String>, CheckError> {
+            if layer.session != s.id || s.open == Open::No {
+                return Err(CheckError::ForkInUse);
+            }
+            Ok(layer.texts.get(path).cloned())
+        }
+
+        fn close(&self, s: &mut FakeSession) -> Result<(), CheckError> {
+            if s.open == Open::No {
+                return Err(CheckError::ForkInUse);
+            }
+            s.in_flight.clear();
+            s.ready.clear();
+            if s.layers_held() > 0 {
+                s.open = Open::Closing;
+                return Err(CheckError::ForkInUse);
+            }
+            s.open = Open::No;
+            if s.poisoned {
+                return Err(CheckError::Poisoned(
+                    "a write of the frozen base".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    const FOREVER: Duration = Duration::from_secs(60);
+
+    fn engine_session() -> (FakeForks, FakeSession) {
+        (
+            FakeForks { engine: true },
+            FakeSession::new(1, &[("src/a.rs", "a"), ("src/b.rs", "b")]),
+        )
+    }
+
+    /// Every outcome until `Idle`.
+    fn drain(f: &FakeForks, s: &mut FakeSession) -> Vec<Next<FakeLayer>> {
+        let mut out = Vec::new();
+        loop {
+            match f.next(s, FOREVER).unwrap() {
+                Next::Idle => return out,
+                Next::Pending => panic!("the fake is never pending"),
+                next => out.push(next),
+            }
+        }
+    }
+
+    fn id_of(next: &Next<FakeLayer>) -> JobId {
+        match next {
+            Next::Done(id, _) | Next::Withdrawn(id) => *id,
+            Next::Pending | Next::Idle => panic!("no job: {next:?}"),
+        }
+    }
+
+    #[test]
+    fn outcomes_and_withdrawal_hold_for_the_fake() {
+        let (f, mut s) = engine_session();
+        let root = f.open(&mut s).unwrap();
+        assert_eq!(f.next(&mut s, FOREVER), Ok(Next::Idle), "Idle at once");
+
+        let write = |text: &str| vec![Edit::write(rel("src/a.rs"), text)];
+        let a = f
+            .submit(&mut s, &root, &write("a1"), Scope::Affected)
+            .unwrap();
+        let refused = f
+            .submit(
+                &mut s,
+                &root,
+                &[Edit {
+                    path: rel("src/none.rs"),
+                    new_text: None,
+                }],
+                Scope::Affected,
+            )
+            .expect("a refused edit is an outcome, not an error of submit");
+        let cancelled = f
+            .submit(&mut s, &root, &write("a2"), Scope::Affected)
+            .unwrap();
+        let c = f
+            .submit(&mut s, &root, &write("a3"), Scope::Affected)
+            .unwrap();
+        assert!(a < refused && refused < cancelled && cancelled < c);
+
+        assert_eq!(f.cancel(&mut s, cancelled), Ok(true));
+        // Known and undelivered, but no longer withdrawable: false, not an error.
+        assert_eq!(f.cancel(&mut s, cancelled), Ok(false));
+        assert_eq!(f.cancel(&mut s, refused), Ok(false));
+        let first = f.next(&mut s, FOREVER).unwrap();
+        assert!(
+            matches!(&first, Next::Done(id, Err(CheckError::Edit { .. })) if *id == refused),
+            "{first:?}"
+        );
+        assert_eq!(f.next(&mut s, FOREVER), Ok(Next::Withdrawn(cancelled)));
+        // The other jobs have finished now: not withdrawn, their outcome is what they produced.
+        let last = f.next(&mut s, FOREVER).unwrap();
+        assert_eq!(id_of(&last), c, "completion out of submission order");
+        assert_eq!(f.cancel(&mut s, a), Ok(false));
+        let mut rest = drain(&f, &mut s);
+        assert_eq!(rest.len(), 1);
+        match rest.remove(0) {
+            Next::Done(id, Ok(checked)) => {
+                assert_eq!(id, a);
+                assert_eq!(
+                    f.layer_text(&s, &checked.layer, &rel("src/a.rs")),
+                    Ok(Some("a1".to_owned()))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // The parent is as it was; a delivered id is unknown.
+        assert_eq!(
+            f.layer_text(&s, &root, &rel("src/a.rs")),
+            Ok(Some("a".to_owned()))
+        );
+        assert_eq!(f.cancel(&mut s, a), Err(CheckError::ForkInUse));
+        drop((root, last));
+        assert_eq!(f.close(&mut s), Ok(()));
+    }
+
+    #[test]
+    fn a_done_layer_diagnoses_as_its_flat_composition_for_the_fake() {
+        let (f, mut s) = engine_session();
+        let root = f.open(&mut s).unwrap();
+        let first = vec![Edit::write(rel("src/a.rs"), "an error")];
+        let second = vec![
+            Edit::write(rel("src/b.rs"), "b2"),
+            Edit::write(rel("src/c.rs"), "another error"),
+        ];
+        f.submit(&mut s, &root, &first, Scope::Affected).unwrap();
+        let Next::Done(_, Ok(parent)) = f.next(&mut s, FOREVER).unwrap() else {
+            panic!("the first job finishes");
+        };
+        let mut job = |scope: Scope| {
+            let id = f.submit(&mut s, &parent.layer, &second, scope).unwrap();
+            // A sibling running beside it changes nothing.
+            f.submit(&mut s, &parent.layer, &first, scope).unwrap();
+            let mut done = None;
+            for next in drain(&f, &mut s) {
+                if let Next::Done(got, Ok(checked)) = next
+                    && got == id
+                {
+                    done = Some(checked);
+                }
+            }
+            done.expect("the job finishes")
+        };
+        let workspace = job(Scope::Workspace).findings;
+        let affected = job(Scope::Affected);
+        let files_of = f.layer_files(&s, &affected.layer, Scope::Affected).unwrap();
+        let Checked {
+            layer,
+            findings: affected,
+        } = affected;
+        drop((root, parent, layer));
+        assert_eq!(f.close(&mut s), Ok(()));
+
+        let base_texts = s.base.clone();
+        let base = |p: &RelPath| base_texts.get(p).cloned();
+        let composed = crate::domain::search::compose(&first, &second, &base);
+        let flat = f.check(&mut s, &composed, Scope::Workspace).unwrap();
+        assert_eq!(workspace, flat);
+        let affected = &affected;
+        assert_eq!(affected.files, vec![rel("src/b.rs"), rel("src/c.rs")]);
+        let on_them: Vec<Finding> = flat
+            .findings
+            .iter()
+            .filter(|x| affected.files.contains(&x.path))
+            .cloned()
+            .collect();
+        assert_eq!(affected.findings, on_them);
+        assert_eq!(
+            files_of,
+            vec![rel("src/a.rs"), rel("src/b.rs"), rel("src/c.rs")]
+        );
+    }
+
+    #[test]
+    fn the_fake_refuses_what_forks_refuse() {
+        // C9: the undo-log backend has no forks.
+        let undo_log = FakeForks { engine: false };
+        let mut plain = FakeSession::new(9, &[("src/a.rs", "a")]);
+        assert_eq!(undo_log.open(&mut plain), Err(CheckError::ForkInUse));
+        assert_eq!(
+            undo_log.check(&mut plain, &[], Scope::Affected).map(|_| ()),
+            Ok(())
+        );
+
+        // C6: while forks are open the session's other operations refuse and change nothing.
+        let (f, mut s) = engine_session();
+        let root = f.open(&mut s).unwrap();
+        assert_eq!(
+            f.check(&mut s, &[], Scope::Affected),
+            Err(CheckError::ForkInUse)
+        );
+        assert_eq!(Stacked::fork(&f, &mut s), Err(CheckError::ForkInUse));
+        assert_eq!(f.audit_revert(&mut s), Err(CheckError::ForkInUse));
+        assert_eq!(
+            f.expand(&mut s, &[], &[], 3),
+            Err(ExpandError::Session(CheckError::ForkInUse))
+        );
+        assert_eq!(f.open(&mut s), Err(CheckError::ForkInUse));
+        assert!(!s.stacked_live);
+
+        // C5: a Layer of another session, before the poison is looked at.
+        let (other_f, mut other) = engine_session();
+        other.id = 2;
+        let foreign = other_f.open(&mut other).unwrap();
+        s.poisoned = true;
+        assert_eq!(
+            f.submit(&mut s, &foreign, &[], Scope::Affected),
+            Err(CheckError::ForkInUse)
+        );
+        assert!(s.in_flight.is_empty() && s.ready.is_empty());
+        assert!(matches!(
+            f.submit(&mut s, &root, &[], Scope::Affected),
+            Err(CheckError::Poisoned(_))
+        ));
+        drop((root, foreign));
+        assert!(matches!(f.close(&mut s), Err(CheckError::Poisoned(_))));
+        assert_eq!(other_f.close(&mut other), Ok(()));
+    }
+
+    #[test]
+    fn a_refused_base_write_poisons_the_fake() {
+        let (f, mut s) = engine_session();
+        let root = f.open(&mut s).unwrap();
+        let edits = [Edit::write(rel("src/a.rs"), "x")];
+        let ids: Vec<JobId> = (0..3)
+            .map(|_| f.submit(&mut s, &root, &edits, Scope::Affected).unwrap())
+            .collect();
+        s.refused_write = true;
+        for id in &ids {
+            assert_eq!(f.next(&mut s, FOREVER), Ok(Next::Withdrawn(*id)));
+        }
+        assert!(matches!(
+            f.next(&mut s, FOREVER),
+            Err(CheckError::Poisoned(_))
+        ));
+        drop(root);
+        assert!(matches!(f.close(&mut s), Err(CheckError::Poisoned(_))));
+    }
+
+    #[test]
+    fn a_refused_close_can_be_retried_on_the_fake() {
+        let (f, mut s) = engine_session();
+        let root = f.open(&mut s).unwrap();
+        let edits = [Edit::write(rel("src/a.rs"), "kept")];
+        f.submit(&mut s, &root, &edits, Scope::Affected).unwrap();
+        let Next::Done(_, Ok(kept)) = f.next(&mut s, FOREVER).unwrap() else {
+            panic!("the job finishes");
+        };
+        let queued = f.submit(&mut s, &root, &edits, Scope::Affected).unwrap();
+        drop(root);
+
+        assert_eq!(
+            f.close(&mut s),
+            Err(CheckError::ForkInUse),
+            "a Layer is held"
+        );
+        // Closing: the jobs are gone, only reads and `close` are allowed.
+        assert_eq!(
+            f.submit(&mut s, &kept.layer, &edits, Scope::Affected),
+            Err(CheckError::ForkInUse)
+        );
+        assert_eq!(f.next(&mut s, FOREVER), Err(CheckError::ForkInUse));
+        assert_eq!(f.cancel(&mut s, queued), Err(CheckError::ForkInUse));
+        assert_eq!(
+            f.check(&mut s, &[], Scope::Affected),
+            Err(CheckError::ForkInUse)
+        );
+        assert_eq!(
+            f.layer_text(&s, &kept.layer, &rel("src/a.rs")),
+            Ok(Some("kept".to_owned()))
+        );
+        assert_eq!(
+            f.layer_files(&s, &kept.layer, Scope::Affected),
+            Ok(vec![rel("src/a.rs")])
+        );
+        assert_eq!(f.text(&s, &rel("src/a.rs")), Some("a".to_owned()));
+
+        drop(kept);
+        assert_eq!(f.close(&mut s), Ok(()));
+        assert!(f.check(&mut s, &[], Scope::Affected).is_ok());
+        assert!(f.open(&mut s).is_ok());
     }
 
     #[test]
