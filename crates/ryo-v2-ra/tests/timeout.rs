@@ -7,7 +7,7 @@ use ryo_v2_core::app::ports::{Analyzer, CheckError, RevertAudit, Verifier};
 use ryo_v2_core::domain::{Edit, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
+use ryo_v2_ra::{GapDetector, RaAnalyzer, RaConfig, RaSession};
 use std::sync::Arc;
 
 const LIB: &str = "pub struct S;\n\npub fn a(s: &S) -> u32 {\n    s.missing()\n}\n";
@@ -68,6 +68,33 @@ fn check_past_timeout_is_timed_out_and_session_usable_on() {
     plain
         .check(&mut s, &[edit], Scope::Affected)
         .expect("check after a timeout");
+    assert_eq!(plain.text(&s, &rel("src/lib.rs")).as_deref(), Some(LIB));
+    assert_eq!(Verifier::baseline(&plain, &s), base_findings);
+}
+
+#[test]
+fn a_cancel_inside_a_detector_is_cancelled() {
+    common::both(a_cancel_inside_a_detector_is_cancelled_on);
+}
+
+/// A salsa cancellation raised inside a gap detector is the check's `Cancelled`, never
+/// `Panicked`, and the session stays usable at its base.
+fn a_cancel_inside_a_detector_is_cancelled_on() {
+    let (_f, plain, mut s) = loaded("timeout_detector_cancel");
+    let base_findings = Verifier::baseline(&plain, &s);
+    let edit = lib_edit("\npub fn b() {}\n");
+
+    let cancelling =
+        analyzer(None).with_detector_cancel(Some((GapDetector::UnresolvedPath, rel("src/lib.rs"))));
+    let err = cancelling
+        .check(&mut s, std::slice::from_ref(&edit), Scope::Affected)
+        .expect_err("the cancellation ends the check");
+    assert_eq!(err, CheckError::Cancelled);
+    assert!(s.detector_panics().is_empty(), "{:?}", s.detector_panics());
+
+    plain
+        .check(&mut s, &[edit], Scope::Affected)
+        .expect("check after the cancellation");
     assert_eq!(plain.text(&s, &rel("src/lib.rs")).as_deref(), Some(LIB));
     assert_eq!(Verifier::baseline(&plain, &s), base_findings);
 }

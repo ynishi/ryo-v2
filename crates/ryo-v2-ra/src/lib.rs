@@ -191,8 +191,9 @@ pub struct RaAnalyzer {
     /// Cut-off of the diagnostics of one diagnosis of a level (a check's included), in ms. A field
     /// of the analyzer and not of `RaConfig`, so literals of `RaConfig` elsewhere keep compiling.
     pub(crate) check_timeout_ms: Option<u64>,
-    /// Detector and file on which it is made to panic; a test hook.
-    pub(crate) detector_fault: Option<(GapDetector, RelPath)>,
+    /// Detector and file on which it is made to panic or to raise a salsa cancellation; a test
+    /// hook.
+    pub(crate) detector_fault: Option<DetectorFault>,
     /// File whose text a revert gets wrong; a test hook.
     pub(crate) revert_fault: Option<RelPath>,
     /// Whether the diagnostic re-assert of a revert fails to run; a test hook.
@@ -205,6 +206,16 @@ pub struct RaAnalyzer {
     pub(crate) audit_fault: bool,
     /// Whether every diagnosis of a level panics before it diagnoses a file; a test hook.
     pub(crate) diagnose_panic: bool,
+}
+
+/// The fault the test hooks `RaAnalyzer::with_detector_fault` and
+/// `RaAnalyzer::with_detector_cancel` put on one detector and file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DetectorFault {
+    pub(crate) detector: GapDetector,
+    pub(crate) path: RelPath,
+    /// A salsa cancellation instead of a panic.
+    pub(crate) cancel: bool,
 }
 
 /// The database write of the texts that the test hook `RaAnalyzer::with_db_write_panic` makes
@@ -249,7 +260,24 @@ impl RaAnalyzer {
     /// For the tests of the containment and of the re-assert; nothing else sets it.
     #[doc(hidden)]
     pub fn with_detector_fault(mut self, fault: Option<(GapDetector, RelPath)>) -> RaAnalyzer {
-        self.detector_fault = fault;
+        self.detector_fault = fault.map(|(detector, path)| DetectorFault {
+            detector,
+            path,
+            cancel: false,
+        });
+        self
+    }
+
+    /// Makes that detector raise a salsa cancellation on that file in every collect this
+    /// analyzer runs, as a query of it does when its database is cancelled. For the tests of the
+    /// mapping of a cancellation (it is `Cancelled`, never a panic); nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_detector_cancel(mut self, at: Option<(GapDetector, RelPath)>) -> RaAnalyzer {
+        self.detector_fault = at.map(|(detector, path)| DetectorFault {
+            detector,
+            path,
+            cancel: true,
+        });
         self
     }
 
