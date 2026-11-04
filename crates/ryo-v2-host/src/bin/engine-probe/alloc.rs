@@ -44,6 +44,13 @@ impl HeapGauge for Counting {
     fn peak_bytes(&self) -> u64 {
         self.peak.load(Ordering::Relaxed)
     }
+
+    fn reset_peak(&self) {
+        // An allocation racing the store can raise the peak after it; the peak stays at least
+        // the live bytes of the moment it was reset.
+        self.peak
+            .store(self.live.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
 }
 
 // SAFETY: every method forwards its call to `System` unchanged, so `Counting` meets the
@@ -130,5 +137,15 @@ mod tests {
         drop(zeroed);
         let after = COUNTING.live_bytes();
         assert!(after < before + SLACK, "{before} -> {during} -> {after}");
+        // A reset starts the peak again from the live bytes: a block allocated and freed after
+        // it is its peak, not the earlier larger ones.
+        COUNTING.reset_peak();
+        let reset_at = COUNTING.live_bytes();
+        assert!(COUNTING.peak_bytes() < reset_at + SLACK);
+        let small = vec![1u8; (SIZE / 4) as usize];
+        drop(small);
+        let peak = COUNTING.peak_bytes();
+        assert!(peak + SLACK >= reset_at + SIZE / 4, "{reset_at} -> {peak}");
+        assert!(peak < reset_at + SIZE / 4 + SLACK, "{reset_at} -> {peak}");
     }
 }

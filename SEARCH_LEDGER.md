@@ -925,6 +925,72 @@ Fixed before the run. `RAM` 30.27, `RESERVED` 8; `B` the ryo-rs RSS at P2, 4.908
 | G3 baseline time | met: the ryo-rs rows of tables S1 and S2 are filled, both builds; S2 is one `bench --on` run with repeat 3 |
 | G4 occupancy (reported only) | not measured: the `bench --on` of S2 ran on main 531fc18, which prints no occupancy |
 
+#### Table M4: per layer of the Engine (stage 3b, the source of M)
+
+What one layer of the fork Engine costs, the memory terms of stage 3b's `Forks` and of the bound
+stage 4 states as `max_forks`:
+`W × transient + Σ over live layers of (kept(class) + view(depth)) ≤ A`. Measured by
+`engine-probe --layer-cost` (`ryo-v2-host` `layer_cost`): on one fork of the Engine, 21 levels,
+each one write of one file, written on the level below and diagnosed once at Affected scope
+before the next is written (the search's shape), after one throwaway level that takes the frees
+the load leaves (0.099 GiB on the first diagnosis at 1 thread). Per level: kept = live heap after
+its diagnosis less before its write; transient = the most heap live at once during its write and
+diagnosis less what it keeps (the gauge's peak is reset before each write); view = the level's
+`LayerStats::flat_bytes` once it is sealed and has a child. Item levels append a function
+(`stacked::depth_levels`); body levels change the literal one function returns, whose first level
+on each file appends it and is not counted. The levels rotate over 4 files.
+
+- date: 2026-11-04; machine: 12 cores, 30.27 GiB RAM; other work ran on the machine (load
+  average 0.7 to 4.4), which moves no heap figure.
+- build: stage 3b's commits 0, 1 and 1b on c379541 (the tree of main's cc343dd; uncommitted then), release, `RUSTFLAGS="--cfg
+  no_salsa_async_drops"` (synchronous drops, as Table M3).
+- runs: `engine-probe <BASE> --layer-cost --classes body,item --view-depths 1,10,20 --scope
+  affected` with `--depth-files 4` (first4: the first 4 indexed files in path order, all of
+  `ryo-agent`, Affected scope 18 files) or `--layer-files
+  crates/ryo-symbol/src/id.rs,crates/ryo-source/src/ast.rs,crates/ryo-analysis/src/lib.rs,crates/ryo-storage/src/lib.rs`
+  (wide4: files of the crates most others depend on, Affected scope 434, 462, 348 and 147 files),
+  each at 12 threads per diagnosis and with `--threads 1`; `<BASE>` the ryo-rs export at 67b0ebfb.
+
+Kept and transient in MB (10^6 bytes), min / p50 / p90 / max (nearest rank) over the counted
+levels (17 body, 21 item); view bytes of the level at depth 1 / 10 / 20; the stack is the live heap
+once all 21 levels are diagnosed less before the fork. All [measured].
+
+| files | threads | class | kept | transient | view at 1 / 10 / 20 | stack (21 levels) |
+|---|---|---|---|---|---|---|
+| first4 | 12 | body | 1.892 / 1.955 / 2.017 / 2.018 | 0.128 / 0.213 / 0.294 / 0.305 | 0.003 / 0.379 / 0.379 | 64.1 |
+| first4 | 12 | item | 1.547 / 2.125 / 13.977 / 14.008 | 0.107 / 0.312 / 3.465 / 3.504 | 0.003 / 0.379 / 0.379 | 160.4 |
+| first4 | 1 | body | -3.283 / 2.059 / 2.086 / 2.120 | 0.050 / 0.061 / 0.070 / 4.086 | 0.003 / 0.379 / 0.379 | 65.7 |
+| first4 | 1 | item | -3.169 / 2.115 / 19.140 / 19.170 | 0.089 / 0.135 / 3.951 / 3.972 | 0.003 / 0.379 / 0.379 | 160.8 |
+| wide4 | 12 | body | 10.549 / 19.647 / 19.720 / 19.722 | 0.568 / 1.071 / 1.564 / 1.708 | 0.207 / 1.516 / 1.516 | 401.1 |
+| wide4 | 12 | item | 20.142 / 30.469 / 47.659 / 47.667 | 1.456 / 1.949 / 9.858 / 9.867 | 0.207 / 1.516 / 1.516 | 742.8 |
+| wide4 | 1 | body | 10.088 / 16.931 / 20.179 / 20.182 | 0.239 / 0.627 / 0.631 / 0.631 | 0.207 / 1.516 / 1.516 | 398.2 |
+| wide4 | 1 | item | 16.501 / 31.558 / 52.167 / 52.175 | 0.294 / 0.601 / 0.715 / 0.715 | 0.207 / 1.516 / 1.516 | 745.2 |
+
+- Kept follows the file, not the depth: on first4 an item level on a `src/` file keeps 13.9 to
+  19.2 MB and one on an `examples/` file about 2.1 MB; on wide4 a body level keeps the same
+  figure every time its file comes back (within 0.01 MB over depths 5 to 21), and an item level
+  at most 6 % more than the first on its file (28.8 to 30.5 MB on `ryo-symbol`). A body level
+  keeps about a tenth (first4 `src/`) to two thirds (wide4) of an item level on the same file.
+- The view stops growing at depth 3 here: with 4 files the chain's distinct memo keys stop
+  growing once each file was written, and `flat_bytes` is the capacity of the view's maps
+  (powers of two). A chain over more distinct files keeps growing (F14 of stage 3b). A
+  level's view is built when its child seals it, during the next level's write, so kept(k+1)
+  likely holds view(k) already; the bound below adds the view again and errs high by at most
+  1.52 MB a layer.
+- At 1 thread on first4, the levels on `crates/ryo-agent/examples/lsp_hybrid_test.rs` after its
+  first keep -3.08 to -3.28 MB with a transient of 3.89 to 4.09 MB (body level 5; item levels 5,
+  9, 13, 17 and 21); at 12 threads they keep about 2 MB. What is freed there is not named.
+- Stage 1's "one check keeps 0.049 to 0.338 GiB" (Table M3) was an undo-log check of a corpus
+  variant on its parent's level, written in place; it is not a layer's cost and is not M.
+
+The bound with the measured terms [estimated]: `A = 30.27 - 8 - 4.908 = 17.36` GiB; the worst
+layer is a wide4 item level at 1 thread, 52.17 MB kept plus 1.52 MB of view; the transient of 12
+jobs at 1 thread is at most 12 × 0.71 MB. Disjoint chains of depth 20 then fit up to K = 17
+(`17 × 20 × 53.69 MB + 8.6 MB = 18.26 GB ≤ 18.64 GB`); 16 × 20 takes 17.19 GB (16.01 GiB). A
+search over body edits at the wide4 p50 (19.65 MB + 1.52 MB) takes 6.8 GB for 16 × 20. Not
+counted: the RSS above the live heap (allocator, fragmentation), which the bench's RSS stop
+guards, and memos two siblings compute twice, which the kept figure already holds per layer.
+
 ### Verdict
 
 - CONCEPT.md Core 4: holds on both. Small workspace worst warm median check 7 ms; ryo-rs worst warm median 4298 ms (body-03, Workspace scope), with assert_revert on. The run's line: `holds (worst warm median check_ms 4298 at corpus/body-03 [workspace], limit 5000)`. The margin is small at Workspace scope; Affected keeps every row under 2.1 s. Revert costs about as much again (1.4 to 2.1 s median), so one candidate is check + revert, 3 to 6 s.

@@ -7,5 +7,6 @@
 
 pub mod bench;
 pub mod engine_probe;
+pub mod layer_cost;
 pub mod proc;
 pub mod stacked;
