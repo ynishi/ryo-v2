@@ -14,13 +14,13 @@
 use crate::RaAnalyzer;
 use crate::check::{fingerprints, map_error};
 use crate::diagnostics::{diagnostics_config, panic_message};
-use crate::fork::db_text;
+use crate::fork::db_text_in;
 use crate::session::{ExpanderPanic, RaSession};
 use crate::stack;
 use ra_ap_hir::{Crate, PrefixKind};
 use ra_ap_ide::TextRange as RaRange;
 use ra_ap_ide::{
-    Analysis, AssistConfig, AssistKind, AssistResolveStrategy, DiagnosticsConfig,
+    Analysis, AnalysisHost, AssistConfig, AssistKind, AssistResolveStrategy, DiagnosticsConfig,
     ExprFillDefaultMode, FilePosition, FileRange, RenameConfig, RootDatabase, Semantics,
     SingleResolve, SourceChange, TextSize,
 };
@@ -398,15 +398,17 @@ fn extract_name(body: &SyntaxNode, lo: u32, hi: u32) -> Option<String> {
 }
 
 impl<'a> Env<'a> {
-    fn new(sess: &'a RaSession, state_fp: StateFp) -> Env<'a> {
-        let db = sess.host.raw_database();
+    /// The environment of an expansion of `sess` reading the state `host` holds: the session's
+    /// own host, or on the Engine a host over the top level of the live fork.
+    fn new(sess: &'a RaSession, host: &'a AnalysisHost, state_fp: StateFp) -> Env<'a> {
+        let db = host.raw_database();
         let mut diag_cfg = diagnostics_config();
         // No diagnostics quick fixes are wanted in `assists_with_fixes`.
         diag_cfg.enabled = false;
         Env {
             sess,
             db,
-            analysis: sess.host.analysis(),
+            analysis: host.analysis(),
             sema: Semantics::new(db),
             state_fp,
             assist_cfg: assist_config(),
@@ -436,7 +438,7 @@ impl<'a> Env<'a> {
         if let Some(t) = self.texts.borrow().get(&id) {
             return Some(t.clone());
         }
-        let t: Rc<str> = Rc::from(db_text(&self.sess.host, id).ok()?);
+        let t: Rc<str> = Rc::from(db_text_in(self.db, id).ok()?);
         self.texts.borrow_mut().insert(id, t.clone());
         Some(t)
     }
@@ -1534,15 +1536,35 @@ fn parse_crate_use(text: &str) -> Option<(String, Vec<String>, String)> {
     ))
 }
 
-/// Runs the generation on the current database state; the views are dropped before it returns.
+/// Runs the generation on the current database state, the top level of the live fork (read on
+/// the Engine through its layer, or a throwaway child of it once it is sealed); the views are
+/// dropped before it returns.
 fn generate(
     sess: &RaSession,
     state_fp: StateFp,
     targets: &[Target],
     max: usize,
 ) -> Result<Vec<Blueprint>, ExpandError> {
+    crate::fork::with_top_host(sess, |host| generate_on(sess, host, state_fp, targets, max))
+        .unwrap_or_else(|e| {
+            Err(match e {
+                // A top level whose layer a panic poisoned yields nothing, as a panic does.
+                AnalyzerError::Panicked(msg) => ExpandError::Analysis(msg),
+                other => ExpandError::Session(map_error(other, &[])),
+            })
+        })
+}
+
+/// [`generate`] on the state `host` holds.
+fn generate_on(
+    sess: &RaSession,
+    host: &AnalysisHost,
+    state_fp: StateFp,
+    targets: &[Target],
+    max: usize,
+) -> Result<Vec<Blueprint>, ExpandError> {
     let got = catch_unwind(AssertUnwindSafe(|| {
-        let env = Env::new(sess, state_fp);
+        let env = Env::new(sess, host, state_fp);
         // hir_ty reads the database through a thread-local that `Analysis` sets for its own
         // queries; the `Semantics` calls of this file need it set too.
         ra_ap_hir::attach_db_allow_change(env.db, || env.run(targets, max))

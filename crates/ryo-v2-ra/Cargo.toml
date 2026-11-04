@@ -7,8 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/ryo-v2-ra"
 readme.workspace = true
+# D11: nothing that depends on the patched salsa (the fork Engine) is published in this phase.
+publish = false
 keywords = ["rust-analyzer", "refactoring", "diagnostics", "hir"]
 categories = ["development-tools"]
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
@@ -16,8 +17,14 @@ include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 [lints]
 workspace = true
 
+[features]
+# The fork Engine's walk counters on `LayerStats` (salsa's `fork-probe`), for measurements only.
+fork-probe = ["ryo-v2-engine/fork-probe"]
+
 [dependencies]
 ryo-v2-core.workspace = true
+# Stacked forks on layers of a frozen base, behind `RaConfig.engine` (D11, stage 3).
+ryo-v2-engine.workspace = true
 ra_ap_ide.workspace = true
 ra_ap_hir.workspace = true
 ra_ap_base_db.workspace = true

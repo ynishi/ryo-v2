@@ -368,9 +368,27 @@ impl MemoHeader {
             "{database_key_index:?}: shallow_verify_memo(memo = {memo:#?})",
             memo = self.tracing_debug(has_value)
         );
+        // ryo-v2 fork: under a layer, a memo of durability above LOW is checked against the
+        // base's last-changed revision before any stamp is looked up (the durability shortcut, D11). Under a
+        // layer that revision is the base's (E3: a layered write above LOW is refused), and
+        // every stamp of the memo on the chain is above the header's own `verified_at` (a stamp
+        // carries its layer's revision, above the memo's own layer or the base, E3), so when the
+        // header alone passes the durability test the newest stamp passes it too: the answer is
+        // `yes()` either way, and under a layer `update_shallow` records nothing for it. Callers
+        // that need the exact revision keep `load_verified_at`. A base handle takes the path
+        // below, as upstream (its `HigherDurability` still marks the memo verified).
+        let revision_now = zalsa.current_revision();
+        if zalsa.layer().is_some() && self.revisions.durability > crate::Durability::LOW {
+            let own = self.verified_at.load();
+            if own == revision_now {
+                return ShallowUpdate::Verified;
+            }
+            if zalsa.base_last_changed(self.revisions.durability) <= own {
+                return ShallowUpdate::HigherDurability;
+            }
+        }
         // ryo-v2 fork: the newest stamp on the chain, and the layer's revision (E1, E3)
         let verified_at = self.load_verified_at(zalsa);
-        let revision_now = zalsa.current_revision();
 
         if verified_at == revision_now {
             // Already verified.

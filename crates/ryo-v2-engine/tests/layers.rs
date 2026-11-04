@@ -254,9 +254,10 @@ fn a_write_reaching_a_sealed_layer_panics() {
     let (db, file) = base();
     salsa::fork::freeze(&db);
     let layer = salsa::fork::root_layer(&db);
+    // A layer is sealed only while no handle carries it; the handle that reaches it comes after.
+    layer.seal().expect("no handle carries the layer");
     let mut handle = db.clone();
     salsa::fork::set_layer(&mut handle, layer.clone());
-    layer.seal();
 
     let panic = catch_unwind(AssertUnwindSafe(|| {
         handle.set_file_text_in_layer(file, Arc::from("b"));

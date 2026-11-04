@@ -6,13 +6,17 @@
 //!
 //! The counting allocator makes every allocation slower, so no time figure of this binary stands
 //! for the engine's speed; `bench`, on the system allocator, gives those.
+//!
+//! `--engine` runs the forks on layers of the fork Engine (`RaConfig.engine`, D11) instead of the
+//! stacked undo log; the report's `backend` key names the backend.
 
 mod alloc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use ryo_v2_core::domain::Scope;
-use ryo_v2_host::engine_probe::{self, BenchMedian, ProbeArgs};
+use ryo_v2_host::engine_probe::{self, BenchMedian, DepthProbeArgs, ProbeArgs};
+use ryo_v2_ra::Backend;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -51,6 +55,39 @@ struct Cli {
     /// Where the JSON report is written.
     #[arg(long, value_name = "OUT")]
     report: PathBuf,
+    /// Run the forks on layers of the fork Engine instead of the stacked undo log; the report's
+    /// `backend` key says `engine` (`undo-log` without it).
+    #[arg(long)]
+    engine: bool,
+    /// Stack this many levels instead of the variants: level k appends a function to one of
+    /// `--depth-files` workspace files (as `bench --depth-sweep`) and is diagnosed once before
+    /// level k + 1 is written on it, the search's shape. The report is a `DepthReport`: the
+    /// stack's live heap, per level the heap delta and the layer's counters.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with_all = ["on", "variants", "bench_median"]
+    )]
+    depth: Option<u32>,
+    /// With `--depth`: the number of workspace files (in path order) the levels rotate over
+    /// [default: 1].
+    #[arg(long, requires = "depth", value_parser = clap::value_parser!(u32).range(1..))]
+    depth_files: Option<u32>,
+    /// With `--depth`: the run fails (after its report is written) when the chain views of a
+    /// stack take more than this percentage of its heap (gate M2-view)
+    /// [default: `engine_probe::M2_VIEW_MAX_SHARE_PCT`, 15].
+    #[arg(long, value_name = "PCT", requires = "depth", value_parser = parse_pct)]
+    max_view_share: Option<f64>,
+}
+
+/// A `--max-view-share` value: a percentage from 0 to 100.
+fn parse_pct(text: &str) -> Result<f64, String> {
+    let pct: f64 = text.parse().map_err(|e| format!("{text:?}: {e}"))?;
+    if (0.0..=100.0).contains(&pct) {
+        Ok(pct)
+    } else {
+        Err(format!("{text:?} is not a percentage from 0 to 100"))
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -99,18 +136,44 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    let scopes = match cli.scope {
+        ScopeArg::Affected => vec![Scope::Affected],
+        ScopeArg::Workspace => vec![Scope::Workspace],
+        ScopeArg::Both => vec![Scope::Affected, Scope::Workspace],
+    };
+    if let Some(depth) = cli.depth {
+        let args = DepthProbeArgs {
+            base: cli.base,
+            depth,
+            files: cli.depth_files.unwrap_or(1),
+            scopes,
+            idle: cli.idle,
+            backend: Backend::of_engine(cli.engine),
+        };
+        let report = engine_probe::run_depth(&args, &COUNTING)?;
+        engine_probe::write_report(&report, &cli.report)
+            .with_context(|| format!("the report {}", cli.report.display()))?;
+        eprintln!(
+            "[probe] depth {}, {} series, report {}",
+            report.depth,
+            report.series.len(),
+            cli.report.display()
+        );
+        return engine_probe::check_view_share(
+            &report,
+            cli.max_view_share
+                .unwrap_or(engine_probe::M2_VIEW_MAX_SHARE_PCT),
+        );
+    }
     let args = ProbeArgs {
         base: cli.base,
         on: cli.on,
         variants: cli.variants,
         repeat: cli.repeat,
-        scopes: match cli.scope {
-            ScopeArg::Affected => vec![Scope::Affected],
-            ScopeArg::Workspace => vec![Scope::Workspace],
-            ScopeArg::Both => vec![Scope::Affected, Scope::Workspace],
-        },
+        scopes,
         idle: cli.idle,
         bench_medians: cli.bench_median,
+        backend: Backend::of_engine(cli.engine),
     };
     let report = engine_probe::run(&args, &COUNTING)?;
     engine_probe::write_report(&report, &cli.report)
@@ -151,6 +214,7 @@ mod tests {
         assert_eq!(cli.variants, [PathBuf::from("/v1"), PathBuf::from("/v2")]);
         assert_eq!(cli.on, Some(PathBuf::from("/p")));
         assert_eq!((cli.repeat, cli.idle), (20, true));
+        assert!(!cli.engine);
         assert_eq!(
             cli.bench_median,
             [BenchMedian {
@@ -172,5 +236,98 @@ mod tests {
         ] {
             assert!(parse_bench_median(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn cli_parses_engine() {
+        let cli = Cli::try_parse_from([
+            "engine-probe",
+            "/b",
+            "--on",
+            "/p",
+            "/v",
+            "--engine",
+            "--report",
+            "/o/probe.json",
+        ])
+        .unwrap();
+        assert!(cli.engine);
+        assert_eq!(cli.variants, [PathBuf::from("/v")]);
+        assert_eq!(Backend::of_engine(cli.engine), Backend::Engine);
+        // Without a parent too: the load and its phases alone, on the Engine.
+        let alone = Cli::try_parse_from(["engine-probe", "/b", "--engine", "--report", "/o"]);
+        assert!(alone.unwrap().engine);
+        // A flag, not an option with a value.
+        assert!(
+            Cli::try_parse_from(["engine-probe", "/b", "--engine=yes", "--report", "/o"]).is_err()
+        );
+    }
+
+    #[test]
+    fn cli_parses_depth() {
+        let cli = Cli::try_parse_from([
+            "engine-probe",
+            "/b",
+            "--depth",
+            "20",
+            "--depth-files",
+            "4",
+            "--engine",
+            "--report",
+            "/o/depth.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            (cli.depth, cli.depth_files, cli.engine),
+            (Some(20), Some(4), true)
+        );
+        // A stack of levels, not a parent and variants; at least one level and one file.
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
+        assert!(
+            parse(&[
+                "engine-probe",
+                "/b",
+                "--depth",
+                "2",
+                "--on",
+                "/p",
+                "--report",
+                "/o"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["engine-probe", "/b", "--depth", "0", "--report", "/o"]).is_err());
+        assert!(parse(&["engine-probe", "/b", "--depth-files", "2", "--report", "/o"]).is_err());
+        assert!(
+            parse(&[
+                "engine-probe",
+                "/b",
+                "--depth",
+                "1",
+                "--depth-files",
+                "0",
+                "--report",
+                "/o"
+            ])
+            .is_err()
+        );
+        // The M2-view ceiling: a percentage, only with `--depth`.
+        let max = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.max_view_share);
+        let depth = ["engine-probe", "/b", "--depth", "2", "--report", "/o"];
+        assert_eq!(max(&depth).unwrap(), None);
+        let with = |pct: &str| max(&[&depth[..], &["--max-view-share", pct]].concat());
+        assert_eq!(with("12.5").unwrap(), Some(12.5));
+        assert!(with("101").is_err() && with("x").is_err());
+        assert!(
+            parse(&[
+                "engine-probe",
+                "/b",
+                "--max-view-share",
+                "5",
+                "--report",
+                "/o"
+            ])
+            .is_err()
+        );
     }
 }

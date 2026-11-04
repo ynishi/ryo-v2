@@ -36,7 +36,7 @@ where
         let memo_value = unsafe { memo.value().unwrap_unchecked() };
 
         // ryo-v2 fork: layers do not record LRU uses (E8): a layer does not evict, and the base's
-        // LRU stays as it was at the freeze
+        // LRU stays as it was at the freeze (nor does the thaw evict: `fork_reset_at_thaw`)
         if zalsa.layer().is_none() {
             self.eviction.record_use(id);
         } else if std::any::TypeId::of::<C::Eviction>()

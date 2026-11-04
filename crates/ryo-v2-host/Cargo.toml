@@ -7,14 +7,21 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/ryo-v2-host"
 readme.workspace = true
+# D11: nothing that depends on the patched salsa (the fork Engine, through `ryo-v2-ra`) is
+# published in this phase.
+publish = false
 keywords = ["refactoring", "rust-analyzer", "cli", "codemod"]
 categories = ["development-tools", "command-line-utilities"]
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lints]
 workspace = true
+
+[features]
+# The fork Engine's walk counters (salsa's `fork-probe`): `bench --depth-sweep` and `engine-probe
+# --depth` then also print them. For measurements of counts only; a timed run is built without it.
+fork-probe = ["ryo-v2-ra/fork-probe"]
 
 [[bin]]
 name = "ryo-v2"

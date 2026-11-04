@@ -249,6 +249,13 @@ impl Zalsa {
         &mut self.runtime
     }
 
+    // ryo-v2 fork: the ingredients and the table at once, for `fork::try_thaw`
+    pub(crate) fn ingredients_and_table_mut(
+        &mut self,
+    ) -> (&mut [Box<dyn Ingredient>], &mut Table) {
+        (&mut self.ingredients_vec, self.runtime.table_mut())
+    }
+
     /// Returns the [`Table`] used to store the value of salsa structs
     #[inline]
     pub fn table(&self) -> &Table {
@@ -476,6 +483,19 @@ impl Zalsa {
                 .reset_for_new_revision(self.runtime.table_mut());
         }
 
+        new_revision
+    }
+
+    // ryo-v2 fork: `new_revision` at the thaw of a frozen base (`fork::try_thaw`, through
+    // `advance_revision_past`): each ingredient runs `Ingredient::fork_reset_at_thaw` in place of
+    // `reset_for_new_revision`, so a tracked function evicts no LRU value at a thaw (E8). Not
+    // called by upstream code paths; `new_revision` is unchanged.
+    pub(crate) fn fork_new_revision_at_thaw(&mut self) -> Revision {
+        let new_revision = self.runtime.new_revision();
+        for ingredient in &self.ingredients_requiring_reset {
+            self.ingredients_vec[ingredient.as_u32() as usize]
+                .fork_reset_at_thaw(self.runtime.table_mut());
+        }
         new_revision
     }
 

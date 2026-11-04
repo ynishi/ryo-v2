@@ -44,8 +44,10 @@ use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
 
-/// The crates meant for crates.io; every other member is `publish = false`.
-const PUBLISHED: [&str; 4] = ["ryo-v2", "ryo-v2-core", "ryo-v2-host", "ryo-v2-ra"];
+/// The crates meant for crates.io; every other member is `publish = false`. `ryo-v2-ra` and
+/// `ryo-v2-host` depend on the fork Engine and the patched salsa, which a published crate cannot
+/// carry (a `[patch]` does not travel), so they are not (D11).
+const PUBLISHED: [&str; 2] = ["ryo-v2", "ryo-v2-core"];
 
 /// One member manifest: the directory name under `crates/` and the parsed file.
 struct Member {

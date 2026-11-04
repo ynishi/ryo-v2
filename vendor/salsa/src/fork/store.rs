@@ -38,4 +38,14 @@ impl<K: Hash + Eq, V: Copy> Sharded<K, V> {
     pub(crate) fn insert(&self, key: K, value: V) -> Option<V> {
         self.shard(&key).write().insert(key, value)
     }
+
+    /// Calls `f` on every entry, one shard at a time under its read lock (so `f` must not write
+    /// into this map). Only consistent with no insert running, as on a sealed layer.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&K, &V)) {
+        for shard in self.shards.iter() {
+            for (key, value) in shard.read().iter() {
+                f(key, value);
+            }
+        }
+    }
 }

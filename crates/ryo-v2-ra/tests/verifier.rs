@@ -1,5 +1,8 @@
 //! `Verifier` for `RaAnalyzer`, on throwaway workspaces (the corpus is never touched).
 
+// For the backend switch of the tests of both backends (`common::both`).
+mod common;
+
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, Event, Verifier};
 use ryo_v2_core::domain::{Edit, ErrorCode, FindingCode, Fingerprint, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
@@ -63,6 +66,7 @@ fn load(
             gap_detectors: true,
             assert_revert_every: every.and_then(std::num::NonZeroU32::new),
             cfg_test,
+            engine: common::engine(),
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),
@@ -81,6 +85,10 @@ fn lib_edit(extra: &str) -> Edit {
 
 #[test]
 fn check_leaves_text_and_baseline_at_base() {
+    common::both(check_leaves_text_and_baseline_at_base_on);
+}
+
+fn check_leaves_text_and_baseline_at_base_on() {
     let f = Fixture::single("verifier_leaves", LIB);
     let (a, mut s, _) = load(&f, None, false);
     let base_findings = Verifier::baseline(&a, &s);
@@ -105,6 +113,10 @@ fn check_leaves_text_and_baseline_at_base() {
 
 #[test]
 fn facts_mark_build_script_and_proc_macro_crate() {
+    common::both(facts_mark_build_script_and_proc_macro_crate_on);
+}
+
+fn facts_mark_build_script_and_proc_macro_crate_on() {
     let f = Fixture::new(
         "verifier_facts",
         &[
@@ -135,6 +147,10 @@ fn facts_mark_build_script_and_proc_macro_crate() {
 
 #[test]
 fn assert_revert_every_samples_the_diagnostic_assert() {
+    common::both(assert_revert_every_samples_the_diagnostic_assert_on);
+}
+
+fn assert_revert_every_samples_the_diagnostic_assert_on() {
     let f = Fixture::single("verifier_every", LIB);
     let (a, mut s, obs) = load(&f, Some(2), false);
     let edit = lib_edit("\npub fn b() {}\n");
@@ -154,6 +170,10 @@ fn assert_revert_every_samples_the_diagnostic_assert() {
 
 #[test]
 fn check_of_unindexed_existing_path_is_edit_error() {
+    common::both(check_of_unindexed_existing_path_is_edit_error_on);
+}
+
+fn check_of_unindexed_existing_path_is_edit_error_on() {
     let f = Fixture::single("verifier_manifest", LIB);
     let (a, mut s, _) = load(&f, None, false);
     let edit = Edit::write(rel("Cargo.toml"), "[package]\n");
@@ -168,6 +188,10 @@ fn check_of_unindexed_existing_path_is_edit_error() {
 
 #[test]
 fn cfg_test_config_diagnoses_test_module() {
+    common::both(cfg_test_config_diagnoses_test_module_on);
+}
+
+fn cfg_test_config_diagnoses_test_module_on() {
     let lib =
         "pub fn f() {}\n\n#[cfg(test)]\nmod t {\n    fn g() {\n        missing_fn();\n    }\n}\n";
     let e0425 = FindingCode::Rustc(ErrorCode::parse("E0425").unwrap());
@@ -188,6 +212,8 @@ fn cfg_test_config_diagnoses_test_module() {
 #[test]
 fn ra_config_default_diagnoses_test_code() {
     assert!(RaConfig::default().cfg_test);
+    // The undo log stays the default backend of the forks (D11, stage 3).
+    assert!(!RaConfig::default().engine);
 }
 
 const UNRESOLVED_LIB: &str =
@@ -204,6 +230,7 @@ fn assert_analyzer(fault: bool) -> RaAnalyzer {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
+            engine: common::engine(),
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -213,6 +240,10 @@ fn assert_analyzer(fault: bool) -> RaAnalyzer {
 
 #[test]
 fn reassert_mismatch_poisons_the_session() {
+    common::both(reassert_mismatch_poisons_the_session_on);
+}
+
+fn reassert_mismatch_poisons_the_session_on() {
     let f = Fixture::single("verifier_reassert_poison", UNRESOLVED_LIB);
     let healthy = assert_analyzer(false);
     let faulty = assert_analyzer(true);
@@ -229,6 +260,18 @@ fn reassert_mismatch_poisons_the_session() {
         format!("{UNRESOLVED_LIB}pub fn h() {{}}\n"),
     );
     let first = faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected);
+    if common::engine() {
+        // The Engine re-asserts no revert: its sampled pop checks the isolation of the base,
+        // which a detector fault does not touch. The new detector panic decides (D7).
+        assert!(
+            matches!(first, Err(CheckError::DetectorPanicked { .. })),
+            "{first:?}"
+        );
+        healthy
+            .check(&mut s, &[edit], Scope::Affected)
+            .expect("the session stays usable");
+        return;
+    }
     assert!(
         matches!(first, Err(CheckError::RevertMismatch { .. })),
         "{first:?}"
@@ -239,6 +282,10 @@ fn reassert_mismatch_poisons_the_session() {
 
 #[test]
 fn session_errors_win_over_a_detector_panic() {
+    common::both(session_errors_win_over_a_detector_panic_on);
+}
+
+fn session_errors_win_over_a_detector_panic_on() {
     let f = Fixture::single("verifier_session_wins", UNRESOLVED_LIB);
     let healthy = assert_analyzer(false);
     let faulty = assert_analyzer(true);
@@ -250,13 +297,27 @@ fn session_errors_win_over_a_detector_panic() {
     // lacks the finding the baseline has: the session error is the result.
     let mut s = healthy.load(&f.dir).expect("load fixture");
     let first = faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected);
-    assert!(
-        matches!(first, Err(CheckError::RevertMismatch { .. })),
-        "{first:?}"
-    );
-    // A poisoned session fails before the detector runs.
-    let second = faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected);
-    assert!(matches!(second, Err(CheckError::Poisoned(_))), "{second:?}");
+    if common::engine() {
+        // No revert on the Engine, so no session error: the detector panic is the result, and
+        // stays so.
+        for checked in [
+            first,
+            faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected),
+        ] {
+            assert!(
+                matches!(checked, Err(CheckError::DetectorPanicked { .. })),
+                "{checked:?}"
+            );
+        }
+    } else {
+        assert!(
+            matches!(first, Err(CheckError::RevertMismatch { .. })),
+            "{first:?}"
+        );
+        // A poisoned session fails before the detector runs.
+        let second = faulty.check(&mut s, std::slice::from_ref(&edit), Scope::Affected);
+        assert!(matches!(second, Err(CheckError::Poisoned(_))), "{second:?}");
+    }
     let mut poisoned = healthy.load(&f.dir).expect("load fixture");
     poisoned.poison("x");
     let third = faulty.check(&mut poisoned, &[edit], Scope::Affected);
@@ -265,6 +326,10 @@ fn session_errors_win_over_a_detector_panic() {
 
 #[test]
 fn discard_reassert_mismatch_poisons_the_session() {
+    common::both(discard_reassert_mismatch_poisons_the_session_on);
+}
+
+fn discard_reassert_mismatch_poisons_the_session_on() {
     let f = Fixture::single("verifier_discard_poison", UNRESOLVED_LIB);
     let healthy = assert_analyzer(false);
     let faulty = assert_analyzer(true);
@@ -277,6 +342,14 @@ fn discard_reassert_mismatch_poisons_the_session() {
     Analyzer::apply(&faulty, &mut s, &mut fork, &[edit]).expect("apply");
     Analyzer::diagnostics(&faulty, &s, &fork, Scope::Affected).expect("diagnostics");
     let discarded = Analyzer::discard(&faulty, &mut s, fork);
+    if common::engine() {
+        // The Engine's discard drops the layer and checks the isolation of the base, which the
+        // detector fault does not touch.
+        discarded.expect("a discard on the Engine reverts nothing");
+        let next = Analyzer::fork(&healthy, &mut s).expect("the session stays usable");
+        Analyzer::discard(&healthy, &mut s, next).expect("discard");
+        return;
+    }
     assert!(
         matches!(discarded, Err(AnalyzerError::RevertMismatch)),
         "{discarded:?}"
@@ -287,6 +360,10 @@ fn discard_reassert_mismatch_poisons_the_session() {
 
 #[test]
 fn provenance_records_the_gap_detector_switch() {
+    common::both(provenance_records_the_gap_detector_switch_on);
+}
+
+fn provenance_records_the_gap_detector_switch_on() {
     for on in [true, false] {
         let f = Fixture::single(&format!("verifier_prov_gap_{on}"), LIB);
         let a = RaAnalyzer::new(
@@ -297,6 +374,7 @@ fn provenance_records_the_gap_detector_switch() {
                 gap_detectors: on,
                 assert_revert_every: None,
                 cfg_test: false,
+                engine: common::engine(),
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),
@@ -333,6 +411,7 @@ fn provenance_of(f: &Fixture) -> ryo_v2_core::domain::Provenance {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
+            engine: common::engine(),
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -343,6 +422,10 @@ fn provenance_of(f: &Fixture) -> ryo_v2_core::domain::Provenance {
 
 #[test]
 fn provenance_fingerprints_manifests_lock_and_toolchain() {
+    common::both(provenance_fingerprints_manifests_lock_and_toolchain_on);
+}
+
+fn provenance_fingerprints_manifests_lock_and_toolchain_on() {
     let f = Fixture::single("verifier_prov_inputs", LIB);
     let p = provenance_of(&f);
     assert_eq!(p.analyzer(), "rust-analyzer");
@@ -382,6 +465,10 @@ fn provenance_fingerprints_manifests_lock_and_toolchain() {
 
 #[test]
 fn provenance_fingerprints_are_of_the_disk_text() {
+    common::both(provenance_fingerprints_are_of_the_disk_text_on);
+}
+
+fn provenance_fingerprints_are_of_the_disk_text_on() {
     // The check before a write compares these with the fingerprint of the file's bytes, so a
     // line ending must not be normalized on the way in.
     let text = "pub fn a() {}\r\npub fn b() {}\r\n// lone\rcarriage return\n";
@@ -397,6 +484,10 @@ fn provenance_fingerprints_are_of_the_disk_text() {
 
 #[test]
 fn provenance_fingerprints_each_member_manifest() {
+    common::both(provenance_fingerprints_each_member_manifest_on);
+}
+
+fn provenance_fingerprints_each_member_manifest_on() {
     let f = Fixture::new(
         "verifier_prov_members",
         &[

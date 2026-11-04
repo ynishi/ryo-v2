@@ -7,14 +7,14 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use ra_ap_base_db::{FileId, SourceDatabase};
+use ra_ap_base_db::{FileId, FileSet, SourceDatabase, SourceRoot};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_ide_db::RootDatabase;
 use ryo_v2_core::app::ports::{Analyzer, Verifier};
 use ryo_v2_core::domain::{Edit, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_engine::{Engine, EngineDb};
+use ryo_v2_engine::{Engine, EngineDb, EngineError};
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
 
 /// A temp workspace that removes itself on drop.
@@ -70,6 +70,7 @@ fn analyzer(threads: usize) -> RaAnalyzer {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
+            engine: false,
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -291,4 +292,105 @@ fn two_layers_create_the_same_file() {
         "pub fn third() {}\n"
     );
     assert_eq!(&*first.text(new_file), "pub fn first() {}\n");
+}
+
+#[test]
+fn try_freeze_refuses_while_a_clone_lives() {
+    let a = analyzer(1);
+    let fixture = Fixture::new("try_freeze", &modules(1));
+    let mut s = Analyzer::load(&a, &fixture.dir).expect("load");
+    let db = s.lend_database();
+    let clone = db.clone();
+    let (db, err) = Engine::try_freeze(db).expect_err("a clone of the database is alive");
+    assert_eq!(err, EngineError::InUse);
+    assert!(!ryo_v2_engine::counters(&db).frozen, "nothing was frozen");
+    drop(clone);
+    let frozen = Engine::try_freeze(db).expect("the only handle freezes");
+    s.return_database(frozen.thaw().expect("no layer lives"));
+}
+
+/// `root` without `file`, as a local source root.
+fn root_without(root: &SourceRoot, file: FileId) -> triomphe::Arc<SourceRoot> {
+    let mut set = FileSet::default();
+    for f in root.iter().filter(|f| *f != file) {
+        set.insert(
+            f,
+            root.path_for_file(&f).expect("a file of the root").clone(),
+        );
+    }
+    triomphe::Arc::new(SourceRoot::new_local(set))
+}
+
+#[test]
+fn a_source_root_write_is_seen_by_its_chain_only() {
+    let a = analyzer(1);
+    let fixture = Fixture::new("source_root", &modules(2));
+    let (s, _twin, frozen) = frozen(&a, &fixture);
+    let file = s.file_id(&rel(&module(1))).unwrap();
+    let root = frozen.root();
+    let root_id = root.source_root_of(file);
+    let in_root = |r: &triomphe::Arc<SourceRoot>| r.path_for_file(&file).is_some();
+    assert!(in_root(&root.source_root(root_id)));
+
+    let mut layer = root.child();
+    layer
+        .set_source_root(root_id, root_without(&root.source_root(root_id), file))
+        .expect("the layer is writable");
+    assert!(
+        !in_root(&layer.source_root(root_id)),
+        "the layer's own value"
+    );
+    let sibling = root.child();
+    assert!(
+        in_root(&sibling.source_root(root_id)),
+        "a sibling keeps the base's"
+    );
+    let sealed = layer.seal().expect("no clone alive");
+    assert!(
+        !in_root(&sealed.child().source_root(root_id)),
+        "a child reads it"
+    );
+    assert!(
+        in_root(&root.source_root(root_id)),
+        "the base keeps its value"
+    );
+}
+
+#[test]
+fn creating_a_file_in_a_root_never_waits() {
+    let a = analyzer(1);
+    let fixture = Fixture::new("create_in_root", &modules(1));
+    let (s, _twin, frozen) = frozen(&a, &fixture);
+    let root_id = frozen
+        .root()
+        .source_root_of(s.file_id(&rel(&module(0))).unwrap());
+    // Another handle of the base alive: a write lock on the base would wait for it.
+    let other = frozen.root().child();
+    let held = RootDatabase::clone(&other.db());
+    let new_file = FileId::from_raw(0x7fff_0002);
+    let (done, result) = mpsc::channel();
+    let frozen = Arc::new(frozen);
+    let in_thread = Arc::clone(&frozen);
+    thread::spawn(move || {
+        let mut layer = in_thread.root().child();
+        layer
+            .create_in_root(new_file, "pub fn created() {}\n", root_id)
+            .expect("the layer is writable");
+        let read = (layer.text(new_file), layer.source_root_of(new_file));
+        done.send(read).unwrap();
+    });
+    let (text, root) = result
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the creation waited for another handle");
+    assert_eq!(&*text, "pub fn created() {}\n");
+    assert_eq!(root, root_id);
+    // A sibling's creation of the same file reads its own text and root, and does not panic.
+    let mut sibling = frozen.root().child();
+    sibling
+        .create_in_root(new_file, "pub fn again() {}\n", root_id)
+        .expect("the sibling is writable");
+    assert_eq!(&*sibling.text(new_file), "pub fn again() {}\n");
+    assert_eq!(sibling.source_root_of(new_file), root_id);
+    assert!(frozen.created_files().contains(&new_file));
+    drop(held);
 }

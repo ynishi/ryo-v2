@@ -103,6 +103,7 @@ fn one_planted_case_runs_end_to_end() {
             gap_detectors: true,
             assert_revert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
             cfg_test: true,
+            engine: false,
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -172,8 +173,25 @@ fn search_verdicts(r: &SearchReport) -> BTreeMap<BlueprintId, Verdict> {
 /// The case list bounds its time. With the first case of gen-lab, shape-lab and
 /// breakage-lab as well it took about 20 s, against about 3 s for the test above; each of those
 /// labs added about 3.4 s, mostly its load. The ten depth-2 cases take about 9 s.
+///
+/// It runs on both backends of the forks (D11, V3): the search's stacked forks on the undo log,
+/// then on the fork Engine; the flat check is the reference check (`RaAnalyzer::reference_check`,
+/// the undo log's check, which runs no layer code). `RYO_V2_BACKEND=undo-log` or `engine` runs
+/// one backend only.
 #[test]
 fn stacked_verdicts_equal_the_flat_check() {
+    let backends: &[bool] = match std::env::var("RYO_V2_BACKEND").as_deref() {
+        Ok("undo-log") => &[false],
+        Ok("engine") => &[true],
+        _ => &[false, true],
+    };
+    for &engine in backends {
+        println!("backend: {}", if engine { "engine" } else { "undo-log" });
+        stacked_verdicts_on(engine);
+    }
+}
+
+fn stacked_verdicts_on(engine: bool) {
     let m = Materials::find().expect("materials");
     let cases: Vec<PlantedCase> =
         PlantedCase::load_all(&m.corpus.join("search/base/search-lab"), &m.corpus)
@@ -191,6 +209,7 @@ fn stacked_verdicts_equal_the_flat_check() {
             gap_detectors: true,
             assert_revert_every: NonZeroU32::new(1),
             cfg_test: true,
+            engine,
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -247,7 +266,9 @@ fn stacked_verdicts_equal_the_flat_check() {
         for t in r.trace.iter().filter(|t| t.node.is_some()) {
             let at = format!("{}: {} at depth {}", case.id, t.blueprint, t.depth);
             let edits = t.edits.as_ref().expect("the trace keeps the edits");
-            let flat = verdict_of(&analyzer, s, edits, Scope::Affected, &baseline);
+            let flat = analyzer
+                .reference_check(s, edits, Scope::Affected)
+                .map(|checked| Verdict::of_check(&baseline, &checked));
             match (&t.fate, flat) {
                 (Fate::Passed | Fate::Failed { .. }, Ok(flat)) => {
                     let stacked = by_search

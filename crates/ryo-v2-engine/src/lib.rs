@@ -15,6 +15,11 @@
 //!   ([`SealedLayer::read`]).
 //! - [`Frozen::thaw`] gives the database back once no layer and no other handle of it lives.
 //!
+//! LRU (salsa fork, E8): the base evicts no LRU value while frozen nor at the thaw, and layers
+//! record no LRU use. A value the base evicted would be recomputed, and never written back, by
+//! every layer of each later freeze, so across a session the base's values grow only through
+//! its own queries (the baseline, audits); the base's own next write evicts as upstream does.
+//!
 //! Sealing is a type: only an open layer lends a database, only a sealed layer has children and
 //! reads, and an open layer is consumed by its seal. The base brand is structural: every layer
 //! holds the base it descends from, and every operation that combines a base and a layer is a
@@ -36,11 +41,18 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use ra_ap_base_db::{FileId, FileText, SourceDatabase};
+use ra_ap_base_db::salsa::Durability;
+use ra_ap_base_db::{
+    FileId, FileSourceRootInput, FileText, SourceDatabase, SourceRoot, SourceRootId,
+    SourceRootInput,
+};
 use ra_ap_ide_db::RootDatabase;
 use salsa::Revision;
-use salsa::fork::{self, BaseFingerprint, Layer, SharedWrites, SkippedWrites};
+use salsa::fork::{self, BaseFingerprint, Layer, LayerSlots, SharedWrites, SkippedWrites};
 use salsa::plumbing::HasStorage;
+
+/// A layer's own counters, as [`OpenLayer::stats`] and [`SealedLayer::stats`] return them.
+pub use salsa::fork::LayerStats;
 
 /// What the Engine needs of a database: a salsa database with a file input whose text a layer
 /// can set.
@@ -95,7 +107,11 @@ pub struct Isolation {
     pub skipped: SkippedWrites,
     /// The writes to the frozen base that were refused. 0 is the isolation gate.
     pub refused: usize,
-    /// The base's memos, revisions and `updated_at`s, slot by slot.
+    /// The table slots layers own now (0 once every layer has dropped), the slots never taken
+    /// again, and the inputs created under layers (kept: one per distinct created file).
+    pub slots: LayerSlots,
+    /// The base's memos, revisions and `updated_at`s, slot by slot, for the slots present at the
+    /// freeze.
     pub fingerprint: BaseFingerprint,
 }
 
@@ -174,9 +190,35 @@ impl Engine {
     /// If `db` carries a layer, another handle of its base (a clone) is alive, or its base is
     /// already frozen.
     pub fn freeze<Db: EngineDb>(db: Db) -> Frozen<Db> {
+        Self::freeze_unchecked(db)
+    }
+
+    /// [`Engine::freeze`], refusing instead of panicking when another handle of `db`'s base is
+    /// alive: the database comes back with [`EngineError::InUse`], unchanged.
+    ///
+    /// # Contract
+    /// - C1: with a clone of `db` alive the call returns `db` with `InUse` and the base is not
+    ///   frozen; with none it freezes as `freeze` does.
+    ///   tested: tests/ra.rs try_freeze_refuses_while_a_clone_lives
+    ///
+    /// # Panics
+    ///
+    /// If `db` carries a layer or its base is already frozen.
+    pub fn try_freeze<Db: EngineDb>(db: Db) -> Result<Frozen<Db>, (Db, EngineError)> {
+        if fork::handle_count(&db) != 1 {
+            return Err((db, EngineError::InUse));
+        }
+        Ok(Self::freeze_unchecked(db))
+    }
+
+    fn freeze_unchecked<Db: EngineDb>(db: Db) -> Frozen<Db> {
         let revision = fork::freeze(&db);
         let root = fork::root_layer(&db);
-        root.seal();
+        // salsa refuses a seal only while a database handle carries the layer; this one was made
+        // here and no handle was given it.
+        if let Err(refused) = root.seal() {
+            unreachable!("ryo-v2-engine: a new root layer has no database handle ({refused})");
+        }
         Frozen {
             base: Arc::new(Base {
                 db: Mutex::new(db),
@@ -219,6 +261,27 @@ impl<Db: EngineDb> Frozen<Db> {
         self.base.revision
     }
 
+    /// Records `files` as files the database already knows (created under an earlier freeze, or
+    /// by a write of the thawed base): a layer that creates one of them sets its text in the
+    /// layer instead of creating its input, which would take a setter, and a setter panics on a
+    /// layered handle. Call it before the first layer creates a file.
+    pub fn adopt_created(&self, files: impl IntoIterator<Item = Db::File>) {
+        self.base.created().extend(files);
+    }
+
+    /// Every file a layer of this freeze created, and every file [`Frozen::adopt_created`]
+    /// recorded, in no order: the files the database knows beyond those it had at the freeze.
+    pub fn created_files(&self) -> Vec<Db::File> {
+        self.base.created().iter().copied().collect()
+    }
+
+    /// The writes to the frozen base that were refused so far (each a panic, which a caller may
+    /// have caught): [`Isolation::refused`] without reading the base's slots. 0 is the isolation
+    /// gate (I2).
+    pub fn refused_writes(&self) -> usize {
+        fork::refused_writes(&*self.base.lock())
+    }
+
     /// What the layers did to the base so far (D11, I2). Reads every slot of the base: call it
     /// with no query running on a layer.
     ///
@@ -233,6 +296,7 @@ impl<Db: EngineDb> Frozen<Db> {
             shared: fork::shared_writes(&*db),
             skipped: fork::skipped_writes(&*db),
             refused: fork::refused_writes(&*db),
+            slots: fork::layer_slots(&*db),
             fingerprint: fork::base_fingerprint(&*db),
         }
     }
@@ -393,7 +457,7 @@ impl<Db: EngineDb> OpenLayer<Db> {
     }
 
     /// The layer's own counters (memos, stamps, deep verifies, tracked-struct entries).
-    pub fn stats(&self) -> fork::LayerStats {
+    pub fn stats(&self) -> LayerStats {
         self.layer.stats()
     }
 
@@ -402,8 +466,23 @@ impl<Db: EngineDb> OpenLayer<Db> {
         self.layer.revision()
     }
 
+    /// The text of `file` as this layer sees it: the newest text its chain set, else the base's.
+    /// Reads the input, runs no query, and does not lend the database (a write may follow).
+    pub fn text(&self, file: Db::File) -> Arc<str> {
+        self.db.file_text(file)
+    }
+
+    /// The files this layer wrote so far, each once, in the order of their first write.
+    pub fn written(&self) -> &[Db::File] {
+        &self.files
+    }
+
     /// Seals the layer: it takes no further write and may have children. With a clone of its
     /// database alive it returns the open layer with [`EngineError::InUse`] at once.
+    ///
+    /// The layer's own database is dropped first: salsa seals a layer only while no database
+    /// handle carries it (so no query on it is in flight, E9), and refuses otherwise; that
+    /// refusal is `InUse` too, with the layer open and a new database of it lent as before.
     pub fn seal(self) -> Result<SealedLayer<Db>, (OpenLayer<Db>, EngineError)> {
         if Arc::strong_count(&self.layer) != OWN_REFERENCES {
             return Err((self, EngineError::InUse));
@@ -414,10 +493,23 @@ impl<Db: EngineDb> OpenLayer<Db> {
             layer,
             db,
             files,
-            lent: _,
+            lent,
         } = self;
         drop(db);
-        layer.seal();
+        if layer.seal().is_err() {
+            let db = Box::new(base.handle(&layer));
+            return Err((
+                OpenLayer {
+                    base,
+                    parent,
+                    layer,
+                    db,
+                    files,
+                    lent,
+                },
+                EngineError::InUse,
+            ));
+        }
         Ok(SealedLayer {
             base,
             node: Arc::new(Node {
@@ -521,7 +613,147 @@ impl<Db: EngineDb> SealedLayer<Db> {
     }
 
     /// The layer's own counters (memos, stamps, deep verifies, tracked-struct entries).
-    pub fn stats(&self) -> fork::LayerStats {
+    pub fn stats(&self) -> LayerStats {
         self.node.layer.stats()
+    }
+}
+
+/// The source root of `file` and the files of `root`, as the handle `db` sees them (its layer's
+/// chain, if it has one). Input reads: no query runs.
+fn root_of(db: &RootDatabase, file: FileId) -> SourceRootId {
+    SourceDatabase::file_source_root(db, file).source_root_id(db)
+}
+
+fn root_value(db: &RootDatabase, root: SourceRootId) -> triomphe::Arc<SourceRoot> {
+    SourceDatabase::source_root(db, root).source_root(db)
+}
+
+/// The writes of rust-analyzer's source roots into a layer (D11, stage 3: created, deleted and
+/// revived files). Each is refused, with the layer unchanged, as [`OpenLayer::write`] is (C4 of
+/// the type).
+impl OpenLayer<RootDatabase> {
+    /// Sets the files of the source root `root` in this layer: the `SourceRootInput` keeps its
+    /// id, and the layer holds the new value. A file a root no longer lists is deleted for
+    /// rust-analyzer's module tree; one it lists again is back.
+    ///
+    /// # Contract
+    /// - C1: after `set_source_root(root, value)` the layer and its children read `value` for
+    ///   `root`, while the base, the parent and a sibling keep theirs.
+    ///   tested: tests/ra.rs a_source_root_write_is_seen_by_its_chain_only
+    pub fn set_source_root(
+        &mut self,
+        root: SourceRootId,
+        value: triomphe::Arc<SourceRoot>,
+    ) -> Result<(), EngineError> {
+        self.check_writable()?;
+        let input = SourceDatabase::source_root(&*self.db, root);
+        fork::set_input_field::<SourceRootInput, _>(&*self.db, input, 0, |fields| {
+            fields.0 = value;
+        });
+        Ok(())
+    }
+
+    /// Creates `file` in this layer with `text`, as a file of the source root `root` (its
+    /// `FileText` and `FileSourceRootInput`), without a write lock on the base. A file the base
+    /// already knows (created by another layer of this freeze, or recorded with
+    /// [`Frozen::adopt_created`]) gets its text and its root in the layer instead. The root's
+    /// own file set is written with [`OpenLayer::set_source_root`].
+    ///
+    /// # Contract
+    /// - C1: with another handle of the base alive the call returns (it never waits); the layer
+    ///   reads `text` and `root` for `file`; a second creation of the same file in a sibling
+    ///   reads its own text and root, and neither panics.
+    ///   tested: tests/ra.rs creating_a_file_in_a_root_never_waits
+    pub fn create_in_root(
+        &mut self,
+        file: FileId,
+        text: impl Into<Arc<str>>,
+        root: SourceRootId,
+    ) -> Result<(), EngineError> {
+        self.check_writable()?;
+        let text = text.into();
+        // As in `create`: the registry's lock is held over the creation.
+        let mut created = self.base.created();
+        if !created.contains(&file) {
+            // The vacant entries of `Files` create both inputs under the layer (counted shared
+            // writes, D11 E2); an occupied one would run a setter, which panics on a layered
+            // handle instead of waiting.
+            SourceDatabase::set_file_text(&mut *self.db, file, &text);
+            SourceDatabase::set_file_source_root_with_durability(
+                &mut *self.db,
+                file,
+                root,
+                Durability::LOW,
+            );
+            // Recorded once both inputs exist: a panic between the two leaves the file
+            // unrecorded, so a later creation takes this path again, and the setter of the text
+            // input that now exists is a refused write of the base, which poisons the session
+            // at the thaw (I2), instead of every later layer reading a file with no source root.
+            created.insert(file);
+        } else {
+            drop(created);
+            self.db.set_file_text_in_layer(file, text);
+            let input = SourceDatabase::file_source_root(&*self.db, file);
+            fork::set_input_field::<FileSourceRootInput, _>(&*self.db, input, 0, |fields| {
+                fields.0 = root;
+            });
+        }
+        if !self.files.contains(&file) {
+            self.files.push(file);
+        }
+        Ok(())
+    }
+
+    /// The source root of `file` as this layer sees it. Reads inputs, runs no query.
+    pub fn source_root_of(&self, file: FileId) -> SourceRootId {
+        root_of(&self.db, file)
+    }
+
+    /// The files of the source root `root` as this layer sees it. Reads inputs, runs no query.
+    pub fn source_root(&self, root: SourceRootId) -> triomphe::Arc<SourceRoot> {
+        root_value(&self.db, root)
+    }
+}
+
+/// Reads of rust-analyzer's source roots on a sealed layer.
+impl SealedLayer<RootDatabase> {
+    /// The source root of `file` as this layer sees it. Reads inputs, runs no query.
+    pub fn source_root_of(&self, file: FileId) -> SourceRootId {
+        root_of(&self.base.handle(&self.node.layer), file)
+    }
+
+    /// The files of the source root `root` as this layer sees it. Reads inputs, runs no query.
+    pub fn source_root(&self, root: SourceRootId) -> triomphe::Arc<SourceRoot> {
+        root_value(&self.base.handle(&self.node.layer), root)
+    }
+}
+
+/// The fork counters of a database, read without touching its slots: what layers did to it
+/// since it was created (frozen or not), and whether it is frozen now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Counters {
+    /// The shared writes layers made.
+    pub shared: SharedWrites,
+    /// The base writes layers reached and did not make.
+    pub skipped: SkippedWrites,
+    /// The writes to a frozen base that were refused (each a panic). 0 is the isolation gate.
+    pub refused: usize,
+    /// Whether the database is a frozen base now.
+    pub frozen: bool,
+}
+
+/// The fork counters of the database `db` belongs to. A database no layer was ever made on has
+/// every counter at 0.
+///
+/// # Contract
+/// - C1: a check that runs no layer code leaves every counter as it was, and the database is
+///   not frozen during it.
+///   tested: ryo-v2-ra tests/stack.rs reference_check_runs_no_layer_code
+pub fn counters<Db: EngineDb>(db: &Db) -> Counters {
+    Counters {
+        shared: fork::shared_writes(db),
+        skipped: fork::skipped_writes(db),
+        refused: fork::refused_writes(db),
+        frozen: fork::is_frozen(db),
     }
 }

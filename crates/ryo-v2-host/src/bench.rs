@@ -8,18 +8,28 @@
 //! Memory and CPU time are read through `proc.rs`: a failed read is an error of the run, so the
 //! host runs on Linux only. With `--on` every run also prints its process CPU ms, its wall ms
 //! and its core occupancy ([`occupancy`]).
+//!
+//! With `--engine` the forks run on layers of the fork Engine (`RaConfig.engine`, D11) instead
+//! of the stacked undo log; every summary line ends with ` backend engine` or ` backend undo-log`
+//! ([`Backend`]).
+//!
+//! With `--depth-sweep` ([`run_depth_sweep`]) it measures how a diagnosis of the top level grows
+//! with the depth of a stack: per depth K, K one-file levels written on one fork by
+//! `stacked::depth_series`, the top level diagnosed `--repeat` times, and the levels popped. On
+//! the Engine it also prints, per level, the counters of the level's layer
+//! ([`level_stats_line`]), with the walk counters of `fork-probe` when built with that feature.
 
 use crate::proc::{self, ProcError};
-use crate::stacked::{self, Point};
+use crate::stacked::{self, DepthPoint, DepthShape, Point};
 use anyhow::{Context, Result};
 use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, Event, Observer, Verifier};
 use ryo_v2_core::app::verify::verify;
 use ryo_v2_core::domain::search::compose;
-use ryo_v2_core::domain::{Edit, Scope, Verdict};
+use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{RaAnalyzer, RaConfig};
+use ryo_v2_ra::{Backend, LayerStats, RaAnalyzer, RaConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,6 +51,8 @@ pub struct BenchArgs {
     pub proc_macro: bool,
     /// Whether to re-diagnose after the revert and compare with the baseline.
     pub assert_revert: bool,
+    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
+    pub backend: Backend,
 }
 
 /// How a child is brought to its state.
@@ -402,19 +414,26 @@ fn record(
     }
 }
 
-/// Loads `args.base` once and runs every variant; prints the fixed output format.
-pub fn run(args: &BenchArgs) -> Result<()> {
+/// Builds the analyzer of a bench on `backend`, loads `base` once and prints the load's lines to
+/// stderr.
+pub(crate) fn load(
+    base: &std::path::Path,
+    proc_macro: bool,
+    assert_revert: bool,
+    backend: Backend,
+) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
     let observer = Arc::new(RecordingObserver::default());
     let analyzer = RaAnalyzer::new(
         RaConfig {
-            proc_macro: args.proc_macro,
-            assert_revert: args.assert_revert,
+            proc_macro,
+            assert_revert,
             ..RaConfig::default()
-        },
+        }
+        .with_backend(backend),
         Arc::new(MonotonicClock::new()),
         observer.clone(),
     );
-    let mut session = analyzer.load(&args.base)?;
+    let session = analyzer.load(base)?;
     let rss_after_load = proc::vm_rss_kb().context("read the RSS after load")?;
     for event in observer.take() {
         match event {
@@ -436,6 +455,17 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         }
     }
     eprintln!("[rss] {rss_after_load} kB after load");
+    Ok((analyzer, observer, session))
+}
+
+/// Loads `args.base` once and runs every variant; prints the fixed output format.
+pub fn run(args: &BenchArgs) -> Result<()> {
+    let (analyzer, observer, mut session) = load(
+        &args.base,
+        args.proc_macro,
+        args.assert_revert,
+        args.backend,
+    )?;
 
     let parent = match &args.on {
         Some(dir) => {
@@ -546,7 +576,15 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                         (reverted, mode_txt.clone())
                     }
                 };
-                print_summary(&name, sname, &mode_txt, &extra, &series, &mut worst);
+                print_summary(
+                    &name,
+                    sname,
+                    &mode_txt,
+                    &extra,
+                    args.backend,
+                    &series,
+                    &mut worst,
+                );
                 if !reverted {
                     fail_infra += 1;
                     break 'scopes;
@@ -567,19 +605,333 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     Ok(())
 }
 
-/// Prints the summary line of a series; `mode` is added to the label of the worst check, `extra`
-/// ends the line.
+/// Arguments of one `bench --depth-sweep` invocation.
+pub struct DepthArgs {
+    /// The workspace to load.
+    pub base: PathBuf,
+    /// The depths to measure, in order: each is the number of levels of one stack.
+    pub depths: Vec<u32>,
+    /// The number of workspace files the levels rotate over.
+    pub files: u32,
+    /// Diagnoses of the top level per depth.
+    pub repeat: u32,
+    /// Scopes to diagnose, in order.
+    pub scopes: Vec<Scope>,
+    /// Whether to start the proc-macro server.
+    pub proc_macro: bool,
+    /// Whether every level's write is sampled for the re-assert at its pop.
+    pub assert_revert: bool,
+    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
+    pub backend: Backend,
+}
+
+/// What the hook of one depth series measured; durations in microseconds, by wall clock.
+#[derive(Default)]
+struct DepthRecord {
+    /// The number of levels of the series.
+    depth: usize,
+    /// The number of diagnoses of the series.
+    repeat: u32,
+    /// The start of the port call in progress.
+    started: Option<Instant>,
+    write_us: Vec<u64>,
+    check_us: Vec<u64>,
+    pop_us: Vec<u64>,
+    /// The scope files and findings of each diagnosis.
+    diagnosed: Vec<(usize, usize)>,
+    /// The VmRSS once every level is written.
+    rss_after_stack: Option<u64>,
+    /// The VmRSS after the last diagnosis, before the first pop.
+    rss_after_diagnose: Option<u64>,
+}
+
+impl DepthRecord {
+    fn elapsed_us(&mut self) -> u64 {
+        self.started
+            .take()
+            .map_or(0, |t| t.elapsed().as_micros() as u64)
+    }
+
+    /// Times each write, diagnosis and pop between its points, and reads VmRSS with the strict
+    /// reader once the stack is written and once it is diagnosed; a failed read ends the series.
+    fn observe(&mut self, point: DepthPoint<'_>) -> Result<(), ProcError> {
+        match point {
+            DepthPoint::BeforeWrite(_)
+            | DepthPoint::BeforeDiagnose(_)
+            | DepthPoint::BeforePop(_) => self.started = Some(Instant::now()),
+            DepthPoint::AfterWrite(k) => {
+                let us = self.elapsed_us();
+                self.write_us.push(us);
+                if k == self.depth {
+                    self.rss_after_stack = Some(proc::vm_rss_kb()?);
+                }
+            }
+            DepthPoint::AfterDiagnose(r, found) => {
+                let us = self.elapsed_us();
+                self.check_us.push(us);
+                self.diagnosed
+                    .push((found.files.len(), found.findings.len()));
+                if r == self.repeat {
+                    self.rss_after_diagnose = Some(proc::vm_rss_kb()?);
+                }
+            }
+            DepthPoint::AfterPop(_) => {
+                let us = self.elapsed_us();
+                self.pop_us.push(us);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Microseconds as milliseconds with three decimals.
+fn ms(us: u64) -> String {
+    format!("{}.{:03}", us / 1000, us % 1000)
+}
+
+/// (min/median/max) of microseconds in milliseconds, `-` when empty.
+fn triple_ms(us: &[u64]) -> String {
+    match summarize(us) {
+        Some((a, b, c)) => format!("{}/{}/{}", ms(a), ms(b), ms(c)),
+        None => "-".to_string(),
+    }
+}
+
+/// The summary line of one depth: the first diagnosis of the top level, the warm ones (from the
+/// second on) as min/median/max, the writes and pops per level as min/median/max and in total,
+/// the VmRSS after the stack is written and after it is diagnosed, and the last diagnosis'
+/// scope files and findings; ` backend <name>` ends it.
+///
+/// # Contract
+/// - C1: one line per depth and scope, `summary depth-sweep [<scope>] depth <K> files <N>
+///   n=<R>` followed by the figures in the order above, ending with ` backend <name>`; a figure
+///   without a value (no warm diagnosis, no read) prints `-`.
+///   tested: bench::tests::depth_summary_line_ends_with_the_backend
+fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backend) -> String {
+    let first = rec.check_us.first().map_or("-".to_string(), |&us| ms(us));
+    let warm = rec.check_us.get(1..).unwrap_or(&[]);
+    let opt = |x: Option<u64>| x.map_or("-".to_string(), |k| k.to_string());
+    let (scope_files, findings) = rec
+        .diagnosed
+        .last()
+        .map_or(("-".to_string(), "-".to_string()), |(s, f)| {
+            (s.to_string(), f.to_string())
+        });
+    format!(
+        "summary depth-sweep [{sname}] depth {} files {files} n={} first_check_ms {first} \
+         warm_check_ms {} write_ms_per_level {} write_ms_total {} pop_ms_per_level {} \
+         pop_ms_total {} rss_kb_after_stack {} rss_kb_after_diagnose {} scope_files \
+         {scope_files} findings {findings} backend {}",
+        rec.depth,
+        rec.check_us.len(),
+        triple_ms(warm),
+        triple_ms(&rec.write_us),
+        ms(rec.write_us.iter().sum()),
+        triple_ms(&rec.pop_us),
+        ms(rec.pop_us.iter().sum()),
+        opt(rec.rss_after_stack),
+        opt(rec.rss_after_diagnose),
+        backend.name(),
+    )
+}
+
+/// The line of one level of a stack on the fork Engine: its layer's counters
+/// (`RaSession::level_stats`), read once every level is written and diagnosed, before the pops.
+///
+/// # Contract
+/// - C1: `level <label> level <k>` followed by `memos`, `stamps`, `tracked_entries`,
+///   `tombstones`, `deep_verifies`, `flat_memos`, `flat_tracked`, `flat_hidden` and
+///   `flat_bytes` (the layer's chain view), each a name and its value; built with the `fork-probe`
+///   feature it goes on with `chain_memo_probes`, `chain_tracked_probes`, `stamp_visits`,
+///   `cancel_walks`, `chain_unique_memo_keys`, `chain_unique_tracked_ids` and
+///   `chain_unique_tombstoned_ids`.
+///   tested: bench::tests::a_level_line_names_each_counter
+pub(crate) fn level_stats_line(label: &str, k: usize, stats: &LayerStats) -> String {
+    #[allow(unused_mut)]
+    let mut line = format!(
+        "level {label} level {k} memos {} stamps {} tracked_entries {} tombstones {} \
+         deep_verifies {} flat_memos {} flat_tracked {} flat_hidden {} flat_bytes {}",
+        stats.memos,
+        stats.stamps,
+        stats.tracked_entries,
+        stats.tombstones,
+        stats.deep_verifies,
+        stats.flat_memos,
+        stats.flat_tracked,
+        stats.flat_hidden,
+        stats.flat_bytes,
+    );
+    #[cfg(feature = "fork-probe")]
+    line.push_str(&format!(
+        " chain_memo_probes {} chain_tracked_probes {} stamp_visits {} cancel_walks {} \
+         chain_unique_memo_keys {} chain_unique_tracked_ids {} chain_unique_tombstoned_ids {}",
+        stats.chain_memo_probes,
+        stats.chain_tracked_probes,
+        stats.stamp_visits,
+        stats.cancel_walks,
+        stats.chain_unique_memo_keys,
+        stats.chain_unique_tracked_ids,
+        stats.chain_unique_tombstoned_ids,
+    ));
+    line
+}
+
+/// The `.rs` files under `dir`, relative to `root`, in path order; `target` and hidden dirs are
+/// not walked.
+pub(crate) fn rs_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<RelPath>,
+) -> Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("read {}", dir.display()))?;
+    entries.sort();
+    for path in entries {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if name != "target" && !name.starts_with('.') {
+                rs_files(root, &path, out)?;
+            }
+        } else if name.ends_with(".rs")
+            && let Ok(rel) = path.strip_prefix(root)
+            && let Some(rel) = rel.to_str()
+            && let Ok(rel) = RelPath::parse(&rel.replace(std::path::MAIN_SEPARATOR, "/"))
+        {
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+/// The first `n` `.rs` files of the workspace at `base` that `session` indexed, in path order,
+/// with their texts: the files the levels of a depth series rotate over. Fewer is an error.
+pub(crate) fn depth_files(
+    analyzer: &RaAnalyzer,
+    session: &ryo_v2_ra::RaSession,
+    base: &std::path::Path,
+    n: u32,
+) -> Result<Vec<(RelPath, String)>> {
+    let mut paths = Vec::new();
+    rs_files(base, base, &mut paths)?;
+    let files: Vec<(RelPath, String)> = paths
+        .into_iter()
+        .filter_map(|p| analyzer.text(session, &p).map(|t| (p, t)))
+        .take(n as usize)
+        .collect();
+    if files.len() < n as usize {
+        anyhow::bail!(
+            "--depth-files {n}: the workspace has {} indexed .rs files",
+            files.len()
+        );
+    }
+    Ok(files)
+}
+
+/// Loads `args.base` once and, per scope and depth K, writes K levels on one fork with
+/// `stacked::depth_series` (the levels of `stacked::depth_levels` over the first `args.files`
+/// files of the workspace that the session indexed, in path order), diagnoses the top level
+/// `args.repeat` times and pops back; prints a line per diagnosis and a summary per depth.
+pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
+    let (analyzer, _observer, mut session) = load(
+        &args.base,
+        args.proc_macro,
+        args.assert_revert,
+        args.backend,
+    )?;
+    let files = depth_files(&analyzer, &session, &args.base, args.files)?;
+    let names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
+    eprintln!("[depth-sweep] levels rotate over {}", names.join(", "));
+    let mut fail_infra = 0usize;
+    'scopes: for &scope in &args.scopes {
+        let sname = scope_name(scope);
+        for &depth in &args.depths {
+            let levels = stacked::depth_levels(&files, depth as usize);
+            let mut rec = DepthRecord {
+                depth: levels.len(),
+                repeat: args.repeat,
+                ..DepthRecord::default()
+            };
+            let name = format!("depth {depth}");
+            let mut level_stats = Vec::new();
+            let reverted = stacked::depth_series(
+                &analyzer,
+                &mut session,
+                &name,
+                &levels,
+                scope,
+                DepthShape::Top(args.repeat),
+                &mut |point| rec.observe(point),
+                &mut |s| level_stats = s.level_stats(),
+            )?;
+            for (i, (&us, &(scope_files, findings))) in
+                rec.check_us.iter().zip(&rec.diagnosed).enumerate()
+            {
+                println!(
+                    "depth {depth} [{sname}] {}/{}: check_ms {} scope_files {scope_files} findings {findings}",
+                    i + 1,
+                    args.repeat,
+                    ms(us),
+                );
+            }
+            println!(
+                "{}",
+                depth_summary_line(sname, args.files, &rec, args.backend)
+            );
+            let label = format!("depth-sweep [{sname}] depth {}", rec.depth);
+            for (i, stats) in level_stats.iter().enumerate() {
+                println!("{}", level_stats_line(&label, i + 1, stats));
+            }
+            if !reverted {
+                fail_infra += 1;
+                break 'scopes;
+            }
+        }
+    }
+    if fail_infra > 0 {
+        anyhow::bail!("{fail_infra} depth series failed revert");
+    }
+    Ok(())
+}
+
+/// Prints the summary line of a series; `mode` is added to the label of the worst check.
 fn print_summary(
     name: &str,
     sname: &str,
     mode: &str,
     extra: &str,
+    backend: Backend,
     s: &Series,
     worst: &mut Option<(u64, String)>,
 ) {
+    let Some(line) = summary_line(name, sname, extra, backend, s) else {
+        return;
+    };
+    println!("{line}");
+    // Without warm runs (n == 1) the first (cold) check stands in.
+    let basis = summarize(&s.check_ms[1..]).map_or(s.check_ms[0], |(_, med, _)| med);
+    if worst.as_ref().is_none_or(|(w, _)| basis > *w) {
+        *worst = Some((basis, format!("{name} [{sname}]{mode}")));
+    }
+}
+
+/// The summary line of a series, `None` for a series without runs: `extra` and the warm
+/// occupancy follow the figures, and ` backend <name>` ends the line, so that runs on the two
+/// backends can be told apart.
+fn summary_line(
+    name: &str,
+    sname: &str,
+    extra: &str,
+    backend: Backend,
+    s: &Series,
+) -> Option<String> {
     let n = s.check_ms.len();
     if n == 0 {
-        return;
+        return None;
     }
     let warm_check = &s.check_ms[1..];
     let warm_revert = &s.revert_ms[1..];
@@ -605,19 +957,15 @@ fn print_summary(
         Some(m) => format!(" warm_occupancy_median {m:.2}"),
         None => String::new(),
     };
-    println!(
-        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt}",
+    Some(format!(
+        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt} backend {}",
         s.check_ms[0],
         triple(warm_check),
         triple(warm_revert),
         slope(warm_rss),
         leak_suspect(warm_rss),
-    );
-    // Without warm runs (n == 1) the first (cold) check stands in.
-    let basis = summarize(warm_check).map_or(s.check_ms[0], |(_, med, _)| med);
-    if worst.as_ref().is_none_or(|(w, _)| basis > *w) {
-        *worst = Some((basis, format!("{name} [{sname}]{mode}")));
-    }
+        backend.name(),
+    ))
 }
 
 /// (min, median, max); the median is the lower one for an even count (sorted[(n-1)/2]). None when empty.
@@ -772,6 +1120,132 @@ mod tests {
             }
             assert!(series.occupancy.is_empty());
         }
+    }
+
+    /// `level_stats_line` C1.
+    #[test]
+    fn a_level_line_names_each_counter() {
+        let mut stats = LayerStats::default();
+        stats.memos = 5;
+        stats.stamps = 4;
+        stats.tracked_entries = 3;
+        stats.tombstones = 2;
+        stats.deep_verifies = 1;
+        stats.flat_memos = 9;
+        stats.flat_tracked = 8;
+        stats.flat_hidden = 7;
+        stats.flat_bytes = 600;
+        let line = level_stats_line("depth-sweep [affected] depth 2", 1, &stats);
+        let head = "level depth-sweep [affected] depth 2 level 1 memos 5 stamps 4 \
+                    tracked_entries 3 tombstones 2 deep_verifies 1 flat_memos 9 \
+                    flat_tracked 8 flat_hidden 7 flat_bytes 600";
+        #[cfg(not(feature = "fork-probe"))]
+        assert_eq!(line, head);
+        #[cfg(feature = "fork-probe")]
+        assert_eq!(
+            line,
+            format!(
+                "{head} chain_memo_probes 0 chain_tracked_probes 0 stamp_visits 0 \
+                 cancel_walks 0 chain_unique_memo_keys 0 chain_unique_tracked_ids 0 \
+                 chain_unique_tombstoned_ids 0"
+            )
+        );
+    }
+
+    /// `ryo_v2_ra::Backend` C1: the word a summary line ends with.
+    #[test]
+    fn summary_line_ends_with_the_backend() {
+        let series = Series {
+            check_ms: vec![10, 20],
+            revert_ms: vec![1, 2],
+            rss_kb: Vec::new(),
+            occupancy: Vec::new(),
+        };
+        // Without `--on` and `--engine`: the line of a bench before the backend was named, and
+        // ` backend undo-log` after it.
+        assert_eq!(
+            summary_line("v", "affected", "", Backend::UndoLog, &series).unwrap(),
+            "summary v [affected] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
+             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false backend undo-log"
+        );
+        // With `--on`: the backend follows the mode, the parent's level and the occupancy.
+        let stacked = Series {
+            occupancy: vec![0.5, 0.25],
+            ..series
+        };
+        assert_eq!(
+            summary_line(
+                "v",
+                "workspace",
+                " mode stacked rss_kb_after_parent_level 5",
+                Backend::Engine,
+                &stacked
+            )
+            .unwrap(),
+            "summary v [workspace] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
+             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false mode stacked \
+             rss_kb_after_parent_level 5 warm_occupancy_median 0.25 backend engine"
+        );
+        assert!(summary_line("v", "affected", "", Backend::Engine, &Series::default()).is_none());
+    }
+
+    /// `depth_summary_line` C1.
+    #[test]
+    fn depth_summary_line_ends_with_the_backend() {
+        let rec = DepthRecord {
+            depth: 2,
+            repeat: 3,
+            write_us: vec![1500, 2500],
+            check_us: vec![9000, 4000, 3000],
+            pop_us: vec![250, 750],
+            diagnosed: vec![(3, 0), (3, 0), (3, 1)],
+            rss_after_stack: Some(100),
+            rss_after_diagnose: Some(120),
+            ..DepthRecord::default()
+        };
+        assert_eq!(
+            depth_summary_line("affected", 1, &rec, Backend::Engine),
+            "summary depth-sweep [affected] depth 2 files 1 n=3 first_check_ms 9.000 \
+             warm_check_ms 3.000/3.000/4.000 write_ms_per_level 1.500/1.500/2.500 \
+             write_ms_total 4.000 pop_ms_per_level 0.250/0.250/0.750 pop_ms_total 1.000 \
+             rss_kb_after_stack 100 rss_kb_after_diagnose 120 scope_files 3 findings 1 \
+             backend engine"
+        );
+        let empty = DepthRecord::default();
+        let line = depth_summary_line("workspace", 2, &empty, Backend::UndoLog);
+        assert!(line.contains("first_check_ms - warm_check_ms -"), "{line}");
+        assert!(line.contains("rss_kb_after_stack - "), "{line}");
+        assert!(line.ends_with(" backend undo-log"), "{line}");
+    }
+
+    /// The depth hook times between the points and reads VmRSS with the strict reader.
+    #[test]
+    fn depth_record_times_each_call_and_reads_rss_at_the_top() {
+        let mut rec = DepthRecord {
+            depth: 2,
+            repeat: 1,
+            ..DepthRecord::default()
+        };
+        let found = ryo_v2_core::domain::ScopedFindings::default();
+        for point in [
+            DepthPoint::BeforeWrite(1),
+            DepthPoint::AfterWrite(1),
+            DepthPoint::BeforeWrite(2),
+            DepthPoint::AfterWrite(2),
+            DepthPoint::BeforeDiagnose(1),
+            DepthPoint::AfterDiagnose(1, &found),
+            DepthPoint::BeforePop(2),
+            DepthPoint::AfterPop(2),
+            DepthPoint::BeforePop(1),
+            DepthPoint::AfterPop(1),
+        ] {
+            rec.observe(point).unwrap();
+        }
+        assert_eq!(
+            (rec.write_us.len(), rec.check_us.len(), rec.pop_us.len()),
+            (2, 1, 2)
+        );
+        assert!(rec.rss_after_stack.is_some() && rec.rss_after_diagnose.is_some());
     }
 
     #[test]

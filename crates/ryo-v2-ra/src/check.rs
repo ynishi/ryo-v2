@@ -86,7 +86,7 @@ pub(crate) fn base_text_at(
     }
     match s.base_texts.get(&id) {
         Some(text) => Ok(text.clone()),
-        None => fork::db_text(&s.host, id),
+        None => fork::base_db_text(s, id),
     }
 }
 
@@ -364,9 +364,49 @@ impl Verifier for RaAnalyzer {
         // A check is the one-level case of a fork: write, diagnose, release. The release always
         // runs, and its failure, always about the session, wins; then the write's; then the
         // diagnosis's.
-        stack::open_fork(s, ForkPort::Stacked);
+        let engine = s.engine;
+        stack::open_fork(s, ForkPort::Stacked, engine).map_err(|e| map_error(e, &[]))?;
         let outcome =
             stack::write_level(self, s, edits).and_then(|()| diagnose_for_check(self, s, scope));
+        fork::release_levels(self, s).map_err(revert_error)?;
+        outcome
+    }
+}
+
+impl RaAnalyzer {
+    /// The flat reference check (D11, 4.3): `check` of `edits` on the undo log whatever
+    /// `RaConfig.engine` says, so it runs no line of the layer code: with no layer live it writes
+    /// the edits with rust-analyzer's own setters (`apply_change`), diagnoses, and writes the
+    /// base texts back, comparing them as `check` does. It is not a write of the sampling (the
+    /// write count does not move); its paths are recorded for the revert audit, since it writes
+    /// the base. The differential tests compare a level on the Engine with it.
+    ///
+    /// # Contract
+    /// - C1: on a session of either backend no layer exists during it and the fork counters of
+    ///   the database (shared writes, skipped and refused writes) are as before it; its result
+    ///   equals `check` of the same edits on the undo log, and the session is left at its base.
+    ///   tested: tests/stack.rs reference_check_runs_no_layer_code
+    #[doc(hidden)]
+    pub fn reference_check(
+        &self,
+        s: &mut RaSession,
+        edits: &[Edit],
+        scope: Scope,
+    ) -> Result<ScopedFindings, CheckError> {
+        stack::require_free(s)?;
+        let edited = fork::edited_paths(edits);
+        s.edited_since_audit.extend(edited.iter().cloned());
+        stack::open_fork(s, ForkPort::Stacked, false).map_err(|e| map_error(e, &[]))?;
+        debug_assert!(
+            s.frozen.is_none(),
+            "the reference check runs on the undo log"
+        );
+        let outcome = fork::push_level(self, s, edits, edited.clone(), s.assert_revert)
+            .map_err(|e| match &s.poisoned {
+                Some(msg) => CheckError::Poisoned(msg.clone()),
+                None => map_error(e, &edited),
+            })
+            .and_then(|()| diagnose_for_check(self, s, scope));
         fork::release_levels(self, s).map_err(revert_error)?;
         outcome
     }
@@ -385,11 +425,22 @@ impl Verifier for RaAnalyzer {
 ///   to audit, so the next audit diagnoses them; an audit that runs to its end, clean or not,
 ///   forgets the paths it audited.
 ///   tested: tests/timeout.rs a_failed_audit_keeps_its_paths
+/// - C4: on the Engine (`RaConfig.engine`) the audit first checks that the base was never
+///   written (I2): a write the frozen base refused, at any time since load, poisons the session
+///   and is `RevertMismatch` of the paths; then it re-diagnoses as on the undo log, on the
+///   same cadence.
+///   tested: tests/timeout.rs audit_revert_is_ok_after_checks_and_refuses_poisoned
 impl RevertAudit for RaAnalyzer {
     fn audit_revert(&self, s: &mut RaSession) -> Result<(), CheckError> {
         stack::require_free(s)?;
         if s.edited_since_audit.is_empty() {
             return Ok(());
+        }
+        if s.engine && ryo_v2_engine::counters(s.host.raw_database()).refused > 0 {
+            s.poisoned = Some("a layer wrote the base (I2)".to_owned());
+            return Err(CheckError::RevertMismatch {
+                paths: s.edited_since_audit.iter().cloned().collect(),
+            });
         }
         // The record is kept until the diagnosis has run to its end: an audit that cannot run
         // leaves every path for the next one.

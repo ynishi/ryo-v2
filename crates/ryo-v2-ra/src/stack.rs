@@ -5,7 +5,7 @@ use crate::RaAnalyzer;
 use crate::check::{diagnose_for_check, map_error, revert_error};
 use crate::fork;
 use crate::session::{ForkPort, Live, RaSession};
-use ryo_v2_core::app::ports::{CheckError, Stacked};
+use ryo_v2_core::app::ports::{AnalyzerError, CheckError, Stacked};
 use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,11 +23,20 @@ pub struct RaStack {
 }
 
 /// Makes a new fork of `port` the live fork of `s` and returns the id of its ticket. The caller
-/// has checked that no fork is live.
-pub(crate) fn open_fork(s: &mut RaSession, port: ForkPort) -> u64 {
+/// has checked that no fork is live. With `on_engine` the fork's levels are layers: the base is
+/// frozen here and thawed when the fork ends; a base that cannot be frozen (another handle of the
+/// database is alive) is `ForkInUse` and opens no fork.
+pub(crate) fn open_fork(
+    s: &mut RaSession,
+    port: ForkPort,
+    on_engine: bool,
+) -> Result<u64, AnalyzerError> {
+    if on_engine {
+        crate::engine::freeze(s)?;
+    }
     let id = NEXT_FORK_ID.fetch_add(1, Ordering::Relaxed);
     s.live = Some(Live { id, port });
-    id
+    Ok(id)
 }
 
 /// Whether `id` is the ticket of the live fork, opened by `port`.
@@ -111,7 +120,11 @@ pub(crate) fn write_level(
     })
 }
 
-/// The stacked writes of the adapter: the levels are the session's undo log of its one database.
+/// The stacked writes of the adapter. On the undo log (the default) the levels are the session's
+/// undo log of its one database; on the fork Engine (`RaConfig.engine`, D11) a level is a layer
+/// over the frozen base, `pop` drops the top layer and `release` drops them all, and a level's
+/// write is checked by the isolation of the base (I2) instead of a revert. The cut-off (D1), the
+/// detector-panic rule (D7) and the unseen classes of a diagnosis are the same on both.
 ///
 /// # Contract
 /// - C1: the diagnostic re-assert of a level runs when its write is sampled (`assert_revert`, or
@@ -138,13 +151,29 @@ pub(crate) fn write_level(
 ///   (code pulled in with `include!`), on that file, which is in the scanned file's crate
 ///   (`diagnostics::collect_errors` C1, C3 and C4); and every scope holds whole crates.
 ///   tested: tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
+/// - C7: on the Engine a level is sealed when a write pushes the next level on it, and stays
+///   sealed until it is popped; a diagnosis of a sealed top level runs in a throwaway child of its
+///   layer and gives what the level gave before it was sealed, and a level written on it is its
+///   flat composition.
+///   tested: tests/stack.rs a_sealed_level_diagnoses_through_a_read_child
+/// - C8: on the Engine a panic inside a level's layer poisons that layer only. A write that
+///   panics pushes no level and is a panic of reach Blueprint; a level whose diagnosis panicked
+///   while its layer was open refuses every further diagnosis and every write on it the same
+///   way, until it is popped. The levels below, a level written after the pop and the session
+///   are untouched, and no write of the base was refused.
+///   tested: tests/stack.rs a_panic_in_a_layer_poisons_only_that_layer
+/// - C9: on the Engine, while a layer of the base lives, every operation that writes the base (a
+///   check, the reference check, the revert audit, the memory report, a new fork) is refused as
+///   a live fork is, at once, and changes nothing.
+///   tested: tests/stack.rs a_base_write_with_a_live_layer_is_fork_in_use
 impl Stacked for RaAnalyzer {
     type Fork = RaStack;
 
     fn fork(&self, s: &mut RaSession) -> Result<RaStack, CheckError> {
         require_free(s)?;
+        let engine = s.engine;
         Ok(RaStack {
-            id: open_fork(s, ForkPort::Stacked),
+            id: open_fork(s, ForkPort::Stacked, engine).map_err(|e| map_error(e, &[]))?,
         })
     }
 

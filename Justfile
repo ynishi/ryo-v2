@@ -87,6 +87,9 @@ salsa-upstream:
     # compile-pass cases (gated on inventory and persistence) run too; `manual_registration`
     # needs `not(inventory)` and is left to upstream.
     env -u RUSTUP_TOOLCHAIN cargo test --locked --features fork,rayon,salsa_unstable,macros,inventory,triomphe,persistence
+    # The walk counters of the fork layer (`fork-probe`, never on in the run above or in a timed
+    # build) and the tests that read them.
+    env -u RUSTUP_TOOLCHAIN cargo test --locked --features fork,fork-probe,rayon,salsa_unstable,macros,inventory,triomphe,persistence --test fork_probe
 
 # Compares ryo-v2-ra with corpus/*/expected. Never runs cargo check.
 oracle:

@@ -70,7 +70,10 @@ fn fork_layer_reads_its_own_input() {
     assert_eq!(file.text(&g_db), "base");
 
     // A child of the sealed layer reads through the chain, and a write in it shadows its parent's.
-    f.seal();
+    // The layer is sealed with no handle carrying it.
+    drop(f_db);
+    f.seal().expect("no handle carries the layer");
+    let f_db = layered(&db, &f);
     let child = fork::child_layer(&f);
     let child_db = layered(&db, &child);
     assert_eq!(file.text(&child_db), "in f");
@@ -151,8 +154,8 @@ fn a_write_to_a_sealed_layer_panics() {
     let file = File::new(&db, "base".to_owned());
     fork::freeze(&db);
     let layer = fork::root_layer(&db);
+    layer.seal().expect("no handle carries the layer");
     let layer_db = layered(&db, &layer);
-    layer.seal();
     let message = panic_message(|| write(&layer_db, file, "changed"));
     assert!(message.contains("write to a sealed layer"), "{message}");
     assert_eq!(file.text(&layer_db), "base");
@@ -190,7 +193,7 @@ fn a_layer_of_an_earlier_freeze_is_refused() {
     let file = File::new(&db, "base".to_owned());
     fork::freeze(&db);
     let old = fork::root_layer(&db);
-    old.seal();
+    old.seal().expect("no handle carries the layer");
     fork::try_thaw(&mut db).expect("the base is the only handle");
     file.set_text(&mut db).to("after thaw".to_owned());
     fork::freeze(&db);
@@ -289,7 +292,7 @@ fn thaw_skips_past_every_layer_revision() {
 
     fork::freeze(&db);
     let root = fork::root_layer(&db);
-    root.seal();
+    root.seal().expect("no handle carries the layer");
     let child = fork::child_layer(&root);
     let child_db = layered(&db, &child);
     write(&child_db, low, "changed in a layer");
@@ -408,6 +411,91 @@ fn writes_to_two_fields_from_two_handles_of_a_layer_are_both_kept() {
     assert_eq!((pair.a(&db), pair.b(&db)), (0, 0));
 }
 
+#[salsa::tracked(returns(copy))]
+fn pair_sum(db: &dyn Database, pair: Pair) -> u32 {
+    pair.a(db) + pair.b(db)
+}
+
+/// Reads through the flattened input view a layer builds at its seal: per input the newest entry
+/// of the chain, whichever layer set it, from a sealed layer, from an open one (its own entries,
+/// then its parent's view) and from write-free layers (which share their parent's view); a
+/// sibling branch and the base keep their own values, and a tracked function sees each field's
+/// revision.
+#[test]
+fn a_deep_chain_reads_the_newest_input_of_each_layer() {
+    let db = Db::default();
+    let pair = Pair::new(&db, 0, 0);
+    let other = Pair::new(&db, 100, 100);
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    // Depth 1..=40: `a` set at every 3rd layer, `b` at every 7th, `other` only at depth 20;
+    // the other layers write nothing.
+    let mut layers = Vec::new();
+    let mut parent: Option<std::sync::Arc<Layer>> = None;
+    let mut expected = Vec::new();
+    let (mut a, mut b, mut o) = (0, 0, 100);
+    for depth in 1..=40u32 {
+        let layer = match &parent {
+            None => fork::root_layer(&db),
+            Some(p) => fork::child_layer(p),
+        };
+        let layer_db = layered(&db, &layer);
+        if depth % 3 == 0 {
+            fork::set_input_field::<Pair, _>(&layer_db, pair, 0, |f| f.0 = depth);
+            a = depth;
+        }
+        if depth % 7 == 0 {
+            fork::set_input_field::<Pair, _>(&layer_db, pair, 1, |f| f.1 = depth);
+            b = depth;
+        }
+        if depth == 20 {
+            fork::set_input_field::<Pair, _>(&layer_db, other, 0, |f| f.0 = 7);
+            o = 7;
+        }
+        // Open: its own entries, then the parent's view.
+        assert_eq!((pair.a(&layer_db), pair.b(&layer_db)), (a, b));
+        assert_eq!(other.a(&layer_db), o);
+        assert_eq!(pair_sum(&layer_db, pair), a + b);
+        // A layer is sealed with no handle carrying it; a handle made after reads it.
+        drop(layer_db);
+        layer.seal().expect("no handle carries the layer");
+        let layer_db = layered(&db, &layer);
+        // Sealed: its own view.
+        assert_eq!((pair.a(&layer_db), pair.b(&layer_db)), (a, b));
+        expected.push((a, b, o));
+        layers.push(layer.clone());
+        parent = Some(layer);
+    }
+    for (layer, &(a, b, o)) in layers.iter().zip(&expected) {
+        let layer_db = layered(&db, layer);
+        assert_eq!((pair.a(&layer_db), pair.b(&layer_db)), (a, b));
+        assert_eq!((other.a(&layer_db), other.b(&layer_db)), (o, 100));
+        // A write-free child reads its parent's view, and its queries see the same revisions.
+        let child_db = layered(&db, &fork::child_layer(layer));
+        assert_eq!((pair.a(&child_db), pair.b(&child_db)), (a, b));
+        assert_eq!(pair_sum(&child_db, pair), a + b);
+    }
+
+    // An open leaf at depth 41 that writes `b` sees its own `b` and the chain's `a`.
+    let leaf = fork::child_layer(layers.last().unwrap());
+    let leaf_db = layered(&db, &leaf);
+    fork::set_input_field::<Pair, _>(&leaf_db, pair, 1, |f| f.1 = 41);
+    assert_eq!((pair.a(&leaf_db), pair.b(&leaf_db)), (39, 41));
+    assert_eq!(pair_sum(&leaf_db, pair), 80);
+
+    // A sibling branch off depth 10 sees depth 10's values, not those set below it.
+    let sibling = fork::child_layer(&layers[9]);
+    let sibling_db = layered(&db, &sibling);
+    assert_eq!((pair.a(&sibling_db), pair.b(&sibling_db)), (9, 7));
+    assert_eq!(other.a(&sibling_db), 100);
+
+    assert_eq!((pair.a(&db), pair.b(&db), other.a(&db)), (0, 0, 100));
+    drop((leaf_db, sibling_db));
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+    assert_eq!(fork::refused_writes(&db), 0);
+}
+
 #[test]
 fn a_layer_cancellation_survives_another_handles_attach() {
     let db = Db::default();
@@ -429,7 +517,7 @@ fn cancelling_a_layer_stops_its_descendants() {
     let db = Db::default();
     fork::freeze(&db);
     let root = fork::root_layer(&db);
-    root.seal();
+    root.seal().expect("no handle carries the layer");
     let child = fork::child_layer(&root);
     let child_db = layered(&db, &child);
     let sibling = fork::root_layer(&db);
@@ -443,4 +531,170 @@ fn cancelling_a_layer_stops_its_descendants() {
     assert!(!child_db.cancellation_token().is_cancelled());
     child.cancellation_token().cancel();
     assert!(child_db.cancellation_token().is_cancelled());
+}
+
+// ---------------------------------------------------------------------------------------------
+// A sealed layer is quiescent (E9, D11)
+
+#[test]
+fn seal_refuses_while_a_layered_handle_lives() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    let clone = layer_db.clone();
+    assert_eq!(layer.handles(), 2);
+
+    // A query of either handle may be past its write check: the seal refuses and undoes itself.
+    assert_eq!(layer.seal(), Err(fork::SealRefused { handles: 2 }));
+    assert!(!layer.is_sealed());
+    let message = panic_message(|| {
+        fork::child_layer(&layer);
+    });
+    assert!(message.contains("only a sealed layer gets a child"), "{message}");
+    // The layer is open and writable, and the refused seal built no input view: a write after
+    // it is what the layer reads.
+    write(&layer_db, file, "after the refused seal");
+    assert_eq!(file.text(&clone), "after the refused seal");
+    assert_eq!(fork::refused_writes(&db), 0);
+
+    drop((layer_db, clone));
+    assert_eq!(layer.handles(), 0);
+    layer.seal().expect("no handle carries the layer");
+    // Idempotent, also with a handle of the sealed layer alive.
+    let sealed_db = layered(&db, &layer);
+    assert_eq!(layer.seal(), Ok(()));
+    assert_eq!(file.text(&sealed_db), "after the refused seal");
+    let child = fork::child_layer(&layer);
+    assert_eq!(file.text(&layered(&db, &child)), "after the refused seal");
+}
+
+#[salsa::interned(debug)]
+struct Name<'db> {
+    #[returns(ref)]
+    text: String,
+}
+
+/// A tracked struct whose identity is a file's text.
+#[salsa::tracked(debug)]
+struct Made<'db> {
+    #[returns(clone)]
+    text: String,
+}
+
+#[salsa::tracked(returns(copy))]
+fn made(db: &dyn Database, file: File) -> Made<'_> {
+    Made::new(db, file.text(db))
+}
+
+#[salsa::tracked(returns(copy))]
+fn sealed_length(db: &dyn Database, file: File) -> usize {
+    file.text(db).len()
+}
+
+#[test]
+fn a_handle_made_after_the_seal_cannot_insert() {
+    let db = Db::default();
+    let stamped = File::new(&db, "stamped".to_owned());
+    let fresh = File::new(&db, "fresh".to_owned());
+    assert_eq!(sealed_length(&db, stamped), 7);
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    // The layer's write makes every base memo of LOW durability need a deep verify in it.
+    write(&layered(&db, &layer), fresh, "fresh in the layer");
+    layer.seal().expect("no handle carries the layer");
+    let sealed_db = layered(&db, &layer);
+    let refused = fork::refused_writes(&db);
+    let owned = fork::layer_slots(&db).owned;
+
+    let message = panic_message(|| {
+        sealed_length(&sealed_db, fresh);
+    });
+    assert!(message.contains("sealed layer (a memo insert)"), "{message}");
+    // The base memo is still valid; verifying it would stamp it in the layer.
+    let message = panic_message(|| {
+        sealed_length(&sealed_db, stamped);
+    });
+    assert!(message.contains("sealed layer (a memo stamp)"), "{message}");
+    let message = panic_message(|| {
+        Name::new(&sealed_db, "never interned".to_owned());
+    });
+    assert!(message.contains("sealed layer (an interned insert)"), "{message}");
+    let message = panic_message(|| {
+        made(&sealed_db, fresh);
+    });
+    assert!(
+        message.contains("sealed layer (a layer-owned tracked-struct slot)"),
+        "{message}"
+    );
+    // The two refusals that would otherwise leave a trace are counted (I2), and no slot was taken.
+    assert_eq!(fork::refused_writes(&db), refused + 2);
+    assert_eq!(fork::layer_slots(&db).owned, owned);
+    assert_eq!(layer.stats().memos, 0);
+    assert_eq!(layer.stats().stamps, 0);
+}
+
+#[test]
+fn a_base_handle_clone_touches_no_layer_counter() {
+    let db = Db::default();
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    assert_eq!(layer.handles(), 0);
+    let layer_db = layered(&db, &layer);
+    assert_eq!(layer.handles(), 1);
+    // Base handles carry no layer: cloning and dropping them counts nothing.
+    let base_clones: Vec<Db> = (0..4).map(|_| db.clone()).collect();
+    assert_eq!(layer.handles(), 1);
+    drop(base_clones);
+    assert_eq!(layer.handles(), 1);
+    // A clone of a layered handle is a handle of its layer, until it drops.
+    let clone = layer_db.clone();
+    assert_eq!(layer.handles(), 2);
+    let moved = std::thread::spawn(move || clone.zalsa().current_revision())
+        .join()
+        .unwrap();
+    assert_eq!(moved, layer.revision());
+    assert_eq!(layer.handles(), 1);
+    drop(layer_db);
+    assert_eq!(layer.handles(), 0);
+    layer.seal().expect("no handle carries the layer");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The durability shortcut is a layer's only (D11)
+
+#[salsa::tracked(returns(copy))]
+fn durable_length(db: &dyn Database, file: File) -> usize {
+    file.text(db).len()
+}
+
+/// The base fingerprint of a base that computed a HIGH memo, then took a LOW write, and, when
+/// `refetch`, fetched the memo again before its freeze.
+fn fingerprint_after(refetch: bool) -> fork::BaseFingerprint {
+    let mut db = Db::default();
+    let low = File::new(&db, "low".to_owned());
+    let high = File::builder("high".to_owned())
+        .durability(Durability::HIGH)
+        .new(&db);
+    assert_eq!(durable_length(&db, high), 4);
+    low.set_text(&mut db).to("changed".to_owned());
+    if refetch {
+        assert_eq!(durable_length(&db, high), 4);
+    }
+    fork::freeze(&db);
+    fork::base_fingerprint(&db)
+}
+
+#[test]
+fn a_base_handle_shallow_verify_is_upstreams() {
+    // On a base handle a memo that passes on durability is marked verified at the new revision
+    // (upstream's `HigherDurability`): the refetch changes the memo's `verified_at`, which the
+    // fingerprint reads. The layer's shortcut records nothing and must not reach this path.
+    let refetched = fingerprint_after(true);
+    assert_eq!(refetched, fingerprint_after(true), "the fingerprint is deterministic");
+    assert!(
+        refetched.preserved_in(&fingerprint_after(false)).is_err(),
+        "a base handle's durability pass left the memo's verified_at as it was"
+    );
 }

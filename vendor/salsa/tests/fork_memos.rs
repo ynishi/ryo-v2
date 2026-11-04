@@ -46,7 +46,7 @@ fn write(db: &Db, file: File, text: &str) {
 fn sealed_child(db: &Db, parent: &Arc<Layer>, file: File, text: &str) -> Arc<Layer> {
     let child = fork::child_layer(parent);
     write(&layered(db, &child), file, text);
-    child.seal();
+    child.seal().expect("no handle carries the layer");
     child
 }
 
@@ -136,7 +136,7 @@ fn a_read_child_does_no_deep_verify() {
     write(&layered(&db, &parent), c, "changed");
     assert_eq!(read_child_sum(&layered(&db, &parent), a, b), 5);
     assert!(parent.stats().deep_verifies > 0);
-    parent.seal();
+    parent.seal().expect("no handle carries the layer");
 
     // A write-free child inherits the parent's LOW revision: everything the parent verified is
     // shallow-valid in it, with no deep verify and no stamp.
@@ -204,6 +204,120 @@ fn fork_tracked_struct_keeps_its_id() {
     assert_eq!(shout(&layer_db, file), "SECOND");
     // The base slot keeps its fields, revisions and `updated_at`.
     assert_eq!(base_item.value(&db), "first");
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+}
+
+/// A tracked struct whose identity is a file's text: a layer that changes the text creates it
+/// with a new identity, in a slot the layer owns.
+#[salsa::tracked(debug)]
+struct Named<'db> {
+    #[returns(clone)]
+    name: String,
+}
+
+#[salsa::tracked(returns(copy))]
+fn make_named(db: &dyn Database, file: File) -> Named<'_> {
+    Named::new(db, file.text(db))
+}
+
+/// The id of `file`'s named struct, and its name, on `db`.
+fn named(db: &Db, file: File) -> (salsa::Id, String) {
+    let named = make_named(db, file);
+    (salsa::plumbing::AsId::as_id(&named), named.name(db))
+}
+
+#[test]
+fn a_dropped_layers_tracked_slot_is_taken_again() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    let (base_id, _) = named(&db, file);
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    let first = fork::root_layer(&db);
+    let first_db = layered(&db, &first);
+    write(&first_db, file, "one");
+    let (one, name) = named(&first_db, file);
+    assert_eq!(name, "one");
+    assert_ne!(one.index(), base_id.index());
+    assert_eq!(fork::layer_slots(&db).owned, 1);
+    drop(first_db);
+    drop(first);
+    assert_eq!(fork::layer_slots(&db).owned, 0);
+    assert_eq!(fork::shared_writes(&db).slot_frees, 1);
+
+    let second = fork::root_layer(&db);
+    let second_db = layered(&db, &second);
+    write(&second_db, file, "two");
+    let (two, name) = named(&second_db, file);
+    // The same slot, a new identity: its generation is bumped and it holds the new fields.
+    assert_eq!(name, "two");
+    assert_eq!(two.index(), one.index());
+    assert_eq!(two.generation(), one.generation() + 1);
+    assert_eq!(fork::shared_writes(&db).slot_reuses, 1);
+    // The base struct is unchanged.
+    assert_eq!(named(&second_db, file).0, two);
+    drop(second_db);
+    drop(second);
+    assert_eq!(named(&db, file), (base_id, "base".to_owned()));
+
+    let slots = fork::layer_slots(&db);
+    assert_eq!((slots.owned, slots.leaked), (0, 0));
+    assert_eq!(fork::shared_writes(&db).slot_frees, 2);
+    assert_eq!(fork::refused_writes(&db), 0);
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+}
+
+#[test]
+fn after_a_thaw_a_given_back_tracked_slot_is_the_bases() {
+    let mut db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    named(&db, file);
+    fork::freeze(&db);
+
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    write(&layer_db, file, "in a layer");
+    let (in_layer, _) = named(&layer_db, file);
+    drop(layer_db);
+    drop(layer);
+    fork::try_thaw(&mut db).expect("no other handle is alive");
+
+    // The base takes the slot back from its own free list, with a bumped generation.
+    file.set_text(&mut db).to("after the thaw".to_owned());
+    let (after, name) = named(&db, file);
+    assert_eq!(name, "after the thaw");
+    assert_eq!(after.index(), in_layer.index());
+    assert_eq!(after.generation(), in_layer.generation() + 1);
+}
+
+#[test]
+fn a_slot_given_back_after_a_refreeze_by_an_older_layer_is_leaked() {
+    let mut db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    named(&db, file);
+    fork::freeze(&db);
+    // A layer that outlives the thaw (past the Engine, which refuses that).
+    let old = fork::root_layer(&db);
+    let old_db = layered(&db, &old);
+    write(&old_db, file, "old freeze");
+    named(&old_db, file);
+    drop(old_db);
+    fork::try_thaw(&mut db).expect("no other handle is alive");
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    // Given back under the new freeze, it is not taken again: the new freeze's fingerprint
+    // covers that slot.
+    drop(old);
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    write(&layer_db, file, "new freeze");
+    assert_eq!(named(&layer_db, file).1, "new freeze");
+    assert_eq!(fork::layer_slots(&db).leaked, 1);
+    assert_eq!(fork::shared_writes(&db).slot_reuses, 0);
+    drop(layer_db);
+    assert_eq!(fork::refused_writes(&db), 0);
     assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
 }
 
@@ -470,12 +584,184 @@ fn fork_interned_slot_is_not_reused_while_frozen() {
     assert_eq!(old.text(&layer_db), "old");
     assert_eq!(new.text(&layer_db), "new under a layer");
     assert_eq!(fork::shared_writes(&db).interned_inserts, inserts + 1);
-    // Content-keyed: a sibling interning the same text gets the same id.
+    // Chain-scoped: a sibling interning the same text gets an id of its own, also a new slot.
     let sibling = fork::root_layer(&db);
     let sibling_db = layered(&db, &sibling);
     write(&sibling_db, file, "new under a layer");
-    assert_eq!(intern_text(&sibling_db, file), new);
-    assert_eq!(fork::shared_writes(&db).interned_inserts, inserts + 1);
+    let in_sibling = intern_text(&sibling_db, file);
+    assert_ne!(in_sibling, new);
+    assert_ne!(
+        salsa::plumbing::AsId::as_id(&in_sibling).index(),
+        salsa::plumbing::AsId::as_id(&new).index()
+    );
+    assert_eq!(in_sibling.text(&sibling_db), "new under a layer");
+    assert_eq!(fork::shared_writes(&db).interned_inserts, inserts + 2);
+}
+
+/// A word interned from `file`'s text in a tracked function of its own.
+#[salsa::tracked(returns(copy))]
+fn chain_word<'db>(db: &'db dyn Database, file: File) -> Word<'db> {
+    Word::new(db, file.text(db))
+}
+
+/// The id of `text` interned as a word outside any query.
+fn word_of(db: &Db, text: &str) -> salsa::Id {
+    salsa::plumbing::AsId::as_id(&Word::new(db, text.to_owned()))
+}
+
+/// The text of the word `id`.
+fn word_text(db: &Db, id: salsa::Id) -> String {
+    let word: Word<'_> = salsa::plumbing::FromId::from_id(id);
+    word.text(db).clone()
+}
+
+#[test]
+fn a_layer_interned_value_is_seen_by_its_chain_only() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let root = fork::root_layer(&db);
+    root.seal().expect("no handle carries the layer");
+
+    let parent = sealed_child(&db, &root, file, "word");
+    let parent_word = {
+        let read = fork::child_layer(&parent);
+        let read_db = layered(&db, &read);
+        salsa::plumbing::AsId::as_id(&chain_word(&read_db, file))
+    };
+    // The read child that interned it is gone: its value was given back.
+    assert_eq!(fork::layer_slots(&db).owned, 0);
+
+    let parent = sealed_child(&db, &root, file, "word");
+    let open = fork::child_layer(&parent);
+    let open_db = layered(&db, &open);
+    let in_parent = word_of(&open_db, "word");
+    drop(open_db);
+    open.seal().expect("no handle carries the layer");
+    // A descendant finds its ancestor's value; a sibling of the ancestor does not.
+    let child = fork::child_layer(&open);
+    let child_db = layered(&db, &child);
+    assert_eq!(word_of(&child_db, "word"), in_parent);
+    let sibling = fork::child_layer(&parent);
+    let sibling_db = layered(&db, &sibling);
+    let in_sibling = word_of(&sibling_db, "word");
+    assert_ne!(in_sibling, in_parent);
+    assert_eq!(word_text(&sibling_db, in_sibling), "word");
+    // The first value's slot was taken again by one of them, with a bumped generation.
+    let ids = [in_parent, in_sibling];
+    let again = ids
+        .iter()
+        .find(|id| id.index() == parent_word.index())
+        .expect("a later layer takes the given-back slot");
+    assert!(again.generation() > parent_word.generation());
+    assert!(fork::shared_writes(&db).slot_reuses >= 1);
+}
+
+#[test]
+fn after_a_thaw_the_base_never_finds_a_layers_value() {
+    let mut db = Db::default();
+    // A value the base interned before the freeze: every layer finds it.
+    let shared = word_of(&db, "shared");
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    assert_eq!(word_of(&layer_db, "shared"), shared);
+    let in_layer = word_of(&layer_db, "layer word");
+    drop(layer_db);
+    drop(layer);
+    fork::try_thaw(&mut db).expect("no other handle is alive");
+
+    // The base's lookup has no owner check: the thaw took the layer's value out of the key maps,
+    // so the base interns the content in a slot of its own.
+    let in_base = word_of(&db, "layer word");
+    assert_ne!(in_base.index(), in_layer.index());
+    assert_eq!(word_of(&db, "layer word"), in_base);
+    assert_eq!(word_text(&db, in_base), "layer word");
+    assert_eq!(word_of(&db, "shared"), shared);
+
+    // A thaw after a freeze whose layers interned nothing keeps the base's values.
+    fork::freeze(&db);
+    let reader = fork::root_layer(&db);
+    let reader_db = layered(&db, &reader);
+    assert_eq!(word_of(&reader_db, "layer word"), in_base);
+    drop(reader_db);
+    drop(reader);
+    fork::try_thaw(&mut db).expect("no other handle is alive");
+    assert_eq!(word_of(&db, "layer word"), in_base);
+    assert_eq!(word_of(&db, "shared"), shared);
+}
+
+/// An immortal interned struct, as rust-analyzer's `SyntaxContextImpl` is.
+#[salsa::interned(revisions = usize::MAX)]
+struct Forever<'db> {
+    #[returns(ref)]
+    text: String,
+}
+
+#[test]
+fn an_immortal_value_is_taken_again_under_its_own_id() {
+    let db = Db::default();
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+    let forever = |db: &Db, text: &str| salsa::plumbing::AsId::as_id(&Forever::new(db, text.to_owned()));
+
+    let first = fork::root_layer(&db);
+    let first_db = layered(&db, &first);
+    let old = forever(&first_db, "kept id");
+    drop(first_db);
+    drop(first);
+
+    let second = fork::root_layer(&db);
+    let second_db = layered(&db, &second);
+    let again = forever(&second_db, "kept id");
+    // The same slot under the same id, generation 0: upstream never moves an immortal value's
+    // generation, so code that rebuilds the id from its index alone (rust-analyzer's
+    // `SyntaxContext`) gets this id.
+    assert_eq!(again, old);
+    assert_eq!(again.generation(), 0);
+    assert_eq!(fork::shared_writes(&db).slot_reuses, 1);
+    let word: Forever<'_> = salsa::plumbing::FromId::from_id(again);
+    assert_eq!(word.text(&second_db), "kept id");
+    drop(second_db);
+    drop(second);
+    assert_eq!(fork::layer_slots(&db).owned, 0);
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+}
+
+#[test]
+fn a_given_back_interned_slot_does_not_find_its_old_content() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    let first = fork::root_layer(&db);
+    let first_db = layered(&db, &first);
+    let old = word_of(&first_db, "gone");
+    drop(first_db);
+    drop(first);
+    assert_eq!(fork::shared_writes(&db).slot_frees, 1);
+
+    // A later layer interning the same content does not find the dead value (its owner is on no
+    // live chain): it takes the slot again (the free list is per shard, and the same content
+    // hashes to the same shard), under a new id.
+    let second = fork::root_layer(&db);
+    let second_db = layered(&db, &second);
+    let again = word_of(&second_db, "gone");
+    assert_ne!(again, old);
+    assert_eq!(again.index(), old.index());
+    assert_eq!(again.generation(), old.generation() + 1);
+    assert_eq!(word_of(&second_db, "gone"), again);
+    assert_eq!(word_text(&second_db, again), "gone");
+    assert_eq!(fork::shared_writes(&db).slot_reuses, 1);
+    drop(second_db);
+    drop(second);
+    let slots = fork::layer_slots(&db);
+    assert_eq!(slots.owned, 0);
+    assert_eq!(slots.leaked, 0);
+    assert_eq!(fork::refused_writes(&db), 0);
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+    let _ = file;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -523,7 +809,8 @@ fn fork_cycle_iterates_inside_the_layer() {
     assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
 
     // A child of the sealed layer reads the final memos.
-    layer.seal();
+    drop(layer_db);
+    layer.seal().expect("no handle carries the layer");
     let child = fork::child_layer(&layer);
     assert_eq!(climb_a(&layered(&db, &child), target), flat_climb(7));
     assert_eq!(child.stats().memos, 0);
@@ -651,11 +938,18 @@ fn shared_writes_under_a_layer_are_the_listed_ones() {
         interned_inserts,
         last_interned_at_stores,
         sync_claims,
+        slot_reuses,
+        slot_frees,
     } = fork::shared_writes(&db);
     assert!(slot_allocations >= 2, "an interned value and an input");
     assert_eq!(interned_inserts, 1);
     assert!(last_interned_at_stores >= 1);
     assert!(sync_claims >= 1);
+    // No layer dropped yet: nothing given back, nothing taken again.
+    assert_eq!((slot_reuses, slot_frees), (0, 0));
+    let slots = fork::layer_slots(&db);
+    assert_eq!(slots.owned, 1, "the interned value");
+    assert_eq!(slots.created_inputs, 1);
     // The base writes on the "not done" list were reached and not made.
     let skipped = fork::skipped_writes(&db);
     assert!(skipped.lru_uses >= 1, "{skipped:?}");
@@ -664,7 +958,52 @@ fn shared_writes_under_a_layer_are_the_listed_ones() {
     // `updated_at`s are as at the freeze.
     assert_eq!(fork::refused_writes(&db), 0);
     drop(layer_db);
+    drop(layer);
+    // The layer gave its interned value back; the created input is kept.
+    assert_eq!(fork::shared_writes(&db).slot_frees, 1);
+    assert_eq!(fork::layer_slots(&db).owned, 0);
     assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+}
+
+// ---------------------------------------------------------------------------------------------
+// LRU at a thaw (E8)
+
+#[salsa::tracked(lru = 2, returns(copy))]
+fn thaw_lru_len(db: &dyn Database, file: File) -> usize {
+    THAW_LRU_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static THAW_LRU_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_thaw_evicts_nothing() {
+    let mut db = Db::default();
+    let files: Vec<File> = (0..8).map(|n| File::new(&db, "x".repeat(n))).collect();
+    let read_all = |db: &Db| {
+        for (n, &file) in files.iter().enumerate() {
+            assert_eq!(thaw_lru_len(db, file), n);
+        }
+    };
+    // Eight values for an LRU of two: the base keeps them all until its next new revision.
+    read_all(&db);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8);
+    fork::freeze(&db);
+
+    // A layer reads every value from the base and records no LRU use.
+    let layer = fork::root_layer(&db);
+    read_all(&layered(&db, &layer));
+    drop(layer);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8);
+
+    // The thaw is a new base revision, and it evicts nothing: every value is still there.
+    fork::try_thaw(&mut db).expect("no other handle is alive");
+    read_all(&db);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8, "the thaw evicted a value");
+
+    // The base's own next new revision evicts as upstream does, down to the LRU's capacity.
+    db.synthetic_write(Durability::LOW);
+    read_all(&db);
+    assert_eq!(THAW_LRU_RUNS.load(Ordering::SeqCst), 8 + 6);
 }
 
 #[salsa::tracked(returns(copy))]
@@ -680,13 +1019,200 @@ fn an_insert_on_a_sealed_layer_panics() {
     let layer = fork::root_layer(&db);
     let layer_db = layered(&db, &layer);
     write(&layer_db, file, "in the layer");
-    // A handle past the types: the layer is sealed while a handle of it lives.
-    layer.seal();
+    // The layer is sealed with no handle carrying it; a handle made after it, past the types,
+    // runs a query.
+    drop(layer_db);
+    layer.seal().expect("no handle carries the layer");
+    let layer_db = layered(&db, &layer);
     let message = panic_message(|| {
         sealed_len(&layer_db, file);
     });
     assert!(message.contains("write to a sealed layer"), "{message}");
     assert_eq!(layer.stats().memos, 0);
+}
+
+#[test]
+fn a_sealed_parent_intern_after_a_childs_intern_is_refused() {
+    let db = Db::default();
+    let known = word_of(&db, "known");
+    fork::freeze(&db);
+    let parent = fork::root_layer(&db);
+    parent.seal().expect("no handle carries the layer");
+    let child = fork::child_layer(&parent);
+    let child_db = layered(&db, &child);
+    let in_child = word_of(&child_db, "fresh");
+    let refused = fork::refused_writes(&db);
+    let inserts = fork::shared_writes(&db).interned_inserts;
+    let owned = fork::layer_slots(&db).owned;
+
+    // A handle of the sealed parent misses the child's value (its chain does not see it). An
+    // insert would be a value of the parent, which the child's chain matches as well, so a lookup
+    // in the child could return it instead of the child's own: it is refused and counted.
+    let parent_db = layered(&db, &parent);
+    let message = panic_message(|| {
+        word_of(&parent_db, "fresh");
+    });
+    assert!(
+        message.contains("write to a sealed layer (an interned insert)"),
+        "{message}"
+    );
+    assert_eq!(fork::refused_writes(&db), refused + 1);
+    assert_eq!(fork::shared_writes(&db).interned_inserts, inserts);
+    assert_eq!(fork::layer_slots(&db).owned, owned);
+    // The child still gets its own id.
+    assert_eq!(word_of(&child_db, "fresh"), in_child);
+    // A hit on a value the parent's chain sees stays allowed (it only raises its last use).
+    assert_eq!(word_of(&parent_db, "known"), known);
+    assert_eq!(fork::refused_writes(&db), refused + 1);
+}
+
+#[test]
+fn a_new_identity_tracked_struct_on_a_sealed_layer_is_refused() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    write(&layered(&db, &layer), file, "only in the layer");
+    layer.seal().expect("no handle carries the layer");
+    let refused = fork::refused_writes(&db);
+    let allocations = fork::shared_writes(&db).slot_allocations;
+
+    // A query on a handle of the sealed layer creates a struct with a new identity: the slot it
+    // would take is refused before it is taken, and counted.
+    let sealed_db = layered(&db, &layer);
+    let message = panic_message(|| {
+        make_named(&sealed_db, file);
+    });
+    assert!(
+        message.contains("write to a sealed layer (a layer-owned tracked-struct slot)"),
+        "{message}"
+    );
+    assert_eq!(fork::refused_writes(&db), refused + 1);
+    assert_eq!(fork::shared_writes(&db).slot_allocations, allocations);
+    assert_eq!(fork::layer_slots(&db).owned, 0);
+    // A child of the layer creates it in a slot it owns.
+    let child = fork::child_layer(&layer);
+    let child_db = layered(&db, &child);
+    assert_eq!(named(&child_db, file).1, "only in the layer");
+    assert_eq!(fork::layer_slots(&db).owned, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The chain view of a sealed layer (D11, `fork/flat.rs`)
+
+#[salsa::tracked(returns(copy))]
+fn view_len(db: &dyn Database, file: File) -> usize {
+    VIEW_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static VIEW_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_query_on_a_sealed_layer_handle_builds_its_view() {
+    let db = Db::default();
+    let file = File::new(&db, "base".to_owned());
+    fork::freeze(&db);
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    write(&layer_db, file, "abc");
+    assert_eq!(view_len(&layer_db, file), 3);
+    drop(layer_db);
+    layer.seal().expect("no handle carries the layer");
+    // A sealed leaf has no view until something looks a memo up in it.
+    assert_eq!(layer.stats().flat_memos, 0);
+
+    // A handle of the sealed layer finds the layer's own memo through the layer's view, built
+    // on that lookup; nothing is inserted.
+    let sealed_db = layered(&db, &layer);
+    assert_eq!(view_len(&sealed_db, file), 3);
+    let stats = layer.stats();
+    assert_eq!((stats.flat_memos, stats.memos, stats.stamps), (1, 1, 0));
+    assert!(stats.flat_bytes > 0);
+}
+
+#[salsa::tracked(returns(copy))]
+fn item_len<'db>(db: &'db dyn Database, item: Item<'db>) -> usize {
+    ITEM_LEN_RUNS.fetch_add(1, Ordering::SeqCst);
+    item.value(db).len()
+}
+static ITEM_LEN_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_tombstone_hides_older_memos_through_a_view() {
+    let db = Db::default();
+    let flag = Flag::new(&db, true);
+    let item = maybe_item(&db, flag).expect("created");
+    fork::freeze(&db);
+
+    // The oldest layer computes a memo keyed by the struct.
+    let old = fork::root_layer(&db);
+    assert_eq!(item_len(&layered(&db, &old), item), 4);
+    old.seal().expect("no handle carries the layer");
+    // Its child no longer creates the struct: the struct is tombstoned there.
+    let gone = fork::child_layer(&old);
+    let gone_db = layered(&db, &gone);
+    fork::set_input_field::<Flag, _>(&gone_db, flag, 0, |fields| fields.0 = false);
+    assert_eq!(maybe_item(&gone_db, flag), None);
+    assert_eq!(gone.stats().tombstones, 1);
+    drop(gone_db);
+    gone.seal().expect("no handle carries the layer");
+
+    // Below the tombstone the old memo is not found: the function runs again, and its read of
+    // the struct panics as a read of a deleted struct does.
+    let runs = ITEM_LEN_RUNS.load(Ordering::SeqCst);
+    let below = fork::child_layer(&gone);
+    let message = panic_message(|| {
+        item_len(&layered(&db, &below), item);
+    });
+    assert!(message.contains("write lock taken"), "{message}");
+    assert_eq!(ITEM_LEN_RUNS.load(Ordering::SeqCst), runs + 1);
+    let stats = gone.stats();
+    assert_eq!((stats.flat_hidden, stats.flat_tracked), (1, 1));
+    // A sibling of the tombstoning layer still finds the old memo, and runs nothing.
+    let sibling = fork::child_layer(&old);
+    assert_eq!(item_len(&layered(&db, &sibling), item), 4);
+    assert_eq!(ITEM_LEN_RUNS.load(Ordering::SeqCst), runs + 1);
+    assert_eq!(old.stats().flat_hidden, 0);
+}
+
+#[salsa::tracked(returns(copy))]
+fn sibling_len(db: &dyn Database, file: File) -> usize {
+    SIBLING_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static SIBLING_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn siblings_share_a_view_and_keep_their_own_memos() {
+    let db = Db::default();
+    let (a, b) = (File::new(&db, "a".to_owned()), File::new(&db, "b".to_owned()));
+    fork::freeze(&db);
+    let parent = fork::root_layer(&db);
+    assert_eq!(sibling_len(&layered(&db, &parent), a), 1);
+    parent.seal().expect("no handle carries the layer");
+
+    // Two siblings, each with its own text of `b` and its own memo for it.
+    let sibling = |text: &str| {
+        let layer = fork::child_layer(&parent);
+        let layer_db = layered(&db, &layer);
+        write(&layer_db, b, text);
+        assert_eq!(sibling_len(&layer_db, b), text.len());
+        drop(layer_db);
+        layer.seal().expect("no handle carries the layer");
+        layer
+    };
+    let (one, three) = (sibling("x"), sibling("yyy"));
+    let runs = SIBLING_RUNS.load(Ordering::SeqCst);
+    for (layer, len) in [(&one, 1), (&three, 3)] {
+        let child_db = layered(&db, &fork::child_layer(layer));
+        assert_eq!(sibling_len(&child_db, b), len);
+        assert_eq!(sibling_len(&child_db, a), 1);
+        // Each sibling's view holds the parent's memo and its own.
+        assert_eq!(layer.stats().flat_memos, 2);
+    }
+    // Every memo came from a view: nothing ran again.
+    assert_eq!(SIBLING_RUNS.load(Ordering::SeqCst), runs);
+    assert_eq!(parent.stats().flat_memos, 1);
 }
 
 #[salsa::tracked(returns(copy))]
@@ -702,7 +1228,7 @@ fn reading_the_parent_does_not_change_a_childs_result() {
     assert_eq!(parent_child_len(&db, a, b), 11);
     fork::freeze(&db);
     let root = fork::root_layer(&db);
-    root.seal();
+    root.seal().expect("no handle carries the layer");
     let parent = sealed_child(&db, &root, a, "aaa");
     let child = fork::child_layer(&parent);
     let child_db = layered(&db, &child);
@@ -741,7 +1267,7 @@ fn a_waiter_stops_when_an_ancestor_is_cancelled() {
     GATE.get_or_init(|| Barrier::new(2));
     fork::freeze(&db);
     let root = fork::root_layer(&db);
-    root.seal();
+    root.seal().expect("no handle carries the layer");
     let child = sealed_child(&db, &root, file, "in the child");
     let read = fork::child_layer(&child);
     let (runner, waiter) = (layered(&db, &read), layered(&db, &read));
@@ -789,4 +1315,44 @@ fn the_disabled_bit_is_per_handle() {
     layer.cancellation_token().cancel();
     let cancelled = catch_unwind(AssertUnwindSafe(|| second.unwind_if_revision_cancelled()));
     assert!(cancelled.is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The durability shortcut (D11)
+
+#[salsa::tracked(returns(copy))]
+fn stale_durable_len(db: &dyn Database, file: File) -> usize {
+    STALE_DURABLE_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static STALE_DURABLE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_durable_memo_stale_in_the_base_is_still_verified_deeply() {
+    // The base's HIGH memo was computed before a HIGH write and not fetched again before the
+    // freeze: the base's HIGH last-changed revision is above the memo's `verified_at`, so the
+    // shortcut does not pass it, and a layer deep-verifies it and runs it again.
+    let mut db = Db::default();
+    let high = File::builder("high".to_owned())
+        .durability(Durability::HIGH)
+        .new(&db);
+    assert_eq!(stale_durable_len(&db, high), 4);
+    high.set_text(&mut db)
+        .with_durability(Durability::HIGH)
+        .to("changed high".to_owned());
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    assert_eq!(stale_durable_len(&layer_db, high), 12);
+    assert_eq!(STALE_DURABLE_RUNS.load(Ordering::SeqCst), 2);
+    let stats = layer.stats();
+    assert_eq!((stats.deep_verifies, stats.memos), (1, 1));
+    // The layer's own memo now passes at once, and the base is untouched.
+    assert_eq!(stale_durable_len(&layer_db, high), 12);
+    assert_eq!(STALE_DURABLE_RUNS.load(Ordering::SeqCst), 2);
+    drop(layer_db);
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+    assert_eq!(fork::refused_writes(&db), 0);
 }

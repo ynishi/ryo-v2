@@ -9,6 +9,7 @@ mod assess;
 mod check;
 mod diagnostics;
 mod duplicate;
+mod engine;
 mod expand;
 mod field_bounds;
 mod fork;
@@ -27,6 +28,8 @@ pub use assess::SyntaxAssessor;
 pub use diagnostics::GapDetector;
 pub use fork::RaFork;
 pub use memory::{IngredientRow, MemoRow, MemoryReport};
+/// A layer's own counters on the fork Engine ([`RaSession::level_stats`]).
+pub use ryo_v2_engine::LayerStats;
 pub use session::{DetectorPanic, ExpanderPanic, RaSession};
 pub use stack::RaStack;
 
@@ -62,6 +65,23 @@ pub struct RaConfig {
     ///   tested: tests/verifier.rs cfg_test_config_diagnoses_test_module
     ///   tested: tests/verifier.rs ra_config_default_diagnoses_test_code
     pub cfg_test: bool,
+    /// The backend of the forks (`Stacked`, `Analyzer`, and a check, which is a one-level fork):
+    /// `false` (the default) writes each level in place and reverts it from its undo log; `true`
+    /// runs it on the fork Engine (D11): the base is frozen while a fork is live, a level is a
+    /// layer over it, `pop` drops the top layer and `release` drops them all, so the base is
+    /// never written.
+    ///
+    /// # Contract
+    /// - C1: every differential and contract test of `Stacked`, `Verifier` and the cut-off gives
+    ///   the same results on both backends, where the Engine has no revert to get wrong (a
+    ///   revert fault, a re-assert of a revert and a database write of a revert have no
+    ///   counterpart there), and except a level's write that panics: on the Engine it poisons
+    ///   only its dropped layer and is of reach Blueprint (`Stacked` C8), where the undo log
+    ///   poisons the session.
+    ///   tested: tests/stack.rs a_stack_diagnoses_as_its_flat_composition
+    ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
+    ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
+    pub engine: bool,
 }
 
 impl Default for RaConfig {
@@ -73,6 +93,92 @@ impl Default for RaConfig {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: true,
+            engine: false,
+        }
+    }
+}
+
+impl RaConfig {
+    /// This configuration with its forks on `backend`: `engine` is true exactly for
+    /// [`Backend::Engine`].
+    pub fn with_backend(self, backend: Backend) -> RaConfig {
+        RaConfig {
+            engine: backend == Backend::Engine,
+            ..self
+        }
+    }
+
+    /// The backend `engine` selects.
+    pub fn backend(&self) -> Backend {
+        Backend::of_engine(self.engine)
+    }
+}
+
+/// The backend the forks run on, as [`RaConfig::engine`] selects it (D11): the stacked undo log,
+/// the default, or layers of the fork Engine. The one name of the backend for the measurement
+/// commands (`ryo-v2 bench`, `engine-probe`, `search-recall run`) and their reports.
+///
+/// # Contract
+/// - C1: its name, `undo-log` or `engine`, is the value it serializes as and the word a bench
+///   summary line ends with after ` backend `; it is the Engine exactly when `RaConfig.engine`
+///   is true (`RaConfig::with_backend`, `RaConfig::backend`).
+///   tested: tests::backend_names_itself_one_way
+///   tested: ryo-v2-host bench::tests::summary_line_ends_with_the_backend
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Backend {
+    /// The stacked undo log on the one database (`RaConfig.engine` false).
+    #[default]
+    UndoLog,
+    /// Layers of the fork Engine over a frozen base (`RaConfig.engine` true).
+    Engine,
+}
+
+impl Backend {
+    /// The backend of `RaConfig.engine` = `engine`, or of an `--engine` flag.
+    pub fn of_engine(engine: bool) -> Backend {
+        if engine {
+            Backend::Engine
+        } else {
+            Backend::UndoLog
+        }
+    }
+
+    /// The name a summary or header line prints and a report holds.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::UndoLog => "undo-log",
+            Backend::Engine => "engine",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_names_itself_one_way() {
+        assert_eq!(Backend::default(), Backend::UndoLog);
+        assert_eq!(RaConfig::default().backend(), Backend::UndoLog);
+        for (flag, b, name) in [
+            (false, Backend::UndoLog, "undo-log"),
+            (true, Backend::Engine, "engine"),
+        ] {
+            assert_eq!(Backend::of_engine(flag), b);
+            assert_eq!(b.name(), name);
+            assert_eq!(serde_json::to_value(b).unwrap(), serde_json::json!(name));
+            let config = RaConfig::default().with_backend(b);
+            assert_eq!(config.engine, flag);
+            assert_eq!(config.backend(), b);
+            // The other fields are kept.
+            let custom = RaConfig {
+                proc_macro: false,
+                threads: Some(3),
+                ..RaConfig::default()
+            }
+            .with_backend(b);
+            assert_eq!((custom.proc_macro, custom.threads), (false, Some(3)));
         }
     }
 }
@@ -97,6 +203,8 @@ pub struct RaAnalyzer {
     pub(crate) db_read_fault: Option<RelPath>,
     /// Whether the diagnosis of every revert audit fails to run; a test hook.
     pub(crate) audit_fault: bool,
+    /// Whether every diagnosis of a level panics before it diagnoses a file; a test hook.
+    pub(crate) diagnose_panic: bool,
 }
 
 /// The database write of the texts that the test hook `RaAnalyzer::with_db_write_panic` makes
@@ -124,7 +232,17 @@ impl RaAnalyzer {
             db_write_panic: None,
             db_read_fault: None,
             audit_fault: false,
+            diagnose_panic: false,
         }
+    }
+
+    /// Makes every diagnosis of a level (a check's included) panic inside the level, before it
+    /// diagnoses a file, as a panic of rust-analyzer in a query of that level would. For the
+    /// tests of the poison of a layer; nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_diagnose_panic(mut self, panic: bool) -> RaAnalyzer {
+        self.diagnose_panic = panic;
+        self
     }
 
     /// Makes that detector panic on that file in every collect this analyzer runs.

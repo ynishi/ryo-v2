@@ -52,10 +52,9 @@ fn analyzer() -> RaAnalyzer {
         RaConfig {
             proc_macro: false,
             threads: Some(2),
-            assert_revert: false,
             gap_detectors: true,
-            assert_revert_every: None,
             cfg_test: false,
+            ..RaConfig::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -297,7 +296,23 @@ fn run_gate(base: &str, dir: &Path, sequences: &[(&'static str, Vec<Level>)]) ->
                 .expect("no clone escapes the read");
             let read = read.unwrap_or_else(|e| panic!("{at}: {e:?}"));
             assert_eq!(&read, flat, "{at}: read");
-            assert_eq!(layer.stats(), before, "{at}: the sealed layer took nothing");
+            // What a layer takes: memos, stamps, deep verifies, tracked entries, tombstones. The
+            // read's child may build the layer's chain view (`flat_*`), a cache of the chain, on
+            // its first lookup.
+            let took = |s: &salsa::fork::LayerStats| {
+                (
+                    s.memos,
+                    s.stamps,
+                    s.deep_verifies,
+                    s.tracked_entries,
+                    s.tombstones,
+                )
+            };
+            assert_eq!(
+                took(&layer.stats()),
+                took(&before),
+                "{at}: the sealed layer took nothing"
+            );
             assert_eq!(deep_verifies, 0, "{at}: the read child deep-verified");
         }
     }
@@ -310,11 +325,17 @@ fn run_gate(base: &str, dir: &Path, sequences: &[(&'static str, Vec<Level>)]) ->
         Ok(()),
         "the base's memos, revisions and updated_at are those at the freeze"
     );
+    // Every layer but the root has dropped, and gave back what it owned.
+    assert_eq!(
+        after.slots.owned, 0,
+        "layer-owned slots after every layer dropped"
+    );
     eprintln!(
-        "V2 {base}: {compared} levels compared, 0 differences; I2: refused {}, {:?}, {:?}, {} base slots and {} memos unchanged",
+        "V2 {base}: {compared} levels compared, 0 differences; I2: refused {}, {:?}, {:?}, {:?}, {} base slots and {} memos unchanged",
         after.refused,
         after.shared,
         after.skipped,
+        after.slots,
         at_freeze.fingerprint.slots(),
         at_freeze.fingerprint.memos,
     );
