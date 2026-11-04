@@ -408,6 +408,88 @@ fn writes_to_two_fields_from_two_handles_of_a_layer_are_both_kept() {
     assert_eq!((pair.a(&db), pair.b(&db)), (0, 0));
 }
 
+#[salsa::tracked(returns(copy))]
+fn pair_sum(db: &dyn Database, pair: Pair) -> u32 {
+    pair.a(db) + pair.b(db)
+}
+
+/// Reads through the flattened input view a layer builds at its seal: per input the newest entry
+/// of the chain, whichever layer set it, from a sealed layer, from an open one (its own entries,
+/// then its parent's view) and from write-free layers (which share their parent's view); a
+/// sibling branch and the base keep their own values, and a tracked function sees each field's
+/// revision.
+#[test]
+fn a_deep_chain_reads_the_newest_input_of_each_layer() {
+    let db = Db::default();
+    let pair = Pair::new(&db, 0, 0);
+    let other = Pair::new(&db, 100, 100);
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    // Depth 1..=40: `a` set at every 3rd layer, `b` at every 7th, `other` only at depth 20;
+    // the other layers write nothing.
+    let mut layers = Vec::new();
+    let mut parent: Option<std::sync::Arc<Layer>> = None;
+    let mut expected = Vec::new();
+    let (mut a, mut b, mut o) = (0, 0, 100);
+    for depth in 1..=40u32 {
+        let layer = match &parent {
+            None => fork::root_layer(&db),
+            Some(p) => fork::child_layer(p),
+        };
+        let layer_db = layered(&db, &layer);
+        if depth % 3 == 0 {
+            fork::set_input_field::<Pair, _>(&layer_db, pair, 0, |f| f.0 = depth);
+            a = depth;
+        }
+        if depth % 7 == 0 {
+            fork::set_input_field::<Pair, _>(&layer_db, pair, 1, |f| f.1 = depth);
+            b = depth;
+        }
+        if depth == 20 {
+            fork::set_input_field::<Pair, _>(&layer_db, other, 0, |f| f.0 = 7);
+            o = 7;
+        }
+        // Open: its own entries, then the parent's view.
+        assert_eq!((pair.a(&layer_db), pair.b(&layer_db)), (a, b));
+        assert_eq!(other.a(&layer_db), o);
+        assert_eq!(pair_sum(&layer_db, pair), a + b);
+        layer.seal();
+        // Sealed: its own view.
+        assert_eq!((pair.a(&layer_db), pair.b(&layer_db)), (a, b));
+        expected.push((a, b, o));
+        layers.push(layer.clone());
+        parent = Some(layer);
+    }
+    for (layer, &(a, b, o)) in layers.iter().zip(&expected) {
+        let layer_db = layered(&db, layer);
+        assert_eq!((pair.a(&layer_db), pair.b(&layer_db)), (a, b));
+        assert_eq!((other.a(&layer_db), other.b(&layer_db)), (o, 100));
+        // A write-free child reads its parent's view, and its queries see the same revisions.
+        let child_db = layered(&db, &fork::child_layer(layer));
+        assert_eq!((pair.a(&child_db), pair.b(&child_db)), (a, b));
+        assert_eq!(pair_sum(&child_db, pair), a + b);
+    }
+
+    // An open leaf at depth 41 that writes `b` sees its own `b` and the chain's `a`.
+    let leaf = fork::child_layer(layers.last().unwrap());
+    let leaf_db = layered(&db, &leaf);
+    fork::set_input_field::<Pair, _>(&leaf_db, pair, 1, |f| f.1 = 41);
+    assert_eq!((pair.a(&leaf_db), pair.b(&leaf_db)), (39, 41));
+    assert_eq!(pair_sum(&leaf_db, pair), 80);
+
+    // A sibling branch off depth 10 sees depth 10's values, not those set below it.
+    let sibling = fork::child_layer(&layers[9]);
+    let sibling_db = layered(&db, &sibling);
+    assert_eq!((pair.a(&sibling_db), pair.b(&sibling_db)), (9, 7));
+    assert_eq!(other.a(&sibling_db), 100);
+
+    assert_eq!((pair.a(&db), pair.b(&db), other.a(&db)), (0, 0, 100));
+    drop((leaf_db, sibling_db));
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+    assert_eq!(fork::refused_writes(&db), 0);
+}
+
 #[test]
 fn a_layer_cancellation_survives_another_handles_attach() {
     let db = Db::default();

@@ -12,7 +12,11 @@
 //! What a layer holds, each read through the chain (the layer first, then its ancestors, then the
 //! base):
 //!
-//! - input values it set ([`set_input_field`]), with their revisions;
+//! - input values it set ([`set_input_field`]), with their revisions. When the layer is sealed it
+//!   also builds a *flattened view* of the inputs: per input, the newest entry the layer or an
+//!   ancestor set. A sealed layer takes no write, so the view never changes, and an input read
+//!   under a layer is one lookup in the layer's own entries (an open layer, under its lock) and
+//!   one in its parent's view (no lock), whatever the depth of the chain;
 //! - the memos of the queries it ran (re-runs, fixpoint iterations), in its own store; a memo of
 //!   an ancestor or of the base that the layer verified gets a *stamp* in the layer, so siblings
 //!   never see it. A base memo is valid in a layer by salsa's own revision test on the chain;
@@ -68,7 +72,7 @@ pub use self::view::ZalsaView;
 use crate::input::Configuration as InputConfiguration;
 use crate::runtime::DependencyGraph;
 use crate::storage::HasStorage;
-use crate::sync::{Arc, Mutex, MutexGuard};
+use crate::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use crate::table::memo::Memo as ErasedMemoTrait;
 use crate::zalsa::{IngredientIndex, Zalsa};
 use crate::zalsa_local::CancellationToken;
@@ -287,6 +291,14 @@ pub(crate) struct InputEntry<C: InputConfiguration> {
     pub(crate) durabilities: Box<[Durability]>,
 }
 
+/// A type-erased [`InputEntry`], shared between the layer that set it and the flattened views of
+/// that layer and its descendants.
+type SharedInputEntry = Arc<dyn Any + Send + Sync>;
+
+/// The flattened input view of a sealed layer: `(input struct ingredient, id)` to the newest
+/// entry the layer or one of its ancestors set. Built once, at the seal, and never changed.
+type FlatInputs = FxHashMap<(IngredientIndex, Id), SharedInputEntry>;
+
 /// What a layer holds for a tracked struct id: an entry (an index into `values`) or a tombstone.
 #[derive(Copy, Clone, Debug)]
 enum TrackedSlot {
@@ -350,10 +362,15 @@ pub struct Layer {
     /// and a seal do not interleave, and two writes to one input in one layer lose neither.
     write: Mutex<()>,
     token: CancellationToken,
-    /// `(input struct ingredient, id)` to the index of the newest entry in `values`.
+    /// `(input struct ingredient, id)` to the index of the newest entry in `input_values`.
     inputs: Mutex<FxHashMap<(IngredientIndex, Id), usize>>,
-    /// Append-only: an entry stays until the layer is dropped. Input entries and tracked-struct
-    /// entries.
+    /// Append-only: an input entry stays until the layer is dropped (and as long as a flattened
+    /// view of a descendant holds it).
+    input_values: boxcar::Vec<SharedInputEntry>,
+    /// The flattened view of the chain's inputs, set once by [`Layer::seal`] (before the sealed
+    /// flag) and never changed: a set view means the layer takes no input write.
+    flat_inputs: OnceLock<Arc<FlatInputs>>,
+    /// Append-only: an entry stays until the layer is dropped. Tracked-struct entries.
     values: boxcar::Vec<Box<dyn Any + Send + Sync>>,
     /// `(function ingredient, id)` to the index of the newest memo in `memo_values`.
     memos: Sharded<(IngredientIndex, Id), usize>,
@@ -427,6 +444,8 @@ impl Layer {
             write: Mutex::new(()),
             token: CancellationToken::default(),
             inputs: Mutex::new(FxHashMap::default()),
+            input_values: boxcar::Vec::new(),
+            flat_inputs: OnceLock::new(),
             values: boxcar::Vec::new(),
             memos: Sharded::new(),
             memo_values: boxcar::Vec::new(),
@@ -458,10 +477,42 @@ impl Layer {
     }
 
     /// Seals the layer. Idempotent. Waits for an input write in progress on the layer, so a
-    /// write either completes before the seal or is refused after it.
+    /// write either completes before the seal or is refused after it, and builds the layer's
+    /// flattened input view from its own entries and its parent's view.
     pub fn seal(&self) {
         let _write = self.write.lock();
+        self.flat_inputs.get_or_init(|| self.flatten_inputs());
         self.sealed.store(true, Ordering::Release);
+    }
+
+    /// The flattened input view of this layer: the parent's view (empty for a root layer) with
+    /// this layer's own entries over it. A layer that set no input shares its parent's view; one
+    /// that did copies the parent's map (one entry per input set on the chain, each an `Arc`).
+    /// Runs under the write lock, so the own entries are complete.
+    fn flatten_inputs(&self) -> Arc<FlatInputs> {
+        let parent = self.parent.as_ref().map(|p| p.sealed_inputs());
+        let own = self.inputs.lock();
+        if own.is_empty() {
+            return parent.cloned().unwrap_or_default();
+        }
+        let mut flat = parent.map(|p| FlatInputs::clone(p)).unwrap_or_default();
+        flat.reserve(own.len());
+        for (&key, &index) in own.iter() {
+            let entry = self
+                .input_values
+                .get(index)
+                .expect("ryo-v2 fork: an input entry index names a pushed value");
+            flat.insert(key, Arc::clone(entry));
+        }
+        Arc::new(flat)
+    }
+
+    /// The flattened input view of this sealed layer.
+    #[inline]
+    fn sealed_inputs(&self) -> &Arc<FlatInputs> {
+        self.flat_inputs
+            .get()
+            .expect("ryo-v2 fork: a sealed layer has its flattened input view")
     }
 
     /// Whether the layer itself has set an input.
@@ -545,27 +596,33 @@ impl Layer {
         &self.dependency_graph
     }
 
-    /// The newest values of input `id` of ingredient `ingredient` on the chain.
+    /// The newest values of input `id` of ingredient `ingredient` on the chain: a sealed layer
+    /// looks in its own flattened view; an open one in its own entries, then in its parent's
+    /// view. At most two lookups, whatever the depth; `None` means the base slot is current.
     pub(crate) fn input<C: InputConfiguration>(
         &self,
         ingredient: IngredientIndex,
         id: Id,
     ) -> Option<&InputEntry<C>> {
-        for layer in self.chain() {
-            let index = layer.inputs.lock().get(&(ingredient, id)).copied();
-            if let Some(index) = index {
-                let entry = layer
-                    .values
-                    .get(index)
-                    .expect("ryo-v2 fork: an input entry index names a pushed value");
-                return Some(
-                    entry
-                        .downcast_ref::<InputEntry<C>>()
-                        .expect("ryo-v2 fork: an input entry has its ingredient's type"),
-                );
+        let key = (ingredient, id);
+        let entry: &(dyn Any + Send + Sync) = match self.flat_inputs.get() {
+            Some(flat) => &**flat.get(&key)?,
+            None => {
+                let index = self.inputs.lock().get(&key).copied();
+                match index {
+                    Some(index) => &**self
+                        .input_values
+                        .get(index)
+                        .expect("ryo-v2 fork: an input entry index names a pushed value"),
+                    None => &**self.parent.as_ref()?.sealed_inputs().get(&key)?,
+                }
             }
-        }
-        None
+        };
+        Some(
+            entry
+                .downcast_ref::<InputEntry<C>>()
+                .expect("ryo-v2 fork: an input entry has its ingredient's type"),
+        )
     }
 
     /// Takes the layer's write lock for an input write into it, after refusing a sealed layer.
@@ -603,7 +660,7 @@ impl Layer {
         entry: InputEntry<C>,
     ) {
         self.assert_open("an input write");
-        let index = self.values.push(Box::new(entry));
+        let index = self.input_values.push(Arc::new(entry));
         self.inputs.lock().insert((ingredient, id), index);
         self.written.store(true, Ordering::Release);
     }
