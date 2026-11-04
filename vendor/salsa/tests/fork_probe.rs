@@ -11,9 +11,12 @@
 //! misses in every layer.
 //!
 //! Stage 1 of the chain views (the view of `fork/flat.rs`) bounds memo and tracked lookups;
-//! stamp lookups (stage 2) and the cancellation walk (stage 4) still walk the chain.
+//! stage 2 skips the stamp lookup for a memo above `LOW` (the durability shortcut) and keeps the
+//! `LOW` stamp walk under a ceiling (`a_low_memo_stamp_lookup_is_bounded`); stage 4 walks the
+//! ancestors' cancellation tokens only after a cancel (the cancel epoch).
 
-use std::sync::Arc;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use salsa::fork::{self, Layer};
 use salsa::{Database, Durability};
@@ -140,10 +143,75 @@ fn a_durable_memo_under_a_deep_chain_visits_no_stamp() {
     let first = top.stats().stamp_visits - before;
     assert_eq!(text_len(&top_db, file), 7);
     let second = top.stats().stamp_visits - before - first;
-    // The stamps are read before the durability test: every layer is visited and misses, on
-    // every check (the durability shortcut of D11 reads the base's HIGH revision first).
-    assert_eq!((first, second), (DEPTH + 1, DEPTH + 1));
+    // The base's HIGH revision is read before any stamp (the durability shortcut, D11): no layer is visited (a
+    // walk read the stamps first and visited the 41 layers on every check).
+    assert_eq!((first, second), (0, 0));
     assert_eq!(top.stats().stamps, 0);
+    assert_eq!(top.stats().memos, 0);
+}
+
+/// The layers of the diagnosed chain of [`a_low_memo_stamp_lookup_is_bounded`].
+const DIAGNOSED: usize = 20;
+
+/// The stamp-walk ceiling of the chain views (SEARCH_LEDGER D11): a LOW memo's stamp is still looked
+/// up layer by layer, which is bounded on the paths the search takes. On a chain of 20 layers,
+/// each of which wrote a LOW input and checked a LOW and a HIGH base memo:
+/// - a warm repeat in the top layer finds the LOW memo's stamp in the top: 1 visit per check;
+/// - a fresh child's first check finds it in its parent: at most 2 visits;
+/// - the HIGH memo visits no layer (the durability shortcut).
+///
+/// If this ceiling fails, the stamp view (the last stage of the chain views) is due.
+#[test]
+fn a_low_memo_stamp_lookup_is_bounded() {
+    let db = Db::default();
+    let low = File::new(&db, "low".to_owned());
+    let high = File::builder("high".to_owned())
+        .durability(Durability::HIGH)
+        .new(&db);
+    let written: Vec<File> = (0..DIAGNOSED)
+        .map(|i| File::new(&db, format!("written {i}")))
+        .collect();
+    assert_eq!(text_len(&db, low), 3);
+    assert_eq!(text_len(&db, high), 4);
+    fork::freeze(&db);
+
+    // Each layer writes a LOW input, so LOW changed in it, and then checks both memos: the LOW
+    // memo deep-verifies and is stamped in the layer, the HIGH memo passes on durability.
+    let mut layer = fork::root_layer(&db);
+    for (i, &file) in written.iter().enumerate() {
+        let layer_db = layered(&db, &layer);
+        fork::set_input_field::<File, _>(&layer_db, file, 0, |fields| {
+            fields.0 = format!("layer {i}");
+        });
+        assert_eq!(text_len(&layer_db, low), 3);
+        assert_eq!(text_len(&layer_db, high), 4);
+        drop(layer_db);
+        if i + 1 < DIAGNOSED {
+            layer.seal().expect("no handle carries the layer");
+            layer = fork::child_layer(&layer);
+        }
+    }
+    let top = layer;
+    assert_eq!(top.stats().memos, 0, "both base memos stay valid");
+    assert_eq!(top.stats().stamps, 1, "the LOW memo is stamped in the top");
+
+    // A warm repeat in the top layer: the LOW memo's stamp is the top's own.
+    let top_db = layered(&db, &top);
+    let before = top.stats().stamp_visits;
+    assert_eq!(text_len(&top_db, low), 3);
+    assert_eq!(text_len(&top_db, high), 4);
+    assert_eq!(top.stats().stamp_visits - before, 1);
+    drop(top_db);
+
+    // A fresh child of the diagnosed chain: the LOW memo's newest stamp is its parent's.
+    top.seal().expect("no handle carries the layer");
+    let child = fork::child_layer(&top);
+    let child_db = layered(&db, &child);
+    assert_eq!(text_len(&child_db, low), 3);
+    assert_eq!(text_len(&child_db, high), 4);
+    let first = child.stats().stamp_visits;
+    assert!(first <= 2, "a fresh child's first check visited {first} layers");
+    assert_eq!(child.stats().memos, 0);
 }
 
 #[test]
@@ -170,8 +238,18 @@ fn the_chain_unique_counts_are_the_union_over_the_chain() {
     assert_eq!(root.stats().chain_unique_memo_keys, 1);
 }
 
+/// The cancel epoch is process-wide: a test that cancels a token makes every layer of a test
+/// running beside it walk once more, so the tests that cancel or count cancellation walks take
+/// this lock.
+static CANCEL_SERIAL: Mutex<()> = Mutex::new(());
+
+fn cancel_serial() -> MutexGuard<'static, ()> {
+    CANCEL_SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[test]
 fn no_cancel_no_walk() {
+    let _serial = cancel_serial();
     let db = Db::default();
     let files: Vec<File> = (0..8)
         .map(|i| File::new(&db, format!("file {i}")))
@@ -180,11 +258,63 @@ fn no_cancel_no_walk() {
     let (top, _below) = deep_chain(&db);
     let top_db = layered(&db, &top);
 
+    // A layer's cached answer starts at "no cancel" (epoch 0); a cancel of a token earlier in
+    // the process makes the first check walk once, and no later check walks.
+    assert_eq!(text_len(&top_db, files[0]), 6);
     let before = top.stats().cancel_walks;
+    assert!(before <= 1, "the first fetch walked {before} times");
     for &file in &files {
         assert_eq!(text_len(&top_db, file), 6);
     }
-    let walks = top.stats().cancel_walks - before;
-    // No token was cancelled, yet every fetch walks the ancestors' tokens once.
-    assert_eq!(walks, files.len());
+    // No token was cancelled since: no fetch walks the ancestors' tokens (a walk on every fetch
+    // walked 8 times).
+    assert_eq!(top.stats().cancel_walks - before, 0);
+}
+
+#[test]
+fn a_repeated_cancel_bumps_the_epoch_once() {
+    let _serial = cancel_serial();
+    let db = Db::default();
+    let files: Vec<File> = (0..4)
+        .map(|i| File::new(&db, format!("file {i}")))
+        .collect();
+    fork::freeze(&db);
+    let (top, _below) = deep_chain(&db);
+    let top_db = layered(&db, &top);
+    // A sibling chain's token, cancelled again and again (a deadline loop).
+    let sibling = fork::root_layer(&db);
+    let token = sibling.cancellation_token();
+
+    assert_eq!(text_len(&top_db, files[0]), 6);
+    let before = top.stats().cancel_walks;
+    for (i, &file) in files.iter().enumerate() {
+        for _ in 0..16 {
+            token.cancel();
+        }
+        assert_eq!(text_len(&top_db, file), 6, "fetch {i}");
+    }
+    // Only the first cancel raised the epoch: one walk, at the next fetch; the top's chain is
+    // not cancelled (a walk on every fetch walked 4 times).
+    assert_eq!(top.stats().cancel_walks - before, 1);
+}
+
+#[test]
+fn a_cancel_after_a_cached_answer_is_seen() {
+    let _serial = cancel_serial();
+    let db = Db::default();
+    let file = File::new(&db, "file".to_owned());
+    fork::freeze(&db);
+    let (top, below) = deep_chain(&db);
+    let top_db = layered(&db, &top);
+    assert_eq!(text_len(&top_db, file), 4);
+    let walks = top.stats().cancel_walks;
+
+    // The cached "not cancelled" is dropped by the epoch the cancel raises: the next check walks,
+    // finds the cancelled ancestor and unwinds, and keeps that answer without walking again.
+    below[DEPTH / 2].cancellation_token().cancel();
+    for _ in 0..3 {
+        let cancelled = catch_unwind(AssertUnwindSafe(|| top_db.unwind_if_revision_cancelled()));
+        assert!(cancelled.is_err());
+    }
+    assert_eq!(top.stats().cancel_walks - walks, 1);
 }

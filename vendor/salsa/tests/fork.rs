@@ -660,3 +660,41 @@ fn a_base_handle_clone_touches_no_layer_counter() {
     assert_eq!(layer.handles(), 0);
     layer.seal().expect("no handle carries the layer");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The durability shortcut is a layer's only (D11)
+
+#[salsa::tracked(returns(copy))]
+fn durable_length(db: &dyn Database, file: File) -> usize {
+    file.text(db).len()
+}
+
+/// The base fingerprint of a base that computed a HIGH memo, then took a LOW write, and, when
+/// `refetch`, fetched the memo again before its freeze.
+fn fingerprint_after(refetch: bool) -> fork::BaseFingerprint {
+    let mut db = Db::default();
+    let low = File::new(&db, "low".to_owned());
+    let high = File::builder("high".to_owned())
+        .durability(Durability::HIGH)
+        .new(&db);
+    assert_eq!(durable_length(&db, high), 4);
+    low.set_text(&mut db).to("changed".to_owned());
+    if refetch {
+        assert_eq!(durable_length(&db, high), 4);
+    }
+    fork::freeze(&db);
+    fork::base_fingerprint(&db)
+}
+
+#[test]
+fn a_base_handle_shallow_verify_is_upstreams() {
+    // On a base handle a memo that passes on durability is marked verified at the new revision
+    // (upstream's `HigherDurability`): the refetch changes the memo's `verified_at`, which the
+    // fingerprint reads. The layer's shortcut records nothing and must not reach this path.
+    let refetched = fingerprint_after(true);
+    assert_eq!(refetched, fingerprint_after(true), "the fingerprint is deterministic");
+    assert!(
+        refetched.preserved_in(&fingerprint_after(false)).is_err(),
+        "a base handle's durability pass left the memo's verified_at as it was"
+    );
+}

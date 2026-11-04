@@ -66,7 +66,12 @@ impl CancellationToken {
 
     /// Inform the database to cancel the current query computation.
     pub fn cancel(&self) {
-        self.0.fetch_or(Self::CANCELLED_MASK, Ordering::Relaxed);
+        // ryo-v2 fork: the first cancel of the token raises the fork's cancel epoch, so a layer
+        // walks its ancestors' tokens only after a cancel; a repeated cancel costs nothing more
+        let previous = self.0.fetch_or(Self::CANCELLED_MASK, Ordering::Relaxed);
+        if previous & Self::CANCELLED_MASK == 0 {
+            crate::fork::record_first_cancel();
+        }
     }
 
     /// Check if the query computation has been requested to be cancelled.

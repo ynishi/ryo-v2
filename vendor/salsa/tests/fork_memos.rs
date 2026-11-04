@@ -1316,3 +1316,43 @@ fn the_disabled_bit_is_per_handle() {
     let cancelled = catch_unwind(AssertUnwindSafe(|| second.unwind_if_revision_cancelled()));
     assert!(cancelled.is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// The durability shortcut (D11)
+
+#[salsa::tracked(returns(copy))]
+fn stale_durable_len(db: &dyn Database, file: File) -> usize {
+    STALE_DURABLE_RUNS.fetch_add(1, Ordering::SeqCst);
+    file.text(db).len()
+}
+static STALE_DURABLE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn a_durable_memo_stale_in_the_base_is_still_verified_deeply() {
+    // The base's HIGH memo was computed before a HIGH write and not fetched again before the
+    // freeze: the base's HIGH last-changed revision is above the memo's `verified_at`, so the
+    // shortcut does not pass it, and a layer deep-verifies it and runs it again.
+    let mut db = Db::default();
+    let high = File::builder("high".to_owned())
+        .durability(Durability::HIGH)
+        .new(&db);
+    assert_eq!(stale_durable_len(&db, high), 4);
+    high.set_text(&mut db)
+        .with_durability(Durability::HIGH)
+        .to("changed high".to_owned());
+    fork::freeze(&db);
+    let before = fork::base_fingerprint(&db);
+
+    let layer = fork::root_layer(&db);
+    let layer_db = layered(&db, &layer);
+    assert_eq!(stale_durable_len(&layer_db, high), 12);
+    assert_eq!(STALE_DURABLE_RUNS.load(Ordering::SeqCst), 2);
+    let stats = layer.stats();
+    assert_eq!((stats.deep_verifies, stats.memos), (1, 1));
+    // The layer's own memo now passes at once, and the base is untouched.
+    assert_eq!(stale_durable_len(&layer_db, high), 12);
+    assert_eq!(STALE_DURABLE_RUNS.load(Ordering::SeqCst), 2);
+    drop(layer_db);
+    assert_eq!(before.preserved_in(&fork::base_fingerprint(&db)), Ok(()));
+    assert_eq!(fork::refused_writes(&db), 0);
+}

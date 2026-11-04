@@ -23,8 +23,16 @@
 //!   A sealed layer that gets a child (or a lookup on a handle of it) builds a *chain view* of
 //!   the memos, tombstones and tracked-struct entries (module `flat`): per key the entry the walk
 //!   over the chain would find, so a memo or tracked lookup under a layer is at most four map
-//!   probes (the layer's own, then its parent's view), whatever the depth. Stamps are still
-//!   looked up layer by layer;
+//!   probes (the layer's own, then its parent's view), whatever the depth. A memo above `LOW`
+//!   is checked against the base's last-changed revision of its durability before any stamp
+//!   (E3: only `LOW` changes in a layer), so it looks no stamp up when that passes. A `LOW`
+//!   memo's stamp is still looked up layer by layer, newest first: on a warm check it is in the
+//!   reading layer or its parent (a decision with a ceiling, SEARCH_LEDGER D11);
+//! - its `LOW` last-changed revision: its own when it set an input, else the one its ancestors
+//!   fixed when it was made (a sealed ancestor takes no write), read without a walk;
+//! - whether an ancestor's cancellation token was cancelled, cached per process-wide cancel
+//!   epoch, which only a token's first cancel raises: the ancestors are walked only after a
+//!   cancel;
 //! - for a tracked struct the layer re-created, an entry with the new fields, per-field revisions,
 //!   durability and its own `updated_at` (the layer's revision); the struct keeps its id. A stale
 //!   struct is tombstoned in the layer, never deleted from the base;
@@ -113,6 +121,21 @@ static LAYER_REVISION: AtomicUsize = AtomicUsize::new(0);
 
 /// Source of the identities that tie a layer to one freeze of its base (never 0).
 static BASE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The process-wide cancel epoch: raised once by every first cancel of a token (a cancel that
+/// sets the token's cancelled bit, [`CancellationToken::cancel`]), never by a repeated cancel of
+/// a cancelled token. A layer caches whether an ancestor is cancelled per epoch
+/// (`Layer::cancel_seen`), so it walks its ancestors' tokens only after a cancel somewhere in
+/// the process. 0 means no token was ever cancelled.
+static CANCEL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Raises the cancel epoch: called by [`CancellationToken::cancel`] after it set a token's
+/// cancelled bit that was clear (its `fetch_or` is sequenced before this `Release`, so a reader
+/// that loads the new epoch with `Acquire` sees the bit).
+#[inline]
+pub(crate) fn record_first_cancel() {
+    CANCEL_EPOCH.fetch_add(1, Ordering::Release);
+}
 
 /// Takes the next layer revision.
 fn next_layer_revision() -> Revision {
@@ -500,6 +523,14 @@ pub struct Layer {
     /// refused while one lives.
     handles: AtomicUsize,
     written: AtomicBool,
+    /// The revision of the newest ancestor that has writes ([`Layer::last_written`] of the
+    /// parent), fixed at [`Layer::new`]: the parent is sealed, so no ancestor takes a write again.
+    inherited_last_written: Option<Revision>,
+    /// The ancestors' cancellation as last read, packed as `epoch << 1 | cancelled`, `epoch` the
+    /// [`CANCEL_EPOCH`] the read began at ([`Layer::ancestor_cancelled`]). It starts at 0, which
+    /// is right because epoch 0 means no token was ever cancelled. Only raised (`fetch_max`): a
+    /// layer's cancellation is final, so a `true` cached after its cancel was counted stays.
+    cancel_seen: AtomicU64,
     /// Whether a query wrote into the layer (a memo, stamp, entry or tombstone).
     queried: AtomicBool,
     /// Held by an input write for its whole read-modify-insert and by [`Layer::seal`]: a write
@@ -591,6 +622,7 @@ impl Layer {
             }
             None => Box::default(),
         };
+        let inherited_last_written = ancestors.last().and_then(|parent| parent.last_written());
         Arc::new(Layer {
             slot_counters,
             owned: Mutex::new(OwnedSlots::default()),
@@ -600,6 +632,8 @@ impl Layer {
             state: AtomicU8::new(OPEN),
             handles: AtomicUsize::new(0),
             written: AtomicBool::new(false),
+            inherited_last_written,
+            cancel_seen: AtomicU64::new(0),
             queried: AtomicBool::new(false),
             write: Mutex::new(()),
             token: CancellationToken::default(),
@@ -872,15 +906,47 @@ impl Layer {
         SlotCounters::add(&self.slot_counters.leaked, 1);
     }
 
-    /// The revision of the newest layer of the chain that has writes, if any.
+    /// The revision of the newest layer of the chain that has writes, if any: this layer's own
+    /// when it has written, else the one its ancestors fixed at [`Layer::new`]. Reads no ancestor.
+    #[inline]
     pub(crate) fn last_written(&self) -> Option<Revision> {
-        self.chain().find(|l| l.has_writes()).map(|l| l.revision)
+        if self.has_writes() {
+            Some(self.revision)
+        } else {
+            self.inherited_last_written
+        }
     }
 
     /// Whether an ancestor's token (not this layer's own) was cancelled.
+    ///
+    /// The answer is cached per [cancel epoch](CANCEL_EPOCH): the ancestors' tokens are walked
+    /// only when a token somewhere was cancelled since the last walk. Correct because:
+    /// - the `Acquire` load of the epoch pairs with the `Release` raise of every counted cancel,
+    ///   so a walk begun at epoch `e` sees every cancel counted up to `e`;
+    /// - an ancestor is a sealed layer and a layer's token is never reset (`uncancel` leaves a
+    ///   layer's token), so once a cancel is counted the answer stays `true`;
+    /// - a cancel racing a check is seen at the next check, as with the walk alone. Before its
+    ///   epoch raise lands, a walk at a newer epoch may still read the bit clear and cache `false`
+    ///   over an earlier `true`; the raise then forces a walk that sees it.
+    #[inline]
     pub(crate) fn ancestor_cancelled(&self) -> bool {
+        let epoch = CANCEL_EPOCH.load(Ordering::Acquire);
+        let seen = self.cancel_seen.load(Ordering::Relaxed);
+        if seen >> 1 == epoch {
+            return seen & 1 != 0;
+        }
+        self.walk_ancestor_tokens(epoch)
+    }
+
+    /// The walk of [`Layer::ancestor_cancelled`] after a cancel, cached at `epoch`.
+    #[cold]
+    #[inline(never)]
+    fn walk_ancestor_tokens(&self, epoch: u64) -> bool {
         self.probe.add(ProbeKind::CancelWalks, 1);
-        self.ancestors.iter().any(|l| l.token.is_cancelled())
+        let cancelled = self.ancestors.iter().any(|l| l.token.is_cancelled());
+        self.cancel_seen
+            .fetch_max((epoch << 1) | u64::from(cancelled), Ordering::Relaxed);
+        cancelled
     }
 
     /// The dependency graph of this layer's blocked threads and transfers.

@@ -534,4 +534,31 @@ mod tests {
         );
         assert_eq!(layer.stats().flat_bytes, view.bytes());
     }
+
+    #[test]
+    fn last_written_reads_no_ancestor() {
+        // A written root, a write-free middle layer and a top: the top's LOW last-changed
+        // revision is the root's, fixed when the top was made (the durability shortcut, D11).
+        let root = root();
+        root.written.store(true, std::sync::atomic::Ordering::Release);
+        root.seal().unwrap();
+        let middle = child(&root);
+        middle.seal().unwrap();
+        let top = child(&middle);
+        assert_eq!(top.last_written(), Some(root.revision()));
+
+        // Flags changed behind the sealed ancestors' backs (no path does this; a sealed layer
+        // takes no write, E9) are not read: the answer comes from no ancestor. A walk over the
+        // chain would find the middle layer.
+        middle.written.store(true, std::sync::atomic::Ordering::Release);
+        root.written.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(top.last_written(), Some(root.revision()));
+        // The layer's own write counts at once.
+        top.written.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(top.last_written(), Some(top.revision()));
+        // A chain with no write has none.
+        let fresh = self::root();
+        fresh.seal().unwrap();
+        assert_eq!(child(&fresh).last_written(), None);
+    }
 }
