@@ -14,8 +14,9 @@ mod alloc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use ryo_v2_core::domain::Scope;
+use ryo_v2_core::domain::{RelPath, Scope};
 use ryo_v2_host::engine_probe::{self, BenchMedian, DepthProbeArgs, ProbeArgs};
+use ryo_v2_host::layer_cost::{self, EditClass, LayerCostArgs};
 use ryo_v2_ra::Backend;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,7 +28,8 @@ static COUNTING: alloc::Counting = alloc::Counting::new();
 #[derive(Parser)]
 #[command(
     name = "engine-probe",
-    about = "Measure what a loaded session holds and what each stacked check adds to the heap"
+    about = "Measure what a loaded session holds and what each stacked check adds to the heap",
+    group(clap::ArgGroup::new("stacks").args(["depth", "layer_cost"]))
 )]
 struct Cli {
     /// The workspace to load.
@@ -69,15 +71,62 @@ struct Cli {
         conflicts_with_all = ["on", "variants", "bench_median"]
     )]
     depth: Option<u32>,
-    /// With `--depth`: the number of workspace files (in path order) the levels rotate over
+    /// With `--depth` or `--layer-cost`: the number of workspace files (in path order) the
+    /// levels rotate over
     /// [default: 1].
-    #[arg(long, requires = "depth", value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(long, requires = "stacks", value_parser = clap::value_parser!(u32).range(1..))]
     depth_files: Option<u32>,
     /// With `--depth`: the run fails (after its report is written) when the chain views of a
     /// stack take more than this percentage of its heap (gate M2-view)
     /// [default: `engine_probe::M2_VIEW_MAX_SHARE_PCT`, 15].
     #[arg(long, value_name = "PCT", requires = "depth", value_parser = parse_pct)]
     max_view_share: Option<f64>,
+    /// Measure what one layer of the fork Engine costs (always on the Engine): per edit class of
+    /// `--classes`, a stack one level deeper than the largest of `--view-depths`, each level
+    /// written and diagnosed once before the next. The report is a `LayerCostReport`: per level
+    /// the heap it keeps, its transient peak and the bytes of its chain view; per class the
+    /// quantiles and the view bytes at each view depth.
+    #[arg(
+        long,
+        conflicts_with_all = ["on", "variants", "bench_median", "depth", "engine"]
+    )]
+    layer_cost: bool,
+    /// With `--layer-cost`: the edit classes [default: body,item].
+    #[arg(long, value_enum, value_delimiter = ',', requires = "layer_cost")]
+    classes: Vec<ClassArg>,
+    /// With `--layer-cost`: the depths whose chain-view bytes are reported [default: 1,10,20].
+    #[arg(
+        long,
+        value_delimiter = ',',
+        requires = "layer_cost",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    view_depths: Vec<u32>,
+    /// With `--layer-cost`: `RaConfig.threads`, the threads of one diagnosis [default: the
+    /// available parallelism].
+    #[arg(long, requires = "layer_cost", value_parser = clap::value_parser!(u32).range(1..))]
+    threads: Option<u32>,
+    /// With `--layer-cost`: the workspace files (relative paths) the levels rotate over, in
+    /// this order, instead of the first `--depth-files` in path order.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        requires = "layer_cost",
+        conflicts_with = "depth_files",
+        value_parser = parse_rel
+    )]
+    layer_files: Vec<RelPath>,
+}
+
+/// A `--layer-files` path: a workspace-relative path.
+fn parse_rel(text: &str) -> Result<RelPath, String> {
+    RelPath::parse(text).map_err(|e| format!("{text:?}: {e}"))
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ClassArg {
+    Body,
+    Item,
 }
 
 /// A `--max-view-share` value: a percentage from 0 to 100.
@@ -141,6 +190,43 @@ fn run() -> Result<()> {
         ScopeArg::Workspace => vec![Scope::Workspace],
         ScopeArg::Both => vec![Scope::Affected, Scope::Workspace],
     };
+    if cli.layer_cost {
+        let classes = if cli.classes.is_empty() {
+            vec![EditClass::Body, EditClass::Item]
+        } else {
+            cli.classes
+                .iter()
+                .map(|c| match c {
+                    ClassArg::Body => EditClass::Body,
+                    ClassArg::Item => EditClass::Item,
+                })
+                .collect()
+        };
+        let args = LayerCostArgs {
+            base: cli.base,
+            classes,
+            view_depths: if cli.view_depths.is_empty() {
+                vec![1, 10, 20]
+            } else {
+                cli.view_depths
+            },
+            files: cli.depth_files.unwrap_or(1),
+            paths: cli.layer_files,
+            scopes,
+            threads: cli.threads.map(|t| t as usize),
+            idle: cli.idle,
+        };
+        let report = layer_cost::run_layer_cost(&args, &COUNTING)?;
+        engine_probe::write_report(&report, &cli.report)
+            .with_context(|| format!("the report {}", cli.report.display()))?;
+        eprintln!(
+            "[probe] layer cost, depth {}, {} series, report {}",
+            report.depth,
+            report.series.len(),
+            cli.report.display()
+        );
+        return Ok(());
+    }
     if let Some(depth) = cli.depth {
         let args = DepthProbeArgs {
             base: cli.base,
@@ -324,6 +410,98 @@ mod tests {
                 "/b",
                 "--max-view-share",
                 "5",
+                "--report",
+                "/o"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_parses_layer_cost() {
+        let cli = Cli::try_parse_from([
+            "engine-probe",
+            "/b",
+            "--layer-cost",
+            "--classes",
+            "body,item",
+            "--view-depths",
+            "1,10,20",
+            "--depth-files",
+            "4",
+            "--threads",
+            "1",
+            "--report",
+            "/o/layer-cost.json",
+        ])
+        .unwrap();
+        assert!(cli.layer_cost);
+        assert_eq!(cli.classes.len(), 2);
+        assert_eq!(cli.view_depths, [1, 10, 20]);
+        assert_eq!((cli.depth_files, cli.threads), (Some(4), Some(1)));
+        assert!(cli.layer_files.is_empty());
+        let chosen = Cli::try_parse_from([
+            "engine-probe",
+            "/b",
+            "--layer-cost",
+            "--layer-files",
+            "a/src/lib.rs,b/src/x.rs",
+            "--report",
+            "/o",
+        ])
+        .unwrap();
+        assert_eq!(
+            chosen.layer_files,
+            [
+                RelPath::parse("a/src/lib.rs").unwrap(),
+                RelPath::parse("b/src/x.rs").unwrap()
+            ]
+        );
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
+        // Only on the Engine, which it always runs on, and not with another mode.
+        for other in [&["--engine"][..], &["--depth", "2"], &["--on", "/p", "/v"]] {
+            let args = [
+                &["engine-probe", "/b", "--layer-cost", "--report", "/o"][..],
+                other,
+            ]
+            .concat();
+            assert!(parse(&args).is_err(), "{other:?}");
+        }
+        // Its options need it; a depth is at least 1.
+        assert!(parse(&["engine-probe", "/b", "--classes", "body", "--report", "/o"]).is_err());
+        assert!(parse(&["engine-probe", "/b", "--threads", "2", "--report", "/o"]).is_err());
+        assert!(
+            parse(&[
+                "engine-probe",
+                "/b",
+                "--layer-files",
+                "a.rs",
+                "--report",
+                "/o"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "engine-probe",
+                "/b",
+                "--layer-cost",
+                "--layer-files",
+                "a.rs",
+                "--depth-files",
+                "2",
+                "--report",
+                "/o"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "engine-probe",
+                "/b",
+                "--layer-cost",
+                "--view-depths",
+                "0",
                 "--report",
                 "/o"
             ])

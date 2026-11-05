@@ -41,6 +41,7 @@ impl Probe {
                 assert_revert_every: None,
                 cfg_test: false,
                 engine: false,
+                ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),
@@ -493,6 +494,7 @@ pub struct Note {\n    pub text: String,\n}\n";
                 assert_revert_every: None,
                 cfg_test: false,
                 engine: false,
+                ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),
@@ -567,6 +569,7 @@ pub struct Note {\n    pub text: String,\n}\n";
                     assert_revert_every: None,
                     cfg_test: false,
                     engine: false,
+                    ..Default::default()
                 },
                 Arc::new(MonotonicClock::new()),
                 Arc::new(RecordingObserver::default()),

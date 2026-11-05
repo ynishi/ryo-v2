@@ -18,7 +18,7 @@ use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath, UnseenClass}
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Maps a rust-analyzer code to an E-code where it is one.
@@ -211,13 +211,74 @@ const DETECTORS: [(GapDetector, Detect); 3] = [
     (GapDetector::FieldBounds, field_bounds::find),
 ];
 
+/// The error of a payload caught around a diagnosis: a salsa cancellation is `Cancelled` (the
+/// check could not finish: its database was cancelled), never a panic; a cancellation salsa
+/// raises because a query another thread was computing panicked (`PropagatedPanic`) is that
+/// panic; any other payload is `Panicked` with its message.
+fn caught(payload: Box<dyn std::any::Any + Send>) -> AnalyzerError {
+    match payload.downcast::<Cancelled>() {
+        Ok(cancelled) => match *cancelled {
+            Cancelled::PropagatedPanic => AnalyzerError::Panicked(cancelled.to_string()),
+            _ => AnalyzerError::Cancelled,
+        },
+        Err(payload) => AnalyzerError::Panicked(panic_message(payload)),
+    }
+}
+
 /// What a collect needs to run, and to report on, the detectors of [`DETECTORS`].
 #[derive(Clone, Copy)]
 pub(crate) struct Detector<'a> {
-    /// Detector and file on which that detector is made to panic (test hook).
-    pub(crate) fault: Option<&'a (GapDetector, RelPath)>,
+    /// Detector and file on which that detector is made to panic, or to raise a salsa
+    /// cancellation (test hook).
+    pub(crate) fault: Option<&'a crate::DetectorFault>,
     /// Where a contained detector panic is recorded.
     pub(crate) panics: &'a Mutex<BTreeSet<DetectorPanic>>,
+    /// Counts the threads diagnosing (test hook `RaAnalyzer::with_thread_count`).
+    pub(crate) probe: Option<&'a ThreadCount>,
+}
+
+/// The threads that diagnose files at once, over every collect of an analyzer, and the most
+/// threads one collect spread over: what a test of the thread budget of `Forks` reads
+/// (`RaAnalyzer::with_thread_count`). Only [`collect_errors_par`] spawns threads in a diagnosis,
+/// so it is counted there.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ThreadCount {
+    now: AtomicUsize,
+    most: AtomicUsize,
+    most_in_one: AtomicUsize,
+}
+
+impl ThreadCount {
+    /// The most threads that diagnosed files at once.
+    pub fn most(&self) -> usize {
+        self.most.load(Ordering::SeqCst)
+    }
+
+    /// The most threads one diagnosis spread its files over.
+    pub fn most_in_one(&self) -> usize {
+        self.most_in_one.load(Ordering::SeqCst)
+    }
+
+    /// One thread starts diagnosing; it stops when the guard drops.
+    fn enter(&self) -> Busy<'_> {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        Busy(self)
+    }
+
+    fn spread(&self, threads: usize) {
+        self.most_in_one.fetch_max(threads, Ordering::SeqCst);
+    }
+}
+
+/// A thread of [`ThreadCount`] that is diagnosing.
+struct Busy<'a>(&'a ThreadCount);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Whether `code` is one rust-analyzer 0.0.358 gives a macro call it could not expand: an
@@ -255,6 +316,12 @@ fn is_unexpanded_macro(code: &DiagnosticCode) -> bool {
 ///   crates holds both, and the baseline difference and the revert asserts compare the
 ///   attributed file against its own baseline.
 ///   tested: tests/attribution.rs include_of_another_crates_file_is_not_loaded
+/// - C5: a salsa cancellation raised while a file is diagnosed, inside a gap detector included,
+///   is `Cancelled`, never `Panicked`: an error kind says whether the check could not finish or
+///   panicked. The cancellation salsa raises on a thread whose query another thread was
+///   computing when that thread panicked (a propagated panic) is that panic, `Panicked`.
+///   tested: tests/timeout.rs a_cancel_inside_a_detector_is_cancelled
+///   tested: diagnostics::tests::a_caught_cancellation_is_cancelled_and_a_propagated_panic_is_panicked
 fn collect_errors(
     analysis: &Analysis,
     db: Option<&RootDatabase>,
@@ -263,6 +330,7 @@ fn collect_errors(
     deadline: Option<&Deadline>,
     detector: Detector<'_>,
 ) -> Result<Collected, AnalyzerError> {
+    let _busy = detector.probe.map(ThreadCount::enter);
     let diag_config = diagnostics_config();
     let known: HashMap<FileId, &RelPath> = known.iter().map(|(id, rel)| (*id, rel)).collect();
     let mut errors = Collected::default();
@@ -328,14 +396,21 @@ fn collect_errors(
                     // Each detector is contained on its own: a panic in one costs this file
                     // that detector's findings, not the others' and not the collect.
                     let hits = catch_unwind(AssertUnwindSafe(|| {
-                        if detector.fault.is_some_and(|(d, r)| *d == which && r == rel) {
+                        if let Some(fault) = detector.fault
+                            && fault.detector == which
+                            && &fault.path == rel
+                        {
+                            if fault.cancel {
+                                std::panic::resume_unwind(Box::new(Cancelled::Local));
+                            }
                             panic!("{} detector fault injected on {rel}", which);
                         }
                         run(db, *file_id, &inactive, &line_of)
                     }))
                     .unwrap_or_else(|payload| {
                         // salsa 0.28 raises its cancellation with `resume_unwind`; it is not a
-                        // detector fault, so it goes on to the outer catch as before.
+                        // detector fault, so it goes on to the outer catch, which makes it
+                        // `Cancelled`.
                         if payload.downcast_ref::<Cancelled>().is_some() {
                             std::panic::resume_unwind(payload);
                         }
@@ -367,7 +442,7 @@ fn collect_errors(
             }
             Ok::<_, ()>(found)
         }))
-        .map_err(|p| AnalyzerError::Panicked(panic_message(p)))?;
+        .map_err(caught)?;
         errors.extend(got.map_err(|()| AnalyzerError::Cancelled)?);
     }
     Ok(errors)
@@ -447,6 +522,9 @@ pub(crate) fn collect_errors_par(
     detector: Detector<'_>,
 ) -> Result<Collect, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
+        if let Some(probe) = detector.probe {
+            probe.spread(1);
+        }
         let db = gap_detectors.then(|| host.raw_database().clone());
         return collect_errors(
             &host.analysis(),
@@ -460,6 +538,9 @@ pub(crate) fn collect_errors_par(
     }
     let chunk_size = files.len().div_ceil(threads);
     let chunks: Vec<&[(FileId, RelPath)]> = files.chunks(chunk_size).collect();
+    if let Some(probe) = detector.probe {
+        probe.spread(chunks.len());
+    }
     let snapshots: Vec<(Analysis, Option<RootDatabase>)> = (0..chunks.len())
         .map(|_| {
             (
@@ -480,9 +561,7 @@ pub(crate) fn collect_errors_par(
             })
             .collect();
         for h in handles {
-            let got = h
-                .join()
-                .map_err(|p| AnalyzerError::Panicked(panic_message(p)))?;
+            let got = h.join().map_err(caught)?;
             errors.extend(got?);
         }
         Ok(())
@@ -493,6 +572,29 @@ pub(crate) fn collect_errors_par(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caught_cancellation_is_cancelled_and_a_propagated_panic_is_panicked() {
+        assert!(matches!(
+            caught(Box::new(Cancelled::Local)),
+            AnalyzerError::Cancelled
+        ));
+        assert!(matches!(
+            caught(Box::new(Cancelled::PendingWrite)),
+            AnalyzerError::Cancelled
+        ));
+        assert!(
+            matches!(
+                caught(Box::new(Cancelled::PropagatedPanic)),
+                AnalyzerError::Panicked(_)
+            ),
+            "a propagated panic is a panic"
+        );
+        assert!(matches!(
+            caught(Box::new("boom")),
+            AnalyzerError::Panicked(m) if m == "boom"
+        ));
+    }
 
     #[test]
     fn classify_maps_rustc_hard_error() {

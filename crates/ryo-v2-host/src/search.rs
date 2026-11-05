@@ -57,6 +57,7 @@ fn search_with<J: Judge>(args: &SearchArgs, request: &Request, judge: &J) -> Res
             assert_revert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
             cfg_test: true,
             engine: false,
+            ..Default::default()
         },
         clock.clone(),
         Arc::new(RecordingObserver::default()),

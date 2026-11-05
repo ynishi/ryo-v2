@@ -46,8 +46,12 @@ fn diff_gib(to: u64, from: u64) -> f64 {
 pub trait HeapGauge: Sync {
     /// The bytes allocated and not yet freed.
     fn live_bytes(&self) -> u64;
-    /// The most bytes that were live at once since the process started.
+    /// The most bytes that were live at once since the process started, or since the last
+    /// [`HeapGauge::reset_peak`].
     fn peak_bytes(&self) -> u64;
+    /// Starts the peak again from the bytes live now, so that the next `peak_bytes` is the most
+    /// live at once from here on (the transient peak of one operation).
+    fn reset_peak(&self);
 }
 
 /// Reads the resident set size in kB: `proc::vm_rss_kb`, or a failing reader in a test.
@@ -967,6 +971,9 @@ mod tests {
         }
         fn peak_bytes(&self) -> u64 {
             self.peak.load(Ordering::SeqCst)
+        }
+        fn reset_peak(&self) {
+            self.peak.store(self.live_bytes(), Ordering::SeqCst);
         }
     }
 

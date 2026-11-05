@@ -14,6 +14,10 @@
 //!   write and may have children; a query on a sealed layer runs in a throwaway child
 //!   ([`SealedLayer::read`]).
 //! - [`Frozen::thaw`] gives the database back once no layer and no other handle of it lives.
+//! - [`Jobs`] runs jobs on layers on a pool of worker threads (stage 3b): a write job opens a
+//!   child of a sealed layer, writes, queries and seals it; a read job queries a throwaway child.
+//!   [`Budget`] sizes the pool, and [`Jobs::cancel`] withdraws a job and cancels its layer alone
+//!   ([`OpenLayer::canceller`]).
 //!
 //! LRU (salsa fork, E8): the base evicts no LRU value while frozen nor at the thaw, and layers
 //! record no LRU use. A value the base evicted would be recomputed, and never written back, by
@@ -33,6 +37,10 @@
 //! under a layer, with their memos, stamps and re-created structs held by the layer.
 
 #![forbid(unsafe_code)]
+
+mod jobs;
+
+pub use jobs::{Budget, Hooks, JobCtx, JobKey, Jobs, Outcome, Point, Recv};
 
 use std::collections::HashSet;
 use std::fmt;
@@ -461,9 +469,35 @@ impl<Db: EngineDb> OpenLayer<Db> {
         self.layer.stats()
     }
 
+    /// Runs `f` on this layer's database as a write-free throwaway child, then drops the layer:
+    /// [`SealedLayer::read`], and the read jobs of [`Jobs`], which register the layer's
+    /// canceller before `f` runs.
+    fn read_throwaway<R>(self, f: impl FnOnce(&Db) -> R) -> Result<R, EngineError> {
+        let result = f(&self.db);
+        if Arc::strong_count(&self.layer) != OWN_REFERENCES {
+            return Err(EngineError::InUse);
+        }
+        Ok(result)
+    }
+
     /// The layer's revision: unique in the process, above its parent's and the base's.
     pub fn revision(&self) -> Revision {
         self.layer.revision()
+    }
+
+    /// A handle that cancels the queries of this layer, from any thread. An open layer has no
+    /// children, so the cancel stops this layer alone: its parent, its siblings and every other
+    /// layer keep running. A [`SealedLayer`] has no canceller, since its token would stop every
+    /// descendant. The cancel is final for the layer.
+    ///
+    /// # Contract
+    /// - C1: after `cancel` a query on this layer raises salsa's cancellation at its next fetch,
+    ///   while the parent, a sibling and a read of the parent run to their end.
+    ///   tested: tests/jobs.rs cancel_leaves_parent_and_siblings
+    pub fn canceller(&self) -> Canceller {
+        Canceller {
+            token: self.layer.cancellation_token(),
+        }
     }
 
     /// The text of `file` as this layer sees it: the newest text its chain set, else the base's.
@@ -534,6 +568,34 @@ impl<Db> Deref for LayerDb<'_, Db> {
     }
 }
 
+/// Cancels the queries of one open layer ([`OpenLayer::canceller`]); `Send + Sync`, cheap to
+/// clone.
+#[derive(Clone)]
+pub struct Canceller {
+    token: salsa::CancellationToken,
+}
+
+impl fmt::Debug for Canceller {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Canceller")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl Canceller {
+    /// Cancels the layer: a query on it raises salsa's `Cancelled` at its next fetch, verify or
+    /// specify. A write is never torn by it, since salsa checks the token at none of them.
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    /// Whether the layer was cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 /// A layer that takes no write: the base ([`Frozen::root`]) or a sealed [`OpenLayer`]. Cheap to
 /// clone; dropping the last clone (and every child) frees the layer. Its clauses are those of
 /// [`OpenLayer`].
@@ -579,12 +641,18 @@ impl<Db: EngineDb> SealedLayer<Db> {
     /// afterwards. When a clone of that database outlives `f`, returns [`EngineError::InUse`]
     /// instead of the result of `f`.
     pub fn read<R>(&self, f: impl FnOnce(&Db) -> R) -> Result<R, EngineError> {
-        let child = self.child();
-        let result = f(&child.db);
-        if Arc::strong_count(&child.layer) != OWN_REFERENCES {
-            return Err(EngineError::InUse);
-        }
-        Ok(result)
+        self.child().read_throwaway(f)
+    }
+
+    /// Whether this layer descends from `frozen`'s base (this freeze of it): the brand a caller
+    /// checks before it pairs a layer it was handed with a base it holds.
+    ///
+    /// # Contract
+    /// - C1: true for the root and every layer of `frozen`, false for every layer of another
+    ///   frozen base.
+    ///   tested: tests/jobs.rs is_of_tells_the_base
+    pub fn is_of(&self, frozen: &Frozen<Db>) -> bool {
+        Arc::ptr_eq(&self.base, &frozen.base)
     }
 
     /// The text of `file` as this layer sees it: the newest text its chain set, else the base's.

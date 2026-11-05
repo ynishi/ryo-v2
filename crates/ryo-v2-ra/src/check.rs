@@ -2,7 +2,7 @@
 //! session as it found it.
 
 use crate::RaAnalyzer;
-use crate::diagnostics::{Deadline, Detector, collect_errors_par};
+use crate::diagnostics::{Deadline, Detector, GapDetector, collect_errors_par};
 use crate::fork::{self, RevertFailure};
 use crate::rev_deps::scoped_files;
 use crate::session::{ForkPort, RaSession};
@@ -146,10 +146,21 @@ fn finish_check(
     deadline: Option<&Deadline>,
     diagnosed: Result<fork::Diagnosed, AnalyzerError>,
 ) -> Result<ScopedFindings, CheckError> {
+    finish_diagnosis(a.check_timeout_ms, &s.baseline_panics, deadline, diagnosed)
+}
+
+/// [`finish_check`] given the time limit and the baseline's detector panics instead of the
+/// analyzer and the session, for a diagnosis on a worker of `Forks`.
+pub(crate) fn finish_diagnosis(
+    check_timeout_ms: Option<u64>,
+    baseline_panics: &BTreeSet<(GapDetector, RelPath)>,
+    deadline: Option<&Deadline>,
+    diagnosed: Result<fork::Diagnosed, AnalyzerError>,
+) -> Result<ScopedFindings, CheckError> {
     let (mut found, panics) = match diagnosed {
         Ok(diagnosed) => diagnosed,
         Err(AnalyzerError::Cancelled) => {
-            return Err(match a.check_timeout_ms {
+            return Err(match check_timeout_ms {
                 Some(limit_ms) if deadline.is_some_and(Deadline::was_hit) => {
                     CheckError::TimedOut { limit_ms }
                 }
@@ -162,7 +173,7 @@ fn finish_check(
     // edit: named, not a failure. A new one means the file cannot be judged.
     let mut new_panic = None;
     for (detector, file) in panics {
-        if s.baseline_panics.contains(&(detector, file.clone())) {
+        if baseline_panics.contains(&(detector, file.clone())) {
             found
                 .unseen_at
                 .entry(detector.unseen_class())
@@ -463,6 +474,7 @@ impl RevertAudit for RaAnalyzer {
                 Detector {
                     fault: self.detector_fault.as_ref(),
                     panics: &s.detector_panics,
+                    probe: self.thread_count.as_deref(),
                 },
             )
         };

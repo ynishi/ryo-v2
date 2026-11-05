@@ -127,6 +127,35 @@ pub(crate) fn kb_line(file: &Path, key: &'static str) -> Result<u64, ProcError> 
     parse_kb(file, &read(file)?, key)
 }
 
+/// The threads of this process, the `Threads` line of `/proc/self/status`: rust-analyzer's
+/// dropper threads and the job pool's workers included.
+///
+/// # Contract
+/// - C1: the figure is the one number after `Threads:` on the first line that starts with it; no
+///   such line, or a field that is not a number or is followed by anything, is
+///   `ProcError::Field` naming the file and the key.
+///   tested: proc::tests::threads_reads_the_count
+pub fn threads() -> Result<u64, ProcError> {
+    let file = Path::new(STATUS);
+    parse_count(file, &read(file)?, "Threads:")
+}
+
+/// The number of the first `<key> <n>` line of `text`, a count without a unit.
+fn parse_count(file: &Path, text: &str, key: &'static str) -> Result<u64, ProcError> {
+    let fields: Option<Vec<&str>> = text
+        .lines()
+        .find_map(|l| l.strip_prefix(key))
+        .map(|rest| rest.split_whitespace().collect());
+    match fields.as_deref() {
+        Some([n]) => n.parse::<u64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| ProcError::Field {
+        file: file.to_path_buf(),
+        field: key,
+    })
+}
+
 /// The memory of the machine in kB, the `MemTotal` line of `/proc/meminfo`.
 ///
 /// # Contract
@@ -248,6 +277,29 @@ mod tests {
     #[test]
     fn vm_rss_of_this_process_reads() {
         assert!(vm_rss_kb().unwrap() > 0);
+    }
+
+    #[test]
+    fn threads_reads_the_count() {
+        let f = Path::new(STATUS);
+        assert_eq!(
+            parse_count(f, "Name:\tx\nThreads:\t17\nThreads:\t2\n", "Threads:").unwrap(),
+            17
+        );
+        for text in [
+            "Name:\tx\n",
+            "Threads:\n",
+            "Threads:\tmany\n",
+            "Threads:\t3 kB\n",
+        ] {
+            match parse_count(f, text, "Threads:") {
+                Err(e @ ProcError::Field { .. }) => {
+                    assert!(e.to_string().contains("Threads:"), "{e}");
+                }
+                other => panic!("{text:?}: {other:?}"),
+            }
+        }
+        assert!(threads().unwrap() >= 1);
     }
 
     #[test]

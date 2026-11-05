@@ -95,6 +95,8 @@ pub(crate) enum ForkPort {
     Analyzer,
     /// `Stacked::fork`, or a fork opened inside the adapter for a `Verifier::check`.
     Stacked,
+    /// `Forks::open`: the base is frozen and jobs write layers over it, until `Forks::close`.
+    Forks,
 }
 
 /// The live fork of a session: the id its ticket carries, and the port that opened it.
@@ -165,6 +167,9 @@ pub struct RaSession {
     /// level created, on either backend; the map never forgets one). A layer creating one of
     /// them sets its inputs in the layer instead of creating them.
     pub(crate) created_in_db: BTreeSet<FileId>,
+    /// The forks opened by `Forks::open` (`live` is then of `ForkPort::Forks`), until
+    /// `Forks::close` thaws the base.
+    pub(crate) forks: Option<crate::forks::ForksState>,
 }
 
 impl RaSession {
@@ -260,6 +265,24 @@ impl RaSession {
             .then(|| ryo_v2_engine::counters(self.host.raw_database()))
     }
 
+    /// Drains the changes the session's vfs has queued and returns how many there were; for the
+    /// tests that every vfs write of a fork drains its change (nothing else reads them).
+    #[doc(hidden)]
+    pub fn take_vfs_changes(&mut self) -> usize {
+        self.vfs.take_changes().len()
+    }
+
+    /// Whether the session's vfs holds a file at `path` (as a created file has while it is
+    /// registered); for the tests of when a created file leaves the vfs.
+    #[doc(hidden)]
+    pub fn vfs_has(&self, path: &RelPath) -> bool {
+        let abs = ra_ap_vfs::AbsPathBuf::assert_utf8(self.root.join(path.as_str()));
+        matches!(
+            self.vfs.file_id(&ra_ap_vfs::VfsPath::from(abs)),
+            Some((_, ra_ap_vfs::FileExcluded::No))
+        )
+    }
+
     /// The `FileId` of the load-time file `path`, if it is one.
     #[doc(hidden)]
     pub fn file_id(&self, path: &RelPath) -> Option<FileId> {
@@ -281,6 +304,7 @@ fn rel_of(root: &Path, path: &Path) -> Option<RelPath> {
 
 pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerError> {
     let t0 = a.clock.now_ms();
+    refuse_postcard(a.config.engine, std::env::var_os(POSTCARD).as_deref())?;
     let root = root
         .canonicalize()
         .map_err(|e| AnalyzerError::Load(format!("workspace root {}: {e}", root.display())))?;
@@ -300,8 +324,9 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         },
         prefill_caches: false,
         num_worker_threads: 4,
-        // 0 makes ra_ap_proc_macro_api's process pool empty, and it panics.
-        proc_macro_processes: 2,
+        // Never 0 (a `NonZeroUsize`): 0 makes ra_ap_proc_macro_api's process pool empty, and it
+        // panics.
+        proc_macro_processes: a.config.proc_macro_processes.get(),
     };
 
     let (db, vfs, _proc_macro) = catch_unwind(AssertUnwindSafe(|| {
@@ -350,6 +375,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         Detector {
             fault: a.detector_fault.as_ref(),
             panics: &detector_panics,
+            probe: a.thread_count.as_deref(),
         },
     )?;
     let baseline_panics: BTreeSet<(GapDetector, RelPath)> = collected.panics.into_iter().collect();
@@ -388,5 +414,44 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         frozen: None,
         spare_db: None,
         created_in_db: BTreeSet::new(),
+        forks: None,
     })
+}
+
+/// The environment variable that switches rust-analyzer's proc-macro client to its
+/// bidirectional (postcard) protocol.
+const POSTCARD: &str = "RUST_ANALYZER_USE_POSTCARD";
+
+/// The refusal of a load on the Engine (`engine`) in an environment where `postcard` (the value
+/// of [`POSTCARD`], if set) switches the proc-macro client to the bidirectional protocol, which
+/// runs salsa queries under a server's lock (`RaConfig.engine` C2).
+fn refuse_postcard(engine: bool, postcard: Option<&std::ffi::OsStr>) -> Result<(), AnalyzerError> {
+    match postcard {
+        Some(_) if engine => Err(AnalyzerError::Load(format!(
+            "{POSTCARD} is set: its proc-macro protocol runs queries of a layer under a server's \
+             lock, which the forks of the Engine can deadlock on; unset it"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn postcard_protocol_is_refused_at_load() {
+        // Read as rust-analyzer reads it: set at all, whatever the value.
+        for value in ["1", "", "0"] {
+            let refused = refuse_postcard(true, Some(OsStr::new(value)));
+            assert!(
+                matches!(&refused, Err(AnalyzerError::Load(m)) if m.contains(POSTCARD)),
+                "{value:?}: {refused:?}"
+            );
+            assert!(refuse_postcard(false, Some(OsStr::new(value))).is_ok());
+        }
+        assert!(refuse_postcard(true, None).is_ok());
+        assert!(refuse_postcard(false, None).is_ok());
+    }
 }

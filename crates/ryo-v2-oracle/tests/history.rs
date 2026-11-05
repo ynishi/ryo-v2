@@ -67,6 +67,7 @@ fn run_pair(pair: &HistoryPair, proc_macro: bool) -> Result<(Outcome, Option<u64
             assert_revert_every: None,
             cfg_test: switch_on("RYO_V2_ORACLE_CFG_TEST"),
             engine: false,
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),

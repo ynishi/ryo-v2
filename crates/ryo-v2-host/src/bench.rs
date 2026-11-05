@@ -422,11 +422,23 @@ pub(crate) fn load(
     assert_revert: bool,
     backend: Backend,
 ) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
+    load_on_threads(base, proc_macro, assert_revert, backend, None)
+}
+
+/// [`load`] with `RaConfig.threads` set to `threads` (`None`: the available parallelism).
+pub(crate) fn load_on_threads(
+    base: &std::path::Path,
+    proc_macro: bool,
+    assert_revert: bool,
+    backend: Backend,
+    threads: Option<usize>,
+) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
     let observer = Arc::new(RecordingObserver::default());
     let analyzer = RaAnalyzer::new(
         RaConfig {
             proc_macro,
             assert_revert,
+            threads,
             ..RaConfig::default()
         }
         .with_backend(backend),

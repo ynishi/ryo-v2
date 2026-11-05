@@ -123,6 +123,9 @@
 //!   diagnosed at the top level, reverted level by level.
 //! - Level: one write of a stacked fork, on top of the level below; the base state is below the
 //!   first.
+//! - Forks: a verifier whose forks are layers over a frozen base, any number alive at once; a job
+//!   writes edits on top of a finished layer and is checked on a pool of workers, and its outcome
+//!   comes back by its job id, or as a withdrawal. includes: JobId, Checked, Next
 //! - RevertAudit: a check that undoing a candidate's edits returns the files to the base.
 //! - ExpandError: why an expander could not propose.
 //! - JudgeError: why a judge could not answer.
