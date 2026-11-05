@@ -167,6 +167,7 @@ fn oracle() {
                 assert_revert_every: None,
                 cfg_test: cfg_test_on,
                 engine: false,
+                ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
             observer.clone(),

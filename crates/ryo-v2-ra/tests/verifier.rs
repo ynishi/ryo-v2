@@ -67,6 +67,7 @@ fn load(
             assert_revert_every: every.and_then(std::num::NonZeroU32::new),
             cfg_test,
             engine: common::engine(),
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),
@@ -231,6 +232,7 @@ fn assert_analyzer(fault: bool) -> RaAnalyzer {
             assert_revert_every: None,
             cfg_test: false,
             engine: common::engine(),
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -375,6 +377,7 @@ fn provenance_records_the_gap_detector_switch_on() {
                 assert_revert_every: None,
                 cfg_test: false,
                 engine: common::engine(),
+                ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),
@@ -412,6 +415,7 @@ fn provenance_of(f: &Fixture) -> ryo_v2_core::domain::Provenance {
             assert_revert_every: None,
             cfg_test: false,
             engine: common::engine(),
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),

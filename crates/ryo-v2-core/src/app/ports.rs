@@ -553,44 +553,52 @@ pub enum Next<L> {
 ///   id, ids increasing in submission order; edits are resolved at submit, and a refused edit is a
 ///   `Done` with `Edit` and no layer, never an `Err` of `submit`.
 ///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
-///   tested: ryo-v2-engine tests/jobs.rs one_outcome_per_submit
+///   tested: ryo-v2-ra tests/forks.rs a_refused_edit_is_a_done_without_a_layer
+///   tested: ryo-v2-ra tests/forks.rs parallel_jobs_equal_serial_and_the_reference
 /// - C2: the layer of a `Done` diagnoses as its flat composition: at `Scope::Workspace` its
 ///   findings are what `Verifier::check` gives for the edits that take the base to its state,
 ///   and at `Scope::Affected` its files are the job's scope with the findings that check gives on
 ///   them, whatever ran beside it.
 ///   tested: app::ports::tests::a_done_layer_diagnoses_as_its_flat_composition_for_the_fake
-///   tested: ryo-v2-engine tests/jobs.rs results_do_not_depend_on_the_width
+///   tested: ryo-v2-ra tests/forks.rs parallel_jobs_equal_serial_and_the_reference
 /// - C3: `cancel` returning true makes the job's outcome `Withdrawn`, never a `Done`, and leaves
 ///   the parent and every other job as they were; a job that already finished is not withdrawn
 ///   (false), and its outcome is what it produced.
 ///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
+///   tested: ryo-v2-ra tests/forks.rs a_cancel_withdraws_only_its_job
 ///   tested: ryo-v2-engine tests/jobs.rs cancel_true_is_always_withdrawn
-///   tested: ryo-v2-engine tests/jobs.rs cancel_leaves_parent_and_siblings
 /// - C4: at most `width` jobs run at once, an expansion's read jobs among them; with T the
 ///   adapter's threads, `width` is at most `max(1, T - 1)` when the caller works between its
 ///   calls and at most T when it only waits in `next`, and a job's diagnosis uses that share
 ///   divided by `width`, rounded down, and at least one thread.
-///   tested: ryo-v2-engine tests/jobs.rs width_and_job_threads_fit_the_budget
+///   tested: ryo-v2-ra tests/forks.rs job_threads_times_jobs_fit_the_budget
 ///   tested: ryo-v2-engine tests/jobs.rs a_read_job_counts_in_the_width
 /// - C5: a Layer whose base is not this session's is `ForkInUse` before anything else, the
 ///   poison included, and changes nothing.
 ///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
+///   tested: ryo-v2-ra tests/forks.rs a_layer_of_another_session_is_refused
 /// - C6: while forks are open, `Verifier::check`, `Stacked::fork` and `RevertAudit::audit_revert`
 ///   are `ForkInUse`, `Expander::expand` is `ExpandError::Session` with `ForkInUse`, and a second
 ///   `open` is `ForkInUse`; none of them changes anything.
 ///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
+///   tested: ryo-v2-ra tests/forks.rs session_operations_refuse_while_forks_are_open
+///   tested: ryo-v2-ra tests/forks.rs expand_refuses_while_forks_are_open
 /// - C7: a write the frozen base refused poisons the session and withdraws every job not yet
 ///   delivered: `next` gives their `Withdrawn`, then `Poisoned`. The full isolation check of the
 ///   base runs only while no job runs, so under continuous load only at `close`.
 ///   tested: app::ports::tests::a_refused_base_write_poisons_the_fake
+///   tested: ryo-v2-ra tests/forks.rs a_refused_base_write_poisons_and_withdraws
 /// - C8: `close` withdraws every job, joins the workers and checks the isolation of the base;
 ///   with a Layer still held it is `ForkInUse`, the base stays frozen and only `layer_files`,
 ///   `layer_text`, the reads of `Verifier` and `close` are allowed, until a `close` after the
 ///   last Layer is dropped thaws the base. A caller that keeps a Layer keeps the base frozen.
 ///   tested: app::ports::tests::a_refused_close_can_be_retried_on_the_fake
+///   tested: ryo-v2-ra tests/forks.rs a_refused_close_can_be_retried
+///   tested: ryo-v2-ra tests/forks.rs isolation_holds_after_parallel_jobs
 /// - C9: `open` on an adapter whose forks write into the session's one database (the undo-log
 ///   backend) is `ForkInUse`: forks need the Engine backend.
 ///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
+///   tested: ryo-v2-ra tests/forks.rs forks_need_the_engine_backend
 pub trait Forks: Verifier {
     /// A finished job's layer, or the base's root: what a job writes on top of. Holding one
     /// keeps the base frozen (C8).

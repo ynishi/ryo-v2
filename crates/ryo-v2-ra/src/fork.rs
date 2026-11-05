@@ -376,6 +376,7 @@ fn findings_of(
         Detector {
             fault: a.detector_fault.as_ref(),
             panics: &session.detector_panics,
+            probe: a.thread_count.as_deref(),
         },
     )?
     .findings)
@@ -492,13 +493,7 @@ pub(crate) fn diagnose_files(
     live: &[(FileId, RelPath)],
     deadline: Option<&Deadline>,
 ) -> Result<Diagnosed, AnalyzerError> {
-    if a.diagnose_panic {
-        // The test hook: the diagnosis fails as a panic of rust-analyzer in a query would.
-        return Err(AnalyzerError::Panicked(
-            "injected diagnosis panic".to_owned(),
-        ));
-    }
-    let collected = collect_errors_par(
+    diagnose_on(
         host,
         diag_scope,
         live,
@@ -508,7 +503,40 @@ pub(crate) fn diagnose_files(
         Detector {
             fault: a.detector_fault.as_ref(),
             panics: &session.detector_panics,
+            probe: a.thread_count.as_deref(),
         },
+        a.diagnose_panic,
+    )
+}
+
+/// [`diagnose_files`] given what it needs without the session, for a diagnosis on a worker of
+/// `Forks`: `threads` and `gap_detectors` as the collect takes them, `detector` where its panics
+/// go, and `diagnose_panic` the test hook that makes the diagnosis fail as a panic of
+/// rust-analyzer in a query would.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn diagnose_on(
+    host: &AnalysisHost,
+    diag_scope: &[(FileId, RelPath)],
+    live: &[(FileId, RelPath)],
+    threads: usize,
+    gap_detectors: bool,
+    deadline: Option<&Deadline>,
+    detector: Detector<'_>,
+    diagnose_panic: bool,
+) -> Result<Diagnosed, AnalyzerError> {
+    if diagnose_panic {
+        return Err(AnalyzerError::Panicked(
+            "injected diagnosis panic".to_owned(),
+        ));
+    }
+    let collected = collect_errors_par(
+        host,
+        diag_scope,
+        live,
+        threads,
+        gap_detectors,
+        deadline,
+        detector,
     )?;
     let mut files: Vec<RelPath> = diag_scope.iter().map(|(_, r)| r.clone()).collect();
     files.sort();

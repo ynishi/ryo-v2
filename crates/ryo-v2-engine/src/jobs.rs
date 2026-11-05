@@ -10,7 +10,9 @@
 //! The pool is owned by one caller thread: submitting, receiving and cancelling take `&mut self`.
 //! Each job has a state, changed only by compare-and-swap, which alone decides whether its
 //! outcome is a withdrawal: `Queued → Running → Finished`, or `Queued | Running → Withdrawn`. An
-//! error kind never decides it; a salsa cancellation the caller did not ask for is a panic.
+//! error kind never decides it. A salsa cancellation the caller did not ask for is
+//! `Outcome::Cancelled` (the job could not finish), as rust-analyzer's adapter names one raised
+//! inside a diagnosis; one salsa raises because another thread's query panicked is that panic.
 //!
 //! Locks: the queue is a `Mutex<VecDeque>` with a `Condvar`, held only to push, pop or remove a
 //! task (W workers pull from one queue, and `std::sync::mpsc` has a single consumer). Outcomes go
@@ -189,8 +191,12 @@ pub enum Outcome<Db: EngineDb, R, E> {
     /// The caller withdrew the job ([`Jobs::cancel`] returned true). No layer and nothing the
     /// closure produced. (The jobs [`Jobs::close`] withdraws are not delivered.)
     Withdrawn,
-    /// The closure panicked (a salsa cancellation the caller did not ask for included), or the
-    /// worker panicked outside it; the layer was dropped.
+    /// The closure raised a salsa cancellation the caller did not ask for (the job was not
+    /// withdrawn): the job could not finish; the layer was dropped. A cancellation salsa raises
+    /// because a query another thread was computing panicked (`Cancelled::PropagatedPanic`) is
+    /// that panic, `Panicked`.
+    Cancelled,
+    /// The closure panicked, or the worker panicked outside it; the layer was dropped.
     Panicked(String),
 }
 
@@ -202,6 +208,7 @@ impl<Db: EngineDb, R: fmt::Debug, E: fmt::Debug> fmt::Debug for Outcome<Db, R, E
             Outcome::Failed(e) => f.debug_tuple("Failed").field(e).finish(),
             Outcome::Refused(e) => f.debug_tuple("Refused").field(e).finish(),
             Outcome::Withdrawn => f.write_str("Withdrawn"),
+            Outcome::Cancelled => f.write_str("Cancelled"),
             Outcome::Panicked(m) => f.debug_tuple("Panicked").field(m).finish(),
         }
     }
@@ -368,16 +375,18 @@ type Delivered<Db, R, E> = (JobKey, Outcome<Db, R, E>);
 /// # Contract
 /// - C1: until the pool is closed or dropped, every accepted job yields exactly one outcome
 ///   through `recv`, with its key: a write
-///   job that ran `Sealed`, `Failed`, `Refused` or `Panicked`, a read job `Read`, `Failed`,
-///   `Refused` or `Panicked`, and a withdrawn one `Withdrawn`; once all are delivered `recv` is
+///   job that ran `Sealed`, `Failed`, `Refused`, `Cancelled` or `Panicked`, a read job `Read`,
+///   `Failed`, `Refused`, `Cancelled` or `Panicked`, and a withdrawn one `Withdrawn`; once all are
+///   delivered `recv` is
 ///   `Idle` at once.
 ///   tested: tests/jobs.rs one_outcome_per_submit
 /// - C2: `cancel` returns true only when it withdrew a queued or running job, and then the
 ///   job's outcome is `Withdrawn`; whether it is `Withdrawn` is decided from the job's state alone,
 ///   never from what its closure returned or raised; a finished job's cancel is false and its
-///   outcome what it produced.
+///   outcome what it produced. A salsa cancellation the closure raised without a withdrawal is
+///   `Cancelled`, a propagated panic `Panicked`.
 ///   tested: tests/jobs.rs cancel_true_is_always_withdrawn
-///   tested: tests/jobs.rs a_cancelled_payload_without_withdrawal_is_panicked
+///   tested: tests/jobs.rs a_cancelled_payload_without_withdrawal_is_cancelled
 /// - C3: at most `width` jobs, write and read, run at once.
 ///   tested: tests/jobs.rs a_read_job_counts_in_the_width
 /// - C4: a panic of a worker outside a job's closure still delivers that job's outcome
@@ -680,7 +689,7 @@ fn run<Db: EngineDb + Send, R: Send + 'static, E: Send + 'static>(
                 }
                 Err(payload) => {
                     drop(layer);
-                    Outcome::Panicked(message(&*payload))
+                    unwound(&*payload)
                 }
             }
         }
@@ -696,7 +705,7 @@ fn run<Db: EngineDb + Send, R: Send + 'static, E: Send + 'static>(
                 Ok(Ok(Ok(value))) => Outcome::Read(value),
                 Ok(Ok(Err(error))) => Outcome::Failed(error),
                 Ok(Err(refused)) => Outcome::Refused(refused),
-                Err(payload) => Outcome::Panicked(message(&*payload)),
+                Err(payload) => unwound(&*payload),
             }
         }
     };
@@ -719,15 +728,24 @@ fn start(shared: &Shared, canceller: Canceller, threads: NonZeroUsize) -> Option
     })
 }
 
-/// The text of a panic payload. A salsa cancellation here is one the caller did not ask for (a
-/// withdrawal is decided from the job's state before this is read), so it is named as such.
+/// The outcome of a closure that unwound with `payload`. A salsa cancellation here is one the
+/// caller did not ask for (a withdrawal is decided from the job's state, after this), so it is
+/// `Cancelled`; a propagated panic, and every other payload, is `Panicked` with its text.
+fn unwound<Db: EngineDb, R, E>(payload: &(dyn Any + Send)) -> Outcome<Db, R, E> {
+    match payload.downcast_ref::<salsa::Cancelled>() {
+        Some(salsa::Cancelled::PropagatedPanic) | None => Outcome::Panicked(message(payload)),
+        Some(_) => Outcome::Cancelled,
+    }
+}
+
+/// The text of a panic payload.
 fn message(payload: &(dyn Any + Send)) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
         (*text).to_owned()
     } else if let Some(text) = payload.downcast_ref::<String>() {
         text.clone()
     } else if let Some(cancelled) = payload.downcast_ref::<salsa::Cancelled>() {
-        format!("a salsa cancellation the caller did not ask for: {cancelled}")
+        format!("a salsa cancellation: {cancelled}")
     } else {
         "a panic with a payload that is not a string".to_owned()
     }

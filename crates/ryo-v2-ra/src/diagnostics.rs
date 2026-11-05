@@ -18,7 +18,7 @@ use ryo_v2_core::domain::{ErrorCode, Finding, FindingCode, RelPath, UnseenClass}
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Maps a rust-analyzer code to an E-code where it is one.
@@ -233,6 +233,52 @@ pub(crate) struct Detector<'a> {
     pub(crate) fault: Option<&'a crate::DetectorFault>,
     /// Where a contained detector panic is recorded.
     pub(crate) panics: &'a Mutex<BTreeSet<DetectorPanic>>,
+    /// Counts the threads diagnosing (test hook `RaAnalyzer::with_thread_count`).
+    pub(crate) probe: Option<&'a ThreadCount>,
+}
+
+/// The threads that diagnose files at once, over every collect of an analyzer, and the most
+/// threads one collect spread over: what a test of the thread budget of `Forks` reads
+/// (`RaAnalyzer::with_thread_count`). Only [`collect_errors_par`] spawns threads in a diagnosis,
+/// so it is counted there.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct ThreadCount {
+    now: AtomicUsize,
+    most: AtomicUsize,
+    most_in_one: AtomicUsize,
+}
+
+impl ThreadCount {
+    /// The most threads that diagnosed files at once.
+    pub fn most(&self) -> usize {
+        self.most.load(Ordering::SeqCst)
+    }
+
+    /// The most threads one diagnosis spread its files over.
+    pub fn most_in_one(&self) -> usize {
+        self.most_in_one.load(Ordering::SeqCst)
+    }
+
+    /// One thread starts diagnosing; it stops when the guard drops.
+    fn enter(&self) -> Busy<'_> {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        Busy(self)
+    }
+
+    fn spread(&self, threads: usize) {
+        self.most_in_one.fetch_max(threads, Ordering::SeqCst);
+    }
+}
+
+/// A thread of [`ThreadCount`] that is diagnosing.
+struct Busy<'a>(&'a ThreadCount);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Whether `code` is one rust-analyzer 0.0.358 gives a macro call it could not expand: an
@@ -284,6 +330,7 @@ fn collect_errors(
     deadline: Option<&Deadline>,
     detector: Detector<'_>,
 ) -> Result<Collected, AnalyzerError> {
+    let _busy = detector.probe.map(ThreadCount::enter);
     let diag_config = diagnostics_config();
     let known: HashMap<FileId, &RelPath> = known.iter().map(|(id, rel)| (*id, rel)).collect();
     let mut errors = Collected::default();
@@ -475,6 +522,9 @@ pub(crate) fn collect_errors_par(
     detector: Detector<'_>,
 ) -> Result<Collect, AnalyzerError> {
     if threads <= 1 || files.len() < 8 {
+        if let Some(probe) = detector.probe {
+            probe.spread(1);
+        }
         let db = gap_detectors.then(|| host.raw_database().clone());
         return collect_errors(
             &host.analysis(),
@@ -488,6 +538,9 @@ pub(crate) fn collect_errors_par(
     }
     let chunk_size = files.len().div_ceil(threads);
     let chunks: Vec<&[(FileId, RelPath)]> = files.chunks(chunk_size).collect();
+    if let Some(probe) = detector.probe {
+        probe.spread(chunks.len());
+    }
     let snapshots: Vec<(Analysis, Option<RootDatabase>)> = (0..chunks.len())
         .map(|_| {
             (

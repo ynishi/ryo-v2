@@ -57,6 +57,7 @@ impl Probe {
                 assert_revert_every: None,
                 cfg_test: false,
                 engine: false,
+                ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),
@@ -311,6 +312,7 @@ fn detector_panic_is_contained_per_file() {
                 assert_revert_every: None,
                 cfg_test: false,
                 engine: false,
+                ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),
@@ -372,6 +374,7 @@ fn detector_panic_is_contained_per_file() {
                 assert_revert_every: None,
                 cfg_test: false,
                 engine: false,
+                ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
             Arc::new(RecordingObserver::default()),

@@ -104,6 +104,7 @@ fn one_planted_case_runs_end_to_end() {
             assert_revert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
             cfg_test: true,
             engine: false,
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
@@ -210,6 +211,7 @@ fn stacked_verdicts_on(engine: bool) {
             assert_revert_every: NonZeroU32::new(1),
             cfg_test: true,
             engine,
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),

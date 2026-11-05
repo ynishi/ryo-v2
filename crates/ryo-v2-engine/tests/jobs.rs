@@ -412,7 +412,7 @@ fn cancel_true_is_always_withdrawn() {
 }
 
 #[test]
-fn a_cancelled_payload_without_withdrawal_is_panicked() {
+fn a_cancelled_payload_without_withdrawal_is_cancelled() {
     let (db, files, _) = base(1);
     let file = files[0];
     let frozen = Engine::freeze(db);
@@ -432,13 +432,19 @@ fn a_cancelled_payload_without_withdrawal_is_panicked() {
         std::panic::resume_unwind(Box::new(salsa::Cancelled::Local))
     });
     let outcomes = drain(&mut jobs);
-    for key in [own, propagated, read] {
-        match &outcomes[&key] {
-            Outcome::Panicked(message) => {
-                assert!(message.contains("cancellation"), "{message}");
-            }
-            other => panic!("{key:?}: {other:?}"),
-        }
+    // Not withdrawn, so never `Withdrawn`: the job could not finish (`Cancelled`, the kind
+    // rust-analyzer's adapter gives a cancellation inside a diagnosis), or another thread's
+    // panic reached it (`Panicked`).
+    for key in [own, read] {
+        assert!(
+            matches!(&outcomes[&key], Outcome::Cancelled),
+            "{key:?}: {:?}",
+            outcomes[&key]
+        );
+    }
+    match &outcomes[&propagated] {
+        Outcome::Panicked(message) => assert!(message.contains("cancellation"), "{message}"),
+        other => panic!("{propagated:?}: {other:?}"),
     }
     assert_eq!(jobs.close(), 0);
 }

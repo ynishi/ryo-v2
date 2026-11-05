@@ -44,6 +44,7 @@ pub(crate) fn run_apply(args: &ApplyArgs) -> Result<ExitCode> {
             assert_revert_every: None,
             cfg_test: true,
             engine: false,
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),

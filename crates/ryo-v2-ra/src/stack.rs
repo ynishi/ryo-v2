@@ -66,7 +66,9 @@ pub(crate) enum ExpandOn {
 }
 
 /// The guard of an expansion: the poison first; then a live `Analyzer` fork is `ForkInUse`, and a
-/// live stacked fork is read at its top level.
+/// live stacked fork is read at its top level. Forks that are open are `ForkInUse` too (`Forks`
+/// C6): the base is frozen and `expand` takes no Layer to read (stage 4 reads one in a pool read
+/// job).
 pub(crate) fn expand_on(s: &RaSession) -> Result<ExpandOn, CheckError> {
     if let Some(msg) = &s.poisoned {
         return Err(CheckError::Poisoned(msg.clone()));
@@ -74,7 +76,7 @@ pub(crate) fn expand_on(s: &RaSession) -> Result<ExpandOn, CheckError> {
     match s.live.map(|l| l.port) {
         None => Ok(ExpandOn::Base),
         Some(ForkPort::Stacked) => Ok(ExpandOn::StackedTop),
-        Some(ForkPort::Analyzer) => Err(CheckError::ForkInUse),
+        Some(ForkPort::Analyzer | ForkPort::Forks) => Err(CheckError::ForkInUse),
     }
 }
 

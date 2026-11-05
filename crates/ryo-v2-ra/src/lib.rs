@@ -13,6 +13,7 @@ mod engine;
 mod expand;
 mod field_bounds;
 mod fork;
+mod forks;
 mod memory;
 mod rev_deps;
 mod session;
@@ -25,8 +26,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use assess::SyntaxAssessor;
-pub use diagnostics::GapDetector;
+pub use diagnostics::{GapDetector, ThreadCount};
 pub use fork::RaFork;
+pub use forks::RaLayer;
 pub use memory::{IngredientRow, MemoRow, MemoryReport};
 /// A layer's own counters on the fork Engine ([`RaSession::level_stats`]).
 pub use ryo_v2_engine::LayerStats;
@@ -81,8 +83,51 @@ pub struct RaConfig {
     ///   tested: tests/stack.rs a_stack_diagnoses_as_its_flat_composition
     ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
     ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
+    /// - C2: with `engine` on, `load` refuses a process whose environment sets
+    ///   `RUST_ANALYZER_USE_POSTCARD` (`AnalyzerError::Load`), and with it off the variable is
+    ///   no reason to refuse: with it the proc-macro server's bidirectional protocol runs salsa
+    ///   queries of a layer while it holds a server's lock, a lock cycle with the claims of the
+    ///   layer's other threads that salsa cannot see once forks run side by side (D11, 3b).
+    ///   tested: session::tests::postcard_protocol_is_refused_at_load
     pub engine: bool,
+    /// The forks that run side by side on the Engine (`Forks`, D11 stage 3b); read at
+    /// `Forks::open`.
+    pub forks: ForksConfig,
+    /// The proc-macro server processes the load starts (with `proc_macro`), fixed for the
+    /// session: the jobs of `Forks` share them.
+    pub proc_macro_processes: std::num::NonZeroUsize,
 }
+
+/// How [`RaAnalyzer`]'s `Forks` shares the session's threads (`RaConfig.threads`, T) among the
+/// jobs it runs at once.
+///
+/// With N = `width` and c = 1 when `caller_works` (else 0), the workers' share is
+/// `T_w = max(1, T - c)`, `Forks::width` is `W = min(N, T_w)` and a job's diagnosis runs on
+/// `t = max(1, T_w / W)` threads, so the busy threads, the caller's included, are at most T.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForksConfig {
+    /// N, the jobs asked to run at once; `None` = the workers' whole share, `T_w`.
+    pub width: Option<std::num::NonZeroUsize>,
+    /// Whether the caller's own thread works between its calls (it expands, judges, assesses):
+    /// it is then counted out of the workers' share. `false` for a caller that only waits in
+    /// `Forks::next` (a bench).
+    pub caller_works: bool,
+}
+
+impl Default for ForksConfig {
+    fn default() -> Self {
+        Self {
+            width: None,
+            caller_works: true,
+        }
+    }
+}
+
+/// The proc-macro server processes a load starts by default (`RaConfig.proc_macro_processes`).
+const PROC_MACRO_PROCESSES: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(2) {
+    Some(n) => n,
+    None => std::num::NonZeroUsize::MIN,
+};
 
 impl Default for RaConfig {
     fn default() -> Self {
@@ -94,6 +139,8 @@ impl Default for RaConfig {
             assert_revert_every: None,
             cfg_test: true,
             engine: false,
+            forks: ForksConfig::default(),
+            proc_macro_processes: PROC_MACRO_PROCESSES,
         }
     }
 }
@@ -206,7 +253,16 @@ pub struct RaAnalyzer {
     pub(crate) audit_fault: bool,
     /// Whether every diagnosis of a level panics before it diagnoses a file; a test hook.
     pub(crate) diagnose_panic: bool,
+    /// Counts the threads diagnosing at once; a test hook.
+    pub(crate) thread_count: Option<Arc<ThreadCount>>,
+    /// Runs on a `Forks` job's worker between its writes and its diagnosis; a test hook.
+    pub(crate) job_hook: Option<JobHook>,
+    /// Whether every `Forks` job writes the frozen base after its own writes; a test hook.
+    pub(crate) job_base_write: bool,
 }
+
+/// A test hook run on the worker of a `Forks` job ([`RaAnalyzer::with_job_hook`]).
+pub(crate) type JobHook = Arc<dyn Fn(ryo_v2_core::app::ports::JobId) + Send + Sync>;
 
 /// The fault the test hooks `RaAnalyzer::with_detector_fault` and
 /// `RaAnalyzer::with_detector_cancel` put on one detector and file.
@@ -244,7 +300,40 @@ impl RaAnalyzer {
             db_read_fault: None,
             audit_fault: false,
             diagnose_panic: false,
+            thread_count: None,
+            job_hook: None,
+            job_base_write: false,
         }
+    }
+
+    /// Counts, in `count`, the threads that diagnose files at once and the most one diagnosis
+    /// spreads over, in every diagnosis this analyzer runs. For the tests of the thread budget of
+    /// `Forks`; nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_thread_count(mut self, count: Option<Arc<ThreadCount>>) -> RaAnalyzer {
+        self.thread_count = count;
+        self
+    }
+
+    /// Runs `hook` with the job's id on the worker of every `Forks` job, after the job's writes
+    /// and before its diagnosis (a delay, a rendezvous, a raised salsa cancellation). For the
+    /// tests of jobs side by side; nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_job_hook(
+        mut self,
+        hook: Option<Arc<dyn Fn(ryo_v2_core::app::ports::JobId) + Send + Sync>>,
+    ) -> RaAnalyzer {
+        self.job_hook = hook;
+        self
+    }
+
+    /// Makes every `Forks` job, after its writes, create an input of the frozen base (a
+    /// singleton, whose index the base and every layer share): a write the base refuses and
+    /// counts. For the tests of the isolation guard (I2); nothing else sets it.
+    #[doc(hidden)]
+    pub fn with_job_base_write(mut self, write: bool) -> RaAnalyzer {
+        self.job_base_write = write;
+        self
     }
 
     /// Makes every diagnosis of a level (a check's included) panic inside the level, before it

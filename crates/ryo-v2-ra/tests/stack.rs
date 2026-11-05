@@ -38,6 +38,7 @@ fn analyzer(assert_revert: bool) -> (RaAnalyzer, Arc<RecordingObserver>) {
             assert_revert_every: None,
             cfg_test: false,
             engine: common::engine(),
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),
@@ -420,6 +421,7 @@ fn analyzer_every(n: u32) -> (RaAnalyzer, Arc<RecordingObserver>) {
             assert_revert_every: std::num::NonZeroU32::new(n),
             cfg_test: false,
             engine: common::engine(),
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         observer.clone(),
@@ -2115,6 +2117,7 @@ fn the_diagnoses_of_a_level_do_not_add_up_on() {
             assert_revert_every: None,
             cfg_test: false,
             engine: common::engine(),
+            ..Default::default()
         },
         clock.clone(),
         observer.clone(),

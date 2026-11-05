@@ -39,10 +39,10 @@ use triomphe::Arc as TriArc;
 pub(crate) struct EngineBase {
     pub(crate) frozen: Frozen<RootDatabase>,
     /// The base's refused writes at the freeze (the count is kept for the database's life).
-    refused_at_freeze: usize,
+    pub(crate) refused_at_freeze: usize,
     /// The isolation of the base when the fork's first sampled write was made: every later
     /// sampled check compares the base with it.
-    sampled_from: Option<Isolation>,
+    pub(crate) sampled_from: Option<Isolation>,
     /// Every path given a vfs entry as a created file since the freeze; the thaw drops them.
     pub(crate) vfs_created: BTreeSet<RelPath>,
 }
@@ -133,7 +133,7 @@ fn layer_of(level: &Level) -> Result<&LevelLayer, AnalyzerError> {
         .ok_or_else(|| lost("a level has no layer"))
 }
 
-fn engine_error(e: EngineError) -> AnalyzerError {
+pub(crate) fn engine_error(e: EngineError) -> AnalyzerError {
     match e {
         // Neither can happen to a layer the adapter just opened and has not lent; both are a
         // handle the adapter let escape, which `ForkInUse` names at the ports.
@@ -206,6 +206,52 @@ fn thaw(s: &mut RaSession) -> Result<(), RevertFailure> {
         return Err(RevertFailure::Poisoned(msg));
     }
     Ok(())
+}
+
+/// The writes the frozen base refused since the freeze (0 with no frozen base): a rise is a
+/// layer that wrote the base (I2).
+pub(crate) fn refused_since_freeze(s: &RaSession) -> usize {
+    s.frozen.as_ref().map_or(0, |base| {
+        base.frozen
+            .refused_writes()
+            .saturating_sub(base.refused_at_freeze)
+    })
+}
+
+/// Thaws the base when nothing of it is held any more, and then puts its database back into
+/// `host` and drops the vfs entries of the files created while it was frozen: true. With a layer
+/// or another handle of the base alive it changes nothing and is false, so it can be tried again
+/// (`Forks::close` C8); it never poisons the session. True with no frozen base.
+pub(crate) fn try_thaw(s: &mut RaSession) -> bool {
+    let Some(base) = s.frozen.take() else {
+        return true;
+    };
+    let EngineBase {
+        frozen,
+        refused_at_freeze,
+        sampled_from,
+        vfs_created,
+    } = base;
+    let created = frozen.created_files();
+    match frozen.thaw() {
+        Ok(db) => {
+            s.created_in_db.extend(created);
+            s.spare_db = Some(std::mem::replace(s.host.raw_database_mut(), db));
+            for rel in vfs_created {
+                fork::vfs_drop(s, &rel);
+            }
+            true
+        }
+        Err((frozen, _)) => {
+            s.frozen = Some(EngineBase {
+                frozen,
+                refused_at_freeze,
+                sampled_from,
+                vfs_created,
+            });
+            false
+        }
+    }
 }
 
 /// Runs `f` with a host of the state of the top level: the session's own host when no fork is
@@ -351,7 +397,7 @@ pub(crate) fn push_level(
 /// `state` as each is made. `inject` makes the write panic first (the test hook
 /// `DbWritePanic::Write`). A deleted file loses its text and leaves its source root, as on the
 /// undo log; a created or revived file enters the source root of its sibling or its own.
-fn write_actions(
+pub(crate) fn write_actions(
     state: &mut LayerState,
     child: &mut OpenLayer<RootDatabase>,
     actions: Vec<Action>,

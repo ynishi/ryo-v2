@@ -22,6 +22,7 @@ fn analyzer(timeout_ms: Option<u64>) -> RaAnalyzer {
             assert_revert_every: None,
             cfg_test: false,
             engine: common::engine(),
+            ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
         Arc::new(RecordingObserver::default()),
