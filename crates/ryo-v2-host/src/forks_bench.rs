@@ -31,7 +31,7 @@ use crate::bench::scope_name;
 use crate::layer_cost::{EditClass, Quantiles};
 use crate::proc;
 use anyhow::{Context, Result};
-use ryo_v2_core::app::ports::{CheckError, Event, Forks, JobId, Next, Stacked, Verifier};
+use ryo_v2_core::app::ports::{CheckError, Event, Forks, JobId, Limit, Next, Stacked, Verifier};
 use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -765,7 +765,10 @@ fn seed_layer<A: Forks>(
     seed: &[Edit],
     scope: Scope,
 ) -> Result<A::Layer> {
-    let id = a.submit(s, root, seed, scope).context("submit the seed")?;
+    // The seed is cut off like every job of the bench: the series measures jobs under D1.
+    let id = a
+        .submit(s, root, seed, scope, Limit::Check)
+        .context("submit the seed")?;
     loop {
         match a.next(s, NEXT_TICK).context("wait for the seed")? {
             Next::Done(got, Ok(checked)) if got == id => return Ok(checked.layer),
@@ -775,7 +778,7 @@ fn seed_layer<A: Forks>(
             Next::Withdrawn(got) if got == id => anyhow::bail!("the seed job was withdrawn"),
             Next::Pending => {}
             Next::Idle => anyhow::bail!("the seed job gave no outcome"),
-            Next::Done(..) | Next::Withdrawn(_) => {
+            Next::Done(..) | Next::Expanded(..) | Next::Withdrawn(_) => {
                 anyhow::bail!("an outcome of a job the bench did not submit")
             }
         }
@@ -796,7 +799,7 @@ fn submit_level<A: Forks>(
 ) -> Result<()> {
     for job in tree.levels.get(level - 1).into_iter().flatten() {
         let id = a
-            .submit(s, parent, &job.edits, scope)
+            .submit(s, parent, &job.edits, scope, Limit::Check)
             .with_context(|| format!("submit job {}.{}", job.level, job.index))?;
         inflight.insert(id, (job.level, job.index));
         run.submitted += 1;
@@ -868,6 +871,7 @@ fn drive<A: Forks>(
                     }
                 }
             }
+            Next::Expanded(..) => anyhow::bail!("an expansion the bench did not ask for"),
             Next::Withdrawn(id) => {
                 let node = inflight
                     .remove(&id)

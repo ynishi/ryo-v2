@@ -1563,8 +1563,9 @@ fn parse_crate_use(text: &str) -> Option<(String, Vec<String>, String)> {
 }
 
 /// Runs the generation on the current database state, the top level of the live fork (read on
-/// the Engine through its layer, or a throwaway child of it once it is sealed); the views are
-/// dropped before it returns. The panics it contained are added to `panics`.
+/// the Engine through its layer, or a throwaway child of it once it is sealed), over the files of
+/// that state, the ones it created included; the views are dropped before it returns. The panics
+/// it contained are added to `panics`.
 fn generate(
     sess: &RaSession,
     state_fp: StateFp,
@@ -1573,8 +1574,9 @@ fn generate(
     panics: &mut BTreeSet<ExpanderPanic>,
 ) -> Result<Vec<Blueprint>, ExpandError> {
     let facts = ExpandFacts::of(sess);
+    let files = crate::fork::live_below(sess);
     crate::fork::with_top_host(sess, |host| {
-        let (out, contained) = generate_on(&facts, &sess.files, host, state_fp, targets, max);
+        let (out, contained) = generate_on(&facts, files, host, state_fp, targets, max);
         panics.extend(contained);
         out
     })
@@ -1589,8 +1591,9 @@ fn generate(
 
 /// [`generate`] on the state `host` holds, whose local `.rs` files are `files`, with the facts
 /// `facts`. It reads no session: it returns the Blueprints (or the failure) together with the
-/// panics it contained, and the caller merges those into the session's record.
-fn generate_on(
+/// panics it contained, and the caller merges those into the session's record. It is also the
+/// whole of a read job of `Forks::expand`, on a worker.
+pub(crate) fn generate_on(
     facts: &ExpandFacts,
     files: &[(FileId, RelPath)],
     host: &AnalysisHost,
@@ -1740,6 +1743,9 @@ fn state_edit_rejected(path: &RelPath, reason: &str) -> ExpandError {
 ///   needs and cannot read makes `expand` `ExpandError::Session(CheckError::Load(..))`, and
 ///   changes nothing.
 ///   tested: tests/stack.rs a_failed_base_read_is_a_session_error
+/// - C18: the files an expansion reads are those of the state, the ones it created included: a
+///   target in a file the state created is expanded, and move-item may move an item into it.
+///   tested: tests/forks.rs an_expansion_sees_a_file_the_state_created
 impl Expander for RaAnalyzer {
     type Session = RaSession;
 

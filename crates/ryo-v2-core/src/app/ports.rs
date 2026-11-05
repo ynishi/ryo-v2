@@ -2,7 +2,8 @@
 
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, ChangeProbe, CheckFailure, Edit, Finding, JudgeRequest,
-    Judgement, Provenance, RelPath, Scope, ScopedFindings, StaticMetrics, Target, UnseenClass,
+    Judgement, Provenance, RelPath, Scope, ScopedFindings, StateFp, StaticMetrics, Target,
+    UnseenClass,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -517,6 +518,10 @@ pub enum Next<L> {
     /// The job ran: its layer and diagnosis, or why its check could not finish. An error here
     /// reaches the job's Blueprint only.
     Done(JobId, Result<Checked<L>, CheckError>),
+    /// A read job of [`Forks::expand`] ran: the children of its Layer's state, or why that
+    /// parent yields nothing (`ExpandError::Analysis`) or the session cannot go on
+    /// (`ExpandError::Session`).
+    Expanded(JobId, Result<Vec<Blueprint>, ExpandError>),
     /// The caller withdrew the job (`Forks::cancel` returned true), or the session withdrew it
     /// when it was poisoned: no layer, and no fact about its Blueprint. (The jobs `Forks::close`
     /// withdraws are not delivered: `next` is refused after it.)
@@ -527,6 +532,18 @@ pub enum Next<L> {
     Idle,
 }
 
+/// The time limit of a job of [`Forks::submit`].
+///
+/// D1's per-candidate cut-off is for a candidate's check. The search's start state is no
+/// candidate: its job runs to its end, however long it takes (Forks C11).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Limit {
+    /// The adapter's check cut-off (D1), counted from the job's start on a worker.
+    Check,
+    /// No cut-off.
+    None,
+}
+
 /// A [`Verifier`] whose forks run side by side: layers over the session's frozen base, any
 /// number alive at once, each job checked on a pool of workers (D11, stage 3b).
 ///
@@ -534,11 +551,12 @@ pub enum Next<L> {
 /// top of a Layer, resolved against that Layer's state as `Stacked::write` resolves them against
 /// the top level, diagnoses its scope there, and finishes as a new Layer. `next` gives the
 /// outcomes in the order the jobs finish. A job's parent is always a finished Layer, never one in
-/// flight; siblings are jobs on one parent. `cancel` withdraws a job. `close` ends the pool and
-/// thaws the base.
+/// flight; siblings are jobs on one parent. `expand` queues a read job that proposes the children
+/// of a Layer's state, written nowhere. `cancel` withdraws a job. `close` ends the pool and thaws
+/// the base.
 ///
-/// `open`, `submit`, `next`, `cancel` and `close` take the session mutably: the session belongs to
-/// one thread, while the jobs run on the workers. The reads take it shared.
+/// `open`, `submit`, `expand`, `next`, `cancel` and `close` take the session mutably: the session
+/// belongs to one thread, while the jobs run on the workers. The reads take it shared.
 ///
 /// A withdrawal is no fact about a Blueprint, so it is `Next::Withdrawn`, never a [`CheckError`];
 /// a `CheckError::Cancelled` inside a `Done` means the check could not finish although nobody
@@ -549,9 +567,10 @@ pub enum Next<L> {
 /// While forks are open the reads of [`Verifier`] describe the base, as `Stacked` C3 says.
 ///
 /// # Contract
-/// - C1: until `close`, every accepted `submit` yields exactly one `Done` or `Withdrawn` with its
-///   id, ids increasing in submission order; edits are resolved at submit, and a refused edit is a
-///   `Done` with `Edit` and no layer, never an `Err` of `submit`.
+/// - C1: until `close`, every accepted `submit` or `expand` yields exactly one `Done`, `Expanded`
+///   or `Withdrawn` with its id (`Done` for a `submit`, `Expanded` for an `expand`), ids
+///   increasing in submission order; edits are resolved at submit, and a refused edit is a `Done`
+///   with `Edit` and no layer, never an `Err` of `submit`.
 ///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
 ///   tested: ryo-v2-ra tests/forks.rs a_refused_edit_is_a_done_without_a_layer
 ///   tested: ryo-v2-ra tests/forks.rs parallel_jobs_equal_serial_and_the_reference
@@ -579,7 +598,8 @@ pub enum Next<L> {
 ///   tested: ryo-v2-ra tests/forks.rs a_layer_of_another_session_is_refused
 /// - C6: while forks are open, `Verifier::check`, `Stacked::fork` and `RevertAudit::audit_revert`
 ///   are `ForkInUse`, `Expander::expand` is `ExpandError::Session` with `ForkInUse`, and a second
-///   `open` is `ForkInUse`; none of them changes anything.
+///   `open` is `ForkInUse`; none of them changes anything. An expansion of a Layer is
+///   `Forks::expand` (C10).
 ///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
 ///   tested: ryo-v2-ra tests/forks.rs session_operations_refuse_while_forks_are_open
 ///   tested: ryo-v2-ra tests/forks.rs expand_refuses_while_forks_are_open
@@ -599,6 +619,19 @@ pub enum Next<L> {
 ///   backend) is `ForkInUse`: forks need the Engine backend.
 ///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
 ///   tested: ryo-v2-ra tests/forks.rs forks_need_the_engine_backend
+/// - C10: `expand` of a Layer gives, as `Next::Expanded`, what `Expander::expand` gives for the
+///   Layer's state with no fork open (the same Blueprints, ids included, the files the state
+///   created among those it reads), whatever ran beside it; it writes nothing and counts in the
+///   width (C4).
+///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
+///   tested: ryo-v2-ra tests/forks.rs an_expansion_of_a_layer_is_that_of_its_state
+///   tested: ryo-v2-ra tests/forks.rs expansions_run_beside_jobs_and_change_no_job
+///   tested: ryo-v2-ra tests/forks.rs an_expansion_sees_a_file_the_state_created
+///   tested: ryo-v2-ra tests/forks.rs an_expansion_counts_in_the_width
+/// - C11: a job submitted with `Limit::None` is not cut off: it runs to its end and its outcome
+///   is what the same job gives with no cut-off configured; with `Limit::Check` the adapter's
+///   cut-off (D1) applies from the job's start on a worker.
+///   tested: ryo-v2-ra tests/forks.rs a_start_job_is_not_cut_off
 pub trait Forks: Verifier {
     /// A finished job's layer, or the base's root: what a job writes on top of. Holding one
     /// keeps the base frozen (C8).
@@ -612,13 +645,27 @@ pub trait Forks: Verifier {
     fn width(&self, s: &Self::Session) -> usize;
 
     /// Resolves `edits` against `parent`'s state and queues a job that writes them on top of it
-    /// and diagnoses `scope` there (C1).
+    /// and diagnoses `scope` there (C1), within `limit` (C11).
     fn submit(
         &self,
         s: &mut Self::Session,
         parent: &Self::Layer,
         edits: &[Edit],
         scope: Scope,
+        limit: Limit,
+    ) -> Result<JobId, CheckError>;
+
+    /// Queues a read job that proposes at most `max` children of `layer`'s state within
+    /// `targets` (C10). `state` is the fingerprint of that state's edits over the base, the
+    /// identity the Blueprints' ids are made of (`Expander` C8): the caller keeps it with the
+    /// Layer, so no edit list has to be handed back.
+    fn expand(
+        &self,
+        s: &mut Self::Session,
+        layer: &Self::Layer,
+        state: StateFp,
+        targets: &[Target],
+        max: usize,
     ) -> Result<JobId, CheckError>;
 
     /// The next outcome, waiting at most `timeout` for one while jobs are in flight. `timeout`
@@ -823,7 +870,7 @@ mod tests {
         next_id: u64,
         /// Accepted jobs not delivered, with the outcome they will have and whether they
         /// finished.
-        in_flight: BTreeMap<JobId, (bool, Result<Checked<FakeLayer>, CheckError>)>,
+        in_flight: BTreeMap<JobId, (bool, Next<FakeLayer>)>,
         /// Outcomes known at once (refused edits, withdrawals), delivered first.
         ready: VecDeque<Next<FakeLayer>>,
         held: Arc<()>,
@@ -869,6 +916,19 @@ mod tests {
             }
         }
 
+        /// The id of a job on `parent`, when this session takes one (C5 before the poison).
+        fn accept(&mut self, parent: &FakeLayer) -> Result<JobId, CheckError> {
+            if parent.session != self.id || self.open != Open::Yes {
+                return Err(CheckError::ForkInUse);
+            }
+            if self.poisoned {
+                return Err(CheckError::Poisoned("fake".to_owned()));
+            }
+            let id = JobId::new(self.next_id);
+            self.next_id += 1;
+            Ok(id)
+        }
+
         fn withdraw_all(&mut self) {
             for id in std::mem::take(&mut self.in_flight).into_keys() {
                 self.ready.push_back(Next::Withdrawn(id));
@@ -898,6 +958,18 @@ mod tests {
             }
         }
         Ok(state)
+    }
+
+    /// The fake's expansion of `state`: no Blueprint, and a parent that yields nothing when a
+    /// target is not a file of the state (so a created file is told from a missing one).
+    fn fake_children(
+        state: &BTreeMap<RelPath, String>,
+        targets: &[Target],
+    ) -> Result<Vec<Blueprint>, ExpandError> {
+        match targets.iter().find(|t| !state.contains_key(t.path())) {
+            Some(t) => Err(ExpandError::Analysis(format!("no file {}", t.path()))),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The files of a diagnosis at `scope` of `state`, reached by `edits`.
@@ -1043,12 +1115,14 @@ mod tests {
         fn expand(
             &self,
             s: &mut FakeSession,
-            _: &[Edit],
-            _: &[Target],
+            state: &[Edit],
+            targets: &[Target],
             _: usize,
         ) -> Result<Vec<Blueprint>, ExpandError> {
             s.refuse_while_open().map_err(ExpandError::Session)?;
-            Ok(Vec::new())
+            let state = written(&s.base, state)
+                .map_err(|e| ExpandError::Analysis(format!("state edit rejected: {e}")))?;
+            fake_children(&state, targets)
         }
     }
 
@@ -1077,24 +1151,33 @@ mod tests {
             parent: &FakeLayer,
             edits: &[Edit],
             scope: Scope,
+            _: Limit,
         ) -> Result<JobId, CheckError> {
-            if parent.session != s.id || s.open != Open::Yes {
-                return Err(CheckError::ForkInUse);
-            }
-            if s.poisoned {
-                return Err(CheckError::Poisoned("fake".to_owned()));
-            }
-            let id = JobId::new(s.next_id);
-            s.next_id += 1;
+            let id = s.accept(parent)?;
             match written(&parent.texts, edits) {
                 Err(refused) => s.ready.push_back(Next::Done(id, Err(refused))),
                 Ok(state) => {
                     let findings = diagnose(&state, scope_files(&state, edits, scope));
                     let layer = s.layer(state);
                     s.in_flight
-                        .insert(id, (false, Ok(Checked { layer, findings })));
+                        .insert(id, (false, Next::Done(id, Ok(Checked { layer, findings }))));
                 }
             }
+            Ok(id)
+        }
+
+        fn expand(
+            &self,
+            s: &mut FakeSession,
+            layer: &FakeLayer,
+            _: StateFp,
+            targets: &[Target],
+            _: usize,
+        ) -> Result<JobId, CheckError> {
+            let id = s.accept(layer)?;
+            let children = fake_children(&layer.texts, targets);
+            s.in_flight
+                .insert(id, (false, Next::Expanded(id, children)));
             Ok(id)
         }
 
@@ -1118,7 +1201,7 @@ mod tests {
                 *finished = true;
             }
             match s.in_flight.pop_last() {
-                Some((id, (_, outcome))) => Ok(Next::Done(id, outcome)),
+                Some((_, (_, outcome))) => Ok(outcome),
                 None => Ok(Next::Idle),
             }
         }
@@ -1214,7 +1297,7 @@ mod tests {
 
     fn id_of(next: &Next<FakeLayer>) -> JobId {
         match next {
-            Next::Done(id, _) | Next::Withdrawn(id) => *id,
+            Next::Done(id, _) | Next::Expanded(id, _) | Next::Withdrawn(id) => *id,
             Next::Pending | Next::Idle => panic!("no job: {next:?}"),
         }
     }
@@ -1227,7 +1310,7 @@ mod tests {
 
         let write = |text: &str| vec![Edit::write(rel("src/a.rs"), text)];
         let a = f
-            .submit(&mut s, &root, &write("a1"), Scope::Affected)
+            .submit(&mut s, &root, &write("a1"), Scope::Affected, Limit::Check)
             .unwrap();
         let refused = f
             .submit(
@@ -1238,13 +1321,14 @@ mod tests {
                     new_text: None,
                 }],
                 Scope::Affected,
+                Limit::Check,
             )
             .expect("a refused edit is an outcome, not an error of submit");
         let cancelled = f
-            .submit(&mut s, &root, &write("a2"), Scope::Affected)
+            .submit(&mut s, &root, &write("a2"), Scope::Affected, Limit::Check)
             .unwrap();
         let c = f
-            .submit(&mut s, &root, &write("a3"), Scope::Affected)
+            .submit(&mut s, &root, &write("a3"), Scope::Affected, Limit::Check)
             .unwrap();
         assert!(a < refused && refused < cancelled && cancelled < c);
 
@@ -1280,8 +1364,46 @@ mod tests {
             Ok(Some("a".to_owned()))
         );
         assert_eq!(f.cancel(&mut s, a), Err(CheckError::ForkInUse));
-        drop((root, last));
+
+        // An expansion is a job too: one `Expanded` with its id, of the Layer's own state (a file
+        // the state created among its files), and withdrawn like any job.
+        let created = vec![Edit::write(rel("src/c.rs"), "c")];
+        f.submit(&mut s, &root, &created, Scope::Affected, Limit::Check)
+            .unwrap();
+        let Next::Done(_, Ok(child)) = f.next(&mut s, FOREVER).unwrap() else {
+            panic!("the job finishes");
+        };
+        let targets = [Target::new(rel("src/c.rs"), None)];
+        let state = StateFp::of(&created);
+        let on_child = Forks::expand(&f, &mut s, &child.layer, state, &targets, 5).unwrap();
+        let on_root = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &targets, 5).unwrap();
+        let withdrawn = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &targets, 5).unwrap();
+        assert!(on_child < on_root && on_root < withdrawn);
+        assert_eq!(f.cancel(&mut s, withdrawn), Ok(true));
+        let mut expanded = BTreeMap::new();
+        for next in drain(&f, &mut s) {
+            match next {
+                Next::Expanded(id, children) => {
+                    assert!(expanded.insert(id, children).is_none(), "one outcome");
+                }
+                Next::Withdrawn(id) => assert_eq!(id, withdrawn),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(expanded.len(), 2);
+        drop((root, last, child));
         assert_eq!(f.close(&mut s), Ok(()));
+        // C10: what `Expander::expand` gives for the same states with no fork open.
+        assert_eq!(
+            expanded[&on_child],
+            Expander::expand(&f, &mut s, &created, &targets, 5)
+        );
+        assert_eq!(expanded[&on_child], Ok(Vec::new()));
+        assert_eq!(
+            expanded[&on_root],
+            Expander::expand(&f, &mut s, &[], &targets, 5)
+        );
+        assert!(matches!(expanded[&on_root], Err(ExpandError::Analysis(_))));
     }
 
     #[test]
@@ -1293,14 +1415,18 @@ mod tests {
             Edit::write(rel("src/b.rs"), "b2"),
             Edit::write(rel("src/c.rs"), "another error"),
         ];
-        f.submit(&mut s, &root, &first, Scope::Affected).unwrap();
+        f.submit(&mut s, &root, &first, Scope::Affected, Limit::Check)
+            .unwrap();
         let Next::Done(_, Ok(parent)) = f.next(&mut s, FOREVER).unwrap() else {
             panic!("the first job finishes");
         };
         let mut job = |scope: Scope| {
-            let id = f.submit(&mut s, &parent.layer, &second, scope).unwrap();
+            let id = f
+                .submit(&mut s, &parent.layer, &second, scope, Limit::Check)
+                .unwrap();
             // A sibling running beside it changes nothing.
-            f.submit(&mut s, &parent.layer, &first, scope).unwrap();
+            f.submit(&mut s, &parent.layer, &first, scope, Limit::Check)
+                .unwrap();
             let mut done = None;
             for next in drain(&f, &mut s) {
                 if let Next::Done(got, Ok(checked)) = next
@@ -1362,7 +1488,7 @@ mod tests {
         assert_eq!(Stacked::fork(&f, &mut s), Err(CheckError::ForkInUse));
         assert_eq!(f.audit_revert(&mut s), Err(CheckError::ForkInUse));
         assert_eq!(
-            f.expand(&mut s, &[], &[], 3),
+            Expander::expand(&f, &mut s, &[], &[], 3),
             Err(ExpandError::Session(CheckError::ForkInUse))
         );
         assert_eq!(f.open(&mut s), Err(CheckError::ForkInUse));
@@ -1374,12 +1500,12 @@ mod tests {
         let foreign = other_f.open(&mut other).unwrap();
         s.poisoned = true;
         assert_eq!(
-            f.submit(&mut s, &foreign, &[], Scope::Affected),
+            f.submit(&mut s, &foreign, &[], Scope::Affected, Limit::Check),
             Err(CheckError::ForkInUse)
         );
         assert!(s.in_flight.is_empty() && s.ready.is_empty());
         assert!(matches!(
-            f.submit(&mut s, &root, &[], Scope::Affected),
+            f.submit(&mut s, &root, &[], Scope::Affected, Limit::Check),
             Err(CheckError::Poisoned(_))
         ));
         drop((root, foreign));
@@ -1393,7 +1519,10 @@ mod tests {
         let root = f.open(&mut s).unwrap();
         let edits = [Edit::write(rel("src/a.rs"), "x")];
         let ids: Vec<JobId> = (0..3)
-            .map(|_| f.submit(&mut s, &root, &edits, Scope::Affected).unwrap())
+            .map(|_| {
+                f.submit(&mut s, &root, &edits, Scope::Affected, Limit::Check)
+                    .unwrap()
+            })
             .collect();
         s.refused_write = true;
         for id in &ids {
@@ -1412,11 +1541,14 @@ mod tests {
         let (f, mut s) = engine_session();
         let root = f.open(&mut s).unwrap();
         let edits = [Edit::write(rel("src/a.rs"), "kept")];
-        f.submit(&mut s, &root, &edits, Scope::Affected).unwrap();
+        f.submit(&mut s, &root, &edits, Scope::Affected, Limit::Check)
+            .unwrap();
         let Next::Done(_, Ok(kept)) = f.next(&mut s, FOREVER).unwrap() else {
             panic!("the job finishes");
         };
-        let queued = f.submit(&mut s, &root, &edits, Scope::Affected).unwrap();
+        let queued = f
+            .submit(&mut s, &root, &edits, Scope::Affected, Limit::Check)
+            .unwrap();
         drop(root);
 
         assert_eq!(
@@ -1426,7 +1558,7 @@ mod tests {
         );
         // Closing: the jobs are gone, only reads and `close` are allowed.
         assert_eq!(
-            f.submit(&mut s, &kept.layer, &edits, Scope::Affected),
+            f.submit(&mut s, &kept.layer, &edits, Scope::Affected, Limit::Check),
             Err(CheckError::ForkInUse)
         );
         assert_eq!(f.next(&mut s, FOREVER), Err(CheckError::ForkInUse));

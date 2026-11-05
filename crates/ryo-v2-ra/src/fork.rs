@@ -342,7 +342,7 @@ pub(crate) fn top_state(session: &RaSession) -> Option<&Arc<LayerState>> {
 }
 
 /// The files of the state the next write lands on: the top level's, or the session's own.
-fn live_below(session: &RaSession) -> &[(FileId, RelPath)] {
+pub(crate) fn live_below(session: &RaSession) -> &[(FileId, RelPath)] {
     top_state(session).map_or(session.files.as_slice(), |s| s.live.as_slice())
 }
 

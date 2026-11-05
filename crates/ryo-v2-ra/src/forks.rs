@@ -10,23 +10,29 @@
 //! detector-panic rule, D7), and the pool seals the layer. The worker never touches the session:
 //! what it needs of it is copied once, at `open`, into [`Facts`].
 //!
+//! An expansion of a Layer (`Forks::expand`) is a read job: on a worker, the expander runs on a
+//! throwaway child of the sealed Layer with the Layer's own files, and its contained panics come
+//! back with its outcome, to join the session's at `next`.
+//!
 //! The session is poisoned only when the base was written: a write the frozen base refused
 //! (its counter, read on every outcome), or, at `close`, a fingerprint of the base that changed.
 
 use crate::check::{base_text, finish_diagnosis, map_error};
 use crate::diagnostics::{Deadline, Detector, GapDetector, ThreadCount};
 use crate::engine::{self, engine_error};
+use crate::expand::{ExpandFacts, generate_on};
 use crate::fork::{self, Action, Below, LayerState};
 use crate::rev_deps::{RevDeps, scoped_files};
-use crate::session::{DetectorPanic, ForkPort, Live, RaSession};
+use crate::session::{DetectorPanic, ExpanderPanic, ForkPort, Live, RaSession};
 use crate::{DetectorFault, JobHook, RaAnalyzer};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_vfs::FileId;
 use ryo_v2_core::app::ports::{
-    AnalyzerError, CheckError, CheckReach, Checked, Clock, Event, Forks, JobId, Next, Observer,
+    AnalyzerError, CheckError, CheckReach, Checked, Clock, Event, ExpandError, Forks, JobId, Limit,
+    Next, Observer,
 };
-use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
+use ryo_v2_core::domain::{Blueprint, Edit, RelPath, Scope, ScopedFindings, StateFp, Target};
 use ryo_v2_engine::{Budget, Hooks, JobCtx, JobKey, Jobs, OpenLayer, Outcome, Recv, SealedLayer};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -105,7 +111,23 @@ pub(crate) struct JobFailed {
     panics: BTreeSet<DetectorPanic>,
 }
 
-type Pool = Jobs<RootDatabase, JobDone, JobFailed>;
+/// What a job of the pool gives when its closure returns.
+pub(crate) enum JobValue {
+    /// A check job (`Forks::submit`) that ran to its end.
+    Checked(JobDone),
+    /// An expansion (`Forks::expand`): its children or why the parent yields nothing, and the
+    /// expander panics it contained, merged into the session at `next`.
+    Expanded(Result<Vec<Blueprint>, ExpandError>, BTreeSet<ExpanderPanic>),
+}
+
+/// Which port call a job of the pool came from: it decides the `Next` its outcome becomes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Kind {
+    Check,
+    Expand,
+}
+
+type Pool = Jobs<RootDatabase, JobValue, JobFailed>;
 
 /// The forks of a session from `Forks::open` to the `Forks::close` that thaws its base.
 pub(crate) struct ForksState {
@@ -114,8 +136,8 @@ pub(crate) struct ForksState {
     facts: Arc<Facts>,
     /// The jobs whose edits were refused at `submit`, not yet delivered.
     ready: VecDeque<(JobId, CheckError)>,
-    /// The id of each job in the pool, not yet delivered.
-    ids: HashMap<JobKey, JobId>,
+    /// The id and kind of each job in the pool, not yet delivered.
+    ids: HashMap<JobKey, (JobId, Kind)>,
     keys: HashMap<JobId, JobKey>,
     /// Set when the session was found poisoned: every job not yet delivered is `Withdrawn`, then
     /// `next` is `Poisoned` (C7).
@@ -186,6 +208,7 @@ struct Plan {
     actions: Vec<Action>,
     parent: Option<Arc<LayerState>>,
     scope: Scope,
+    limit: Limit,
 }
 
 /// A job on its worker: writes the plan into `layer`, then diagnoses its scope there under the
@@ -197,20 +220,23 @@ fn run_job(
     plan: Plan,
     layer: &mut OpenLayer<RootDatabase>,
     ctx: JobCtx,
-) -> Result<JobDone, JobFailed> {
+) -> Result<JobValue, JobFailed> {
     let Plan {
         id,
         edited,
         actions,
         parent,
         scope,
+        limit,
     } = plan;
     let started_ms = facts.clock.now_ms();
     // D1's cut-off runs from the job's start on its worker (its time in the queue is not
-    // counted), its writes included.
-    let deadline = facts
-        .check_timeout_ms
-        .map(|ms| Deadline::after(facts.clock.clone(), ms));
+    // counted), its writes included; a job with no limit (the start state) has none (C11).
+    let timeout_ms = match limit {
+        Limit::Check => facts.check_timeout_ms,
+        Limit::None => None,
+    };
+    let deadline = timeout_ms.map(|ms| Deadline::after(facts.clock.clone(), ms));
     let failed = |error: CheckError| JobFailed {
         error,
         panics: BTreeSet::new(),
@@ -259,7 +285,7 @@ fn run_job(
         )
     };
     let found = finish_diagnosis(
-        facts.check_timeout_ms,
+        timeout_ms,
         &facts.baseline_panics,
         deadline.as_ref(),
         diagnosed,
@@ -272,13 +298,113 @@ fn run_job(
                 total_files: facts.files.len(),
                 check_ms: facts.clock.now_ms().saturating_sub(started_ms),
             });
-            Ok(JobDone {
+            Ok(JobValue::Checked(JobDone {
                 state: Arc::new(state),
                 findings,
                 panics,
-            })
+            }))
         }
         Err(error) => Err(JobFailed { error, panics }),
+    }
+}
+
+/// What an expansion's worker needs, owned: it never borrows the session.
+struct ExpandPlan {
+    facts: ExpandFacts,
+    /// The files of the Layer's state, created ones included.
+    files: Vec<(FileId, RelPath)>,
+    state: StateFp,
+    targets: Vec<Target>,
+    max: usize,
+}
+
+/// An expansion on its worker, on the database of a throwaway child of the Layer: the host over
+/// it is dropped before this returns, so no clone of the database outlives the read job.
+fn run_expansion(plan: ExpandPlan, db: &RootDatabase) -> JobValue {
+    let host = AnalysisHost::with_database(db.clone());
+    let (out, panics) = generate_on(
+        &plan.facts,
+        &plan.files,
+        &host,
+        plan.state,
+        &plan.targets,
+        plan.max,
+    );
+    drop(host);
+    JobValue::Expanded(out, panics)
+}
+
+type JobOutcome = Outcome<RootDatabase, JobValue, JobFailed>;
+
+/// The `Next::Done` result of a check job's outcome (not a withdrawal); its detector panics join
+/// the session's.
+fn checked(s: &RaSession, outcome: JobOutcome) -> Result<Checked<RaLayer>, CheckError> {
+    let merge = |panics: BTreeSet<DetectorPanic>| {
+        s.detector_panics
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(panics);
+    };
+    match outcome {
+        Outcome::Sealed(sealed, JobValue::Checked(done)) => {
+            merge(done.panics);
+            Ok(Checked {
+                layer: RaLayer {
+                    sealed,
+                    state: Some(done.state),
+                },
+                findings: done.findings,
+            })
+        }
+        Outcome::Failed(failed) => {
+            merge(failed.panics);
+            Err(failed.error)
+        }
+        Outcome::Cancelled => Err(CheckError::Cancelled),
+        Outcome::Panicked(msg) => Err(CheckError::Panicked(msg)),
+        Outcome::Refused(e) => Err(CheckError::Panicked(format!(
+            "fork Engine: a job's layer could not be sealed: {}",
+            engine_error(e)
+        ))),
+        Outcome::Withdrawn => Err(CheckError::Panicked(
+            "fork Engine: a withdrawal taken for a job's outcome".to_owned(),
+        )),
+        Outcome::Sealed(_, JobValue::Expanded(..)) | Outcome::Read(_) => Err(CheckError::Panicked(
+            "fork Engine: a check job gave an expansion's outcome".to_owned(),
+        )),
+    }
+}
+
+/// The `Next::Expanded` result of an expansion's outcome (not a withdrawal); the expander panics
+/// it contained join the session's, whatever the result. A panic outside the expander's own
+/// containment is `Analysis` (this parent yields nothing); a read the Engine refused is
+/// `Session(Load)`.
+fn expanded(s: &RaSession, outcome: JobOutcome) -> Result<Vec<Blueprint>, ExpandError> {
+    match outcome {
+        Outcome::Read(JobValue::Expanded(out, panics)) => {
+            s.expander_panics
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(panics);
+            out
+        }
+        Outcome::Panicked(msg) => Err(ExpandError::Analysis(format!(
+            "rust-analyzer panicked: {msg}"
+        ))),
+        Outcome::Cancelled => Err(ExpandError::Analysis(
+            "the expansion was cancelled though nobody withdrew it".to_owned(),
+        )),
+        Outcome::Refused(e) => Err(ExpandError::Session(CheckError::Load(format!(
+            "an expansion's read of its layer was refused: {}",
+            engine_error(e)
+        )))),
+        Outcome::Failed(failed) => Err(ExpandError::Session(failed.error)),
+        Outcome::Withdrawn => Err(ExpandError::Session(CheckError::Panicked(
+            "fork Engine: a withdrawal taken for an expansion's outcome".to_owned(),
+        ))),
+        Outcome::Read(JobValue::Checked(_)) | Outcome::Sealed(..) => Err(ExpandError::Session(
+            CheckError::Panicked("fork Engine: an expansion gave a check job's outcome".to_owned()),
+        )),
     }
 }
 
@@ -321,6 +447,12 @@ fn run_job(
 /// - C6: a worker that runs jobs of sibling layers one after another, its trait solver's
 ///   thread-local cache included, gives each layer its own result (E6).
 ///   tested: tests/forks.rs a_worker_reused_across_layers_keeps_e6
+/// - C7: an expansion (`Forks::expand`) reads its Layer on a throwaway child, on a worker, over the
+///   files of the Layer's state (created ones included); the expander panics it contained join
+///   the session's (`RaSession::expander_panics`) when `next` delivers its `Expanded`, as with no
+///   fork open.
+///   tested: tests/forks.rs an_expansions_panics_join_the_session_at_next
+///   tested: tests/forks.rs an_expansion_sees_a_file_the_state_created
 impl Forks for RaAnalyzer {
     type Layer = RaLayer;
 
@@ -397,6 +529,7 @@ impl Forks for RaAnalyzer {
         parent: &RaLayer,
         edits: &[Edit],
         scope: Scope,
+        limit: Limit,
     ) -> Result<JobId, CheckError> {
         brand(s, parent)?;
         if opened(s)?.pool.is_none() {
@@ -434,6 +567,7 @@ impl Forks for RaAnalyzer {
             actions,
             parent: parent.state.clone(),
             scope,
+            limit,
         };
         let facts = Arc::clone(&forks.facts);
         let Some(pool) = forks.pool.as_mut() else {
@@ -442,7 +576,42 @@ impl Forks for RaAnalyzer {
         let key = pool.submit(&parent.sealed, move |layer, ctx| {
             run_job(&facts, plan, layer, ctx)
         });
-        forks.ids.insert(key, id);
+        forks.ids.insert(key, (id, Kind::Check));
+        forks.keys.insert(id, key);
+        Ok(id)
+    }
+
+    fn expand(
+        &self,
+        s: &mut RaSession,
+        layer: &RaLayer,
+        state: StateFp,
+        targets: &[Target],
+        max: usize,
+    ) -> Result<JobId, CheckError> {
+        brand(s, layer)?;
+        if opened(s)?.pool.is_none() {
+            return Err(CheckError::ForkInUse);
+        }
+        refuse_poisoned(s)?;
+        let plan = ExpandPlan {
+            facts: ExpandFacts::of(s),
+            files: layer.live(&s.files).to_vec(),
+            state,
+            targets: targets.to_vec(),
+            max,
+        };
+        let id = JobId::new(NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed));
+        let Some(forks) = s.forks.as_mut() else {
+            return Err(CheckError::ForkInUse);
+        };
+        let Some(pool) = forks.pool.as_mut() else {
+            return Err(CheckError::ForkInUse);
+        };
+        // A read job: a throwaway child of the sealed Layer, written nowhere, on a worker of the
+        // width like any job (C4).
+        let key = pool.read(&layer.sealed, move |db, _ctx| Ok(run_expansion(plan, db)));
+        forks.ids.insert(key, (id, Kind::Expand));
         forks.keys.insert(id, key);
         Ok(id)
     }
@@ -486,7 +655,7 @@ impl Forks for RaAnalyzer {
                 return Err(CheckError::Poisoned(msg));
             }
         };
-        let Some(id) = forks.ids.remove(&key) else {
+        let Some((id, kind)) = forks.ids.remove(&key) else {
             return Err(CheckError::Panicked(
                 "fork Engine: an outcome of a job the forks do not know".to_owned(),
             ));
@@ -510,39 +679,13 @@ impl Forks for RaAnalyzer {
             drop(outcome);
             return Ok(Next::Withdrawn(id));
         }
-        let merge = |panics: BTreeSet<DetectorPanic>| {
-            s.detector_panics
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend(panics);
-        };
-        let done = match outcome {
-            Outcome::Sealed(sealed, done) => {
-                merge(done.panics);
-                Ok(Checked {
-                    layer: RaLayer {
-                        sealed,
-                        state: Some(done.state),
-                    },
-                    findings: done.findings,
-                })
-            }
-            Outcome::Failed(failed) => {
-                merge(failed.panics);
-                Err(failed.error)
-            }
-            Outcome::Cancelled => Err(CheckError::Cancelled),
-            Outcome::Panicked(msg) => Err(CheckError::Panicked(msg)),
-            Outcome::Refused(e) => Err(CheckError::Panicked(format!(
-                "fork Engine: a job's layer could not be sealed: {}",
-                engine_error(e)
-            ))),
-            Outcome::Withdrawn => return Ok(Next::Withdrawn(id)),
-            Outcome::Read(_) => Err(CheckError::Panicked(
-                "fork Engine: a write job gave a read's outcome".to_owned(),
-            )),
-        };
-        Ok(Next::Done(id, done))
+        if matches!(outcome, Outcome::Withdrawn) {
+            return Ok(Next::Withdrawn(id));
+        }
+        Ok(match kind {
+            Kind::Check => Next::Done(id, checked(s, outcome)),
+            Kind::Expand => Next::Expanded(id, expanded(s, outcome)),
+        })
     }
 
     fn cancel(&self, s: &mut RaSession, job: JobId) -> Result<bool, CheckError> {
