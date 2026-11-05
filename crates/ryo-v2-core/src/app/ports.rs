@@ -57,7 +57,8 @@ pub enum CheckError {
         /// Why.
         reason: String,
     },
-    /// The check was cancelled.
+    /// The analyzer cancelled the check by itself; nobody withdrew it. A withdrawal
+    /// (`Forks::cancel`, the poison of a session) is `Next::Withdrawn`, never this.
     #[error("check cancelled")]
     Cancelled,
     /// The analyzer panicked.
@@ -151,27 +152,29 @@ impl CheckError {
                 blueprint,
                 limit_ms,
             }),
-            CheckError::Edit { path, reason } => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::Edit { path, reason },
-            }),
-            CheckError::Cancelled => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::Cancelled,
-            }),
-            CheckError::Panicked(m) => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::Panicked(m),
-            }),
-            CheckError::DetectorPanicked { detector, file } => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::DetectorPanicked { detector, file },
-            }),
-            session @ (CheckError::RevertMismatch { .. }
+            other => other
+                .into_failure()
+                .map(|failure| Blocking::CheckFailed { blueprint, failure }),
+        }
+    }
+
+    /// The `CheckFailure` of an `Edit`, `Cancelled`, `Panicked` or `DetectorPanicked`; the error
+    /// itself for `TimedOut` (a cut-off is no failure of the check) and for a failure of reach
+    /// `Session`.
+    pub fn into_failure(self) -> Result<CheckFailure, CheckError> {
+        match self {
+            CheckError::Edit { path, reason } => Ok(CheckFailure::Edit { path, reason }),
+            CheckError::Cancelled => Ok(CheckFailure::Cancelled),
+            CheckError::Panicked(m) => Ok(CheckFailure::Panicked(m)),
+            CheckError::DetectorPanicked { detector, file } => {
+                Ok(CheckFailure::DetectorPanicked { detector, file })
+            }
+            other @ (CheckError::TimedOut { .. }
+            | CheckError::RevertMismatch { .. }
             | CheckError::Poisoned(_)
             | CheckError::ForkInUse
             | CheckError::AlreadyApplied
-            | CheckError::Load(_)) => Err(session),
+            | CheckError::Load(_)) => Err(other),
         }
     }
 }
@@ -474,8 +477,10 @@ pub trait Expander {
     /// # Contract
     /// - C1: with a stacked fork live on the session and `state` the state of its top level, the
     ///   result is what `expand` gives for `state` with no fork live, and afterwards the fork has
-    ///   the same levels and every text is as before.
+    ///   the same levels and every text is as before; the files the top level created are among
+    ///   those it reads.
     ///   tested: ryo-v2-ra tests/stack.rs expand_reads_the_top_level_of_a_live_fork
+    ///   tested: ryo-v2-ra tests/forks.rs a_stacked_top_expansion_sees_a_file_the_state_created
     fn expand(
         &self,
         s: &mut Self::Session,

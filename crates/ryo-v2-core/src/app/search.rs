@@ -1,31 +1,36 @@
 //! The use case: the best-first beam search of one decision.
 //!
-//! Children of a state are proposed by an [`Expander`], run through the stages of
+//! Children of a state are proposed by an expansion, run through the stages of
 //! [`crate::app::apply`] against the text of their parent, assessed from the texts alone, judged
 //! once per depth and pruned to a beam; only the beam reaches the analyzer. The search ends with
 //! a [`Resolution`], the ranking of every verified node and a trace of every child.
 //!
-//! Children are written on the search's stacked fork on top of their parent (C12 of
-//! [`search_decision`]), and the expander reads that fork.
+//! The search runs on N live forks ([`Forks`], D11 stage 4): each verified node owns its Layer,
+//! a child is a job on its parent's Layer and a parent is expanded by a read job on its own
+//! (C12). At most the forks' width of jobs are in flight, and their outcomes are taken in the
+//! order they were submitted (C16).
 //!
 //! The numbers of the budget are those of the decisions in force in `SEARCH_LEDGER.md`: D1 (time),
-//! D2 (revert audit), D3 (memory per session) and D4 (the triggers that call for perf work).
+//! D2 (revert audit), D3 (memory per session), D4 (the triggers that call for perf work) and D11
+//! (the forks).
 
 use crate::app::apply::Acc;
+use crate::app::memory::{MemoryBudget, RssStop};
 use crate::app::ports::{
-    Assessor, CheckError, CheckReach, Clock, ExpandError, Expander, Judge, JudgeError, RevertAudit,
-    Stacked,
+    Assessor, CheckError, CheckReach, Clock, ExpandError, Forks, Gauge, JobId, Judge, JudgeError,
+    Limit, Next, RevertAudit,
 };
-use crate::domain::search::{prune, rank_final, repath, reward_score, score};
+use crate::domain::search::{prune, rank_final, reward_score, score};
 use crate::domain::stage::{On, Refused, Staged, stage, view_of};
 use crate::domain::{
-    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, CommandKind, Edit, Evidence, Finding,
+    Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, CommandKind, Edit, Evidence,
     Infeasible, Inserted, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, Prior, Proposal,
     ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, Scope, ScopedFindings,
     Scored, SearchBudget, SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU16;
+use std::time::Duration;
 
 /// The budget used when none is given: beam 20, 200 children per depth from the best 4 parents,
 /// depth 3, 6 s per check, 300 s soft and 360 s hard per decision, one audited flaw in ten.
@@ -67,6 +72,13 @@ pub const TRIGGER_CHECK_GROWTH_PERMILLE: u64 = 1_500;
 pub const TRIGGER_AFTER_CHECKS: u32 = 1_000;
 /// Decision D4 (SEARCH_LEDGER.md), trigger 4: one run of the recall harness takes longer than this.
 pub const TRIGGER_HARNESS_MS: u64 = 600_000;
+/// Decision D11 (SEARCH_LEDGER.md), stage 4: the jobs a search's forks run at once, the width a
+/// caller asks of its `Forks` (with a caller that only waits, c = 0), from Table F1: the small
+/// set's median check is 82 ms at 4 against 77 ms at 1, and doubles at 8.
+pub const SEARCH_FORKS: usize = 4;
+/// Decision D11 (SEARCH_LEDGER.md), stage 4: how long one wait of the search in `Forks::next`
+/// lasts before it reads its stops again (C5, C17), in ms.
+pub const SEARCH_TICK_MS: u64 = 100;
 
 /// How many sessions fit in `ram_gb` of memory.
 ///
@@ -93,6 +105,8 @@ pub struct SearchInput<'a> {
     pub scope: Scope,
     /// The limits.
     pub budget: SearchBudget,
+    /// How far the RSS of the process may grow during the search (the RSS stop, C17).
+    pub memory: MemoryBudget,
     /// The weights of the score.
     pub weights: Weights,
     /// Whether the trace keeps the edits of every child that passed the stages.
@@ -107,7 +121,8 @@ pub enum Fate {
     Blocked(Stage),
     /// It was dropped without a check.
     Pruned(PruneStage),
-    /// The time ran out: its check was cut off, or the decision's budget ended before its turn.
+    /// The time ran out: its check was cut off, or the decision's budget ended before its turn;
+    /// or it was withdrawn at the memory stop (C17).
     TimedOut,
     /// It was checked and introduced errors.
     Failed {
@@ -143,7 +158,7 @@ pub struct TraceEntry {
     pub root: bool,
     /// What became of it.
     pub fate: Fate,
-    /// The node it became; `None` when it was never checked.
+    /// The node it became; `None` when its check was never submitted.
     pub node: Option<NodeId>,
     /// The edits of its state, kept only on request.
     pub edits: Option<Vec<Edit>>,
@@ -168,19 +183,19 @@ pub struct DepthStats {
     pub checked: u16,
     /// Checks that passed.
     pub passed: u16,
-    /// Children with the fate of a time out, cut off or not reached.
+    /// Children with the fate of a time out, cut off, not reached or withdrawn.
     pub timed_out: u16,
-    /// Time in the expansions: the expander, and the writes and pops that bring the search's
-    /// fork to each parent's path before it is expanded.
+    /// Time in the expansions: from the first expansion job's submit to the last one's outcome.
     pub expand_ms: u64,
     /// Time in the stages and the assessor.
     pub assess_ms: u64,
     /// Time in the judge.
     pub judge_ms: u64,
-    /// Time in the checks: each child's write, diagnosis and pop, the writes and pops that bring
-    /// the search's fork to its parent's path, and the one diagnosis of the start state.
+    /// Time in the checks: from the first check job's submit to the last one's outcome, and at
+    /// depth 1 the start state's job.
     pub check_ms: u64,
-    /// Level writes on the search's fork in this depth: the parents' paths and the children.
+    /// The write jobs of this depth (`Forks::submit`): the children's checks, and at depth 1 the
+    /// start state's job. An expansion writes nothing and is not counted.
     pub writes: u32,
 }
 
@@ -222,6 +237,8 @@ pub struct SearchReport {
     pub budget_exhausted: bool,
     /// Whether the soft limit kept a further depth from starting.
     pub soft_stopped: bool,
+    /// Whether the RSS stop ended the search (C17).
+    pub memory_stopped: bool,
     /// Time of the whole search.
     pub elapsed_ms: u64,
 }
@@ -242,10 +259,10 @@ pub enum SearchError {
     /// The expander lost its session.
     #[error("expansion failed: {0}")]
     Expand(#[source] ExpandError),
-    /// The search's stacked fork failed outside the level of a child: it could not be opened or
-    /// released, or a level of the start state or of a parent's path could not be written,
-    /// diagnosed or popped; the session is held or poisoned.
-    #[error("the search's fork failed: {0}")]
+    /// The search's forks failed outside the check of a child: they could not be opened or
+    /// closed, a call of the port (`submit`, `expand`, `next`, `cancel`, `layer_files`) failed,
+    /// or the start state's job failed with reach `Session`; the session is held or poisoned.
+    #[error("the search's forks failed: {0}")]
     Fork(#[source] CheckError),
     /// The session did not return to its baseline after the checks.
     #[error("revert audit failed: {0}")]
@@ -296,6 +313,16 @@ struct Run {
     verdicts: BTreeMap<NodeId, Verdict>,
     budget_exhausted: bool,
     soft_stopped: bool,
+    memory_stopped: bool,
+    /// The failure of the start state's job, when it ended the search (C13).
+    start_failed: Option<CheckError>,
+}
+
+impl Run {
+    /// Whether a stop keeps every further job from being submitted (C5, C17).
+    fn stopped(&self) -> bool {
+        self.budget_exhausted || self.memory_stopped
+    }
 }
 
 fn sat16(n: usize) -> u16 {
@@ -306,225 +333,184 @@ fn sat32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// What a step on the search's fork reads of the search.
-struct Ctx<'a> {
-    tree: &'a SearchTree,
-    staged_of: &'a BTreeMap<NodeId, Staged>,
-    start: &'a [Edit],
-    scope: Scope,
-    baseline: &'a [Finding],
+/// What a job of the search is for.
+enum Slot {
+    /// The start state's job (C13).
+    Start,
+    /// The expansion of a parent.
+    Expand(NodeId),
+    /// The check of a child, inserted as `node`.
+    Child(NodeId, Box<Pending>),
 }
 
-/// What became of the check of one child on the search's fork.
-enum Judged {
-    /// Its level was diagnosed: the verdict, and the findings it was made from.
-    Verdict(Verdict, ScopedFindings),
-    /// Its own write, diagnosis, files or pop failed.
-    Failed(CheckError),
-    /// A level it would be written on failed with reach `Blueprint`; it was never written.
-    Refused(CheckError),
-    /// Its parent has no staged path. Parents are passing nodes, each with its staged path.
-    Skipped,
+/// One turn of the search, in submission order (C16).
+enum Turn {
+    /// A job and what it is for.
+    Job(JobId, Slot),
+    /// A child that was a duplicate at its submit: its log entry waits for its turn, so the
+    /// decision log is in the order of the checks whatever the width.
+    Duplicate(BlueprintId),
 }
 
-/// The search's one stacked fork (C12, C13): the nodes whose levels it holds, and the findings of
-/// the state of each node whose verdict was formed on it.
-struct Walk<'v, V: Stacked> {
+/// The turn at the head, with its job's outcome when it is a job (what [`Window::pop`] gives).
+type Popped<L> = (Turn, Option<Next<L>>);
+
+/// The two stops read before each submit and on each `Pending` (C5, C17).
+struct Stops<'a> {
+    clock: &'a dyn Clock,
+    t0: u64,
+    budget: SearchBudget,
+    gauge: &'a dyn Gauge,
+    rss: RssStop,
+}
+
+impl Stops<'_> {
+    fn elapsed(&self) -> u64 {
+        self.clock.now_ms().saturating_sub(self.t0)
+    }
+
+    /// C5: a check that starts now may not finish within the hard limit.
+    fn hard(&self) -> bool {
+        self.elapsed().saturating_add(self.budget.per_candidate_ms) > self.budget.hard_ms
+    }
+
+    /// C17: the RSS has grown past the search's memory budget.
+    fn memory(&self) -> bool {
+        self.rss.reached(self.gauge)
+    }
+}
+
+/// The jobs of the search between their submit and their turn (C16): at most `width` submitted
+/// and not yet received from `Forks::next`, the outcomes received before their turn in `early`.
+struct Window<'v, V: Forks> {
     v: &'v V,
-    fork: V::Fork,
-    /// The nodes whose levels the fork holds, bottom first.
-    held: Vec<NodeId>,
-    /// Whether the start state is a level: only when it has edits.
-    start_level: bool,
-    /// The root's findings (its one diagnosis, or none for an empty start) and those of every
-    /// passing node, as its verdict was made from them. After a depth only those of its passing
-    /// nodes are kept: no other node is a parent again.
-    findings: BTreeMap<NodeId, ScopedFindings>,
-    /// The failure of reach `Blueprint` of a level of a node's path in this depth: every child of
-    /// the node is blocked with it.
-    refused: BTreeMap<NodeId, CheckError>,
+    width: usize,
+    turns: VecDeque<Turn>,
+    early: BTreeMap<JobId, Next<V::Layer>>,
+    /// Submitted and not yet received: what a stop may cancel.
+    undelivered: BTreeSet<JobId>,
 }
 
-impl<'v, V: Stacked> Walk<'v, V> {
-    /// Opens the fork. An empty start is no level and has no findings.
-    fn open(
-        v: &'v V,
-        s: &mut V::Session,
-        root: NodeId,
-        start: &[Edit],
-    ) -> Result<Self, CheckError> {
-        let fork = v.fork(s)?;
-        let mut findings = BTreeMap::new();
-        if start.is_empty() {
-            findings.insert(root, ScopedFindings::default());
-        }
-        Ok(Walk {
-            v,
-            fork,
-            held: Vec::new(),
-            start_level: !start.is_empty(),
-            findings,
-            refused: BTreeMap::new(),
-        })
+/// The id of an outcome of a job.
+fn job_of<L>(next: &Next<L>) -> Option<JobId> {
+    match next {
+        Next::Done(id, _) | Next::Expanded(id, _) | Next::Withdrawn(id) => Some(*id),
+        Next::Pending | Next::Idle => None,
+    }
+}
+
+impl<'v, V: Forks> Window<'v, V> {
+    fn room(&self) -> bool {
+        self.undelivered.len() < self.width
     }
 
-    /// The nodes whose levels make the state of `node`, bottom first: the root when the start
-    /// state has edits, then each node of its path from depth 1.
-    fn levels_of(&self, tree: &SearchTree, node: NodeId) -> Vec<NodeId> {
-        let mut path = tree.path(node);
-        if !self.start_level {
-            path.retain(|n| *n != tree.root());
-        }
-        path
+    fn push(&mut self, id: JobId, slot: Slot) {
+        self.undelivered.insert(id);
+        self.turns.push_back(Turn::Job(id, slot));
     }
 
-    /// Brings the fork to the levels of `node`'s path: pops to the longest common prefix of the
-    /// levels it holds and that path, then writes the rest (`repath`). `false` when a node of the
-    /// path has no staged path; a refused write leaves the fork at the levels written so far.
-    fn to(
+    /// Cancels every job not yet received (C17). A cancel that returns false is followed by
+    /// the job's own outcome, consumed like any other.
+    fn cancel_all(&mut self, s: &mut V::Session) -> Result<(), CheckError> {
+        for id in self.undelivered.clone() {
+            self.v.cancel(s, id)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the stops on a `Pending` (C5, C17): the hard limit stops further submits, and
+    /// cancels the jobs in flight only when `cancel_on_hard` (the start state's job, which has no
+    /// cut-off of its own); the RSS stop cancels them.
+    fn on_pending(
         &mut self,
         s: &mut V::Session,
-        cx: &Ctx<'_>,
-        node: NodeId,
-        writes: &mut u32,
-    ) -> Result<bool, CheckError> {
-        let path = self.levels_of(cx.tree, node);
-        let mut own: Vec<&[Edit]> = Vec::with_capacity(path.len());
-        for n in &path {
-            if *n == cx.tree.root() {
-                own.push(cx.start);
-            } else {
-                match cx.staged_of.get(n) {
-                    Some(staged) => own.push(staged.own()),
-                    None => return Ok(false),
-                }
+        run: &mut Run,
+        stops: &Stops<'_>,
+        cancel_on_hard: bool,
+    ) -> Result<(), CheckError> {
+        if !run.budget_exhausted && stops.hard() {
+            run.budget_exhausted = true;
+            if cancel_on_hard {
+                self.cancel_all(s)?;
             }
         }
-        let (pops, rest) = repath(&self.held, &path);
-        for _ in 0..pops {
-            // A pop that fails has removed the level all the same (`Stacked::pop` C2).
-            self.held.pop();
-            self.v.pop(s, &mut self.fork)?;
+        if !run.memory_stopped && stops.memory() {
+            run.memory_stopped = true;
+            self.cancel_all(s)?;
         }
-        let from = path.len() - rest.len();
-        for (n, edits) in rest.iter().zip(&own[from..]) {
-            *writes = writes.saturating_add(1);
-            self.v.write(s, &mut self.fork, edits)?;
-            self.held.push(*n);
-        }
-        Ok(true)
+        Ok(())
     }
 
-    /// A failure of a level of `node`'s path: of reach `Blueprint`, every child of `node` in this
-    /// depth is refused with it; of reach `Session`, the fork failed.
-    fn refuse(&mut self, node: NodeId, e: CheckError) -> Result<Judged, SearchError> {
-        match e.reach() {
-            CheckReach::Blueprint => {
-                self.refused.insert(node, e.clone());
-                Ok(Judged::Refused(e))
-            }
-            CheckReach::Session => Err(SearchError::Fork(e)),
-        }
-    }
-
-    /// The check of a child of `parent` whose own edits are `own`: the fork is brought to the
-    /// parent's path, the start state is diagnosed if this is its first child, and the child is
-    /// written as one more level, diagnosed at the input's scope and popped. The verdict is
-    /// `Verdict::of_level` on top of the parent's findings, kept to `Stacked::files_of`.
-    fn check_child(
+    /// The turn at the head and its outcome, waited for in `Forks::next` when it has not been
+    /// received; `None` when no turn is left and, with `want_room`, when an outcome of another job
+    /// freed a place, so the caller can submit before the head is in.
+    fn pop(
         &mut self,
         s: &mut V::Session,
-        cx: &Ctx<'_>,
-        parent: NodeId,
-        own: &[Edit],
-        writes: &mut u32,
-    ) -> Result<Judged, SearchError> {
-        if let Some(e) = self.refused.get(&parent) {
-            return Ok(Judged::Refused(e.clone()));
-        }
-        match self.to(s, cx, parent, writes) {
-            Ok(true) => {}
-            Ok(false) => return Ok(Judged::Skipped),
-            Err(e) => return self.refuse(parent, e),
-        }
-        let root = cx.tree.root();
-        if parent == root && !self.findings.contains_key(&root) {
-            let found = match self.v.diagnose(s, &self.fork, cx.scope) {
-                Ok(found) => found,
-                Err(e) => return self.refuse(root, e),
-            };
-            let files = match self.v.files_of(s, &self.fork, cx.scope) {
-                Ok(files) => files,
-                Err(e) => return self.refuse(root, e),
-            };
-            let (_, kept) = Verdict::of_level(
-                cx.baseline,
-                &ScopedFindings::default(),
-                &found,
-                &Edit::deleted_paths(cx.start),
-                &files,
-            );
-            self.findings.insert(root, kept);
-        }
-        let Some(below) = self.findings.get(&parent) else {
-            return Ok(Judged::Skipped);
+        run: &mut Run,
+        stops: &Stops<'_>,
+        cancel_on_hard: bool,
+        want_room: bool,
+    ) -> Result<Option<Popped<V::Layer>>, CheckError> {
+        let head = match self.turns.front() {
+            None => return Ok(None),
+            Some(Turn::Duplicate(_)) => {
+                return Ok(self.turns.pop_front().map(|t| (t, None)));
+            }
+            Some(Turn::Job(id, _)) => *id,
         };
-        *writes = writes.saturating_add(1);
-        if let Err(e) = self.v.write(s, &mut self.fork, own) {
-            return Ok(Judged::Failed(e));
-        }
-        let diagnosed = self
-            .v
-            .diagnose(s, &self.fork, cx.scope)
-            .and_then(|found| Ok((found, self.v.files_of(s, &self.fork, cx.scope)?)));
-        // A failure of reach `Session` ends the search; the release reverts the level.
-        if let Err(e) = &diagnosed
-            && e.reach() == CheckReach::Session
-        {
-            return Ok(Judged::Failed(e.clone()));
-        }
-        if let Err(e) = self.v.pop(s, &mut self.fork) {
-            return Ok(Judged::Failed(e));
-        }
-        Ok(match diagnosed {
-            Ok((found, files)) => {
-                let (verdict, kept) = Verdict::of_level(
-                    cx.baseline,
-                    below,
-                    &found,
-                    &Edit::deleted_paths(own),
-                    &files,
-                );
-                Judged::Verdict(verdict, kept)
+        let next = loop {
+            if let Some(next) = self.early.remove(&head) {
+                break next;
             }
-            Err(e) => Judged::Failed(e),
-        })
+            let next = self.v.next(s, Duration::from_millis(SEARCH_TICK_MS))?;
+            let Some(id) = job_of(&next) else {
+                if matches!(next, Next::Idle) {
+                    return Err(CheckError::Panicked(
+                        "the forks are idle while a job of the search is in flight".to_owned(),
+                    ));
+                }
+                self.on_pending(s, run, stops, cancel_on_hard)?;
+                continue;
+            };
+            self.undelivered.remove(&id);
+            if id == head {
+                break next;
+            }
+            self.early.insert(id, next);
+            if want_room && self.room() {
+                return Ok(None);
+            }
+        };
+        Ok(self.turns.pop_front().map(|t| (t, Some(next))))
     }
+}
 
-    /// Ends the fork, reverting every level.
-    fn release(self, s: &mut V::Session) -> Result<(), CheckError> {
-        self.v.release(s, self.fork)
-    }
+/// An outcome that is not the one its slot expects: the forks broke their contract (C1).
+fn mismatched(what: &str) -> CheckError {
+    CheckError::Panicked(format!(
+        "the forks gave an outcome of the wrong kind for {what}"
+    ))
 }
 
 /// Searches for the best verified changes that answer one decision.
 ///
-/// `v` checks, `e` proposes, `a` measures, `j` judges and `clock` is the only source of time.
-/// The expander and the verifier share the one session `s`, and the search's fork on it.
+/// `v` checks and expands on its forks, `a` measures, `j` judges, `clock` is the only source of
+/// time and `gauge` the only reading of memory.
 ///
 /// # Contract
 /// - C1: depth 1 expands the start state, the roots of the input first; depth `d` above 1
 ///   expands the first `beam_parents` of `rank_final` over the passing nodes of depth `d - 1`,
 ///   each for at most `max(1, max_expand / parents)` children, and the search ends when there
-///   is no such node. Each parent is expanded on the search's fork, with the levels of its path
-///   on it (C12). A failed analysis of one parent, a refused write of its path included, is
-///   recorded in the report and the parent yields nothing; a lost session is
-///   `SearchError::Expand`, or `SearchError::Fork` when the fork lost it (C14); no root and no
-///   child at depth 1 is `SearchError::NoCandidates`.
+///   is no such node. Each parent is expanded by a read job on its own Layer (C12), the
+///   expansions taken in the parents' order (C16). A failed analysis of one parent
+///   (`ExpandError::Analysis`) is recorded in the report and the parent yields nothing; a lost
+///   session is `SearchError::Expand`; no root and no child at depth 1 is
+///   `SearchError::NoCandidates`, unless the memory stop withdrew the expansions (C17).
 ///   tested: app::search::tests::siblings_are_checked_consecutively
 ///   tested: app::search::tests::no_candidates_is_error
 ///   tested: app::search::tests::expand_errors_are_recorded_and_session_error_is_fatal
-///   tested: app::search::tests::parents_are_expanded_on_the_fork
+///   tested: app::search::tests::parents_are_expanded_on_their_layer
 /// - C2: every child runs the stages of `apply_blueprints` against the text of its parent's
 ///   state, not the session base, so a read of the parent's text is fresh; a refusal is
 ///   `Fate::Blocked` with its `Blocking` and log entry and the child is never checked. A child
@@ -547,20 +533,23 @@ impl<'v, V: Stacked> Walk<'v, V> {
 ///   tested: app::search::tests::roots_are_never_pruned
 ///   tested: app::search::tests::siblings_are_checked_consecutively
 ///   tested: app::search::tests::noul_pruned_are_audited_every_10th
-/// - C5: before each check the clock is read: when the time spent plus `per_candidate_ms`
-///   passes `hard_ms`, the whole search ends, `budget_exhausted` is set, and every child of
-///   the beam not yet checked gets `Fate::TimedOut` without a check; so with 360 s and a
-///   6 s limit at most 59 full checks begin after any expansion time. A child whose state is
-///   already in the tree is `Fate::Pruned` for being a duplicate and is not checked. A check
-///   cut off by `CheckError::TimedOut` is `Blocking::BudgetExhausted` and `Fate::TimedOut` and
-///   the search goes on; a check that fails another way with a failure of reach `Blueprint`
-///   is `Blocking::CheckFailed`, a `Stage::Check` log entry with `ok` false and
-///   `Fate::Blocked(Stage::Check)`, and the search goes on; one of reach `Session` is
-///   `SearchError::Check`; a check that adds errors is `Fate::Failed` and
-///   `Blocking::NewErrors`, and a near miss when the errors are few. A `Decided` resolution
-///   lists every blocking of the search.
+/// - C5: before each check job is submitted, in the order of C4, the clock is read: when the
+///   time spent plus `per_candidate_ms` passes `hard_ms`, `budget_exhausted` is set, no further
+///   check is submitted and every child not yet submitted gets `Fate::TimedOut` with no node and
+///   no check. The same reading is taken on each `Next::Pending` while the search waits. The
+///   jobs already submitted are not cancelled: each started within the limit, its own cut-off
+///   ends it, and its outcome is consumed; so with 360 s and a 6 s limit no check starts that
+///   cannot finish. A child whose state is already in the tree is `Fate::Pruned` for being a
+///   duplicate and is not checked. A check cut off by `CheckError::TimedOut` is
+///   `Blocking::BudgetExhausted` and `Fate::TimedOut` and the search goes on; a check that fails
+///   another way with a failure of reach `Blueprint` is `Blocking::CheckFailed`, a
+///   `Stage::Check` log entry with `ok` false and `Fate::Blocked(Stage::Check)`, and the search
+///   goes on; one of reach `Session` is `SearchError::Check`; a check that adds errors is
+///   `Fate::Failed` and `Blocking::NewErrors`, and a near miss when the errors are few. A
+///   `Decided` resolution lists every blocking of the search.
 ///   tested: app::search::tests::budget_exhausted_returns_verified_so_far
 ///   tested: app::search::tests::hard_budget_with_nothing_verified_is_failed_exhausted
+///   tested: app::search::tests::the_hard_budget_is_checked_before_each_submit
 ///   tested: app::search::tests::check_timeout_is_budget_exhausted_blocking
 ///   tested: app::search::tests::per_blueprint_check_error_blocks_only_that_child
 ///   tested: app::search::tests::session_check_error_stops_the_search
@@ -568,17 +557,17 @@ impl<'v, V: Stacked> Walk<'v, V> {
 /// - C6: after a depth, when the time spent has reached `soft_ms`, `soft_stopped` is set and
 ///   no further depth starts.
 ///   tested: app::search::tests::soft_budget_stops_after_the_depth
-/// - C7: the revert is audited exactly once, after the fork is released and before the report
+/// - C7: the revert is audited exactly once, after the forks are closed and before the report
 ///   is returned, whether the resolution is `Decided` or `Failed`; an audit that fails is
 ///   `SearchError::RevertAudit`. A search that ends in an error is not audited.
 ///   tested: app::search::tests::revert_audit_runs_once_at_end
-///   tested: app::search::tests::the_fork_is_released_before_the_audit_and_on_error
+///   tested: app::search::tests::layers_are_dropped_before_close_on_every_path
 /// - C8: the ranking holds every node that passed, at any depth, by `rank_final`, each with
 ///   the Blueprints of its path and its prior. The resolution is `Decided` with every node of
 ///   the ranking as a candidate, in the order of the ranking; the marks of each candidate are
 ///   those of the Blueprints of its path and of the file roles its node edits. With no node
-///   that passed the resolution is `Failed` with every blocking, and the budget flag, of the
-///   search.
+///   that passed the resolution is `Failed` with every blocking of the search, and the budget
+///   flag set when the hard limit or the memory stop ended it.
 ///   tested: app::search::tests::decided_lists_every_passing_node_by_reward
 ///   tested: app::search::tests::path_marks_are_the_union_of_the_path
 ///   tested: app::search::tests::hard_budget_with_nothing_verified_is_failed_exhausted
@@ -594,55 +583,87 @@ impl<'v, V: Stacked> Walk<'v, V> {
 /// - C11: a root with `builds_on` is `SearchError::ChainedRoot` for the first such root,
 ///   returned before anything runs: no check and no expansion.
 ///   tested: app::search::tests::root_with_builds_on_is_refused
-/// - C12: the search keeps one stacked fork from before its first expansion until before its
-///   audit. Before a parent is expanded, and before a child of it is checked, the fork holds the
-///   levels of the parent's path: the start state when it has edits, then the own edits of each
-///   node of the path from depth 1 on. It gets there from the levels it holds by popping to
-///   their longest common prefix and writing the rest (`repath`). A child is one more level, its
-///   own edits, popped after its diagnosis. No write takes a node's edits from the base.
-///   tested: app::search::tests::children_are_written_on_top_of_their_parent
-///   tested: app::search::tests::repath_pops_to_the_common_prefix
-///   tested: app::search::tests::parents_are_expanded_on_the_fork
-/// - C13: the verdict of a child is `Verdict::of_level` of the diagnosis of its level at the
-///   input's scope, on top of its parent's findings, with the paths the child deletes, kept to
-///   the `Stacked::files_of` of its level at that scope. A passing node's findings are those
-///   its verdict was made from. The start state's are one diagnosis of its level kept the same
-///   way, taken at the first check of a child of the root; an empty start has none.
+/// - C12: the search opens the forks once, before its first job, and closes them before its
+///   audit. Each verified node owns a Layer: the root the Layer of the start state's job, or the
+///   base's root for an empty start; a passing child the Layer of its own check job. A child is
+///   the job `Forks::submit` of its own edits on its parent's Layer, at the input's scope, with
+///   `Limit::Check`; a parent is expanded by `Forks::expand` of its Layer with the fingerprint of
+///   its state's edits. No job writes a node's edits from the base, and none writes a parent's
+///   path again.
+///   tested: app::search::tests::children_are_jobs_on_their_parents_layer
+///   tested: app::search::tests::parents_are_expanded_on_their_layer
+/// - C13: the verdict of a child is `Verdict::of_level` of its job's findings on top of its
+///   parent's findings, with the paths the child deletes, kept to the `Forks::layer_files` of its
+///   job's Layer at the input's scope. A passing node's findings are those its verdict was made
+///   from. The start state's are those of one job of the start's edits on the base's root,
+///   submitted with `Limit::None` (the start is no candidate, so D1's cut-off is not its) and
+///   consumed before depth 1, kept the same way over no findings; an empty start has none and
+///   no job. A start job that fails with reach `Blueprint` ends the search with a report: no
+///   depth runs, each root is in the trace with the blocking of that failure and
+///   `Fate::Blocked(Stage::Check)`, and the resolution is `Failed` with `Infeasible::start`
+///   naming the failure (a `TimedOut` is no failure: the roots are `Fate::TimedOut`, the
+///   blockings `BudgetExhausted`).
 ///   tested: app::search::tests::the_verdict_keeps_the_findings_below
-///   tested: app::search::tests::the_start_state_is_diagnosed_once
+///   tested: app::search::tests::the_start_state_is_one_job
+///   tested: app::search::tests::the_start_job_is_not_cut_off
+///   tested: app::search::tests::a_failed_start_state_is_a_failed_report_naming_it
 ///   tested: ryo-v2-ra tests/stack.rs search_and_apply_give_the_same_verdict_on_a_chain
-///   tested: ryo-v2-oracle tests/search_recall.rs stacked_verdicts_equal_the_flat_check
-/// - C14: a failure of the fork outside the level of a child is reported by its reach. Of reach
-///   `Session` (opening it, or a write, diagnosis or pop of the start state's level or of a
-///   parent's path) it is `SearchError::Fork`. Of reach `Blueprint`, it is the check failure of
-///   every child that would be written on that level, each recorded as C5 says, a child whose
-///   own edits write that path again included: the start state's level for every child of the
-///   root, a parent's path for that parent's children in the depth. For an expansion, it is the
-///   failed analysis of that parent. A failure of reach `Session` of a child's own write,
-///   diagnosis or pop is `SearchError::Check` with that child. A child whose diagnosis fails is
-///   popped like the others.
-///   tested: app::search::tests::a_failed_start_level_fails_every_root_child
-///   tested: app::search::tests::a_refused_path_write_blocks_the_children
-///   tested: app::search::tests::a_session_failure_of_a_pop_stops_the_search
-///   tested: app::search::tests::a_session_failure_outside_a_childs_level_is_a_fork_error
-/// - C15: the fork is released before the search returns, whatever it returns. A failed
-///   release is `SearchError::Fork`, which wins over every end that is not a failure of reach
-///   `Session`: a report, and `SearchError::NoCandidates`; a search that already ends in
-///   `SearchError::Check`, `SearchError::Expand` or `SearchError::Fork` returns that error.
-///   tested: app::search::tests::the_fork_is_released_before_the_audit_and_on_error
-///   tested: app::search::tests::a_failed_release_is_a_search_error
-pub fn search_decision<V, E, A, J>(
+///   tested: ryo-v2-oracle tests/search_recall.rs search_verdicts_equal_the_reference_check
+/// - C14: a failed call of the forks (`open`, `submit`, `expand`, `next`, `cancel`, and
+///   `layer_files` with reach `Session`) is `SearchError::Fork`, and so is a start job's
+///   `Next::Done` with an error of reach `Session`; a child's with one is `SearchError::Check`
+///   with that child. A `layer_files` of reach `Blueprint` is the check failure of its child.
+///   tested: app::search::tests::a_session_failure_of_a_call_is_a_fork_error
+///   tested: app::search::tests::session_check_error_stops_the_search
+/// - C15: every Layer the search holds, and every outcome it has received, is dropped and the
+///   forks are closed before the search returns, whatever it returns; `close` withdraws the jobs
+///   still in flight. A failed close is `SearchError::Fork`, which wins over every end that is
+///   not a failure of reach `Session`: a report, and `SearchError::NoCandidates`; a search that
+///   already ends in `SearchError::Check`, `SearchError::Expand` or `SearchError::Fork` returns
+///   that error.
+///   tested: app::search::tests::layers_are_dropped_before_close_on_every_path
+///   tested: app::search::tests::a_failed_close_is_a_search_error
+/// - C16: at most `Forks::width` jobs, checks and expansions, are submitted and not yet received
+///   from `Forks::next`; outcomes are consumed in submission order, and one received before its
+///   turn waits for it and frees its place. Tree insertion and the duplicate check happen at
+///   submit, in that order. Every outcome received is consumed. So for a search with no
+///   wall-clock effect (no flag set, no `TimedOut`), the report's fields other than times are
+///   those of width 1, whatever the width and the order the jobs finish in.
+///   tested: app::search::tests::parallel_search_equals_serial
+///   tested: app::search::tests::the_window_never_holds_more_than_w
+/// - C17: the RSS stop is `RssStop::start(gauge, input.memory)`, read at the search's start;
+///   it is read before each job is submitted and on each `Next::Pending`. When it is reached,
+///   `memory_stopped` is set, nothing more is submitted (no expansion and no child of this
+///   depth, none of a later depth) and the jobs not yet received are cancelled; the outcomes
+///   already received are consumed. A withdrawn child is `Fate::TimedOut`, counted in
+///   `timed_out`, with no blocking, no log entry and no `CheckError`; a withdrawn expansion
+///   yields nothing and records no expand error; a cancel that returns false is consumed as its
+///   job's outcome. The start state's job, which has no cut-off, is cancelled also when the hard
+///   limit of C5 is reached while the search waits for it; a start that is withdrawn, or never
+///   submitted because a stop was reached, ends the search with no depth: each root is in the
+///   trace as `Fate::TimedOut` and the resolution is `Failed` with the budget flag.
+///   tested: app::search::tests::the_rss_stop_is_relative_to_the_search_start
+///   tested: app::search::tests::a_withdrawn_child_is_timed_out_never_blocked
+///   tested: app::search::tests::an_outcome_received_before_a_stop_is_consumed
+///   tested: app::search::tests::a_cancel_that_returns_false_is_consumed_as_its_done
+///   tested: app::search::tests::a_stop_during_expansion_submits_no_child
+///   tested: app::search::tests::the_start_job_is_cut_by_the_hard_budget_and_the_rss_stop
+/// - C18: a failed or withdrawn child's Layer is dropped when it is consumed; a passing child's
+///   is kept until the next depth picks its parents, and dropped then if it is not one; a
+///   parent's Layer, the root's included, is dropped once every child of its depth is consumed;
+///   after the last depth every Layer is dropped before `close`.
+///   tested: app::search::tests::layers_follow_the_retention_rule
+pub fn search_decision<V, A, J>(
     v: &V,
-    e: &E,
     a: &A,
     j: &J,
     clock: &dyn Clock,
+    gauge: &dyn Gauge,
     s: &mut V::Session,
     input: &SearchInput<'_>,
 ) -> Result<SearchReport, SearchError>
 where
-    V: Stacked + RevertAudit,
-    E: Expander<Session = V::Session>,
+    V: Forks + RevertAudit,
     A: Assessor,
     J: Judge,
 {
@@ -657,6 +678,13 @@ where
     let elapsed = || clock.now_ms().saturating_sub(t0);
     let b = input.budget;
     let w = input.weights;
+    let stops = Stops {
+        clock,
+        t0,
+        budget: b,
+        gauge,
+        rss: RssStop::start(gauge, input.memory),
+    };
     let baseline = v.baseline(s);
     let provenance = v.provenance(s);
     let blind = v.blind_classes();
@@ -665,11 +693,124 @@ where
     let mut passing: Vec<NodeId> = Vec::new();
     let mut last_passing: Vec<NodeId> = Vec::new();
     let mut staged_of: BTreeMap<NodeId, Staged> = BTreeMap::new();
-    let mut walk = Walk::open(v, s, tree.root(), input.start).map_err(SearchError::Fork)?;
+    // The findings of the root and of every node that can still be a parent (C13).
+    let mut findings: BTreeMap<NodeId, ScopedFindings> = BTreeMap::new();
+    // The Layer of each node that can still be a parent, with its state's fingerprint (C18).
+    let mut layers: BTreeMap<NodeId, (V::Layer, StateFp)> = BTreeMap::new();
+    let root_layer = v.open(s).map_err(SearchError::Fork)?;
+    layers.insert(tree.root(), (root_layer, StateFp::of(input.start)));
+    let mut window = Window {
+        v,
+        width: v.width(s).max(1),
+        turns: VecDeque::new(),
+        early: BTreeMap::new(),
+        undelivered: BTreeSet::new(),
+    };
 
     let searched: Result<(), SearchError> = 'search: {
+        // 0. the start state, one job with no cut-off (C13, C17)
+        let (mut start_ms, mut start_writes) = (0, 0);
+        if input.start.is_empty() {
+            findings.insert(tree.root(), ScopedFindings::default());
+        } else {
+            let t_start = clock.now_ms();
+            if stops.hard() {
+                run.budget_exhausted = true;
+            } else if stops.memory() {
+                run.memory_stopped = true;
+            } else {
+                let Some((root_layer, _)) = layers.get(&tree.root()) else {
+                    break 'search Err(SearchError::Fork(mismatched("the root")));
+                };
+                let id = match v.submit(s, root_layer, input.start, input.scope, Limit::None) {
+                    Ok(id) => id,
+                    Err(e) => break 'search Err(SearchError::Fork(e)),
+                };
+                start_writes = 1;
+                window.push(id, Slot::Start);
+                let next = match window.pop(s, &mut run, &stops, true, false) {
+                    Ok(Some((Turn::Job(_, Slot::Start), Some(next)))) => next,
+                    Ok(_) => break 'search Err(SearchError::Fork(mismatched("the start"))),
+                    Err(e) => break 'search Err(SearchError::Fork(e)),
+                };
+                match next {
+                    Next::Done(_, Ok(checked)) => {
+                        match v.layer_files(s, &checked.layer, input.scope) {
+                            Ok(files) => {
+                                let (_, kept) = Verdict::of_level(
+                                    &baseline,
+                                    &ScopedFindings::default(),
+                                    &checked.findings,
+                                    &Edit::deleted_paths(input.start),
+                                    &files,
+                                );
+                                findings.insert(tree.root(), kept);
+                                layers
+                                    .insert(tree.root(), (checked.layer, StateFp::of(input.start)));
+                            }
+                            Err(e) if e.reach() == CheckReach::Session => {
+                                break 'search Err(SearchError::Fork(e));
+                            }
+                            Err(e) => run.start_failed = Some(e),
+                        }
+                    }
+                    Next::Done(_, Err(e)) if e.reach() == CheckReach::Session => {
+                        break 'search Err(SearchError::Fork(e));
+                    }
+                    Next::Done(_, Err(e)) => run.start_failed = Some(e),
+                    // Withdrawn at a stop (C17).
+                    Next::Withdrawn(_) => {}
+                    Next::Expanded(..) | Next::Pending | Next::Idle => {
+                        break 'search Err(SearchError::Fork(mismatched("the start")));
+                    }
+                }
+            }
+            start_ms = clock.now_ms().saturating_sub(t_start);
+            if run.start_failed.is_some() || !findings.contains_key(&tree.root()) {
+                // No depth runs: the roots are in the trace with what became of the start.
+                for bp in input.roots {
+                    let bp_id = bp.id();
+                    let fate = match run.start_failed.clone() {
+                        Some(e) => {
+                            run.acc.note(
+                                bp_id,
+                                Stage::Check,
+                                false,
+                                format!("the start state's check failed: {e}"),
+                            );
+                            let timed_out = matches!(e, CheckError::TimedOut { .. });
+                            if let Ok(blocking) = e.into_blocking(bp_id) {
+                                run.blocking.push(blocking);
+                            }
+                            if timed_out {
+                                Fate::TimedOut
+                            } else {
+                                Fate::Blocked(Stage::Check)
+                            }
+                        }
+                        None => Fate::TimedOut,
+                    };
+                    run.trace.push(TraceEntry {
+                        depth: 1,
+                        parent: tree.root(),
+                        blueprint: bp_id,
+                        proposal: ProposalId::of(bp),
+                        command: bp.command().kind(),
+                        state: None,
+                        score: None,
+                        rank: None,
+                        audited: false,
+                        root: true,
+                        fate,
+                        node: None,
+                        edits: None,
+                    });
+                }
+                break 'search Ok(());
+            }
+        }
+
         for d in 1..=b.max_depth {
-            walk.refused.clear();
             // 1. parents and children
             let parents: Vec<NodeId> = if d == 1 {
                 vec![tree.root()]
@@ -683,16 +824,23 @@ where
                     .collect();
                 let mut ranked = rank_final(&verified, &w);
                 ranked.truncate(usize::from(b.beam_parents));
-                if ranked.is_empty() {
-                    break;
-                }
                 ranked
             };
+            // A passing node that is not picked is a parent no more (C18).
+            layers.retain(|id, _| parents.contains(id));
+            findings.retain(|id, _| parents.contains(id));
+            if parents.is_empty() {
+                break;
+            }
             let mut stats = DepthStats {
                 depth: d,
                 parents: sat16(parents.len()),
                 ..DepthStats::default()
             };
+            if d == 1 {
+                stats.check_ms = start_ms;
+                stats.writes = start_writes;
+            }
             let t_expand = clock.now_ms();
             let per_parent = (usize::from(b.max_expand) / parents.len()).max(1);
             let mut children: Vec<Child> = Vec::new();
@@ -705,42 +853,63 @@ where
                     });
                 }
             }
-            for &p in &parents {
-                let cx = Ctx {
-                    tree: &tree,
-                    staged_of: &staged_of,
-                    start: input.start,
-                    scope: input.scope,
-                    baseline: &baseline,
-                };
-                match walk.to(s, &cx, p, &mut stats.writes) {
-                    Ok(true) => {}
-                    // Parents are passing nodes, each with its staged path.
-                    Ok(false) => continue,
-                    Err(err) if err.reach() == CheckReach::Blueprint => {
-                        run.expand_errors.push(ExpandError::Analysis(format!(
-                            "a level of the parent's path was refused: {err}"
-                        )));
-                        walk.refused.insert(p, err);
+            let mut to_expand = parents.iter().copied().peekable();
+            loop {
+                while let Some(&p) = to_expand.peek() {
+                    if !run.memory_stopped && !window.room() {
+                        break;
+                    }
+                    to_expand.next();
+                    if run.memory_stopped {
                         continue;
                     }
-                    Err(err) => break 'search Err(SearchError::Fork(err)),
+                    if stops.memory() {
+                        run.memory_stopped = true;
+                        if let Err(e) = window.cancel_all(s) {
+                            break 'search Err(SearchError::Fork(e));
+                        }
+                        continue;
+                    }
+                    let Some((layer, state)) = layers.get(&p) else {
+                        continue;
+                    };
+                    match v.expand(s, layer, *state, input.targets, per_parent) {
+                        Ok(id) => window.push(id, Slot::Expand(p)),
+                        Err(e) => break 'search Err(SearchError::Fork(e)),
+                    }
                 }
-                let state = tree.node(p).map(|n| n.edits().to_vec()).unwrap_or_default();
-                match e.expand(s, &state, input.targets, per_parent) {
-                    Ok(mut bps) => {
+                let more = to_expand.peek().is_some();
+                let (turn, next) = match window.pop(s, &mut run, &stops, false, more) {
+                    Ok(None) if !more => break,
+                    Ok(None) => continue,
+                    Ok(Some(popped)) => popped,
+                    Err(e) => break 'search Err(SearchError::Fork(e)),
+                };
+                let parent = match turn {
+                    Turn::Job(_, Slot::Expand(p)) => p,
+                    _ => break 'search Err(SearchError::Fork(mismatched("an expansion"))),
+                };
+                match next {
+                    Some(Next::Expanded(_, Ok(mut bps))) => {
                         bps.truncate(per_parent);
                         children.extend(bps.into_iter().map(|bp| Child {
-                            parent: p,
+                            parent,
                             bp,
                             root: false,
                         }));
                     }
-                    Err(err @ ExpandError::Analysis(_)) => run.expand_errors.push(err),
-                    Err(err) => break 'search Err(SearchError::Expand(err)),
+                    Some(Next::Expanded(_, Err(err @ ExpandError::Analysis(_)))) => {
+                        run.expand_errors.push(err);
+                    }
+                    Some(Next::Expanded(_, Err(err))) => {
+                        break 'search Err(SearchError::Expand(err));
+                    }
+                    // Withdrawn at the memory stop: the parent yields nothing (C17).
+                    Some(Next::Withdrawn(_)) => {}
+                    _ => break 'search Err(SearchError::Fork(mismatched("an expansion"))),
                 }
             }
-            if d == 1 && children.is_empty() {
+            if d == 1 && children.is_empty() && !run.memory_stopped {
                 break 'search Err(SearchError::NoCandidates);
             }
             stats.generated = sat32(children.len());
@@ -924,77 +1093,123 @@ where
                 }
             }
 
-            // 5. checks
+            // 5. checks, windowed (C5, C16, C17)
+            let t_check = clock.now_ms();
             let mut depth_passing: Vec<NodeId> = Vec::new();
-            for i in order {
-                let Some(c) = staged[i].take() else {
-                    continue;
+            let mut order = order.into_iter().peekable();
+            loop {
+                while let Some(&i) = order.peek() {
+                    if !run.stopped() && !window.room() {
+                        break;
+                    }
+                    order.next();
+                    let Some(c) = staged[i].take() else {
+                        continue;
+                    };
+                    let bp_id = c.staged.path().last().id();
+                    let t = c.trace;
+                    if run.stopped() {
+                        run.trace[t].fate = Fate::TimedOut;
+                        stats.timed_out = stats.timed_out.saturating_add(1);
+                        continue;
+                    }
+                    if tree.has_state(c.state) {
+                        run.trace[t].fate = Fate::Pruned(PruneStage::Duplicate);
+                        window.turns.push_back(Turn::Duplicate(bp_id));
+                        continue;
+                    }
+                    if stops.hard() {
+                        run.budget_exhausted = true;
+                    } else if stops.memory() {
+                        run.memory_stopped = true;
+                        if let Err(e) = window.cancel_all(s) {
+                            break 'search Err(SearchError::Fork(e));
+                        }
+                    }
+                    if run.stopped() {
+                        run.trace[t].fate = Fate::TimedOut;
+                        stats.timed_out = stats.timed_out.saturating_add(1);
+                        continue;
+                    }
+                    let Some((layer, _)) = layers.get(&c.parent) else {
+                        // Parents are passing nodes, each with its Layer.
+                        continue;
+                    };
+                    let id = match tree.insert(NewNode {
+                        parent: c.parent,
+                        blueprint: c.staged.path().last().clone(),
+                        edits: c.staged.edits().to_vec(),
+                        roles: c.staged.roles().clone(),
+                        metrics: c.metrics,
+                        prior: c.prior,
+                    }) {
+                        Inserted::Added(id) => id,
+                        Inserted::Merged(_) => {
+                            run.trace[t].fate = Fate::Pruned(PruneStage::Duplicate);
+                            continue;
+                        }
+                    };
+                    run.trace[t].node = Some(id);
+                    match v.submit(s, layer, c.staged.own(), input.scope, Limit::Check) {
+                        Ok(job) => window.push(job, Slot::Child(id, Box::new(c))),
+                        Err(e) => break 'search Err(SearchError::Fork(e)),
+                    }
+                    stats.writes = stats.writes.saturating_add(1);
+                }
+                let more = order.peek().is_some();
+                let (turn, next) = match window.pop(s, &mut run, &stops, false, more) {
+                    Ok(None) if !more => break,
+                    Ok(None) => continue,
+                    Ok(Some(popped)) => popped,
+                    Err(e) => break 'search Err(SearchError::Fork(e)),
+                };
+                let (id, c) = match turn {
+                    Turn::Duplicate(bp_id) => {
+                        run.acc.note(
+                            bp_id,
+                            Stage::Prune,
+                            false,
+                            PruneStage::Duplicate.to_string(),
+                        );
+                        continue;
+                    }
+                    Turn::Job(_, Slot::Child(id, c)) => (id, *c),
+                    Turn::Job(..) => break 'search Err(SearchError::Fork(mismatched("a check"))),
                 };
                 let bp_id = c.staged.path().last().id();
                 let t = c.trace;
-                if run.budget_exhausted {
-                    run.trace[t].fate = Fate::TimedOut;
-                    stats.timed_out = stats.timed_out.saturating_add(1);
-                    continue;
-                }
-                if tree.has_state(c.state) {
-                    run.trace[t].fate = Fate::Pruned(PruneStage::Duplicate);
-                    run.acc.note(
-                        bp_id,
-                        Stage::Prune,
-                        false,
-                        PruneStage::Duplicate.to_string(),
-                    );
-                    continue;
-                }
-                if elapsed().saturating_add(b.per_candidate_ms) > b.hard_ms {
-                    run.budget_exhausted = true;
-                    run.trace[t].fate = Fate::TimedOut;
-                    stats.timed_out = stats.timed_out.saturating_add(1);
-                    continue;
-                }
-                let id = match tree.insert(NewNode {
-                    parent: c.parent,
-                    blueprint: c.staged.path().last().clone(),
-                    edits: c.staged.edits().to_vec(),
-                    roles: c.staged.roles().clone(),
-                    metrics: c.metrics,
-                    prior: c.prior,
-                }) {
-                    Inserted::Added(id) => id,
-                    Inserted::Merged(_) => {
-                        run.trace[t].fate = Fate::Pruned(PruneStage::Duplicate);
+                let result = match next {
+                    Some(Next::Done(_, Ok(checked))) => {
+                        match v.layer_files(s, &checked.layer, input.scope) {
+                            Ok(files) => {
+                                let below = findings.get(&c.parent).cloned().unwrap_or_default();
+                                let (verdict, kept) = Verdict::of_level(
+                                    &baseline,
+                                    &below,
+                                    &checked.findings,
+                                    &Edit::deleted_paths(c.staged.own()),
+                                    &files,
+                                );
+                                Ok((verdict, kept, checked.layer))
+                            }
+                            Err(e) if e.reach() == CheckReach::Session => {
+                                break 'search Err(SearchError::Fork(e));
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    Some(Next::Done(_, Err(e))) => Err(e),
+                    // Withdrawn at the memory stop: no fact about the Blueprint (C17).
+                    Some(Next::Withdrawn(_)) => {
+                        run.trace[t].fate = Fate::TimedOut;
+                        stats.timed_out = stats.timed_out.saturating_add(1);
                         continue;
                     }
+                    _ => break 'search Err(SearchError::Fork(mismatched("a check"))),
                 };
-                run.trace[t].node = Some(id);
-                let t_check = clock.now_ms();
-                let cx = Ctx {
-                    tree: &tree,
-                    staged_of: &staged_of,
-                    start: input.start,
-                    scope: input.scope,
-                    baseline: &baseline,
-                };
-                let judged =
-                    match walk.check_child(s, &cx, c.parent, c.staged.own(), &mut stats.writes) {
-                        Ok(judged) => judged,
-                        Err(err) => break 'search Err(err),
-                    };
-                stats.check_ms = stats
-                    .check_ms
-                    .saturating_add(clock.now_ms().saturating_sub(t_check));
-                let (result, below) = match judged {
-                    Judged::Skipped => continue,
-                    Judged::Verdict(verdict, kept) => (Ok((verdict, kept)), false),
-                    Judged::Failed(err) => (Err(err), false),
-                    Judged::Refused(err) => (Err(err), true),
-                };
-                if !below {
-                    stats.checked = stats.checked.saturating_add(1);
-                }
+                stats.checked = stats.checked.saturating_add(1);
                 match result {
-                    Ok((verdict, kept)) => {
+                    Ok((verdict, kept, layer)) => {
                         run.acc.verdicts.push((bp_id, verdict.clone()));
                         let errors = verdict.new_errors.len();
                         run.acc.note(
@@ -1011,14 +1226,17 @@ where
                                 .filter_map(|n| tree.node(*n).map(|x| *x.metrics()))
                                 .collect();
                             tree.set_reward(id, Reward::along(&along, true));
+                            layers.insert(id, (layer, c.state));
                             staged_of.insert(id, c.staged);
-                            walk.findings.insert(id, kept);
+                            findings.insert(id, kept);
                             run.verdicts.insert(id, verdict);
                             passing.push(id);
                             depth_passing.push(id);
                             run.trace[t].fate = Fate::Passed;
                             stats.passed = stats.passed.saturating_add(1);
                         } else {
+                            // A failed child's Layer is dropped here (C18).
+                            drop(layer);
                             run.trace[t].fate = Fate::Failed { new_errors: errors };
                             run.near_miss.extend(NearMiss::of(bp_id, errors));
                             run.blocking.push(Blocking::NewErrors {
@@ -1028,12 +1246,11 @@ where
                         }
                     }
                     Err(CheckError::TimedOut { limit_ms }) => {
-                        let what = if below { "a level below: " } else { "" };
                         run.acc.note(
                             bp_id,
                             Stage::Check,
                             false,
-                            format!("{what}cut off after {limit_ms} ms"),
+                            format!("cut off after {limit_ms} ms"),
                         );
                         run.blocking.push(Blocking::BudgetExhausted {
                             blueprint: bp_id,
@@ -1043,11 +1260,7 @@ where
                         stats.timed_out = stats.timed_out.saturating_add(1);
                     }
                     Err(e) => {
-                        let note = if below {
-                            format!("a level below failed: {e}")
-                        } else {
-                            format!("check failed: {e}")
-                        };
+                        let note = format!("check failed: {e}");
                         match e.into_blocking(bp_id) {
                             Ok(blocking) => {
                                 run.acc.note(bp_id, Stage::Check, false, note);
@@ -1064,13 +1277,20 @@ where
                     }
                 }
             }
+            stats.check_ms = stats
+                .check_ms
+                .saturating_add(clock.now_ms().saturating_sub(t_check));
             run.depths.push(stats);
+            // The parents' Layers go once their depth is consumed (C18).
+            for p in &parents {
+                layers.remove(p);
+            }
             last_passing = depth_passing;
             // Only the passing nodes of this depth can be parents of the next.
-            walk.findings.retain(|id, _| last_passing.contains(id));
+            findings.retain(|id, _| last_passing.contains(id));
 
             // 6. limits
-            if run.budget_exhausted {
+            if run.stopped() {
                 break;
             }
             if elapsed() >= b.soft_ms {
@@ -1081,9 +1301,12 @@ where
         Ok(())
     };
 
-    // 7. the fork released, whatever the search ended in (C15)
-    match (searched, walk.release(s)) {
-        // A failure of reach `Session` already ends the search; the release's is the same lost
+    // 7. every Layer and outcome dropped, then the forks closed, whatever the search ended in
+    // (C15, C18)
+    drop(window);
+    drop(layers);
+    match (searched, v.close(s)) {
+        // A failure of reach `Session` already ends the search; the close's is the same lost
         // session.
         (
             Err(e @ (SearchError::Check { .. } | SearchError::Expand(_) | SearchError::Fork(_))),
@@ -1091,7 +1314,7 @@ where
         ) => {
             return Err(e);
         }
-        (_, Err(released)) => return Err(SearchError::Fork(released)),
+        (_, Err(closed)) => return Err(SearchError::Fork(closed)),
         (Err(e), Ok(())) => return Err(e),
         (Ok(()), Ok(())) => {}
     }
@@ -1138,8 +1361,10 @@ where
             candidates.push(c);
         }
     }
-    let resolution = match NonEmpty::new(candidates) {
-        Some(blueprints) => Resolution::Decided {
+    let start_failure = run.start_failed.clone().and_then(|e| e.into_failure().ok());
+    let stopped = run.stopped();
+    let resolution = match (NonEmpty::new(candidates), start_failure) {
+        (Some(blueprints), _) => Resolution::Decided {
             blueprints,
             blocking: run.blocking,
             decision_log: run.acc.log,
@@ -1153,8 +1378,9 @@ where
                 blind,
             ),
         },
-        None => Resolution::Failed(
-            Infeasible::new(run.blocking, run.near_miss, run.budget_exhausted)
+        (None, Some(failure)) => Resolution::Failed(Infeasible::of_start(failure, run.blocking)),
+        (None, None) => Resolution::Failed(
+            Infeasible::new(run.blocking, run.near_miss, stopped)
                 .unwrap_or_else(Infeasible::exhausted),
         ),
     };
@@ -1168,6 +1394,7 @@ where
         expand_errors: run.expand_errors,
         budget_exhausted: run.budget_exhausted,
         soft_stopped: run.soft_stopped,
+        memory_stopped: run.memory_stopped,
         elapsed_ms: elapsed(),
     })
 }
@@ -1175,7 +1402,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::ports::{FileFacts, Verifier};
+    use crate::app::ports::{Checked, FileFacts, Verifier};
     use crate::domain::{
         BaseFp, BlueprintParts, CheckFailure, CleanDelta, Command, Criterion, DEFAULT_BUDGET,
         DEFAULT_WEIGHTS, DecisionRecord, ErrorCode, Finding, FindingCode, Ident, Judgement,
@@ -1291,49 +1518,119 @@ mod tests {
     }
 
     type CheckRule = Box<dyn Fn(&[Edit]) -> Result<ScopedFindings, CheckError>>;
-    /// A failure for the `n`-th call (from 0) with these edits, or none.
+    /// A failure for the `n`-th submit (from 0) of these own edits, or none.
     type FaultRule = Box<dyn Fn(&[Edit], usize) -> Option<CheckError>>;
     type FilesRule = Box<dyn Fn(&[Edit]) -> Vec<RelPath>>;
+    /// Called with the number of a `next` call (from 0) before it answers: `true` makes it
+    /// `Pending`, with nothing finished.
+    type NextHook = Box<dyn Fn(usize) -> bool>;
+    /// The children of a state, from its composed edits.
+    type GenerateRule = Box<dyn Fn(&[Edit]) -> Vec<Blueprint>>;
 
-    /// One operation on the fake's fork, or an expansion, in the order they ran.
+    /// One call on the fake's forks, in the order they ran.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Op {
-        Fork,
-        Write(Vec<Edit>),
-        /// The number of levels it diagnosed at.
-        Diagnose(usize),
-        FilesOf,
-        /// The edits of the level it popped.
-        Pop(Vec<Edit>),
-        Release,
+        Open,
+        /// A job: the composed edits of its parent's Layer, its own edits and its limit.
+        Submit {
+            on: Vec<Edit>,
+            own: Vec<Edit>,
+            limit: Limit,
+        },
+        /// An expansion: the composed edits of its Layer, and the Layers alive at its submit.
+        Expand {
+            on: Vec<Edit>,
+            live: usize,
+        },
+        /// A cancel, and what it returned.
+        Cancel(bool),
+        /// The Layers alive at the close.
+        Close {
+            live: usize,
+        },
         Audit,
-        /// The levels the fork held when the expander was called.
-        Expand(Vec<Vec<Edit>>),
     }
 
-    /// The fake fork's levels and the log of the operations, shared by `FakeV` and `FakeE`.
-    #[derive(Clone, Default)]
-    struct Shared {
-        levels: std::rc::Rc<RefCell<Vec<Vec<Edit>>>>,
-        ops: std::rc::Rc<RefCell<Vec<Op>>>,
+    /// A Layer of the fake: the edits that take the base to its state.
+    #[derive(Clone, Debug)]
+    struct FakeLayer {
+        edits: Vec<Edit>,
+        /// A clone of the fake's `held`, which counts the Layers alive; never read.
+        _held: Arc<()>,
     }
 
+    #[derive(Default)]
+    struct Jobs {
+        next_id: u64,
+        /// Jobs not delivered, whether they finished, and their outcome.
+        in_flight: BTreeMap<JobId, (bool, Next<FakeLayer>)>,
+        /// Outcomes known at once (refused edits, withdrawals), delivered first.
+        ready: VecDeque<Next<FakeLayer>>,
+        nexts: usize,
+        /// The most jobs submitted and not delivered at once.
+        most_out: usize,
+    }
+
+    impl Jobs {
+        fn out(&self) -> usize {
+            self.in_flight.len() + self.ready.len()
+        }
+    }
+
+    /// The expansions of the fake, by the fingerprint of the state.
+    #[derive(Default)]
+    struct FakeE {
+        by_state: BTreeMap<StateFp, Result<Vec<Blueprint>, ExpandError>>,
+        calls: RefCell<Vec<(StateFp, usize)>>,
+        /// The children of a state that `by_state` does not name, from its composed edits.
+        generate: Option<GenerateRule>,
+    }
+    impl FakeE {
+        fn set(&mut self, at: StateFp, bps: Vec<Blueprint>) {
+            self.by_state.insert(at, Ok(bps));
+        }
+    }
+
+    /// A pseudo-random number of `seed` and `n`.
+    fn mix(seed: u64, n: u64) -> u64 {
+        let mut x = seed ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^ (x >> 31)
+    }
+
+    /// A fake `Forks` whose every job runs at its submit: a check job's diagnosis answers from
+    /// `rule` of its Layer's composed edits, so a file keeps its findings unless the composed
+    /// state changes, and `layer_files` gives the files a check of those edits gives, none for
+    /// none (`Forks` C2, `Stacked::files_of` C1, C2). A job finishes at the first `next` after its
+    /// submit that is not `Pending`, and outcomes come out of submission order: the newest
+    /// first, or in a seeded order. Its faults are refusals the port allows.
     struct FakeV {
         texts: BTreeMap<RelPath, String>,
         build_scripts: BTreeSet<RelPath>,
         rule: CheckRule,
+        /// The composed edits of every check job, in submission order.
         checks: RefCell<Vec<Vec<Edit>>>,
         events: RefCell<Vec<&'static str>>,
         audit_error: Option<CheckError>,
+        /// Each check job advances the clock by its cost, at its submit.
         tick: Option<(Ticker, u64)>,
         baseline: Vec<Finding>,
-        /// The files `files_of` gives for composed edits; by default those of `rule`.
+        /// The files `layer_files` gives for composed edits; by default those of `rule`.
         files: Option<FilesRule>,
-        shared: Shared,
-        fork_error: Option<CheckError>,
-        write_fault: FaultRule,
-        pop_fault: FaultRule,
-        release_error: Option<CheckError>,
+        e: FakeE,
+        width: usize,
+        /// `None`: the newest job first; `Some(seed)`: a pseudo-random one of those in flight.
+        order: Option<u64>,
+        next_hook: Option<NextHook>,
+        /// A call of these names fails with this error, of reach Session.
+        fails: BTreeMap<&'static str, CheckError>,
+        /// A job's own edits refused at its submit: an outcome of reach Blueprint, or an error of
+        /// `submit` of reach Session.
+        submit_fault: FaultRule,
+        jobs: RefCell<Jobs>,
+        ops: RefCell<Vec<Op>>,
+        held: Arc<()>,
     }
     impl Verifier for FakeV {
         type Session = ();
@@ -1361,11 +1658,6 @@ mod tests {
             edits: &[Edit],
             _: Scope,
         ) -> Result<ScopedFindings, CheckError> {
-            self.checks.borrow_mut().push(edits.to_vec());
-            self.events.borrow_mut().push("check");
-            if let Some((ticker, cost)) = &self.tick {
-                ticker.advance(*cost);
-            }
             (self.rule)(edits)
         }
     }
@@ -1379,77 +1671,159 @@ mod tests {
             }
         }
     }
-    /// A stack of levels whose every diagnosis answers from the flat rule of the composed edits,
-    /// so a file keeps its findings unless the composed state changes (`Stacked::diagnose` C3),
-    /// and whose `files_of` gives the files a check of those edits gives, none for none
-    /// (`Stacked::files_of` C1, C2). Its faults are refusals the port allows.
-    impl Stacked for FakeV {
-        type Fork = ();
-        fn fork(&self, _: &mut ()) -> Result<(), CheckError> {
-            self.op(Op::Fork);
-            match &self.fork_error {
-                Some(e) => Err(e.clone()),
-                None => Ok(()),
+    impl Forks for FakeV {
+        type Layer = FakeLayer;
+        fn open(&self, _: &mut ()) -> Result<FakeLayer, CheckError> {
+            self.op(Op::Open);
+            self.fail("open")?;
+            Ok(self.layer(Vec::new()))
+        }
+        fn width(&self, _: &()) -> usize {
+            self.width
+        }
+        fn submit(
+            &self,
+            _: &mut (),
+            parent: &FakeLayer,
+            edits: &[Edit],
+            _: Scope,
+            limit: Limit,
+        ) -> Result<JobId, CheckError> {
+            self.fail("submit")?;
+            let n = self.count(|op| matches!(op, Op::Submit { own, .. } if own == edits));
+            self.op(Op::Submit {
+                on: parent.edits.clone(),
+                own: edits.to_vec(),
+                limit,
+            });
+            let id = self.new_id();
+            if let Some(e) = (self.submit_fault)(edits, n) {
+                if e.reach() == CheckReach::Session {
+                    return Err(e);
+                }
+                self.deliver_now(Next::Done(id, Err(e)));
+                return Ok(id);
             }
-        }
-        fn write(&self, _: &mut (), _: &mut (), edits: &[Edit]) -> Result<(), CheckError> {
-            let n = self.count(|op| *op == Op::Write(edits.to_vec()));
-            self.op(Op::Write(edits.to_vec()));
-            if let Some(e) = (self.write_fault)(edits, n) {
-                return Err(e);
-            }
-            self.shared.levels.borrow_mut().push(edits.to_vec());
-            Ok(())
-        }
-        fn levels(&self, _: &(), _: &()) -> Result<usize, CheckError> {
-            Ok(self.shared.levels.borrow().len())
-        }
-        fn fork_text(&self, _: &(), _: &(), path: &RelPath) -> Result<Option<String>, CheckError> {
-            let composed = self.composed();
-            Ok(match composed.iter().find(|e| e.path == *path) {
-                Some(e) => e.new_text.clone(),
-                None => self.texts.get(path).cloned(),
-            })
-        }
-        fn diagnose(&self, _: &(), _: &(), _: Scope) -> Result<ScopedFindings, CheckError> {
-            self.op(Op::Diagnose(self.shared.levels.borrow().len()));
-            let composed = self.composed();
+            let base = |p: &RelPath| self.texts.get(p).cloned();
+            let composed = crate::domain::search::compose(&parent.edits, edits, &base);
             self.checks.borrow_mut().push(composed.clone());
             self.events.borrow_mut().push("check");
             if let Some((ticker, cost)) = &self.tick {
                 ticker.advance(*cost);
             }
-            (self.rule)(&composed)
+            let outcome = (self.rule)(&composed).map(|findings| Checked {
+                layer: self.layer(composed),
+                findings,
+            });
+            self.queue(id, Next::Done(id, outcome));
+            Ok(id)
         }
-        fn files_of(&self, _: &(), _: &(), _: Scope) -> Result<Vec<RelPath>, CheckError> {
-            self.op(Op::FilesOf);
-            let composed = self.composed();
-            if composed.is_empty() {
+        fn expand(
+            &self,
+            _: &mut (),
+            layer: &FakeLayer,
+            state: StateFp,
+            _: &[Target],
+            max: usize,
+        ) -> Result<JobId, CheckError> {
+            self.fail("expand")?;
+            self.op(Op::Expand {
+                on: layer.edits.clone(),
+                live: self.live(),
+            });
+            self.e.calls.borrow_mut().push((state, max));
+            let children = match (self.e.by_state.get(&state), &self.e.generate) {
+                (Some(children), _) => children.clone(),
+                (None, Some(generate)) => Ok(generate(&layer.edits)),
+                (None, None) => Ok(Vec::new()),
+            };
+            let id = self.new_id();
+            self.queue(id, Next::Expanded(id, children));
+            Ok(id)
+        }
+        fn next(&self, _: &mut (), _: Duration) -> Result<Next<FakeLayer>, CheckError> {
+            self.fail("next")?;
+            let n = {
+                let mut jobs = self.jobs.borrow_mut();
+                jobs.nexts += 1;
+                jobs.nexts - 1
+            };
+            if let Some(hook) = &self.next_hook
+                && hook(n)
+            {
+                return Ok(Next::Pending);
+            }
+            let mut jobs = self.jobs.borrow_mut();
+            if let Some(next) = jobs.ready.pop_front() {
+                return Ok(next);
+            }
+            for (finished, _) in jobs.in_flight.values_mut() {
+                *finished = true;
+            }
+            let pick = match self.order {
+                None => jobs.in_flight.keys().next_back().copied(),
+                Some(seed) => {
+                    let len = jobs.in_flight.len().max(1) as u64;
+                    let at = usize::try_from(mix(seed, n as u64) % len).unwrap();
+                    jobs.in_flight.keys().nth(at).copied()
+                }
+            };
+            Ok(match pick.and_then(|id| jobs.in_flight.remove(&id)) {
+                Some((_, next)) => next,
+                None => Next::Idle,
+            })
+        }
+        fn cancel(&self, _: &mut (), job: JobId) -> Result<bool, CheckError> {
+            self.fail("cancel")?;
+            let mut jobs = self.jobs.borrow_mut();
+            let withdrawn = match jobs.in_flight.get(&job) {
+                Some((true, _)) => false,
+                Some((false, _)) => {
+                    jobs.in_flight.remove(&job);
+                    jobs.ready.push_back(Next::Withdrawn(job));
+                    true
+                }
+                None if jobs.ready.iter().any(|next| job_of(next) == Some(job)) => false,
+                None => return Err(CheckError::ForkInUse),
+            };
+            drop(jobs);
+            self.op(Op::Cancel(withdrawn));
+            Ok(withdrawn)
+        }
+        fn layer_files(
+            &self,
+            _: &(),
+            layer: &FakeLayer,
+            _: Scope,
+        ) -> Result<Vec<RelPath>, CheckError> {
+            self.fail("layer_files")?;
+            if layer.edits.is_empty() {
                 return Ok(Vec::new());
             }
             match &self.files {
-                Some(files) => Ok(files(&composed)),
-                None => (self.rule)(&composed).map(|found| found.files),
+                Some(files) => Ok(files(&layer.edits)),
+                None => (self.rule)(&layer.edits).map(|found| found.files),
             }
         }
-        fn pop(&self, _: &mut (), _: &mut ()) -> Result<bool, CheckError> {
-            let Some(top) = self.shared.levels.borrow_mut().pop() else {
-                return Ok(false);
-            };
-            let n = self.count(|op| *op == Op::Pop(top.clone()));
-            self.op(Op::Pop(top.clone()));
-            match (self.pop_fault)(&top, n) {
-                Some(e) => Err(e),
-                None => Ok(true),
-            }
+        fn layer_text(
+            &self,
+            _: &(),
+            layer: &FakeLayer,
+            path: &RelPath,
+        ) -> Result<Option<String>, CheckError> {
+            Ok(match layer.edits.iter().find(|e| e.path == *path) {
+                Some(e) => e.new_text.clone(),
+                None => self.texts.get(path).cloned(),
+            })
         }
-        fn release(&self, _: &mut (), _: ()) -> Result<(), CheckError> {
-            self.op(Op::Release);
-            self.shared.levels.borrow_mut().clear();
-            match &self.release_error {
-                Some(e) => Err(e.clone()),
-                None => Ok(()),
+        fn close(&self, _: &mut ()) -> Result<(), CheckError> {
+            {
+                let mut jobs = self.jobs.borrow_mut();
+                jobs.in_flight.clear();
+                jobs.ready.clear();
             }
+            self.op(Op::Close { live: self.live() });
+            self.fail("close")
         }
     }
     impl FakeV {
@@ -1464,43 +1838,65 @@ mod tests {
                 tick: None,
                 baseline: Vec::new(),
                 files: None,
-                shared: Shared::default(),
-                fork_error: None,
-                write_fault: Box::new(|_, _| None),
-                pop_fault: Box::new(|_, _| None),
-                release_error: None,
+                e: FakeE::default(),
+                width: SEARCH_FORKS,
+                order: None,
+                next_hook: None,
+                fails: BTreeMap::new(),
+                submit_fault: Box::new(|_, _| None),
+                jobs: RefCell::default(),
+                ops: RefCell::default(),
+                held: Arc::new(()),
             }
         }
+        fn fail(&self, call: &str) -> Result<(), CheckError> {
+            match self.fails.get(call) {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            }
+        }
+        fn layer(&self, edits: Vec<Edit>) -> FakeLayer {
+            FakeLayer {
+                edits,
+                _held: Arc::clone(&self.held),
+            }
+        }
+        /// The Layers alive.
+        fn live(&self) -> usize {
+            Arc::strong_count(&self.held) - 1
+        }
+        fn new_id(&self) -> JobId {
+            let mut jobs = self.jobs.borrow_mut();
+            jobs.next_id += 1;
+            JobId::new(jobs.next_id)
+        }
+        fn note_out(&self) {
+            let mut jobs = self.jobs.borrow_mut();
+            jobs.most_out = jobs.most_out.max(jobs.out());
+        }
+        fn queue(&self, id: JobId, next: Next<FakeLayer>) {
+            self.jobs.borrow_mut().in_flight.insert(id, (false, next));
+            self.note_out();
+        }
+        fn deliver_now(&self, next: Next<FakeLayer>) {
+            self.jobs.borrow_mut().ready.push_back(next);
+            self.note_out();
+        }
         fn op(&self, op: Op) {
-            self.shared.ops.borrow_mut().push(op);
+            self.ops.borrow_mut().push(op);
         }
         fn count(&self, which: impl Fn(&Op) -> bool) -> usize {
-            self.shared
-                .ops
-                .borrow()
-                .iter()
-                .filter(|op| which(op))
-                .count()
-        }
-        /// The levels composed over the base texts, as `compose` puts a child on its parent.
-        fn composed(&self) -> Vec<Edit> {
-            let base = |p: &RelPath| self.texts.get(p).cloned();
-            self.shared
-                .levels
-                .borrow()
-                .iter()
-                .fold(Vec::new(), |acc, level| {
-                    crate::domain::search::compose(&acc, level, &base)
-                })
+            self.ops.borrow().iter().filter(|op| which(op)).count()
         }
         fn ops(&self) -> Vec<Op> {
-            self.shared.ops.borrow().clone()
+            self.ops.borrow().clone()
         }
+        /// The own edits of every job, in submission order.
         fn writes(&self) -> Vec<Vec<Edit>> {
             self.ops()
                 .into_iter()
                 .filter_map(|op| match op {
-                    Op::Write(edits) => Some(edits),
+                    Op::Submit { own, .. } => Some(own),
                     _ => None,
                 })
                 .collect()
@@ -1515,34 +1911,21 @@ mod tests {
                 .filter(|e| **e == "audit")
                 .count()
         }
-    }
-
-    #[derive(Default)]
-    struct FakeE {
-        by_state: BTreeMap<StateFp, Result<Vec<Blueprint>, ExpandError>>,
-        calls: RefCell<Vec<(StateFp, usize)>>,
-        /// The fake fork, whose levels each call records as an `Op::Expand`.
-        shared: Shared,
-    }
-    impl Expander for FakeE {
-        type Session = ();
-        fn expand(
-            &self,
-            _: &mut (),
-            state: &[Edit],
-            _: &[Target],
-            max: usize,
-        ) -> Result<Vec<Blueprint>, ExpandError> {
-            let fp = StateFp::of(state);
-            self.calls.borrow_mut().push((fp, max));
-            let levels = self.shared.levels.borrow().clone();
-            self.shared.ops.borrow_mut().push(Op::Expand(levels));
-            self.by_state.get(&fp).cloned().unwrap_or(Ok(vec![]))
+        fn most_out(&self) -> usize {
+            self.jobs.borrow().most_out
         }
     }
-    impl FakeE {
-        fn set(&mut self, at: StateFp, bps: Vec<Blueprint>) {
-            self.by_state.insert(at, Ok(bps));
+
+    /// A gauge that reads what the test sets.
+    struct FakeGauge(std::sync::Mutex<Option<u64>>);
+    impl FakeGauge {
+        fn set(&self, rss_kb: u64) {
+            *self.0.lock().unwrap() = Some(rss_kb);
+        }
+    }
+    impl Gauge for FakeGauge {
+        fn rss_kb(&self) -> Option<u64> {
+            *self.0.lock().unwrap()
         }
     }
 
@@ -1614,10 +1997,11 @@ mod tests {
 
     struct Fx {
         v: FakeV,
-        e: FakeE,
         a: FakeA,
         j: FakeJ,
         clock: Ticker,
+        gauge: Arc<FakeGauge>,
+        memory: MemoryBudget,
         roots: Vec<Blueprint>,
         budget: SearchBudget,
         scope: Scope,
@@ -1626,14 +2010,8 @@ mod tests {
     }
     impl Fx {
         fn new(text: &str) -> Self {
-            let v = FakeV::new(text);
-            let e = FakeE {
-                shared: v.shared.clone(),
-                ..FakeE::default()
-            };
             Self {
-                v,
-                e,
+                v: FakeV::new(text),
                 a: FakeA::default(),
                 j: FakeJ {
                     mode: Mode::Neutral,
@@ -1641,6 +2019,8 @@ mod tests {
                     sizes: RefCell::default(),
                 },
                 clock: Ticker::default(),
+                gauge: Arc::new(FakeGauge(std::sync::Mutex::new(Some(1_000_000)))),
+                memory: MemoryBudget::unbounded(),
                 roots: vec![],
                 budget: SearchBudget {
                     max_depth: 1,
@@ -1654,10 +2034,10 @@ mod tests {
         fn run(&self) -> Result<SearchReport, SearchError> {
             search_decision(
                 &self.v,
-                &self.e,
                 &self.a,
                 &self.j,
                 &self.clock,
+                &*self.gauge,
                 &mut (),
                 &SearchInput {
                     start: &self.start,
@@ -1666,6 +2046,7 @@ mod tests {
                     probes: &[],
                     scope: self.scope,
                     budget: self.budget,
+                    memory: self.memory,
                     weights: DEFAULT_WEIGHTS,
                     keep_trace_edits: self.keep_edits,
                 },
@@ -1678,7 +2059,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, n)| rename(first_id + u16::try_from(i).unwrap(), "a", n, BASE))
                 .collect();
-            self.e.set(root_state(), bps.clone());
+            self.v.e.set(root_state(), bps.clone());
             bps
         }
     }
@@ -1789,7 +2170,7 @@ mod tests {
         };
         fx.v.tick = Some((fx.clock.clone(), 5_000));
         fx.rename_children(1, &["b", "c", "d", "e", "f"]);
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w("let b = 1;")]),
             vec![rename(9, "b", "z", "let b = 1;")],
         );
@@ -1811,7 +2192,7 @@ mod tests {
         assert_eq!(r.depths.len(), 1);
         assert_eq!((r.depths[0].checked, r.depths[0].timed_out), (3, 2));
         // The whole search stopped: nothing was expanded below the first depth.
-        assert_eq!(fx.e.calls.borrow().len(), 1);
+        assert_eq!(fx.v.e.calls.borrow().len(), 1);
         assert_eq!(fx.v.audits(), 1);
     }
 
@@ -1856,7 +2237,7 @@ mod tests {
         // When nothing else passes, the cut-off check is the reason.
         let mut fx = Fx::new(BASE);
         fx.v.rule = Box::new(timeout);
-        fx.e.set(root_state(), vec![rename(2, "a", "c", BASE)]);
+        fx.v.e.set(root_state(), vec![rename(2, "a", "c", BASE)]);
         let r = fx.run().unwrap();
         let i = failed(&r);
         assert_eq!(
@@ -1911,6 +2292,8 @@ mod tests {
     #[test]
     fn session_check_error_stops_the_search() {
         let mut fx = Fx::new(BASE);
+        // One job at a time: at a wider window c is submitted before b's outcome is consumed.
+        fx.v.width = 1;
         fx.v.rule = Box::new(|_| Err(CheckError::Poisoned("x".to_owned())));
         fx.rename_children(1, &["b", "c"]);
         assert!(matches!(
@@ -1982,7 +2365,7 @@ mod tests {
             builds_on: None,
         })
         .unwrap();
-        fx.e.set(state(vec![w(at_b)]), vec![child]);
+        fx.v.e.set(state(vec![w(at_b)]), vec![child]);
         let r = fx.run().unwrap();
         let deep = decided(&r)
             .iter()
@@ -2023,11 +2406,11 @@ mod tests {
         fx.rename_children(1, &["b", "c"]);
         let at_b = "let b = 1;";
         let at_c = "let c = 1;";
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w(at_b)]),
             vec![rename(10, "b", "b1", at_b), rename(11, "b", "b2", at_b)],
         );
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w(at_c)]),
             vec![rename(12, "c", "c1", at_c), rename(13, "c", "c2", at_c)],
         );
@@ -2056,7 +2439,7 @@ mod tests {
             ]
         );
         // Two parents share the expansion budget.
-        let max_seen: Vec<usize> = fx.e.calls.borrow().iter().map(|(_, m)| *m).collect();
+        let max_seen: Vec<usize> = fx.v.e.calls.borrow().iter().map(|(_, m)| *m).collect();
         assert_eq!(max_seen, vec![200, 100, 100]);
         assert_eq!(r.depths.len(), 2);
         assert_eq!(r.depths[1].parents, 2);
@@ -2067,7 +2450,7 @@ mod tests {
     fn same_state_children_are_checked_once() {
         // Two children of one parent lead to the same state.
         let mut fx = Fx::new(BASE);
-        fx.e.set(
+        fx.v.e.set(
             root_state(),
             vec![rename(1, "a", "b", BASE), rename(2, "a", "b", BASE)],
         );
@@ -2084,7 +2467,7 @@ mod tests {
         // A child leading to the state of a root that was checked first.
         let mut fx = Fx::new(BASE);
         fx.roots = vec![rename(3, "a", "b", BASE)];
-        fx.e.set(root_state(), vec![rename(4, "a", "b", BASE)]);
+        fx.v.e.set(root_state(), vec![rename(4, "a", "b", BASE)]);
         let r = fx.run().unwrap();
         assert_eq!(fx.v.checks.borrow().len(), 1);
         assert_eq!(fate_of(&r, 3), Fate::Passed);
@@ -2099,11 +2482,11 @@ mod tests {
             ..DEFAULT_SEARCH_BUDGET
         };
         fx.rename_children(1, &["b", "c"]);
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w("let b = 1;")]),
             vec![rename(10, "b", "b1", "let b = 1;")],
         );
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w("let c = 1;")]),
             vec![rename(11, "c", "c1", "let c = 1;")],
         );
@@ -2146,8 +2529,9 @@ mod tests {
         let at_b = "let b = 1;";
         // Reads the text of the state after the rename: fresh at depth 2, stale against the base.
         fx.roots = vec![rename(3, "b", "c", at_b)];
-        fx.e.set(root_state(), vec![rename(1, "a", "b", BASE)]);
-        fx.e.set(state(vec![w(at_b)]), vec![rename(2, "b", "c", at_b)]);
+        fx.v.e.set(root_state(), vec![rename(1, "a", "b", BASE)]);
+        fx.v.e
+            .set(state(vec![w(at_b)]), vec![rename(2, "b", "c", at_b)]);
         let r = fx.run().unwrap();
 
         assert_eq!(fate_of(&r, 3), Fate::Blocked(Stage::Freshness));
@@ -2190,8 +2574,8 @@ mod tests {
             builds_on: None,
         })
         .unwrap();
-        fx.e.set(root_state(), vec![parent]);
-        fx.e.set(
+        fx.v.e.set(root_state(), vec![parent]);
+        fx.v.e.set(
             state(vec![Edit::write(rel("build.rs"), "let b = 1;")]),
             vec![rename(2, "a", "b", BASE)],
         );
@@ -2219,7 +2603,7 @@ mod tests {
             ..DEFAULT_SEARCH_BUDGET
         };
         fx.rename_children(1, &["b", "c"]);
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w("let b = 1;")]),
             vec![rename(10, "b", "b1", "let b = 1;")],
         );
@@ -2256,7 +2640,7 @@ mod tests {
             ..fx.budget
         };
         fx.roots = vec![rename(1, "a", "b", BASE), rename(2, "a", "c", BASE)];
-        fx.e.set(
+        fx.v.e.set(
             root_state(),
             vec![
                 rename(3, "a", "d", BASE),
@@ -2308,7 +2692,7 @@ mod tests {
         let mut fx = Fx::new(BASE);
         // The first chained root is named, not the last.
         fx.roots = vec![plain.clone(), chained, later];
-        fx.e.set(root_state(), vec![rename(3, "a", "d", BASE)]);
+        fx.v.e.set(root_state(), vec![rename(3, "a", "d", BASE)]);
         let err = fx.run().unwrap_err();
         assert!(
             matches!(&err, SearchError::ChainedRoot { blueprint, parent }
@@ -2317,7 +2701,7 @@ mod tests {
         );
         assert!(fx.v.events.borrow().is_empty(), "no check, no audit");
         assert!(fx.v.checked_texts().is_empty());
-        assert!(fx.e.calls.borrow().is_empty(), "no expansion");
+        assert!(fx.v.e.calls.borrow().is_empty(), "no expansion");
     }
 
     #[test]
@@ -2331,7 +2715,7 @@ mod tests {
     fn expand_errors_are_recorded_and_session_error_is_fatal() {
         let mut fx = Fx::new(BASE);
         fx.roots = vec![rename(1, "a", "b", BASE)];
-        fx.e.by_state.insert(
+        fx.v.e.by_state.insert(
             root_state(),
             Err(ExpandError::Analysis("no targets".to_owned())),
         );
@@ -2344,7 +2728,7 @@ mod tests {
 
         let mut fx = Fx::new(BASE);
         fx.roots = vec![rename(1, "a", "b", BASE)];
-        fx.e.by_state.insert(
+        fx.v.e.by_state.insert(
             root_state(),
             Err(ExpandError::Session(CheckError::Poisoned("x".to_owned()))),
         );
@@ -2396,8 +2780,9 @@ mod tests {
             max_depth: 2,
             ..DEFAULT_SEARCH_BUDGET
         };
-        fx.e.set(root_state(), vec![extract_x(1, base)]);
-        fx.e.set(state(vec![w(after)]), vec![rename(2, "x", "y", after)]);
+        fx.v.e.set(root_state(), vec![extract_x(1, base)]);
+        fx.v.e
+            .set(state(vec![w(after)]), vec![rename(2, "x", "y", after)]);
         let r = fx.run().unwrap();
         let leaf = decided(&r)
             .iter()
@@ -2421,8 +2806,9 @@ mod tests {
             max_depth: 2,
             ..DEFAULT_SEARCH_BUDGET
         };
-        fx.e.set(root_state(), vec![rename(3, "f", "g", base)]);
-        fx.e.set(state(vec![w(renamed)]), vec![extract_x(4, renamed)]);
+        fx.v.e.set(root_state(), vec![rename(3, "f", "g", base)]);
+        fx.v.e
+            .set(state(vec![w(renamed)]), vec![extract_x(4, renamed)]);
         let r = fx.run().unwrap();
         let leaf = decided(&r)
             .iter()
@@ -2445,7 +2831,7 @@ mod tests {
         };
         fx.v.tick = Some((fx.clock.clone(), 6_000));
         fx.rename_children(1, &["b", "c"]);
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w("let b = 1;")]),
             vec![rename(10, "b", "b1", "let b = 1;")],
         );
@@ -2454,7 +2840,7 @@ mod tests {
         assert_eq!(r.depths.len(), 1);
         assert_eq!(r.elapsed_ms, 12_000);
         assert_eq!(decided(&r).len(), 2);
-        assert_eq!(fx.e.calls.borrow().len(), 1);
+        assert_eq!(fx.v.e.calls.borrow().len(), 1);
     }
 
     #[test]
@@ -2462,7 +2848,7 @@ mod tests {
         let build = |keep: bool| {
             let mut fx = Fx::new(BASE);
             fx.keep_edits = keep;
-            fx.e.set(
+            fx.v.e.set(
                 root_state(),
                 vec![
                     rename(1, "a", "b", BASE),
@@ -2525,11 +2911,11 @@ mod tests {
         fx.rename_children(1, &["b", "c"]);
         let at_b = "let b = 1;";
         let at_c = "let c = 1;";
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w(at_b)]),
             vec![rename(10, "b", "b1", at_b), rename(11, "b", "b2", at_b)],
         );
-        fx.e.set(
+        fx.v.e.set(
             state(vec![w(at_c)]),
             vec![rename(12, "c", "c1", at_c), rename(13, "c", "c2", at_c)],
         );
@@ -2562,154 +2948,6 @@ mod tests {
         edits.extend(started());
         edits.sort_by(|a, b| a.path.cmp(&b.path));
         state(edits)
-    }
-
-    #[test]
-    fn children_are_written_on_top_of_their_parent() {
-        let fx = two_parents_two_children();
-        let r = fx.run().unwrap();
-        assert_eq!(r.ranking.len(), 6);
-        let lv = |text: &str| vec![w(text)];
-        let child = |text: &str| {
-            vec![
-                Op::Write(lv(text)),
-                Op::Diagnose(2),
-                Op::FilesOf,
-                Op::Pop(lv(text)),
-            ]
-        };
-        let (b, c) = ("let b = 1;", "let c = 1;");
-        let mut want = vec![Op::Fork, Op::Expand(vec![])];
-        for text in [b, c] {
-            want.extend([
-                Op::Write(lv(text)),
-                Op::Diagnose(1),
-                Op::FilesOf,
-                Op::Pop(lv(text)),
-            ]);
-        }
-        // Depth 2: each parent's path for its expansion, then for its children's checks.
-        want.extend([
-            Op::Write(lv(b)),
-            Op::Expand(vec![lv(b)]),
-            Op::Pop(lv(b)),
-            Op::Write(lv(c)),
-            Op::Expand(vec![lv(c)]),
-            Op::Pop(lv(c)),
-            Op::Write(lv(b)),
-        ]);
-        want.extend(child("let b1 = 1;"));
-        want.extend(child("let b2 = 1;"));
-        want.extend([Op::Pop(lv(b)), Op::Write(lv(c))]);
-        want.extend(child("let c1 = 1;"));
-        want.extend(child("let c2 = 1;"));
-        want.extend([Op::Release, Op::Audit]);
-        assert_eq!(fx.v.ops(), want);
-        // Each diagnosis is at the level of the depth of the child it judges.
-        let writes: Vec<u32> = r.depths.iter().map(|d| d.writes).collect();
-        assert_eq!(writes, vec![2, 8]);
-        assert_eq!(
-            writes.iter().sum::<u32>(),
-            u32::try_from(fx.v.writes().len()).unwrap()
-        );
-    }
-
-    #[test]
-    fn repath_pops_to_the_common_prefix() {
-        let mut fx = from_start();
-        fx.budget = SearchBudget {
-            max_depth: 3,
-            ..DEFAULT_SEARCH_BUDGET
-        };
-        let (at_b, at_c) = ("let b = 1;", "let c = 1;");
-        fx.e.set(
-            on_start(vec![]),
-            vec![rename(1, "a", "b", BASE), rename(2, "a", "c", BASE)],
-        );
-        fx.e.set(
-            on_start(vec![w(at_b)]),
-            vec![rename(10, "b", "b1", at_b), rename(11, "b", "b2", at_b)],
-        );
-        fx.e.set(on_start(vec![w(at_c)]), vec![rename(12, "c", "c1", at_c)]);
-        // The parents of depth 3 in the order b1, b2, c1.
-        for (text, n) in [
-            (at_b, 7),
-            (at_c, 6),
-            ("let b1 = 1;", 9),
-            ("let b2 = 1;", 8),
-            ("let c1 = 1;", 1),
-        ] {
-            fx.a.table.insert(text.to_owned(), clean(n));
-        }
-        let r = fx.run().unwrap();
-        assert_eq!(r.depths.len(), 3);
-        assert_eq!(r.depths[2].parents, 3);
-
-        let ops = fx.v.ops();
-        let expands: Vec<usize> = ops
-            .iter()
-            .enumerate()
-            .filter(|(_, op)| matches!(op, Op::Expand(_)))
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(expands.len(), 6, "{ops:?}");
-        let levels_at = |i: usize| match &ops[i] {
-            Op::Expand(levels) => levels.clone(),
-            other => panic!("{other:?}"),
-        };
-        // Every parent carries the start state at the bottom, written once and never popped.
-        for &i in &expands {
-            assert_eq!(levels_at(i).first(), Some(&started()), "{ops:?}");
-        }
-        assert_eq!(fx.v.writes().iter().filter(|e| **e == started()).count(), 1);
-        assert!(!ops.contains(&Op::Pop(started())), "{ops:?}");
-        // Between the parents of depth 3, the pops and writes are those `repath` gives.
-        let mut shared = Vec::new();
-        for pair in expands[3..].windows(2) {
-            let (held, next) = (levels_at(pair[0]), levels_at(pair[1]));
-            let common = held.iter().zip(&next).take_while(|(h, n)| h == n).count();
-            shared.push(common);
-            let between = &ops[pair[0] + 1..pair[1]];
-            let pops = between.iter().filter(|op| matches!(op, Op::Pop(_))).count();
-            let writes: Vec<Vec<Edit>> = between
-                .iter()
-                .filter_map(|op| match op {
-                    Op::Write(edits) => Some(edits.clone()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(pops, held.len() - common, "{between:?}");
-            assert_eq!(writes, next[common..].to_vec(), "{between:?}");
-            assert_eq!(between.len(), pops + writes.len(), "{between:?}");
-        }
-        // Two siblings share their grandparent; cousins share only the start state.
-        assert_eq!(shared, vec![2, 1]);
-    }
-
-    #[test]
-    fn parents_are_expanded_on_the_fork() {
-        let fx = two_parents_two_children();
-        fx.run().unwrap();
-        let ops = fx.v.ops();
-        let expanded: Vec<Vec<Vec<Edit>>> = ops
-            .iter()
-            .filter_map(|op| match op {
-                Op::Expand(levels) => Some(levels.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            expanded,
-            vec![
-                vec![],
-                vec![vec![w("let b = 1;")]],
-                vec![vec![w("let c = 1;")]]
-            ]
-        );
-        // One fork for the whole search, released after the last expansion and check.
-        assert_eq!(ops.iter().filter(|op| **op == Op::Fork).count(), 1);
-        assert_eq!(ops.iter().filter(|op| **op == Op::Release).count(), 1);
-        assert_eq!(ops[ops.len() - 2..], [Op::Release, Op::Audit]);
     }
 
     #[test]
@@ -2764,11 +3002,11 @@ mod tests {
         fx.v.files = Some(Box::new(|edits| {
             edits.iter().map(|e| e.path.clone()).collect()
         }));
-        fx.e.set(
+        fx.v.e.set(
             root_state(),
             vec![rename_in(1, b_rs, "b", "p", "let b = 1;")],
         );
-        fx.e.set(
+        fx.v.e.set(
             state(parent),
             vec![
                 rename_in(2, a_rs, "a", "c", "let a = 1;"),
@@ -2799,49 +3037,182 @@ mod tests {
         assert_eq!(verdict(3).new_errors.len(), 1);
     }
 
+    /// The jobs the fake ran, as (the parent's composed edits, its own edits, its limit).
+    fn submits(fx: &Fx) -> Vec<(Vec<Edit>, Vec<Edit>, Limit)> {
+        fx.v.ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Submit { on, own, limit } => Some((on, own, limit)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn the_start_state_is_diagnosed_once() {
+    fn children_are_jobs_on_their_parents_layer() {
+        let fx = two_parents_two_children();
+        let r = fx.run().unwrap();
+        assert_eq!(r.ranking.len(), 6);
+        let lv = |text: &str| vec![w(text)];
+        let job = |on: Vec<Edit>, own: &str| (on, lv(own), Limit::Check);
+        let (b, c) = ("let b = 1;", "let c = 1;");
+        // Each child is one job of its own edits on its parent's Layer; no path is written again.
+        assert_eq!(
+            submits(&fx),
+            vec![
+                job(vec![], b),
+                job(vec![], c),
+                job(lv(b), "let b1 = 1;"),
+                job(lv(b), "let b2 = 1;"),
+                job(lv(c), "let c1 = 1;"),
+                job(lv(c), "let c2 = 1;"),
+            ]
+        );
+        let writes: Vec<u32> = r.depths.iter().map(|d| d.writes).collect();
+        assert_eq!(writes, vec![2, 4]);
+        assert_eq!(
+            writes.iter().sum::<u32>(),
+            u32::try_from(fx.v.writes().len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn parents_are_expanded_on_their_layer() {
+        let fx = two_parents_two_children();
+        fx.run().unwrap();
+        let ops = fx.v.ops();
+        let expanded: Vec<Vec<Edit>> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Expand { on, .. } => Some(on.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            expanded,
+            vec![vec![], vec![w("let b = 1;")], vec![w("let c = 1;")]]
+        );
+        // With the fingerprint of the state of each, kept with its Layer.
+        let states: Vec<StateFp> = fx.v.e.calls.borrow().iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            states,
+            vec![
+                root_state(),
+                state(vec![w("let b = 1;")]),
+                state(vec![w("let c = 1;")])
+            ]
+        );
+        // The forks are opened once and closed once, after the last job, before the audit.
+        assert_eq!(ops.iter().filter(|op| **op == Op::Open).count(), 1);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, Op::Close { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(ops[ops.len() - 2..], [Op::Close { live: 0 }, Op::Audit]);
+    }
+
+    #[test]
+    fn layers_follow_the_retention_rule() {
+        let run = |beam_parents: u8| {
+            let mut fx = Fx::new(BASE);
+            fx.budget = SearchBudget {
+                max_depth: 2,
+                beam_parents,
+                ..DEFAULT_SEARCH_BUDGET
+            };
+            fx.rename_children(1, &["b", "c", "d"]);
+            let (at_b, at_c) = ("let b = 1;", "let c = 1;");
+            fx.v.e
+                .set(state(vec![w(at_b)]), vec![rename(10, "b", "b1", at_b)]);
+            fx.v.e
+                .set(state(vec![w(at_c)]), vec![rename(11, "c", "c1", at_c)]);
+            fx.a.table.insert(at_b.to_owned(), clean(7));
+            fx.a.table.insert(at_c.to_owned(), clean(6));
+            fx.v.rule = Box::new(|edits| {
+                Ok(if first_text(edits) == "let d = 1;" {
+                    errors(1)
+                } else {
+                    ScopedFindings::default()
+                })
+            });
+            let r = fx.run().unwrap();
+            assert_eq!(fate_of(&r, 3), Fate::Failed { new_errors: 1 });
+            fx.v.ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    Op::Expand { live, .. } => Some(("expand", live)),
+                    Op::Close { live } => Some(("close", live)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // The root's alone; then b's and c's, the root's and the failed d's gone; none at the
+        // close.
+        assert_eq!(
+            run(4),
+            vec![("expand", 1), ("expand", 2), ("expand", 2), ("close", 0)]
+        );
+        // c is not picked as a parent: its Layer goes before the expansions of depth 2.
+        assert_eq!(run(1), vec![("expand", 1), ("expand", 1), ("close", 0)]);
+    }
+
+    #[test]
+    fn the_start_state_is_one_job() {
         let mut fx = from_start();
         fx.budget = SearchBudget {
             max_depth: 2,
             ..DEFAULT_SEARCH_BUDGET
         };
         let at_b = "let b = 1;";
-        fx.e.set(
+        fx.v.e.set(
             on_start(vec![]),
             vec![rename(1, "a", "b", BASE), rename(2, "a", "c", BASE)],
         );
-        fx.e.set(on_start(vec![w(at_b)]), vec![rename(10, "b", "b1", at_b)]);
+        fx.v.e
+            .set(on_start(vec![w(at_b)]), vec![rename(10, "b", "b1", at_b)]);
         let r = fx.run().unwrap();
         assert_eq!(r.depths.len(), 2);
         assert_eq!(decided(&r).len(), 3);
         let ops = fx.v.ops();
+        // One job of the start's edits on the base's root, before the first expansion, which
+        // reads the start's Layer; the root's children are jobs on that Layer.
         assert_eq!(
-            ops.iter().filter(|op| **op == Op::Write(started())).count(),
-            1
-        );
-        assert_eq!(
-            ops.iter().filter(|op| **op == Op::Diagnose(1)).count(),
-            1,
-            "{ops:?}"
-        );
-        // Diagnosed at the first check of a root child, before that child is written.
-        let at = ops.iter().position(|op| *op == Op::Diagnose(1)).unwrap();
-        assert_eq!(
-            ops[at - 2..at + 3],
+            ops[..3],
             [
-                Op::Write(started()),
-                Op::Expand(vec![started()]),
-                Op::Diagnose(1),
-                Op::FilesOf,
-                Op::Write(vec![w(at_b)]),
+                Op::Open,
+                Op::Submit {
+                    on: vec![],
+                    own: started(),
+                    limit: Limit::None
+                },
+                Op::Expand {
+                    on: started(),
+                    live: 1
+                },
             ]
         );
+        assert_eq!(fx.v.writes().iter().filter(|e| **e == started()).count(), 1);
+        let jobs = submits(&fx);
+        for (on, own, _) in &jobs[1..3] {
+            assert_eq!(on, &started(), "{own:?}");
+        }
         assert_eq!(fx.v.checks.borrow()[0], started());
+        assert_eq!(r.depths[0].writes, 3, "the start's job and two children");
     }
 
     #[test]
-    fn a_failed_start_level_fails_every_root_child() {
+    fn the_start_job_is_not_cut_off() {
+        let mut fx = from_start();
+        fx.roots = vec![rename(1, "a", "b", BASE)];
+        fx.run().unwrap();
+        let limits: Vec<Limit> = submits(&fx).into_iter().map(|(_, _, l)| l).collect();
+        assert_eq!(limits, vec![Limit::None, Limit::Check]);
+    }
+
+    #[test]
+    fn a_failed_start_state_is_a_failed_report_naming_it() {
         let panicked = CheckError::DetectorPanicked {
             detector: "d".to_owned(),
             file: rel(S_RS),
@@ -2851,148 +3222,402 @@ mod tests {
             reason: "no".to_owned(),
         };
         for (what, failure) in [("diagnosis", panicked), ("write", refused)] {
-            let mut fx = from_start();
-            // The second root writes the start's path back to its base text.
-            fx.roots = vec![
-                rename(1, "a", "b", BASE),
-                rename_in(2, S_RS, "started", "start", "started"),
-            ];
-            let fail = failure.clone();
-            if what == "diagnosis" {
-                fx.v.rule = Box::new(move |edits| {
-                    if edits == started().as_slice() {
-                        Err(fail.clone())
-                    } else {
-                        Ok(ScopedFindings::default())
-                    }
-                });
-            } else {
-                fx.v.write_fault =
-                    Box::new(move |edits, _| (edits == started().as_slice()).then(|| fail.clone()));
-            }
-            let r = fx.run().unwrap();
-            let failure = failure.clone().into_blocking(bid(1)).unwrap();
-            let Blocking::CheckFailed { failure, .. } = failure else {
-                panic!("{what}: {failure:?}");
-            };
-            assert_eq!(
-                failed(&r).blocking(),
-                &[
-                    Blocking::CheckFailed {
-                        blueprint: bid(1),
-                        failure: failure.clone()
-                    },
-                    Blocking::CheckFailed {
-                        blueprint: bid(2),
-                        failure
-                    },
-                ],
-                "{what}"
-            );
-            assert_eq!(fate_of(&r, 1), Fate::Blocked(Stage::Check), "{what}");
-            assert_eq!(fate_of(&r, 2), Fate::Blocked(Stage::Check), "{what}");
-            // No child level is written: the start's is the only write.
-            assert_eq!(fx.v.writes(), vec![started()], "{what}");
-            assert_eq!(r.depths[0].checked, 0, "{what}");
-            if what == "write" {
-                assert_eq!(r.expand_errors.len(), 1);
-                assert!(fx.e.calls.borrow().is_empty(), "the root yields nothing");
+            for with_roots in [true, false] {
+                let mut fx = from_start();
+                if with_roots {
+                    fx.roots = vec![
+                        rename(1, "a", "b", BASE),
+                        rename_in(2, S_RS, "started", "start", "started"),
+                    ];
+                }
+                fx.v.e
+                    .set(on_start(vec![]), vec![rename(3, "a", "c", BASE)]);
+                let fail = failure.clone();
+                if what == "diagnosis" {
+                    fx.v.rule = Box::new(move |edits| {
+                        if edits == started().as_slice() {
+                            Err(fail.clone())
+                        } else {
+                            Ok(ScopedFindings::default())
+                        }
+                    });
+                } else {
+                    fx.v.submit_fault = Box::new(move |edits, _| {
+                        (edits == started().as_slice()).then(|| fail.clone())
+                    });
+                }
+                let at = format!("{what}, roots {with_roots}");
+                // A report, never `NoCandidates`.
+                let r = fx.run().unwrap();
+                let i = failed(&r);
+                let want = failure.clone().into_failure().unwrap();
+                assert_eq!(i.start(), Some(&want), "{at}");
+                assert!(!i.budget_exhausted() && !r.budget_exhausted, "{at}");
+                assert!(r.depths.is_empty(), "{at}: no depth runs");
+                assert!(fx.v.e.calls.borrow().is_empty(), "{at}: nothing expanded");
+                assert_eq!(fx.v.writes(), vec![started()], "{at}: the start's job only");
+                assert!(r.trace.iter().all(|t| t.node.is_none()), "{at}");
+                if with_roots {
+                    assert_eq!(
+                        fates(&r),
+                        vec![
+                            (bid(1), Fate::Blocked(Stage::Check)),
+                            (bid(2), Fate::Blocked(Stage::Check))
+                        ],
+                        "{at}"
+                    );
+                    assert_eq!(
+                        i.blocking(),
+                        &[
+                            Blocking::CheckFailed {
+                                blueprint: bid(1),
+                                failure: want.clone()
+                            },
+                            Blocking::CheckFailed {
+                                blueprint: bid(2),
+                                failure: want
+                            },
+                        ],
+                        "{at}"
+                    );
+                } else {
+                    assert!(r.trace.is_empty() && i.blocking().is_empty(), "{at}");
+                }
+                assert_eq!(fx.v.audits(), 1, "{at}");
             }
         }
     }
 
+    /// 1,000 kB of growth past the RSS at the search's start.
+    fn small_budget() -> MemoryBudget {
+        MemoryBudget::of_available(RESERVED_RAM_GB * 1024 * 1024 + 1_000)
+    }
+
     #[test]
-    fn a_refused_path_write_blocks_the_children() {
-        // The writes of b's level: its own check (0), its expansion (1), its children's (2).
-        let refused = CheckError::Edit {
-            path: rel(LIB),
-            reason: "no".to_owned(),
-        };
-        let at_b = vec![w("let b = 1;")];
-        let mut fx = two_parents_two_children();
-        let (fail, b) = (refused.clone(), at_b.clone());
-        fx.v.write_fault = Box::new(move |edits, n| (edits == b && n == 2).then(|| fail.clone()));
+    fn the_start_job_is_cut_by_the_hard_budget_and_the_rss_stop() {
+        for hard in [true, false] {
+            let mut fx = from_start();
+            fx.roots = vec![rename(1, "a", "b", BASE)];
+            fx.memory = small_budget();
+            let (clock, gauge) = (fx.clock.clone(), fx.gauge.clone());
+            // The first wait for the start's job passes the hard limit, or the memory budget.
+            fx.v.next_hook = Some(Box::new(move |n| {
+                if n != 0 {
+                    return false;
+                }
+                if hard {
+                    clock.advance(DEFAULT_SEARCH_BUDGET.hard_ms);
+                } else {
+                    gauge.set(1_001_001);
+                }
+                true
+            }));
+            let r = fx.run().unwrap();
+            assert_eq!(
+                (r.budget_exhausted, r.memory_stopped),
+                (hard, !hard),
+                "{hard}"
+            );
+            assert!(failed(&r).budget_exhausted() && failed(&r).start().is_none());
+            assert!(fx.v.ops().contains(&Op::Cancel(true)), "{hard}");
+            assert_eq!(fates(&r), vec![(bid(1), Fate::TimedOut)], "{hard}");
+            assert_eq!(r.trace[0].node, None);
+            assert!(r.depths.is_empty() && fx.v.e.calls.borrow().is_empty());
+            assert_eq!(fx.v.writes(), vec![started()]);
+        }
+    }
+
+    #[test]
+    fn the_rss_stop_is_relative_to_the_search_start() {
+        // A session that grew once starts its search at 9 GB; its budget counts from there.
+        for (rss, stopped) in [(9_000_000, false), (9_001_000, false), (9_001_001, true)] {
+            let mut fx = Fx::new(BASE);
+            fx.rename_children(1, &["b", "c"]);
+            fx.gauge.set(9_000_000);
+            fx.memory = small_budget();
+            let gauge = fx.gauge.clone();
+            // The read of the first wait for the checks.
+            fx.v.next_hook = Some(Box::new(move |n| {
+                if n == 1 {
+                    gauge.set(rss);
+                }
+                n == 1
+            }));
+            let r = fx.run().unwrap();
+            assert_eq!(r.memory_stopped, stopped, "{rss}");
+            let passed = if stopped { 0 } else { 2 };
+            assert_eq!(r.depths[0].passed, passed, "{rss}");
+        }
+    }
+
+    /// Three children b, c, d of the root (checked in that order) on forks of width 2, with the
+    /// RSS stop reached on the third `next`: by then b has finished and is not received, c is
+    /// received before its turn, and d has not finished.
+    fn stopped_while_checking() -> Fx {
+        let mut fx = Fx::new(BASE);
+        fx.v.width = 2;
+        fx.rename_children(1, &["b", "c", "d"]);
+        for (text, n) in [("let b = 1;", 3), ("let c = 1;", 2), ("let d = 1;", 1)] {
+            fx.a.table.insert(text.to_owned(), clean(n));
+        }
+        fx.memory = small_budget();
+        let gauge = fx.gauge.clone();
+        // `next` 0 gives the expansion; 1 finishes b and c and gives c, which frees the place
+        // d is submitted to; 2 reads the stop.
+        fx.v.next_hook = Some(Box::new(move |n| {
+            if n == 2 {
+                gauge.set(1_001_001);
+            }
+            n == 2
+        }));
+        fx
+    }
+
+    #[test]
+    fn an_outcome_received_before_a_stop_is_consumed() {
+        let fx = stopped_while_checking();
         let r = fx.run().unwrap();
-        for n in [10, 11] {
-            assert_eq!(fate_of(&r, n), Fate::Blocked(Stage::Check), "{n}");
-        }
-        for n in [12, 13] {
-            assert_eq!(fate_of(&r, n), Fate::Passed, "{n}");
-        }
-        let Resolution::Decided { blocking, .. } = &r.resolution else {
+        assert!(r.memory_stopped);
+        assert_eq!(fate_of(&r, 2), Fate::Passed);
+        assert!(decided(&r).iter().any(|c| c.blueprint() == bid(2)));
+    }
+
+    #[test]
+    fn a_cancel_that_returns_false_is_consumed_as_its_done() {
+        let fx = stopped_while_checking();
+        let r = fx.run().unwrap();
+        let cancels: Vec<Op> =
+            fx.v.ops()
+                .into_iter()
+                .filter(|op| matches!(op, Op::Cancel(_)))
+                .collect();
+        // b had finished: not withdrawn, and its verdict is the search's; d had not.
+        assert_eq!(cancels, vec![Op::Cancel(false), Op::Cancel(true)]);
+        assert_eq!(fate_of(&r, 1), Fate::Passed);
+        assert_eq!(
+            decided(&r)
+                .iter()
+                .map(Candidate::blueprint)
+                .collect::<Vec<_>>(),
+            vec![bid(1), bid(2)]
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_child_is_timed_out_never_blocked() {
+        let fx = stopped_while_checking();
+        let r = fx.run().unwrap();
+        assert_eq!(fate_of(&r, 3), Fate::TimedOut);
+        assert!(r.trace[2].node.is_some(), "it was submitted");
+        let Resolution::Decided {
+            blocking,
+            decision_log,
+            evidence,
+            ..
+        } = &r.resolution
+        else {
             panic!("expected Decided");
         };
-        assert_eq!(blocking.len(), 2);
-        assert!(blocking.iter().all(|x| matches!(
-            x,
-            Blocking::CheckFailed {
-                failure: CheckFailure::Edit { .. },
-                ..
-            }
-        )));
-        assert!(!fx.v.writes().contains(&vec![w("let b1 = 1;")]));
-        assert!(r.expand_errors.is_empty());
-
-        // Refused for b's expansion: an expand error, and b yields nothing.
-        let mut fx = two_parents_two_children();
-        let (fail, b) = (refused, at_b);
-        fx.v.write_fault = Box::new(move |edits, n| (edits == b && n == 1).then(|| fail.clone()));
-        let r = fx.run().unwrap();
-        assert_eq!(r.expand_errors.len(), 1);
-        assert!(matches!(r.expand_errors[0], ExpandError::Analysis(_)));
+        assert!(blocking.is_empty(), "{blocking:?}");
         assert!(
-            r.trace
+            !decision_log
+                .entries()
                 .iter()
-                .all(|t| t.blueprint != bid(10) && t.blueprint != bid(11))
+                .any(|e| e.blueprint() == bid(3) && e.stage() == Stage::Check)
         );
-        assert_eq!(fate_of(&r, 12), Fate::Passed);
-        assert_eq!(fate_of(&r, 13), Fate::Passed);
-        assert_eq!(fx.e.calls.borrow().len(), 2, "the root and c only");
+        assert!(evidence.verdicts().iter().all(|(id, _)| *id != bid(3)));
+        assert_eq!((r.depths[0].checked, r.depths[0].timed_out), (2, 1));
+        assert!(!r.budget_exhausted);
     }
 
     #[test]
-    fn a_session_failure_of_a_pop_stops_the_search() {
+    fn a_stop_during_expansion_submits_no_child() {
+        let mut fx = two_parents_two_children();
+        fx.memory = small_budget();
+        let gauge = fx.gauge.clone();
+        // `next` 0 gives the root's expansion, 1 and 2 the checks of b and c; 3 is the first
+        // wait for the expansions of depth 2.
+        fx.v.next_hook = Some(Box::new(move |n| {
+            if n == 3 {
+                gauge.set(1_001_001);
+            }
+            n == 3
+        }));
+        let r = fx.run().unwrap();
+        assert!(r.memory_stopped && !r.budget_exhausted);
+        // Both expansions withdrawn: no child, and no expand error.
+        assert_eq!(
+            fx.v.ops()
+                .iter()
+                .filter(|op| **op == Op::Cancel(true))
+                .count(),
+            2
+        );
+        assert!(r.expand_errors.is_empty());
+        assert!(r.trace.iter().all(|t| t.depth == 1));
+        assert_eq!(fx.v.writes().len(), 2);
+        assert_eq!(r.depths.len(), 2);
+        assert_eq!(r.depths[1].generated, 0);
+        assert_eq!(decided(&r).len(), 2);
+    }
+
+    #[test]
+    fn the_hard_budget_is_checked_before_each_submit() {
+        let at = |width: usize| {
+            let mut fx = Fx::new(BASE);
+            fx.v.width = width;
+            fx.budget = SearchBudget {
+                hard_ms: 20_000,
+                ..fx.budget
+            };
+            fx.v.tick = Some((fx.clock.clone(), 5_000));
+            fx.rename_children(1, &["b", "c", "d", "e", "f"]);
+            let r = fx.run().unwrap();
+            let nodes: Vec<bool> = r.trace.iter().map(|t| t.node.is_some()).collect();
+            (
+                fates(&r),
+                nodes,
+                fx.v.checks.borrow().len(),
+                r.budget_exhausted,
+            )
+        };
+        // The order of the serial search: three checks begin within the limit.
+        let serial = at(1);
+        assert_eq!(serial.2, 3);
+        assert!(serial.3);
+        assert_eq!(serial.1, vec![true, true, true, false, false]);
+        for width in 2..=8 {
+            assert_eq!(at(width), serial, "{width}");
+        }
+    }
+
+    #[test]
+    fn the_window_never_holds_more_than_w() {
+        for width in 1..=8 {
+            let mut fx = Fx::new(BASE);
+            fx.v.width = width;
+            let names: Vec<String> = (0..20).map(|i| format!("n{i:02}")).collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            fx.rename_children(100, &refs);
+            let r = fx.run().unwrap();
+            assert_eq!(r.depths[0].checked, 20);
+            assert_eq!(fx.v.most_out(), width, "{width}");
+        }
+    }
+
+    /// An id of the Blueprint that renames to `name`.
+    fn id_of_name(name: &str) -> u16 {
+        name.bytes()
+            .fold(7u16, |h, b| h.wrapping_mul(31).wrapping_add(u16::from(b)))
+            | 0x8000
+    }
+
+    /// A search of depth 3 whose every state `let X = 1;` has the children that rename `X` to
+    /// `Xa`, `Xb`, `Xc` and `zz`: a name ending in `c` adds errors, one with `bb` is cut off,
+    /// `rab` panics, and `zz` is a duplicate across parents. With `order`, the fake gives its
+    /// outcomes in that seeded order and answers some waits with `Pending`.
+    fn generated(width: usize, order: Option<u64>) -> SearchReport {
         let mut fx = Fx::new(BASE);
-        fx.rename_children(1, &["b", "c"]);
-        fx.v.pop_fault = Box::new(|top, _| {
-            (top == [w("let b = 1;")]).then(|| CheckError::RevertMismatch {
-                paths: vec![rel(LIB)],
-            })
+        fx.budget = SearchBudget {
+            max_depth: 3,
+            beam: 6,
+            ..DEFAULT_SEARCH_BUDGET
+        };
+        fx.v.width = width;
+        fx.v.order = order;
+        if let Some(seed) = order {
+            fx.v.next_hook = Some(Box::new(move |n| {
+                mix(seed.wrapping_add(7), n as u64).is_multiple_of(3)
+            }));
+        }
+        fx.roots = vec![rename(1, "a", "r", BASE)];
+        fx.v.e.generate = Some(Box::new(|edits: &[Edit]| {
+            let text = if edits.is_empty() {
+                BASE.to_owned()
+            } else {
+                first_text(edits)
+            };
+            let name = text
+                .trim_start_matches("let ")
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            ["a", "b", "c"]
+                .iter()
+                .map(|s| format!("{name}{s}"))
+                .chain(["zz".to_owned()])
+                .filter(|to| *to != name)
+                .map(|to| rename(id_of_name(&to), &name, &to, &text))
+                .collect()
+        }));
+        fx.v.rule = Box::new(|edits| {
+            let text = first_text(edits);
+            let name = text
+                .trim_start_matches("let ")
+                .split(' ')
+                .next()
+                .unwrap_or("");
+            if name.contains("bb") {
+                Err(CheckError::TimedOut { limit_ms: 6_000 })
+            } else if name == "rab" {
+                Err(CheckError::Panicked("rab".to_owned()))
+            } else if name.ends_with('c') {
+                Ok(errors(2))
+            } else {
+                Ok(ScopedFindings::default())
+            }
         });
-        let err = fx.run().unwrap_err();
-        assert!(
-            matches!(&err, SearchError::Check { blueprint, source: CheckError::RevertMismatch { .. } }
-                if *blueprint == bid(1)),
-            "{err}"
-        );
-        let ops = fx.v.ops();
-        assert_eq!(ops.last(), Some(&Op::Release));
-        assert!(!ops.contains(&Op::Audit));
-        assert_eq!(fx.v.audits(), 0);
+        let r = fx.run().unwrap();
+        assert!(fx.v.most_out() <= width);
+        r
     }
 
     #[test]
-    fn a_session_failure_outside_a_childs_level_is_a_fork_error() {
+    fn parallel_search_equals_serial() {
+        let serial = generated(1, None);
+        // The fixture reaches every fate the windowed consumption must order.
+        assert_eq!(serial.depths.len(), 3);
+        let fates: Vec<&Fate> = serial.trace.iter().map(|t| &t.fate).collect();
+        for want in [
+            Fate::Passed,
+            Fate::Failed { new_errors: 2 },
+            Fate::TimedOut,
+            Fate::Blocked(Stage::Check),
+            Fate::Pruned(PruneStage::Duplicate),
+        ] {
+            assert!(fates.contains(&&want), "{want:?} in {fates:?}");
+        }
+        for width in 1..=8 {
+            for seed in 0..20 {
+                assert_eq!(
+                    generated(width, Some(seed)),
+                    serial,
+                    "width {width}, seed {seed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn layers_are_dropped_before_close_on_every_path() {
         let poisoned = || CheckError::Poisoned("x".to_owned());
-        let at_b = vec![w("let b = 1;")];
         let cases: Vec<(&str, Fx)> = vec![
-            ("the fork's open", {
+            ("a report", two_parents_two_children()),
+            ("an expansion's lost session", {
                 let mut fx = Fx::new(BASE);
-                fx.rename_children(1, &["b"]);
-                fx.v.fork_error = Some(poisoned());
+                fx.roots = vec![rename(1, "a", "b", BASE)];
+                fx.v.e
+                    .by_state
+                    .insert(root_state(), Err(ExpandError::Session(poisoned())));
                 fx
             }),
-            ("the start level's write", {
-                let mut fx = from_start();
-                fx.roots = vec![rename(1, "a", "b", BASE)];
-                fx.v.write_fault = Box::new(move |edits, _| (edits == started()).then(poisoned));
-                fx
-            }),
-            ("the start level's diagnosis", {
-                let mut fx = from_start();
-                fx.roots = vec![rename(1, "a", "b", BASE)];
+            ("no candidate", Fx::new(BASE)),
+            ("a check's lost session, a Layer received early", {
+                let mut fx = Fx::new(BASE);
+                fx.rename_children(1, &["b", "c"]);
                 fx.v.rule = Box::new(move |edits| {
-                    if edits == started().as_slice() {
+                    if first_text(edits) == "let b = 1;" {
                         Err(poisoned())
                     } else {
                         Ok(ScopedFindings::default())
@@ -3000,86 +3625,57 @@ mod tests {
                 });
                 fx
             }),
-            ("a re-path pop for an expansion", {
-                let mut fx = two_parents_two_children();
-                let b = at_b.clone();
-                fx.v.pop_fault = Box::new(move |top, n| (top == b && n == 1).then(poisoned));
-                fx
-            }),
-            ("a re-path write for checks", {
-                let mut fx = two_parents_two_children();
-                let b = at_b.clone();
-                fx.v.write_fault = Box::new(move |edits, n| (edits == b && n == 2).then(poisoned));
+            ("a failed next", {
+                let mut fx = Fx::new(BASE);
+                fx.rename_children(1, &["b"]);
+                fx.v.fails.insert("next", poisoned());
                 fx
             }),
         ];
         for (what, fx) in cases {
-            let err = fx.run().unwrap_err();
-            assert!(
-                matches!(err, SearchError::Fork(CheckError::Poisoned(_))),
-                "{what}: {err}"
-            );
+            let ended = fx.run();
             let ops = fx.v.ops();
-            assert!(!ops.contains(&Op::Audit), "{what}");
-            if what == "the fork's open" {
-                assert_eq!(ops, vec![Op::Fork], "nothing to release");
-            } else {
-                assert_eq!(ops.last(), Some(&Op::Release), "{what}");
+            let closes: Vec<&Op> = ops
+                .iter()
+                .filter(|op| matches!(op, Op::Close { .. }))
+                .collect();
+            assert_eq!(closes, vec![&Op::Close { live: 0 }], "{what}");
+            match ended {
+                Ok(_) => assert_eq!(ops.last(), Some(&Op::Audit), "{what}"),
+                Err(e) => {
+                    assert_eq!(ops.last(), Some(&Op::Close { live: 0 }), "{what}: {e}");
+                    assert_eq!(fx.v.audits(), 0, "{what}");
+                }
             }
         }
     }
 
     #[test]
-    fn the_fork_is_released_before_the_audit_and_on_error() {
-        let mut fx = Fx::new(BASE);
-        fx.rename_children(1, &["b"]);
-        fx.run().unwrap();
-        let ops = fx.v.ops();
-        assert_eq!(ops[ops.len() - 2..], [Op::Release, Op::Audit]);
-
-        // An expander that loses its session: released, not audited.
-        let mut fx = Fx::new(BASE);
-        fx.roots = vec![rename(1, "a", "b", BASE)];
-        fx.e.by_state.insert(
-            root_state(),
-            Err(ExpandError::Session(CheckError::Poisoned("x".to_owned()))),
-        );
-        assert!(matches!(fx.run(), Err(SearchError::Expand(_))));
-        assert_eq!(fx.v.ops().last(), Some(&Op::Release));
-        assert!(!fx.v.ops().contains(&Op::Audit));
-
-        // Nothing to try: released all the same.
-        let fx = Fx::new(BASE);
-        assert!(matches!(fx.run(), Err(SearchError::NoCandidates)));
-        assert_eq!(fx.v.ops(), vec![Op::Fork, Op::Expand(vec![]), Op::Release]);
-    }
-
-    #[test]
-    fn a_failed_release_is_a_search_error() {
-        let released = || CheckError::Poisoned("release".to_owned());
+    fn a_failed_close_is_a_search_error() {
+        let closed = || CheckError::Poisoned("close".to_owned());
         // Instead of a report.
         let mut fx = Fx::new(BASE);
         fx.rename_children(1, &["b"]);
-        fx.v.release_error = Some(released());
+        fx.v.fails.insert("close", closed());
         let err = fx.run().unwrap_err();
         assert!(
-            matches!(err, SearchError::Fork(CheckError::Poisoned(ref m)) if m == "release"),
+            matches!(err, SearchError::Fork(CheckError::Poisoned(ref m)) if m == "close"),
             "{err}"
         );
         assert_eq!(fx.v.audits(), 0);
 
         // Instead of `NoCandidates`.
         let mut fx = Fx::new(BASE);
-        fx.v.release_error = Some(released());
+        fx.v.fails.insert("close", closed());
         let err = fx.run().unwrap_err();
         assert!(matches!(err, SearchError::Fork(_)), "{err}");
 
         // A child's session failure first: that is the error.
         let mut fx = Fx::new(BASE);
         fx.rename_children(1, &["b"]);
-        fx.v.release_error = Some(released());
-        fx.v.pop_fault = Box::new(|_, _| {
-            Some(CheckError::RevertMismatch {
+        fx.v.fails.insert("close", closed());
+        fx.v.rule = Box::new(|_| {
+            Err(CheckError::RevertMismatch {
                 paths: vec![rel(LIB)],
             })
         });
@@ -3094,6 +3690,49 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_session_failure_of_a_call_is_a_fork_error() {
+        let poisoned = || CheckError::Poisoned("x".to_owned());
+        let mut cases: Vec<(&str, Fx)> = Vec::new();
+        for call in ["open", "submit", "expand", "next", "layer_files"] {
+            let mut fx = Fx::new(BASE);
+            fx.rename_children(1, &["b"]);
+            fx.v.fails.insert(call, poisoned());
+            cases.push((call, fx));
+        }
+        cases.push(("the start's job", {
+            let mut fx = from_start();
+            fx.roots = vec![rename(1, "a", "b", BASE)];
+            fx.v.rule = Box::new(move |edits| {
+                if edits == started().as_slice() {
+                    Err(poisoned())
+                } else {
+                    Ok(ScopedFindings::default())
+                }
+            });
+            fx
+        }));
+        cases.push(("a cancel", {
+            let mut fx = stopped_while_checking();
+            fx.v.fails.insert("cancel", poisoned());
+            fx
+        }));
+        for (what, fx) in cases {
+            let err = fx.run().unwrap_err();
+            assert!(
+                matches!(err, SearchError::Fork(CheckError::Poisoned(_))),
+                "{what}: {err}"
+            );
+            let ops = fx.v.ops();
+            assert!(!ops.contains(&Op::Audit), "{what}");
+            if what == "open" {
+                assert_eq!(ops, vec![Op::Open], "nothing to close");
+            } else {
+                assert_eq!(ops.last(), Some(&Op::Close { live: 0 }), "{what}");
+            }
+        }
     }
 
     #[test]
@@ -3121,6 +3760,7 @@ mod tests {
         assert_eq!(b.audit_every.get(), 10);
         assert_eq!(b.decision_budget(), DEFAULT_BUDGET);
         assert_eq!(ASSERT_REVERT_EVERY, 50);
+        assert_eq!((SEARCH_FORKS, SEARCH_TICK_MS), (4, 100));
         assert_eq!((EXPAND_DEPTH_MS, JUDGE_DEPTH_MS), (10_000, 30_000));
         assert_eq!((SESSION_RAM_GB, RESERVED_RAM_GB), (6, 8));
         assert_eq!(

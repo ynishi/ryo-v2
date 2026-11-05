@@ -2713,41 +2713,21 @@ fn w_blueprint(
     .expect("a Blueprint")
 }
 
-/// Proposes `child` for the state `at` and nothing for any other.
-struct ChildAt {
-    at: ryo_v2_core::domain::StateFp,
-    child: ryo_v2_core::domain::Blueprint,
-}
-
-impl Expander for ChildAt {
-    type Session = RaSession;
-    fn expand(
-        &self,
-        _: &mut RaSession,
-        state: &[Edit],
-        _: &[Target],
-        _: usize,
-    ) -> Result<Vec<ryo_v2_core::domain::Blueprint>, ExpandError> {
-        Ok(if ryo_v2_core::domain::StateFp::of(state) == self.at {
-            vec![self.child.clone()]
-        } else {
-            Vec::new()
-        })
-    }
-}
-
 #[test]
 fn search_and_apply_give_the_same_verdict_on_a_chain() {
-    common::both(search_and_apply_give_the_same_verdict_on_a_chain_on);
+    // The search runs on the forks, which need the Engine (Forks C9).
+    common::engine_only(search_and_apply_give_the_same_verdict_on_a_chain_on);
 }
 
 fn search_and_apply_give_the_same_verdict_on_a_chain_on() {
     use ryo_v2_core::app::apply::apply_blueprints;
+    use ryo_v2_core::app::memory::MemoryBudget;
     use ryo_v2_core::app::search::{DEFAULT_SEARCH_BUDGET, SearchInput, search_decision};
     use ryo_v2_core::domain::{
-        BlueprintSet, Command, DEFAULT_WEIGHTS, Ident, Resolution, Splice, StateFp, TextRange,
+        BlueprintSet, Command, DEFAULT_WEIGHTS, Ident, Resolution, Splice, TextRange,
     };
     use ryo_v2_core::infra::judge::MetricJudge;
+    use ryo_v2_core::infra::memory::ProcGauge;
     use ryo_v2_ra::SyntaxAssessor;
 
     let (a, _) = analyzer(false);
@@ -2799,48 +2779,61 @@ fn search_and_apply_give_the_same_verdict_on_a_chain_on() {
     };
     let flat: BTreeMap<_, _> = evidence.verdicts().iter().cloned().collect();
 
-    // The search: P as its root, C proposed on P's state, two stacked levels.
-    let expander = ChildAt {
-        at: StateFp::of(&[Edit::write(rel(lib), p_text)]),
-        child: free,
-    };
+    // The search, twice on its forks: P as a root on the base, then C as a root on P's state,
+    // the start state's job below C's. A beam of 1 holds the root alone.
     let mut budget = DEFAULT_SEARCH_BUDGET;
-    budget.max_depth = 2;
-    let roots = [p.clone()];
-    let report = search_decision(
-        &a,
-        &expander,
-        &SyntaxAssessor,
-        &MetricJudge,
-        &MonotonicClock::new(),
-        &mut s,
-        &SearchInput {
-            start: &[],
-            roots: &roots,
-            targets: &[],
-            probes: &[],
-            scope: Scope::Affected,
-            budget,
-            weights: DEFAULT_WEIGHTS,
-            keep_trace_edits: false,
-        },
-    )
-    .expect("search");
-    assert_eq!(report.depths.len(), 2, "{report:?}");
-    let Resolution::Decided { evidence, .. } = &report.resolution else {
-        panic!("the search decides P: {report:?}");
+    budget.max_depth = 1;
+    budget.beam = 1;
+    let mut search = |start: &[Edit], root: &ryo_v2_core::domain::Blueprint| {
+        let roots = [root.clone()];
+        let report = search_decision(
+            &a,
+            &SyntaxAssessor,
+            &MetricJudge,
+            &MonotonicClock::new(),
+            &ProcGauge,
+            &mut s,
+            &SearchInput {
+                start,
+                roots: &roots,
+                targets: &[],
+                probes: &[],
+                scope: Scope::Affected,
+                budget,
+                memory: MemoryBudget::unbounded(),
+                weights: DEFAULT_WEIGHTS,
+                keep_trace_edits: false,
+            },
+        )
+        .expect("search");
+        let verdicts: BTreeMap<_, _> = match &report.resolution {
+            Resolution::Decided { evidence, .. } => evidence.verdicts().iter().cloned().collect(),
+            Resolution::Failed(i) => i
+                .blocking()
+                .iter()
+                .filter_map(|b| match b {
+                    ryo_v2_core::domain::Blocking::NewErrors { blueprint, verdict } => {
+                        Some((*blueprint, verdict.clone()))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            Resolution::Stopped(m) => match *m {},
+        };
+        verdicts
     };
-    let stacked: BTreeMap<_, _> = evidence.verdicts().iter().cloned().collect();
+    let on_base = search(&[], &p);
+    let on_p = search(&[Edit::write(rel(lib), p_text)], &free);
 
-    assert_eq!(stacked.len(), 2, "both checked on the stack: {stacked:?}");
-    assert_eq!(stacked, flat, "the same verdicts, unseen classes included");
-    let p_verdict = &stacked[&p.id()];
+    let p_verdict = &on_base[&p.id()];
+    assert_eq!(p_verdict, &flat[&p.id()], "P: the same verdict");
     assert!(p_verdict.passed(), "P passes: {p_verdict:?}");
-    let c = stacked
-        .iter()
-        .find(|(id, _)| **id != p.id())
-        .map(|(_, v)| v)
-        .expect("C's verdict");
+    let c = &on_p[&free.id()];
+    assert_eq!(
+        c,
+        &flat[&free.id()],
+        "C on the start's job: the same verdict, unseen classes included"
+    );
     assert!(!c.passed(), "C adds errors: {c:?}");
     assert!(
         c.unseen.contains(&UnseenClass::UnexpandedMacro),

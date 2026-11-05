@@ -3,15 +3,17 @@
 //! Proc macros are off and the beam is 5, so it takes seconds. The full table is
 //! `just search-recall`. Before the run it checks the probes of every committed case of every
 //! workspace under `corpus/search` (each probe names a type of its workspace). A second test
-//! compares every verdict a stacked search forms with the flat check of the same edits.
+//! compares every verdict the search forms on its forks with the reference check of the same
+//! edits.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use ryo_v2_core::app::memory::MemoryBudget;
 use ryo_v2_core::app::ports::{Analyzer, CheckReach, Verifier};
 use ryo_v2_core::app::search::{
-    ASSERT_REVERT_EVERY, DEFAULT_SEARCH_BUDGET, Fate, SearchError, SearchInput, SearchReport,
-    search_decision,
+    ASSERT_REVERT_EVERY, DEFAULT_SEARCH_BUDGET, Fate, SEARCH_FORKS, SearchError, SearchInput,
+    SearchReport, search_decision,
 };
 use ryo_v2_core::app::verdict_of;
 use ryo_v2_core::domain::{
@@ -19,11 +21,12 @@ use ryo_v2_core::domain::{
 };
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::judge::MetricJudge;
+use ryo_v2_core::infra::memory::ProcGauge;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_oracle::materials::Materials;
 use ryo_v2_oracle::search_recall::{PlantedCase, RunInfo, markdown, run_case};
-use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession, SyntaxAssessor};
-use std::num::NonZeroU32;
+use ryo_v2_ra::{ForksConfig, RaAnalyzer, RaConfig, RaSession, SyntaxAssessor};
+use std::num::{NonZeroU32, NonZeroUsize};
 
 #[test]
 fn one_planted_case_runs_end_to_end() {
@@ -115,10 +118,10 @@ fn one_planted_case_runs_end_to_end() {
     let clock = MonotonicClock::new();
     let run = run_case(
         &analyzer,
-        &analyzer,
         &SyntaxAssessor,
         &MetricJudge,
         &clock,
+        (&ProcGauge, MemoryBudget::unbounded()),
         &mut session,
         case,
         budget,
@@ -165,33 +168,28 @@ fn search_verdicts(r: &SearchReport) -> BTreeMap<BlueprintId, Verdict> {
     }
 }
 
-/// Every node a stacked search checked has the verdict `app::verdict_of` gives for its composed
-/// edits, on the same session after the fork's release: the same new errors and unseen classes,
-/// and its fate follows that verdict. The depth-2 cases of search-lab, which run every stacked
-/// depth, proc macros off, beam 5, every write's revert re-asserted, no time limit.
+/// Every node a search checked has the verdict `app::verdict_of` gives for its composed edits,
+/// on the same session after the forks are closed: the same new errors and unseen classes, and
+/// its fate follows that verdict. The depth-2 cases of search-lab, which run every depth on its
+/// parent's Layer, proc macros off, beam 5, the base's isolation sampled at every job, no time
+/// limit.
 ///
 /// The case list bounds its time. With the first case of gen-lab, shape-lab and
 /// breakage-lab as well it took about 20 s, against about 3 s for the test above; each of those
-/// labs added about 3.4 s, mostly its load. The ten depth-2 cases take about 9 s.
+/// labs added about 3.4 s, mostly its load. The ten depth-2 cases take about 9 s per width.
 ///
-/// It runs on both backends of the forks (D11, V3): the search's stacked forks on the undo log,
-/// then on the fork Engine; the flat check is the reference check (`RaAnalyzer::reference_check`,
-/// the undo log's check, which runs no layer code). `RYO_V2_BACKEND=undo-log` or `engine` runs
-/// one backend only.
+/// It runs the search on the forks of the fork Engine (D11, stage 4) at width 1 and at width 4
+/// (`SEARCH_FORKS`); the flat check is the reference check (`RaAnalyzer::reference_check`, which
+/// runs no layer code).
 #[test]
-fn stacked_verdicts_equal_the_flat_check() {
-    let backends: &[bool] = match std::env::var("RYO_V2_BACKEND").as_deref() {
-        Ok("undo-log") => &[false],
-        Ok("engine") => &[true],
-        _ => &[false, true],
-    };
-    for &engine in backends {
-        println!("backend: {}", if engine { "engine" } else { "undo-log" });
-        stacked_verdicts_on(engine);
+fn search_verdicts_equal_the_reference_check() {
+    for width in [1, SEARCH_FORKS] {
+        println!("width: {width}");
+        search_verdicts_at(width);
     }
 }
 
-fn stacked_verdicts_on(engine: bool) {
+fn search_verdicts_at(width: usize) {
     let m = Materials::find().expect("materials");
     let cases: Vec<PlantedCase> =
         PlantedCase::load_all(&m.corpus.join("search/base/search-lab"), &m.corpus)
@@ -209,7 +207,10 @@ fn stacked_verdicts_on(engine: bool) {
             gap_detectors: true,
             assert_revert_every: NonZeroU32::new(1),
             cfg_test: true,
-            engine,
+            forks: ForksConfig {
+                width: NonZeroUsize::new(width),
+                caller_works: false,
+            },
             ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
@@ -246,15 +247,16 @@ fn stacked_verdicts_on(engine: bool) {
             probes: &case.probes,
             scope: Scope::Affected,
             budget,
+            memory: MemoryBudget::unbounded(),
             weights: DEFAULT_WEIGHTS,
             keep_trace_edits: true,
         };
         let r = match search_decision(
             &analyzer,
-            &analyzer,
             &SyntaxAssessor,
             &MetricJudge,
             &clock,
+            &ProcGauge,
             s,
             &input,
         ) {

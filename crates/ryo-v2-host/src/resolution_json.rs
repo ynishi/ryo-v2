@@ -172,6 +172,16 @@ fn add_freshness(o: &mut Value, f: &Freshness) {
     }
 }
 
+/// The word of a check failure, as a blocking and a start failure name it.
+fn failure_kind(failure: &CheckFailure) -> &'static str {
+    match failure {
+        CheckFailure::Edit { .. } => "edit",
+        CheckFailure::Cancelled => "cancelled",
+        CheckFailure::Panicked(_) => "panicked",
+        CheckFailure::DetectorPanicked { .. } => "detector_panicked",
+    }
+}
+
 fn blocking_json(b: &Blocking) -> Value {
     let blueprint = b.blueprint().to_string();
     match b {
@@ -203,14 +213,13 @@ fn blocking_json(b: &Blocking) -> Value {
             "kind": "budget_exhausted", "blueprint": blueprint, "limit_ms": limit_ms,
         }),
         Blocking::CheckFailed { failure, .. } => {
-            let (kind, extra) = match failure {
-                CheckFailure::Edit { path, .. } => ("edit", vec![("path", path.to_string())]),
-                CheckFailure::Cancelled => ("cancelled", vec![]),
-                CheckFailure::Panicked(_) => ("panicked", vec![]),
-                CheckFailure::DetectorPanicked { detector, file } => (
-                    "detector_panicked",
-                    vec![("detector", detector.clone()), ("file", file.to_string())],
-                ),
+            let kind = failure_kind(failure);
+            let extra = match failure {
+                CheckFailure::Edit { path, .. } => vec![("path", path.to_string())],
+                CheckFailure::Cancelled | CheckFailure::Panicked(_) => vec![],
+                CheckFailure::DetectorPanicked { detector, file } => {
+                    vec![("detector", detector.clone()), ("file", file.to_string())]
+                }
             };
             let mut v = json!({
                 "kind": "check_failed", "blueprint": blueprint,
@@ -248,8 +257,11 @@ fn blocking_json(b: &Blocking) -> Value {
 /// - C2: a `Failed` resolution lists each blocker with its `kind` and the blueprint; a stale
 ///   blocking lists its `drift`, each entry a `file` (path, expected `fingerprint`, `freshness`,
 ///   `actual`), a `read` (path, range, `fingerprint`, freshness) or a `missing` path; a
-///   `parent_failed` blocking lists the `parent` it builds on.
+///   `parent_failed` blocking lists the `parent` it builds on. `start_failed` names the failure
+///   of a search's start state (`Infeasible::start`), its `failure` word and `message`, or is
+///   null.
 ///   tested: resolution_json::tests::failed_lists_stale_reads
+///   tested: resolution_json::tests::failed_names_a_start_state_that_failed
 ///   tested: tests/apply.rs apply_after_disk_change_is_failed_stale
 ///   tested: tests/apply.rs apply_after_insert_above_is_failed_stale
 ///   tested: resolution_json::tests::budget_exhausted_blocking_is_listed
@@ -323,6 +335,10 @@ pub(crate) fn resolution_to_json(r: &Resolution) -> Value {
                 "new_errors": n.new_errors(),
             })).collect::<Vec<_>>(),
             "budget_exhausted": inf.budget_exhausted(),
+            "start_failed": inf.start().map(|failure| json!({
+                "failure": failure_kind(failure),
+                "message": failure.to_string(),
+            })),
         }),
     }
 }
@@ -732,6 +748,18 @@ mod tests {
         assert_eq!(exit_code(&r), 0);
         let inf = Infeasible::new(vec![], vec![], true).expect("budget exhausted");
         assert_eq!(exit_code(&Resolution::Failed(inf)), 2);
+    }
+
+    #[test]
+    fn failed_names_a_start_state_that_failed() {
+        let inf = Infeasible::new(vec![], vec![], true).expect("budget exhausted");
+        let v = resolution_to_json(&Resolution::Failed(inf));
+        assert_eq!(v["start_failed"], Value::Null);
+        let inf = Infeasible::of_start(CheckFailure::Panicked("boom".to_owned()), vec![]);
+        let v = resolution_to_json(&Resolution::Failed(inf));
+        assert_eq!(v["start_failed"]["failure"], "panicked");
+        assert_eq!(v["start_failed"]["message"], "analyzer panicked: boom");
+        assert_eq!(v["budget_exhausted"], false);
     }
 
     #[test]

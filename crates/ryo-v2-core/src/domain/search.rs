@@ -94,19 +94,6 @@ pub fn compose(
         .collect()
 }
 
-/// How a stacked fork gets from the levels it holds to those of a path: the levels to pop, and
-/// the nodes whose levels to write then, in order.
-///
-/// # Contract
-/// - C1: the count is the number of nodes of `held` after the longest common prefix of `held`
-///   and `path`, and the nodes are those of `path` after it, in order; `repath(p, p)` pops and
-///   writes nothing.
-///   tested: domain::search::tests::repath_keeps_the_common_prefix
-pub fn repath<'a>(held: &[NodeId], path: &'a [NodeId]) -> (usize, &'a [NodeId]) {
-    let common = held.iter().zip(path).take_while(|(h, p)| h == p).count();
-    (held.len() - common, &path[common..])
-}
-
 /// Where a change is wanted: a file and, if known, a range of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
@@ -677,18 +664,6 @@ mod tests {
     }
     fn w(path: &str, text: &str) -> Edit {
         Edit::write(rel(path), text)
-    }
-
-    #[test]
-    fn repath_keeps_the_common_prefix() {
-        let [r, a, b, c, d] = [0, 1, 2, 3, 4].map(NodeId);
-        assert_eq!(repath(&[r, a, b], &[r, a, c, d]), (1, [c, d].as_slice()));
-        assert_eq!(repath(&[], &[r]), (0, [r].as_slice()));
-        let p = [r, a, b];
-        assert_eq!(repath(&p, &p), (0, [].as_slice()));
-        assert_eq!(repath(&[r, a], &[r]), (1, [].as_slice()));
-        // Nothing in common: every held level goes.
-        assert_eq!(repath(&[a, b], &[c]), (2, [c].as_slice()));
     }
 
     fn bp() -> Blueprint {
