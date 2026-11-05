@@ -784,6 +784,15 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+/// Reads the memory of this process, for the RSS stop of a search (`app::memory::RssStop`).
+///
+/// `None` means the figure cannot be read here (no `/proc`): a stop that cannot read never fires,
+/// so a gauge never fails a search.
+pub trait Gauge: Send + Sync {
+    /// The resident set size of this process in kB.
+    fn rss_kb(&self) -> Option<u64>;
+}
+
 /// Receives [`Event`]s.
 pub trait Observer: Send + Sync {
     /// Called once per event.

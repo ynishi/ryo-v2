@@ -3124,6 +3124,13 @@ mod tests {
         assert_eq!((EXPAND_DEPTH_MS, JUDGE_DEPTH_MS), (10_000, 30_000));
         assert_eq!((SESSION_RAM_GB, RESERVED_RAM_GB), (6, 8));
         assert_eq!(
+            (
+                crate::app::memory::LAYER_MIB,
+                crate::app::memory::JOB_TRANSIENT_MIB
+            ),
+            (52, 10)
+        );
+        assert_eq!(
             (TRIGGER_DECISION_MEDIAN_MS, TRIGGER_CHECK_MEDIAN_MS),
             (300_000, 5_000)
         );

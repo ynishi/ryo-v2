@@ -6,6 +6,7 @@
 //! ports, never the file system, a process or the environment directly.
 
 pub mod apply;
+pub mod memory;
 pub mod ports;
 pub mod search;
 pub mod verify;
