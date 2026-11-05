@@ -68,10 +68,12 @@ pub struct RaConfig {
     ///   tested: tests/verifier.rs ra_config_default_diagnoses_test_code
     pub cfg_test: bool,
     /// The backend of the forks (`Stacked`, `Analyzer`, and a check, which is a one-level fork):
-    /// `false` (the default) writes each level in place and reverts it from its undo log; `true`
-    /// runs it on the fork Engine (D11): the base is frozen while a fork is live, a level is a
-    /// layer over it, `pop` drops the top layer and `release` drops them all, so the base is
-    /// never written.
+    /// `true` (the default) runs it on the fork Engine (D11): the base is frozen while a fork is
+    /// live, a level is a layer over it, `pop` drops the top layer and `release` drops them all,
+    /// so the base is never written; `false` writes each level in place and reverts it from its
+    /// undo log. The default was `false` until stage 4 of D11: `Forks`, which the search runs
+    /// on, refuses the undo log (`Forks` C9), so the Engine became the default before the search
+    /// moved to it.
     ///
     /// # Contract
     /// - C1: every differential and contract test of `Stacked`, `Verifier` and the cut-off gives
@@ -83,11 +85,13 @@ pub struct RaConfig {
     ///   tested: tests/stack.rs a_stack_diagnoses_as_its_flat_composition
     ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
     ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
-    /// - C2: with `engine` on, `load` refuses a process whose environment sets
-    ///   `RUST_ANALYZER_USE_POSTCARD` (`AnalyzerError::Load`), and with it off the variable is
-    ///   no reason to refuse: with it the proc-macro server's bidirectional protocol runs salsa
-    ///   queries of a layer while it holds a server's lock, a lock cycle with the claims of the
-    ///   layer's other threads that salsa cannot see once forks run side by side (D11, 3b).
+    /// - C2: `load` refuses a process whose environment sets `RUST_ANALYZER_USE_POSTCARD`
+    ///   (`AnalyzerError::Load`), on either backend: with it the proc-macro server's
+    ///   bidirectional protocol runs salsa queries of a layer while it holds a server's lock, a
+    ///   lock cycle with the claims of the layer's other threads that salsa cannot see once
+    ///   forks run side by side (D11, 3b). Until the Engine became the default the undo log
+    ///   accepted the variable; one rule for both backends keeps a session's backend out of the
+    ///   question whether its environment is safe.
     ///   tested: session::tests::postcard_protocol_is_refused_at_load
     pub engine: bool,
     /// The forks that run side by side on the Engine (`Forks`, D11 stage 3b); read at
@@ -138,7 +142,7 @@ impl Default for RaConfig {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: true,
-            engine: false,
+            engine: true,
             forks: ForksConfig::default(),
             proc_macro_processes: PROC_MACRO_PROCESSES,
         }
@@ -161,9 +165,11 @@ impl RaConfig {
     }
 }
 
-/// The backend the forks run on, as [`RaConfig::engine`] selects it (D11): the stacked undo log,
-/// the default, or layers of the fork Engine. The one name of the backend for the measurement
-/// commands (`ryo-v2 bench`, `engine-probe`, `search-recall run`) and their reports.
+/// The backend the forks run on, as [`RaConfig::engine`] selects it (D11): layers of the fork
+/// Engine, the default as `RaConfig`'s is, or the stacked undo log. The one name of the backend
+/// for the measurement commands (`ryo-v2 bench`, `engine-probe`, `search-recall run`) and their
+/// reports. Those commands still pick it by their `--engine` flag, the undo log without it, so a
+/// run without the flag stays comparable with the runs recorded before the default changed.
 ///
 /// # Contract
 /// - C1: its name, `undo-log` or `engine`, is the value it serializes as and the word a bench
@@ -175,9 +181,9 @@ impl RaConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum Backend {
     /// The stacked undo log on the one database (`RaConfig.engine` false).
-    #[default]
     UndoLog,
     /// Layers of the fork Engine over a frozen base (`RaConfig.engine` true).
+    #[default]
     Engine,
 }
 
@@ -206,8 +212,10 @@ mod tests {
 
     #[test]
     fn backend_names_itself_one_way() {
-        assert_eq!(Backend::default(), Backend::UndoLog);
-        assert_eq!(RaConfig::default().backend(), Backend::UndoLog);
+        // The Engine is the default of both (D11, stage 4).
+        assert_eq!(Backend::default(), Backend::Engine);
+        assert_eq!(RaConfig::default().backend(), Backend::Engine);
+        assert!(RaConfig::default().engine);
         for (flag, b, name) in [
             (false, Backend::UndoLog, "undo-log"),
             (true, Backend::Engine, "engine"),

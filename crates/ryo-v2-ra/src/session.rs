@@ -304,7 +304,7 @@ fn rel_of(root: &Path, path: &Path) -> Option<RelPath> {
 
 pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerError> {
     let t0 = a.clock.now_ms();
-    refuse_postcard(a.config.engine, std::env::var_os(POSTCARD).as_deref())?;
+    refuse_postcard(std::env::var_os(POSTCARD).as_deref())?;
     let root = root
         .canonicalize()
         .map_err(|e| AnalyzerError::Load(format!("workspace root {}: {e}", root.display())))?;
@@ -422,16 +422,16 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
 /// bidirectional (postcard) protocol.
 const POSTCARD: &str = "RUST_ANALYZER_USE_POSTCARD";
 
-/// The refusal of a load on the Engine (`engine`) in an environment where `postcard` (the value
-/// of [`POSTCARD`], if set) switches the proc-macro client to the bidirectional protocol, which
-/// runs salsa queries under a server's lock (`RaConfig.engine` C2).
-fn refuse_postcard(engine: bool, postcard: Option<&std::ffi::OsStr>) -> Result<(), AnalyzerError> {
+/// The refusal of a load, on either backend, in an environment where `postcard` (the value of
+/// [`POSTCARD`], if set) switches the proc-macro client to the bidirectional protocol, which runs
+/// salsa queries under a server's lock (`RaConfig.engine` C2).
+fn refuse_postcard(postcard: Option<&std::ffi::OsStr>) -> Result<(), AnalyzerError> {
     match postcard {
-        Some(_) if engine => Err(AnalyzerError::Load(format!(
+        Some(_) => Err(AnalyzerError::Load(format!(
             "{POSTCARD} is set: its proc-macro protocol runs queries of a layer under a server's \
              lock, which the forks of the Engine can deadlock on; unset it"
         ))),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 
@@ -442,16 +442,15 @@ mod tests {
 
     #[test]
     fn postcard_protocol_is_refused_at_load() {
-        // Read as rust-analyzer reads it: set at all, whatever the value.
+        // Read as rust-analyzer reads it: set at all, whatever the value; on either backend, so
+        // the backend is no argument of the refusal.
         for value in ["1", "", "0"] {
-            let refused = refuse_postcard(true, Some(OsStr::new(value)));
+            let refused = refuse_postcard(Some(OsStr::new(value)));
             assert!(
                 matches!(&refused, Err(AnalyzerError::Load(m)) if m.contains(POSTCARD)),
                 "{value:?}: {refused:?}"
             );
-            assert!(refuse_postcard(false, Some(OsStr::new(value))).is_ok());
         }
-        assert!(refuse_postcard(true, None).is_ok());
-        assert!(refuse_postcard(false, None).is_ok());
+        assert!(refuse_postcard(None).is_ok());
     }
 }

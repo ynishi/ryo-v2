@@ -122,8 +122,8 @@ pub(crate) fn write_level(
     })
 }
 
-/// The stacked writes of the adapter. On the undo log (the default) the levels are the session's
-/// undo log of its one database; on the fork Engine (`RaConfig.engine`, D11) a level is a layer
+/// The stacked writes of the adapter. On the undo log the levels are the session's undo log of
+/// its one database; on the fork Engine (`RaConfig.engine`, D11, the default) a level is a layer
 /// over the frozen base, `pop` drops the top layer and `release` drops them all, and a level's
 /// write is checked by the isolation of the base (I2) instead of a revert. The cut-off (D1), the
 /// detector-panic rule (D7) and the unseen classes of a diagnosis are the same on both.

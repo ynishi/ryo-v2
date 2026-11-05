@@ -10,7 +10,7 @@ use std::time::Duration;
 use ra_ap_base_db::{FileId, FileSet, SourceDatabase, SourceRoot};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_ide_db::RootDatabase;
-use ryo_v2_core::app::ports::{Analyzer, Verifier};
+use ryo_v2_core::app::ports::Analyzer;
 use ryo_v2_core::domain::{Edit, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -70,7 +70,6 @@ fn analyzer(threads: usize) -> RaAnalyzer {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
-            engine: false,
             ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
@@ -129,15 +128,16 @@ fn solver_cache_does_not_cross_layers() {
 
     let in_f = a.diagnose_database(&s, &f.db()).expect("F");
     let in_g = a.diagnose_database(&s, &g.db()).expect("G");
+    // The flat side is the reference check, on the undo log whatever the default backend is.
     let flat_f = a
-        .check(
+        .reference_check(
             &mut twin,
             &[Edit::write(rel(&module(0)), f_text)],
             Scope::Workspace,
         )
         .expect("flat F");
     let flat_g = a
-        .check(
+        .reference_check(
             &mut twin,
             &[Edit::write(rel(&module(0)), g_text)],
             Scope::Workspace,
@@ -209,7 +209,9 @@ fn diagnostic_threads_read_the_layer() {
             .expect("the layer is writable");
         edits.push(Edit::write(rel(&module(i)), text));
     }
-    let flat = a.check(&mut twin, &edits, Scope::Workspace).expect("flat");
+    let flat = a
+        .reference_check(&mut twin, &edits, Scope::Workspace)
+        .expect("flat");
     assert_eq!(flat.findings.len(), 4);
     assert_eq!(a.diagnose_database(&s, &layer.db()).expect("layer"), flat);
 

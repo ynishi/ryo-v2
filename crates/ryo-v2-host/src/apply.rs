@@ -43,7 +43,6 @@ pub(crate) fn run_apply(args: &ApplyArgs) -> Result<ExitCode> {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: true,
-            engine: false,
             ..Default::default()
         },
         Arc::new(MonotonicClock::new()),

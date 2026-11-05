@@ -2059,6 +2059,9 @@ mod tests {
             outer_check_ms: 400,
             outer_sample,
             rss_kb: Some(777),
+            // Named, not the default (the Engine, D11 stage 4): the run below on the Engine
+            // differs from this one in the key backend alone.
+            backend: Backend::UndoLog,
             ..RunInfo::default()
         };
         let all = info(OuterSample::All);

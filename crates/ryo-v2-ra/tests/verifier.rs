@@ -213,8 +213,9 @@ fn cfg_test_config_diagnoses_test_module_on() {
 #[test]
 fn ra_config_default_diagnoses_test_code() {
     assert!(RaConfig::default().cfg_test);
-    // The undo log stays the default backend of the forks (D11, stage 3).
-    assert!(!RaConfig::default().engine);
+    // The fork Engine is the default backend of the forks (D11, stage 4; the undo log was until
+    // stage 3).
+    assert!(RaConfig::default().engine);
 }
 
 const UNRESOLVED_LIB: &str =

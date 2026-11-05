@@ -4,14 +4,14 @@
 //! listed shared ones (I2).
 //!
 //! The layers sit over the session's own database, lent to the Engine and given back at the end;
-//! the twin is a second session of the same workspace that runs `Verifier::check` (write,
-//! diagnose, revert) with no layer code.
+//! the twin is a second session of the same workspace that runs `RaAnalyzer::reference_check`
+//! (write, diagnose, revert on the undo log, whatever `RaConfig.engine` says) with no layer code.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ryo_v2_core::app::ports::{Analyzer, Verifier};
+use ryo_v2_core::app::ports::Analyzer;
 use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -254,7 +254,7 @@ fn run_gate(base: &str, dir: &Path, sequences: &[(&'static str, Vec<Level>)]) ->
         for (k, level) in levels.iter().enumerate() {
             let at = format!("{name}, level {}", k + 1);
             let flat = a
-                .check(&mut twin, &compose(&levels[..=k]), Scope::Workspace)
+                .reference_check(&mut twin, &compose(&levels[..=k]), Scope::Workspace)
                 .unwrap_or_else(|e| panic!("{at}: the flat check: {e:?}"));
             let mut layer = parent.child();
             write_level(&s, &mut layer, level);
@@ -348,9 +348,11 @@ fn run_gate(base: &str, dir: &Path, sequences: &[(&'static str, Vec<Level>)]) ->
     s.return_database(db);
     // The returned database diagnoses as before it was lent.
     let back = a
-        .check(&mut s, &[], Scope::Workspace)
+        .reference_check(&mut s, &[], Scope::Workspace)
         .expect("a check on the returned database");
-    let twin_base = a.check(&mut twin, &[], Scope::Workspace).expect("twin");
+    let twin_base = a
+        .reference_check(&mut twin, &[], Scope::Workspace)
+        .expect("twin");
     assert_eq!(back, twin_base, "the returned database");
     compared
 }

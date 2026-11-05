@@ -103,7 +103,6 @@ fn one_planted_case_runs_end_to_end() {
             gap_detectors: true,
             assert_revert_every: NonZeroU32::new(ASSERT_REVERT_EVERY),
             cfg_test: true,
-            engine: false,
             ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
