@@ -65,6 +65,19 @@ impl fmt::Debug for RaLayer {
 }
 
 impl RaLayer {
+    /// The counters of the layer's own Engine layer (memos, stamps, tracked entries, its chain
+    /// view), as `RaSession::level_stats` gives them for a level of a stacked fork. Reads
+    /// counters only, runs no query, changes nothing. The host's measurement series read it on
+    /// the Layers they hold.
+    ///
+    /// # Contract
+    /// - C1: the Layer of a job that ran its diagnosis has memos of its own; reading them changes
+    ///   nothing, so the forks close as they would without the read.
+    ///   tested: tests/forks.rs a_layers_stats_count_its_jobs_memos
+    pub fn stats(&self) -> crate::LayerStats {
+        self.sealed.stats()
+    }
+
     /// The files of the layer's state.
     fn live<'a>(&'a self, base: &'a [(FileId, RelPath)]) -> &'a [(FileId, RelPath)] {
         self.state.as_deref().map_or(base, |s| s.live.as_slice())

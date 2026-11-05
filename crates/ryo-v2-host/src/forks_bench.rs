@@ -31,7 +31,7 @@ use crate::bench::scope_name;
 use crate::layer_cost::{EditClass, Quantiles};
 use crate::proc;
 use anyhow::{Context, Result};
-use ryo_v2_core::app::ports::{CheckError, Event, Forks, JobId, Limit, Next, Stacked, Verifier};
+use ryo_v2_core::app::ports::{CheckError, Event, Forks, JobId, Limit, Next, Verifier};
 use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -939,7 +939,8 @@ pub fn run_tree<A: Forks>(
     }
 }
 
-/// What the tree serially on one `Stacked` fork measured: each job's check and outcome.
+/// What the tree run serially, one job at a time at W = 1 ([`serial_tree`]), measured: each
+/// job's check and outcome.
 #[derive(Debug, Clone, Default)]
 pub struct SerialRun {
     /// From the first write of level 1 to the last diagnosis.
@@ -971,41 +972,51 @@ impl SerialRun {
     }
 }
 
-/// The tree serially on one `Stacked` fork: the seed as level 1, then per level its jobs 1.. each
-/// written as a level, diagnosed and popped, and job 0 written and diagnosed last and kept as
-/// the parent of the next level. The fork is released at the end, whatever happened.
-pub fn serial_tree<A: Stacked>(
+/// The tree serially, one job at a time on `Forks` at W = 1 (the analyzer's forks
+/// [`SERIAL_FORKS`]): the seed as level 1, then per level its jobs 1.. each submitted on the
+/// level's parent, waited for and its Layer dropped, and job 0 submitted last and its Layer kept
+/// as the parent of the next level. Every Layer is dropped and the forks are closed at the end,
+/// whatever happened.
+pub fn serial_tree<A: Forks>(
     a: &A,
     s: &mut A::Session,
     tree: &JobTree,
     scope: Scope,
     observer: &RecordingObserver,
 ) -> Result<SerialRun> {
-    let mut f = a.fork(s).context("open the fork")?;
-    let ran = serial_levels(a, s, &mut f, tree, scope, observer);
-    let released = a.release(s, f);
-    match (ran, released) {
+    let root = a.open(s).context("open the forks")?;
+    let ran = serial_levels(a, s, &root, tree, scope, observer);
+    drop(root);
+    let closed = a.close(s);
+    match (ran, closed) {
         (Ok(run), Ok(())) => Ok(run),
-        (Ok(_), Err(e)) => Err(e).context("release the fork"),
+        (Ok(_), Err(e)) => Err(e).context("close the forks"),
         (Err(e), Ok(())) => Err(e),
-        (Err(e), Err(r)) => {
-            eprintln!("[forks] release after a failed serial run: {r}");
+        (Err(e), Err(c)) => {
+            eprintln!("[forks] close after a failed serial run: {c}");
             Err(e)
         }
     }
 }
 
-/// The levels of [`serial_tree`] on the live fork `f`.
-fn serial_levels<A: Stacked>(
+/// The forks of the serial run: one job in flight on all T threads, as a level of the stacked
+/// fork diagnosed on.
+pub const SERIAL_FORKS: WidthSpec = WidthSpec {
+    n: NonZeroUsize::MIN,
+    caller_works: false,
+};
+
+/// The levels of [`serial_tree`] on the open forks, from `root`; every Layer they hold is dropped
+/// when they return.
+fn serial_levels<A: Forks>(
     a: &A,
     s: &mut A::Session,
-    f: &mut A::Fork,
+    root: &A::Layer,
     tree: &JobTree,
     scope: Scope,
     observer: &RecordingObserver,
 ) -> Result<SerialRun> {
-    a.write(s, f, &tree.seed).context("write the seed")?;
-    a.diagnose(s, f, scope).context("diagnose the seed")?;
+    let mut parent = seed_layer(a, s, root, &tree.seed, scope)?;
     observer.take();
     let mut run = SerialRun::default();
     let started = Instant::now();
@@ -1015,31 +1026,35 @@ fn serial_levels<A: Stacked>(
         };
         for job in siblings {
             let node = (job.level, job.index);
-            match a.write(s, f, &job.edits) {
-                Err(e) => {
-                    run.outcomes.insert(node, JobOutcome::of(Err(&e)));
-                }
-                Ok(()) => {
-                    let found = a.diagnose(s, f, scope);
-                    if let Err(CheckError::TimedOut { limit_ms }) = &found {
-                        run.cut_ms.push(*limit_ms);
-                    }
-                    run.outcomes.insert(node, JobOutcome::of(found.as_ref()));
-                    a.pop(s, f)
-                        .with_context(|| format!("pop job {}.{}", job.level, job.index))?;
-                }
+            let id = a
+                .submit(s, &parent, &job.edits, scope, Limit::Check)
+                .with_context(|| format!("submit job {}.{}", job.level, job.index))?;
+            let found = crate::stacked::outcome(a, s, id)
+                .with_context(|| format!("job {}.{}", job.level, job.index))?;
+            if let Err(CheckError::TimedOut { limit_ms }) = &found {
+                run.cut_ms.push(*limit_ms);
             }
+            run.outcomes
+                .insert(node, JobOutcome::of(found.as_ref().map(|c| &c.findings)));
+            // The sibling's Layer is dropped here.
         }
         let node = (first.level, first.index);
-        a.write(s, f, &first.edits)
-            .with_context(|| format!("write job {}.0", first.level))?;
-        let found = a.diagnose(s, f, scope);
+        let id = a
+            .submit(s, &parent, &first.edits, scope, Limit::Check)
+            .with_context(|| format!("submit job {}.0", first.level))?;
+        let found =
+            crate::stacked::outcome(a, s, id).with_context(|| format!("job {}.0", first.level))?;
+        if let Err(e @ CheckError::Edit { .. }) = &found {
+            return Err(e.clone()).with_context(|| format!("write job {}.0", first.level));
+        }
         if let Err(CheckError::TimedOut { limit_ms }) = &found {
             run.cut_ms.push(*limit_ms);
         }
-        run.outcomes.insert(node, JobOutcome::of(found.as_ref()));
-        if found.is_err() {
-            break;
+        run.outcomes
+            .insert(node, JobOutcome::of(found.as_ref().map(|c| &c.findings)));
+        match found {
+            Ok(checked) => parent = checked.layer,
+            Err(_) => break,
         }
     }
     run.wall_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1084,7 +1099,8 @@ pub struct ForksArgs {
     pub rss_reserve_gib: f64,
     /// Whether to start the proc-macro server.
     pub proc_macro: bool,
-    /// Whether to run the tree serially on one `Stacked` fork too, per repeat.
+    /// Whether to run the tree serially too, one job at a time at W = 1 ([`serial_tree`]), per
+    /// repeat.
     pub serial: bool,
 }
 
@@ -1105,7 +1121,8 @@ fn config(args: &ForksArgs, spec: Option<WidthSpec>) -> RaConfig {
 /// Loads `args.base` on the Engine once and, per scope, repeat and width, runs the job tree
 /// through `Forks` ([`run_tree`]); prints a line per run, a summary per width
 /// ([`summary_line`]) and the W4 verdict. A difference of W4, of a width or of the serial run
-/// on `Stacked`, is the run's error, after every line is printed.
+/// ([`serial_tree`]), is the run's error, after every line is printed. The serial run's summary
+/// keeps its name, `serial-stacked`, from when it ran on one stacked fork.
 pub fn run_forks(args: &ForksArgs) -> Result<()> {
     anyhow::ensure!(!args.widths.is_empty(), "--forks: no width");
     let cores = std::thread::available_parallelism()
@@ -1174,8 +1191,12 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
                 .with_check_timeout(args.cut_off_ms)
         })
         .collect();
-    let serial = RaAnalyzer::new(config(args, None), clock.clone(), observer.clone())
-        .with_check_timeout(args.cut_off_ms);
+    let serial = RaAnalyzer::new(
+        config(args, Some(SERIAL_FORKS)),
+        clock.clone(),
+        observer.clone(),
+    )
+    .with_check_timeout(args.cut_off_ms);
     // W = 1, `1` or `1c` (both give W = 1), is the reference of W4 and the base of the
     // speedup; without it the first width is W4's reference and no speedup is given.
     let one_at = args.widths.iter().position(|w| w.n.get() == 1);
@@ -1204,10 +1225,10 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
             args.widths[0].label(),
             warm.wall_ms
         );
-        // The serial run on `Stacked` has its own untimed warm-up.
+        // The serial run has its own untimed warm-up.
         if args.serial {
             let warm = serial_tree(&serial, &mut session, &tree, scope, &observer)
-                .context("the serial warm-up run on Stacked")?;
+                .context("the serial warm-up run")?;
             eprintln!(
                 "[forks] warm-up [{sname}] serial: wall_ms {:.0}",
                 warm.wall_ms
@@ -1218,7 +1239,7 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
         for r in 1..=args.repeat as usize {
             if args.serial {
                 let run = serial_tree(&serial, &mut session, &tree, scope, &observer)
-                    .context("the serial run on Stacked")?;
+                    .context("the serial run")?;
                 println!(
                     "serial [{sname}] {r}/{}: submitted {}/{jobs} wall_ms {:.0} jobs_per_s {:.2}",
                     args.repeat,

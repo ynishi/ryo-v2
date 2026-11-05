@@ -18,7 +18,9 @@ use ryo_v2_core::app::ports::{Analyzer, Event, Observer};
 use ryo_v2_core::domain::Scope;
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{Backend, IngredientRow, MemoRow, MemoryReport, RaAnalyzer, RaConfig, RaSession};
+use ryo_v2_ra::{
+    Backend, IngredientRow, MemoRow, MemoryReport, RaAnalyzer, RaConfig, RaLayer, RaSession,
+};
 use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
@@ -99,9 +101,11 @@ pub struct ProbeArgs {
 ///   the first key, is the run's [`ryo_v2_ra::Backend`] by name, `"undo-log"` or `"engine"`, so that two
 ///   runs can be told apart.
 ///   tested: engine_probe::tests::report_json_keeps_its_keys_and_values
-/// - C2: a check's freed at write is h0 - hW (what the new revision of the level's write frees),
-///   its delta h1 - hW (what the diagnosis allocates and keeps after that write) and its freed at
-///   pop h2 - h3, all read from the counting allocator, never from the RSS.
+/// - C2: a check's freed at write is h0 - hW (what the submit of the level's job frees), its
+///   delta h1 - hW (what the job, its write and its diagnosis, allocates and keeps) and its freed
+///   at pop h2 - h3 (what the drop of its Layer frees), all read from the counting allocator,
+///   never from the RSS. The job may run on its worker before hW is read, so the split of its
+///   figure between freed at write and delta depends on timing; h1 - h0 does not.
 ///   tested: engine_probe::tests::delta_and_freed_read_the_allocator
 /// - C3: a failed read of `/proc` ends the run with an error naming the file; no figure of the
 ///   report is left out or zero because of it.
@@ -211,8 +215,8 @@ impl Composition {
     }
 }
 
-/// One repeat of a series of a [`ProbeReport`]: the variant's level written on the parent's,
-/// diagnosed and popped.
+/// One repeat of a series of a [`ProbeReport`]: the variant's level, a job of `Forks` on the
+/// parent's Layer (W = 1), written and diagnosed on a worker, and its Layer dropped.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CheckRow {
     /// The variant as given.
@@ -221,28 +225,34 @@ pub struct CheckRow {
     pub scope: &'static str,
     /// The repeat, from 1.
     pub repeat: u32,
-    /// `PASS`, `FAIL` or `REVERT-MISMATCH`, as `bench` labels a run.
+    /// `PASS` or `FAIL`, as `bench` labels a run.
     pub label: &'static str,
     /// The `check_ms` of the level's `Event::Checked`, under the counting allocator.
     pub wall_ms: u64,
-    /// The live heap just before the write of the level (h0).
+    /// The live heap just before the submit of the level's job (h0).
     pub h0_gib: f64,
-    /// The live heap just after the write, before the diagnosis (hW).
+    /// The live heap just after the submit, the edits resolved and queued (hW). The job writes
+    /// and diagnoses in one step on its worker, so no reading falls between the two; the worker
+    /// may already have started the job when hW is read, and the counting allocator counts the
+    /// whole process, so hW holds whatever part of the job ran by then.
     pub hw_gib: f64,
-    /// The live heap just after its diagnosis (h1).
+    /// The live heap just after its job ran (h1).
     pub h1_gib: f64,
-    /// The live heap just before its pop (h2).
+    /// The live heap just before its Layer is dropped (h2).
     pub h2_gib: f64,
-    /// The live heap just after its pop (h3).
+    /// The live heap just after its Layer is dropped (h3).
     pub h3_gib: f64,
-    /// `h0 - hW`: what the new revision of the level's write freed (the predecessors parked in
-    /// `deleted_entries` and the LRU evictions due since the revision before).
+    /// `h0 - hW`: what the submit freed (its edits resolved on the session thread), less what
+    /// the job's worker allocated before hW was read. How the job's figure splits between this
+    /// and `delta_gib` depends on that timing; `delta_gib - freed_at_write_gib` (h1 - h0) does
+    /// not.
     pub freed_at_write_gib: f64,
-    /// `h1 - hW`: what the diagnosis allocated and kept after the level's own write.
+    /// `h1 - hW`: what the job, its write and its diagnosis, allocated and kept after hW was
+    /// read (see `freed_at_write_gib`).
     pub delta_gib: f64,
-    /// `h2 - h3`: what the pop, the database write of the level's revert, freed.
+    /// `h2 - h3`: what the drop of the level's Layer freed.
     pub freed_at_pop_gib: f64,
-    /// The resident set size just after the pop.
+    /// The resident set size just after the drop.
     pub rss_gib: f64,
 }
 
@@ -384,7 +394,7 @@ impl ProbeHook<'_> {
                         variant: self.variant.to_owned(),
                         scope: self.scope,
                         repeat: self.rows.len() as u32 + 1,
-                        label: label_of(verdict),
+                        label: label_of(Some(verdict)),
                         wall_ms: 0,
                         h0_gib: gib(h0),
                         hw_gib: gib(hw),
@@ -459,6 +469,9 @@ fn composition(session: &mut RaSession, phase: &'static str) -> Result<Compositi
 /// Loads `args.base`, runs every (variant, scope) series on top of the `--on` parent and returns
 /// what it measured; `gauge` is the counting allocator of the process.
 pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeReport> {
+    if args.on.is_some() {
+        crate::bench::require_engine(args.backend, "engine-probe --on (the stacked series)")?;
+    }
     let rss: RssReader = proc::vm_rss_kb;
     let ram_gib = kb_gib(proc::mem_total_kb()?);
     let cores = std::thread::available_parallelism()
@@ -472,6 +485,7 @@ pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeRepor
         RaConfig {
             proc_macro: true,
             assert_revert: true,
+            forks: crate::bench::SERIES_FORKS,
             ..RaConfig::default()
         }
         .with_backend(args.backend),
@@ -530,10 +544,10 @@ pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeRepor
                     args.repeat,
                     &mut |point| hook.observe(point),
                 )?;
-                // A revert that failed poisoned the session: nothing after it can be measured.
+                // A base the jobs changed poisoned the session: nothing after it can be measured.
                 anyhow::ensure!(
                     reverted,
-                    "{name} [{}]: a level did not revert",
+                    "{name} [{}]: the base's isolation failed at the close (I2)",
                     scope_name(scope)
                 );
                 let rows = hook.into_rows()?;
@@ -854,11 +868,12 @@ pub fn check_view_share(report: &DepthReport, max_pct: f64) -> Result<()> {
     Ok(())
 }
 
-/// Loads `args.base` and, per scope, stacks `args.depth` levels on one fork (the levels of
-/// `stacked::depth_levels` over the first `args.files` indexed files), each diagnosed once right
-/// after its write, reads the counting allocator at every point and the layers' counters before
-/// the pops, and pops back.
+/// Loads `args.base` and, per scope, stacks `args.depth` levels as jobs of `Forks` at W = 1 (the
+/// levels of `stacked::depth_levels` over the first `args.files` indexed files), each a job on
+/// the Layer of the one below and so diagnosed once right after its write, reads the counting
+/// allocator at every point and the Layers' counters before the drops, and drops them.
 pub fn run_depth(args: &DepthProbeArgs, gauge: &'static dyn HeapGauge) -> Result<DepthReport> {
+    crate::bench::require_engine(args.backend, "engine-probe --depth")?;
     let ram_gib = kb_gib(proc::mem_total_kb()?);
     let cores = std::thread::available_parallelism()
         .context("the available parallelism")?
@@ -904,14 +919,14 @@ pub fn run_depth(args: &DepthProbeArgs, gauge: &'static dyn HeapGauge) -> Result
                 }
                 Ok(())
             },
-            &mut |s| {
+            &mut |_, layers| {
                 stacked_at = gauge.live_bytes();
-                stats = s.level_stats();
+                stats = layers.iter().map(RaLayer::stats).collect();
             },
         )?;
         anyhow::ensure!(
             reverted,
-            "depth {} [{}]: a level did not revert",
+            "depth {} [{}]: the base's isolation failed at the close (I2)",
             args.depth,
             scope_name(scope)
         );
@@ -1258,8 +1273,17 @@ mod tests {
         );
     }
 
+    /// A verdict with no finding: a level that passed.
+    fn passed() -> ryo_v2_core::domain::Verdict {
+        ryo_v2_core::domain::Verdict::from_baseline(
+            &[],
+            &ryo_v2_core::domain::ScopedFindings::default(),
+        )
+    }
+
     #[test]
     fn delta_and_freed_read_the_allocator() {
+        let v = passed();
         let gauge = &DELTA_GAUGE;
         let observer = ProbeObserver::new(gauge, fake_rss);
         let mut hook = ProbeHook {
@@ -1291,7 +1315,7 @@ mod tests {
         at(99 * MIB);
         hook.observe(Point::BeforePop).unwrap();
         at(97 * MIB);
-        hook.observe(Point::AfterPop(None)).unwrap();
+        hook.observe(Point::AfterPop(&v)).unwrap();
         let rows = hook.into_rows().unwrap();
         assert_eq!(rows.len(), 1);
         let r = &rows[0];
@@ -1314,7 +1338,7 @@ mod tests {
         // The RSS is read beside them and enters none of them.
         assert_eq!(r.rss_gib, 5.0);
         assert_eq!(r.wall_ms, 9);
-        assert_eq!(r.label, "REVERT-MISMATCH");
+        assert_eq!(r.label, "PASS");
 
         // A heap that shrank during the diagnosis gives a negative delta, and one that grew at
         // the write a negative freed at write, neither wrapped.
@@ -1331,7 +1355,7 @@ mod tests {
         at(49 * MIB);
         hook.observe(Point::AfterDiagnose).unwrap();
         hook.observe(Point::BeforePop).unwrap();
-        hook.observe(Point::AfterPop(None)).unwrap();
+        hook.observe(Point::AfterPop(&v)).unwrap();
         let rows = hook.into_rows().unwrap();
         assert_eq!(rows[0].freed_at_write_gib, -gib(MIB));
         assert_eq!(rows[0].delta_gib, -gib(2 * MIB));
@@ -1344,7 +1368,7 @@ mod tests {
             Point::AfterWrite,
             Point::AfterDiagnose,
             Point::BeforePop,
-            Point::AfterPop(None),
+            Point::AfterPop(&v),
         ] {
             hook.observe(point).unwrap();
         }
@@ -1367,6 +1391,7 @@ mod tests {
 
     #[test]
     fn a_failed_proc_read_is_an_error() {
+        let v = passed();
         // The parser given an unreadable path: the error names the file.
         match failed_rss() {
             Err(e @ ProcError::Read { .. }) => {
@@ -1422,7 +1447,7 @@ mod tests {
             hook.observe(point).unwrap();
         }
         assert!(matches!(
-            hook.observe(Point::AfterPop(None)),
+            hook.observe(Point::AfterPop(&v)),
             Err(ProcError::Read { .. })
         ));
         assert!(hook.rows.is_empty());

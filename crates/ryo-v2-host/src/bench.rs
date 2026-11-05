@@ -2,22 +2,24 @@
 //!
 //! With `--on <parent overlay>` it measures one child two ways: `rebuilt`, the parent's edits
 //! composed with the variant's and verified from the base, and `stacked`, the variant's edits
-//! that the parent does not already make, written as a level on top of the parent's level of one
-//! `Stacked` fork, by `stacked::stacked_series`.
+//! that the parent does not already make, submitted as a job on the parent's Layer of `Forks` at
+//! W = 1, by `stacked::stacked_series`.
 //!
 //! Memory and CPU time are read through `proc.rs`: a failed read is an error of the run, so the
 //! host runs on Linux only. With `--on` every run also prints its process CPU ms, its wall ms
 //! and its core occupancy ([`occupancy`]).
 //!
-//! With `--engine` the forks run on layers of the fork Engine (`RaConfig.engine`, D11) instead
+//! With `--engine` the checks run on layers of the fork Engine (`RaConfig.engine`, D11) instead
 //! of the stacked undo log; every summary line ends with ` backend engine` or ` backend undo-log`
-//! ([`Backend`]).
+//! ([`Backend`]). The stacked mode and `--depth-sweep` run on `Forks`, which need the Engine
+//! (`Forks` C9), so they ask for `--engine` ([`require_engine`]).
 //!
 //! With `--depth-sweep` ([`run_depth_sweep`]) it measures how a diagnosis of the top level grows
-//! with the depth of a stack: per depth K, K one-file levels written on one fork by
-//! `stacked::depth_series`, the top level diagnosed `--repeat` times, and the levels popped. On
-//! the Engine it also prints, per level, the counters of the level's layer
-//! ([`level_stats_line`]), with the walk counters of `fork-probe` when built with that feature.
+//! with the depth of a stack: per depth K, K one-file levels, each a job on the Layer of the one
+//! below, by `stacked::depth_series`, the top level diagnosed `--repeat` times (diagnosis 1 its
+//! own job, the later ones the same level run again on the level below), and the Layers dropped.
+//! It also prints, per level, the counters of the level's Layer ([`level_stats_line`]), with the
+//! walk counters of `fork-probe` when built with that feature.
 
 use crate::proc::{self, ProcError};
 use crate::stacked::{self, DepthPoint, DepthShape, Point};
@@ -29,7 +31,8 @@ use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{Backend, LayerStats, RaAnalyzer, RaConfig};
+use ryo_v2_ra::{Backend, ForksConfig, LayerStats, RaAnalyzer, RaConfig, RaLayer};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -294,8 +297,8 @@ impl StackedRecord<'_> {
                     self.series,
                     self.runs,
                     &stats,
-                    label_of(verdict),
-                    verdict,
+                    label_of(Some(verdict)),
+                    Some(verdict),
                 );
             }
         }
@@ -414,8 +417,16 @@ fn record(
     }
 }
 
+/// The forks of the series of `stacked.rs`: W = 1 with a caller that only waits, so the one job
+/// in flight diagnoses on all T threads, as a check and a level of the stacked fork did
+/// (`ForksConfig`: `T_w = T`, `t = T`).
+pub(crate) const SERIES_FORKS: ForksConfig = ForksConfig {
+    width: Some(NonZeroUsize::MIN),
+    caller_works: false,
+};
+
 /// Builds the analyzer of a bench on `backend`, loads `base` once and prints the load's lines to
-/// stderr.
+/// stderr. Its forks are [`SERIES_FORKS`].
 pub(crate) fn load(
     base: &std::path::Path,
     proc_macro: bool,
@@ -439,6 +450,7 @@ pub(crate) fn load_on_threads(
             proc_macro,
             assert_revert,
             threads,
+            forks: SERIES_FORKS,
             ..RaConfig::default()
         }
         .with_backend(backend),
@@ -470,8 +482,26 @@ pub(crate) fn load_on_threads(
     Ok((analyzer, observer, session))
 }
 
+/// Refuses a run of the series of `stacked.rs` (`what`) on `backend` unless it is the Engine:
+/// they run on `Forks`, which the undo log does not offer (`Forks` C9).
+///
+/// # Contract
+/// - C1: `Ok` on the Engine; on the undo log an error naming `what` and `--engine`, given
+///   before anything is loaded.
+///   tested: bench::tests::the_series_ask_for_the_engine
+pub(crate) fn require_engine(backend: Backend, what: &str) -> Result<()> {
+    anyhow::ensure!(
+        backend == Backend::Engine,
+        "{what} runs on Forks, which need the fork Engine: add --engine"
+    );
+    Ok(())
+}
+
 /// Loads `args.base` once and runs every variant; prints the fixed output format.
 pub fn run(args: &BenchArgs) -> Result<()> {
+    if args.on.is_some() {
+        require_engine(args.backend, "bench --on (the stacked mode)")?;
+    }
     let (analyzer, observer, mut session) = load(
         &args.base,
         args.proc_macro,
@@ -631,7 +661,8 @@ pub struct DepthArgs {
     pub scopes: Vec<Scope>,
     /// Whether to start the proc-macro server.
     pub proc_macro: bool,
-    /// Whether every level's write is sampled for the re-assert at its pop.
+    /// Whether the writes are sampled (`RaConfig.assert_revert`): on `Forks`, the base's
+    /// fingerprint is taken at `open` and compared at `close` (I2).
     pub assert_revert: bool,
     /// The backend of the forks (`RaConfig.engine`); every summary line names it.
     pub backend: Backend,
@@ -747,8 +778,8 @@ fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backe
     )
 }
 
-/// The line of one level of a stack on the fork Engine: its layer's counters
-/// (`RaSession::level_stats`), read once every level is written and diagnosed, before the pops.
+/// The line of one level of a stack on the fork Engine: its Layer's counters
+/// (`RaLayer::stats`), read once every level is written and diagnosed, before the drops.
 ///
 /// # Contract
 /// - C1: `level <label> level <k>` followed by `memos`, `stamps`, `tracked_entries`,
@@ -844,11 +875,13 @@ pub(crate) fn depth_files(
     Ok(files)
 }
 
-/// Loads `args.base` once and, per scope and depth K, writes K levels on one fork with
-/// `stacked::depth_series` (the levels of `stacked::depth_levels` over the first `args.files`
-/// files of the workspace that the session indexed, in path order), diagnoses the top level
-/// `args.repeat` times and pops back; prints a line per diagnosis and a summary per depth.
+/// Loads `args.base` once and, per scope and depth K, submits K levels as jobs of `Forks` at
+/// W = 1 with `stacked::depth_series` (the levels of `stacked::depth_levels` over the first
+/// `args.files` files of the workspace that the session indexed, in path order, each a job on
+/// the Layer of the one below), diagnoses the top level `args.repeat` times and drops the
+/// Layers; prints a line per diagnosis and a summary per depth.
 pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
+    require_engine(args.backend, "bench --depth-sweep")?;
     let (analyzer, _observer, mut session) = load(
         &args.base,
         args.proc_macro,
@@ -878,7 +911,7 @@ pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
                 scope,
                 DepthShape::Top(args.repeat),
                 &mut |point| rec.observe(point),
-                &mut |s| level_stats = s.level_stats(),
+                &mut |_, layers| level_stats = layers.iter().map(RaLayer::stats).collect(),
             )?;
             for (i, (&us, &(scope_files, findings))) in
                 rec.check_us.iter().zip(&rec.diagnosed).enumerate()
@@ -1095,7 +1128,8 @@ mod tests {
         }
         rec.observe(Point::AfterDiagnose).unwrap();
         rec.observe(Point::BeforePop).unwrap();
-        rec.observe(Point::AfterPop(None)).unwrap();
+        let verdict = Verdict::from_baseline(&[], &ryo_v2_core::domain::ScopedFindings::default());
+        rec.observe(Point::AfterPop(&verdict)).unwrap();
         assert_eq!(series.occupancy.len(), 1);
         assert!(series.occupancy[0] >= 0.0 && series.occupancy[0].is_finite());
 
@@ -1120,7 +1154,7 @@ mod tests {
             let ended = if fail_at_end {
                 begun.unwrap();
                 rec.cpu = failed_cpu;
-                rec.observe(Point::AfterPop(None))
+                rec.observe(Point::AfterPop(&verdict))
             } else {
                 begun
             };
@@ -1132,6 +1166,28 @@ mod tests {
             }
             assert!(series.occupancy.is_empty());
         }
+    }
+
+    /// `require_engine` C1.
+    #[test]
+    fn the_series_ask_for_the_engine() {
+        assert!(require_engine(Backend::Engine, "bench --on").is_ok());
+        let e = require_engine(Backend::UndoLog, "bench --depth-sweep").unwrap_err();
+        let shown = e.to_string();
+        assert!(shown.contains("bench --depth-sweep"), "{shown}");
+        assert!(shown.contains("--engine"), "{shown}");
+        // `run` refuses before it loads anything: the base need not exist.
+        let args = BenchArgs {
+            base: PathBuf::from("/nonexistent-ryo-v2-base"),
+            variants: Vec::new(),
+            on: Some(PathBuf::from("/nonexistent-ryo-v2-parent")),
+            repeat: 1,
+            scopes: vec![Scope::Affected],
+            proc_macro: false,
+            assert_revert: false,
+            backend: Backend::UndoLog,
+        };
+        assert!(run(&args).unwrap_err().to_string().contains("--engine"));
     }
 
     /// `level_stats_line` C1.

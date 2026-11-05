@@ -1271,6 +1271,22 @@ fn splices(children: &Expanded, path: &str) -> bool {
     })
 }
 
+/// `RaLayer::stats` C1: the counters the host's measurement series read on the Layers they hold.
+#[test]
+fn a_layers_stats_count_its_jobs_memos() {
+    let f = w_fixture("forks_layer_stats");
+    let a = analyzer(1, 2);
+    let mut s = Analyzer::load(&a, &f.dir).expect("load W");
+    let base = w_base();
+    let child_edits = node_edits(&base, "p", 0);
+    let root = a.open(&mut s).expect("open");
+    let child = layer_of(&a, &mut s, &root, &child_edits);
+    let stats = child.stats();
+    assert!(stats.memos > 0, "{stats:?}");
+    drop((root, child));
+    a.close(&mut s).expect("close after the read");
+}
+
 #[test]
 fn an_expansion_of_a_layer_is_that_of_its_state() {
     let f = w_fixture("forks_expansion");

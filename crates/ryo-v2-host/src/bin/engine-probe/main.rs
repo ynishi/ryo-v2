@@ -1,14 +1,16 @@
 //! `engine-probe`: loads a workspace once, takes the memory of the process before the load, at
 //! its indexing, after its baseline and after the last check, with the database's composition,
 //! and runs each variant as a level on the `--on` parent's level through the one stacked
-//! procedure of the host, reading the counting allocator at every point of each repeat. It writes
-//! a `ProbeReport` (`ryo_v2_host::engine_probe`) as JSON to `--report`.
+//! procedure of the host (jobs of `Forks` at W = 1), reading the counting allocator at every
+//! point of each repeat. It writes a `ProbeReport` (`ryo_v2_host::engine_probe`) as JSON to
+//! `--report`.
 //!
 //! The counting allocator makes every allocation slower, so no time figure of this binary stands
 //! for the engine's speed; `bench`, on the system allocator, gives those.
 //!
-//! `--engine` runs the forks on layers of the fork Engine (`RaConfig.engine`, D11) instead of the
-//! stacked undo log; the report's `backend` key names the backend.
+//! `--engine` loads on the fork Engine (`RaConfig.engine`, D11) instead of the stacked undo log;
+//! the report's `backend` key names the backend. The series of `--on` and `--depth` run on
+//! `Forks`, which need it.
 
 mod alloc;
 

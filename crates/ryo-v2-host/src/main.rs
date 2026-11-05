@@ -72,16 +72,20 @@ enum Command {
         no_assert_revert: bool,
         /// Measure each VARIANT as a child of the PARENT overlay, two ways: `rebuilt` (the
         /// parent's and the variant's edits composed and verified from BASE) and `stacked` (the
-        /// variant written as a level on top of the parent's level of one fork).
+        /// variant submitted as a job on the parent's Layer of `Forks` at W = 1). Needs
+        /// `--engine`.
         #[arg(long, value_name = "PARENT")]
         on: Option<PathBuf>,
-        /// Run the forks on layers of the fork Engine instead of the stacked undo log; every
-        /// summary line ends with ` backend engine` (` backend undo-log` without it).
+        /// Run the checks on layers of the fork Engine instead of the stacked undo log; every
+        /// summary line ends with ` backend engine` (` backend undo-log` without it). `--on` and
+        /// `--depth-sweep` run on `Forks` and need it.
         #[arg(long)]
         engine: bool,
-        /// Measure stacks of these depths instead of VARIANTS: per depth K, write K levels on one
-        /// fork (level k appends `fn __ryo_depth_<k>() -> u32 { <k> }` to a workspace file),
-        /// diagnose the top level `--repeat` times and pop back. A comma-separated list, each >= 1.
+        /// Measure stacks of these depths instead of VARIANTS: per depth K, K levels, each a job
+        /// of `Forks` at W = 1 on the Layer of the one below (level k appends `fn
+        /// __ryo_depth_<k>() -> u32 { <k> }` to a workspace file), diagnose the top level
+        /// `--repeat` times (the later times the top level run again on the level below) and drop
+        /// the Layers. Needs `--engine`. A comma-separated list, each >= 1.
         #[arg(
             long,
             value_name = "DEPTHS",
@@ -191,7 +195,7 @@ enum Command {
             conflicts_with_all = FORKS_CONFLICTS,
         )]
         rss_stop_gib: f64,
-        /// With `--forks`: also run the tree serially on one `Stacked` fork, per repeat.
+        /// With `--forks`: also run the tree serially, one job at a time at W = 1, per repeat.
         #[arg(long, requires = "forks", conflicts_with_all = FORKS_CONFLICTS)]
         fork_serial: bool,
     },
