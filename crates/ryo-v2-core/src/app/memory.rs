@@ -26,7 +26,7 @@ const KIB_PER_GIB: u64 = 1024 * 1024;
 /// # Contract
 /// - C1: `floor(((ram_gib - RESERVED_RAM_GB - SESSION_RAM_GB) * 1024 - width * JOB_TRANSIENT_MIB)
 ///   / LAYER_MIB)`, every subtraction saturating at zero, and at least 1: 30 GiB at W = 4 gives
-///   314, and no machine gives fewer than 1.
+///   294, and no machine gives fewer than 1.
 ///   tested: app::memory::tests::max_forks_follows_table_m4
 pub fn max_forks(ram_gib: u64, width: u64) -> u64 {
     let free_mib = ram_gib
@@ -35,6 +35,27 @@ pub fn max_forks(ram_gib: u64, width: u64) -> u64 {
         .saturating_mul(1024);
     let layers_mib = free_mib.saturating_sub(width.saturating_mul(JOB_TRANSIENT_MIB));
     (layers_mib / LAYER_MIB).max(1)
+}
+
+/// L_max, the most Layers one search of `budget` holds at once, with `roots` root Blueprints and a
+/// window of `width` jobs (D11 stage 4): the start state's, the parents' chains below
+/// the last depth, one depth's checked children, the roots, the noul audits of a depth, and the
+/// window. The search does not enforce it; the bound is pinned against [`max_forks`] instead.
+///
+/// # Contract
+/// - C1: `1 + (max_depth - 1) * beam_parents + beam + roots + ceil(max_expand / audit_every) +
+///   width`, saturating; the default budget with 20 roots at W = 4 gives 73, and that fits
+///   `max_forks(30, 4)`.
+///   tested: app::memory::tests::the_searchs_layers_fit_max_forks
+pub fn search_layers(budget: &crate::domain::SearchBudget, roots: u64, width: u64) -> u64 {
+    let chains = u64::from(budget.max_depth.saturating_sub(1))
+        .saturating_mul(u64::from(budget.beam_parents));
+    let audited = u64::from(budget.max_expand).div_ceil(u64::from(budget.audit_every.get()));
+    1u64.saturating_add(chains)
+        .saturating_add(u64::from(budget.beam))
+        .saturating_add(roots)
+        .saturating_add(audited)
+        .saturating_add(width)
 }
 
 /// How far the RSS of one search may grow past its RSS at the start.
@@ -138,16 +159,36 @@ mod tests {
     #[test]
     fn max_forks_follows_table_m4() {
         assert_eq!((LAYER_MIB, JOB_TRANSIENT_MIB), (52, 10));
-        // (30 - 8 - 6) * 1024 = 16,384 MiB; less 4 jobs of 10 MiB: 16,344 / 52 = 314.
-        assert_eq!(max_forks(30, 4), 314);
-        assert_eq!(max_forks(30, 1), 314);
-        assert_eq!(max_forks(30, 12), 312);
-        assert_eq!(max_forks(64, 4), 983);
+        // (30 - 8 - 7) * 1024 = 15,360 MiB; less 4 jobs of 10 MiB: 15,320 / 52 = 294.
+        assert_eq!(max_forks(30, 4), 294);
+        assert_eq!(max_forks(30, 1), 295);
+        assert_eq!(max_forks(30, 12), 293);
+        assert_eq!(max_forks(64, 4), 964);
         // No room past the reserve and the session: still one.
         assert_eq!(max_forks(14, 4), 1);
         assert_eq!(max_forks(0, 0), 1);
         assert_eq!(max_forks(15, 200), 1);
         assert_eq!(max_forks(u64::MAX, u64::MAX), 1);
+    }
+
+    #[test]
+    fn the_searchs_layers_fit_max_forks() {
+        use crate::app::search::{DEFAULT_SEARCH_BUDGET, SEARCH_FORKS};
+        let width = SEARCH_FORKS as u64;
+        // 1 + 2 * 4 + 20 + 20 + ceil(200 / 10) + 4.
+        assert_eq!(search_layers(&DEFAULT_SEARCH_BUDGET, 20, width), 73);
+        assert!(search_layers(&DEFAULT_SEARCH_BUDGET, 20, width) <= max_forks(30, width));
+        // The bound grows with the roots and the window, one Layer each.
+        assert_eq!(search_layers(&DEFAULT_SEARCH_BUDGET, 0, 1), 50);
+        let wide = crate::domain::SearchBudget {
+            beam: u16::MAX,
+            ..DEFAULT_SEARCH_BUDGET
+        };
+        assert_eq!(
+            search_layers(&wide, u64::MAX, u64::MAX),
+            u64::MAX,
+            "saturating"
+        );
     }
 
     #[test]

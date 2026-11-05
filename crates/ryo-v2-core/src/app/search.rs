@@ -56,16 +56,21 @@ pub const ASSERT_REVERT_EVERY: u32 = 50;
 pub const EXPAND_DEPTH_MS: u64 = 10_000;
 /// Decision D1 (SEARCH_LEDGER.md): the one judge call of a depth takes at most this long. Recorded, not enforced.
 pub const JUDGE_DEPTH_MS: u64 = 30_000;
-/// Decision D3 (SEARCH_LEDGER.md): memory of one analyzer session, in GB.
-pub const SESSION_RAM_GB: u64 = 6;
+/// Decision D3 (SEARCH_LEDGER.md): memory of one analyzer session, in GB (GiB), its search's
+/// Layers included: the peak of a stage-4 session on the ryo-rs corpus at W = 4 (5.65 GiB, D11
+/// stage 4), rounded up, plus D3's growth margin (0.75 GB over 60 runs), rounded up.
+pub const SESSION_RAM_GB: u64 = 7;
 /// Decision D3 (SEARCH_LEDGER.md): memory left to everything that is not a session, in GB.
 pub const RESERVED_RAM_GB: u64 = 8;
 /// Decision D4 (SEARCH_LEDGER.md), trigger 1: a decision whose median time passes this calls for a redesign.
 pub const TRIGGER_DECISION_MEDIAN_MS: u64 = 300_000;
 /// Decision D4 (SEARCH_LEDGER.md), trigger 2: a warm check at the affected scope whose median time passes this.
 pub const TRIGGER_CHECK_MEDIAN_MS: u64 = 5_000;
-/// Decision D4 (SEARCH_LEDGER.md), trigger 3: resident memory in kB, read after [`TRIGGER_AFTER_CHECKS`] checks.
-pub const TRIGGER_RSS_KB: u64 = 8 * 1024 * 1024;
+/// Decision D4 (SEARCH_LEDGER.md), trigger 3: resident memory in kB, read after a decision's
+/// close (between decisions, its forks closed and its Layers dropped) once
+/// [`TRIGGER_AFTER_CHECKS`] checks have run: one session's memory, [`SESSION_RAM_GB`] GiB (D11,
+/// stage 4). A reading inside a search would count its own Layers, and the allocator keeps a peak.
+pub const TRIGGER_RSS_KB: u64 = SESSION_RAM_GB * 1024 * 1024;
 /// Decision D4 (SEARCH_LEDGER.md), trigger 3: check time relative to the first checks, in thousandths (x1.5).
 pub const TRIGGER_CHECK_GROWTH_PERMILLE: u64 = 1_500;
 /// Decision D4 (SEARCH_LEDGER.md), trigger 3: how many checks pass before memory and growth are looked at.
@@ -3737,13 +3742,15 @@ mod tests {
 
     #[test]
     fn max_sessions_follows_decision_d3() {
+        // SESSION_RAM_GB = 7 (D11 stage 4): (30 - 8) / 7 = 3.
         assert_eq!(max_sessions(30), 3);
         assert_eq!(max_sessions(0), 1);
         assert_eq!(max_sessions(8), 1);
         assert_eq!(max_sessions(13), 1);
         assert_eq!(max_sessions(14), 1);
-        assert_eq!(max_sessions(20), 2);
-        assert_eq!(max_sessions(64), 9);
+        assert_eq!(max_sessions(20), 1);
+        assert_eq!(max_sessions(22), 2);
+        assert_eq!(max_sessions(64), 8);
     }
 
     #[test]
@@ -3762,7 +3769,7 @@ mod tests {
         assert_eq!(ASSERT_REVERT_EVERY, 50);
         assert_eq!((SEARCH_FORKS, SEARCH_TICK_MS), (4, 100));
         assert_eq!((EXPAND_DEPTH_MS, JUDGE_DEPTH_MS), (10_000, 30_000));
-        assert_eq!((SESSION_RAM_GB, RESERVED_RAM_GB), (6, 8));
+        assert_eq!((SESSION_RAM_GB, RESERVED_RAM_GB), (7, 8));
         assert_eq!(
             (
                 crate::app::memory::LAYER_MIB,
@@ -3774,7 +3781,7 @@ mod tests {
             (TRIGGER_DECISION_MEDIAN_MS, TRIGGER_CHECK_MEDIAN_MS),
             (300_000, 5_000)
         );
-        assert_eq!(TRIGGER_RSS_KB, 8_388_608);
+        assert_eq!(TRIGGER_RSS_KB, 7_340_032);
         assert_eq!(
             (TRIGGER_CHECK_GROWTH_PERMILLE, TRIGGER_AFTER_CHECKS),
             (1_500, 1_000)

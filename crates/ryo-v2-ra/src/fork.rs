@@ -377,6 +377,7 @@ fn findings_of(
             fault: a.detector_fault.as_ref(),
             panics: &session.detector_panics,
             probe: a.thread_count.as_deref(),
+            times: a.file_times.as_deref(),
         },
     )?
     .findings)
@@ -504,6 +505,7 @@ pub(crate) fn diagnose_files(
             fault: a.detector_fault.as_ref(),
             panics: &session.detector_panics,
             probe: a.thread_count.as_deref(),
+            times: a.file_times.as_deref(),
         },
         a.diagnose_panic,
     )

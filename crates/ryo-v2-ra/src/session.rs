@@ -376,6 +376,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
             fault: a.detector_fault.as_ref(),
             panics: &detector_panics,
             probe: a.thread_count.as_deref(),
+            times: a.file_times.as_deref(),
         },
     )?;
     let baseline_panics: BTreeSet<(GapDetector, RelPath)> = collected.panics.into_iter().collect();

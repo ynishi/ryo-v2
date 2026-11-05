@@ -26,7 +26,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use assess::SyntaxAssessor;
-pub use diagnostics::{GapDetector, ThreadCount};
+pub use diagnostics::{FileTimes, GapDetector, ThreadCount};
 pub use fork::RaFork;
 pub use forks::RaLayer;
 pub use memory::{IngredientRow, MemoRow, MemoryReport};
@@ -263,6 +263,8 @@ pub struct RaAnalyzer {
     pub(crate) diagnose_panic: bool,
     /// Counts the threads diagnosing at once; a test hook.
     pub(crate) thread_count: Option<Arc<ThreadCount>>,
+    /// Records each file's diagnosis time; a measurement hook.
+    pub(crate) file_times: Option<Arc<FileTimes>>,
     /// Runs on a `Forks` job's worker between its writes and its diagnosis; a test hook.
     pub(crate) job_hook: Option<JobHook>,
     /// Whether every `Forks` job writes the frozen base after its own writes; a test hook.
@@ -309,6 +311,7 @@ impl RaAnalyzer {
             audit_fault: false,
             diagnose_panic: false,
             thread_count: None,
+            file_times: None,
             job_hook: None,
             job_base_write: false,
         }
@@ -320,6 +323,15 @@ impl RaAnalyzer {
     #[doc(hidden)]
     pub fn with_thread_count(mut self, count: Option<Arc<ThreadCount>>) -> RaAnalyzer {
         self.thread_count = count;
+        self
+    }
+
+    /// Records, in `times`, the wall time of each file's diagnosis in every diagnosis this
+    /// analyzer runs (`diagnostics::FileTimes`). For `bench --file-times`, which locates where a
+    /// check's time goes (stage 4 gate RS); it changes no finding.
+    #[doc(hidden)]
+    pub fn with_file_times(mut self, times: Option<Arc<FileTimes>>) -> RaAnalyzer {
+        self.file_times = times;
         self
     }
 

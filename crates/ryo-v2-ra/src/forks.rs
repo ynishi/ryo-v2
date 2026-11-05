@@ -18,7 +18,7 @@
 //! (its counter, read on every outcome), or, at `close`, a fingerprint of the base that changed.
 
 use crate::check::{base_text, finish_diagnosis, map_error};
-use crate::diagnostics::{Deadline, Detector, GapDetector, ThreadCount};
+use crate::diagnostics::{Deadline, Detector, FileTimes, GapDetector, ThreadCount};
 use crate::engine::{self, engine_error};
 use crate::expand::{ExpandFacts, generate_on};
 use crate::fork::{self, Action, Below, LayerState};
@@ -108,6 +108,7 @@ pub(crate) struct Facts {
     write_panic: bool,
     base_write: bool,
     thread_count: Option<Arc<ThreadCount>>,
+    file_times: Option<Arc<FileTimes>>,
     job_hook: Option<JobHook>,
 }
 
@@ -293,6 +294,7 @@ fn run_job(
                 fault: facts.detector_fault.as_ref(),
                 panics: &panics,
                 probe: facts.thread_count.as_deref(),
+                times: facts.file_times.as_deref(),
             },
             facts.diagnose_panic,
         )
@@ -510,6 +512,7 @@ impl Forks for RaAnalyzer {
             write_panic: self.db_write_panic == Some(crate::DbWritePanic::Write),
             base_write: self.job_base_write,
             thread_count: self.thread_count.clone(),
+            file_times: self.file_times.clone(),
             job_hook: self.job_hook.clone(),
         };
         s.forks = Some(ForksState {

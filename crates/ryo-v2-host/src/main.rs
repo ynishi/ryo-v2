@@ -70,6 +70,14 @@ enum Command {
         /// Skip the post-revert re-diagnosis (revert_ms then excludes it; revert_ok prints `-`).
         #[arg(long)]
         no_assert_revert: bool,
+        /// Turn ryo-v2's gap detectors off (`RaConfig.gap_detectors`): each check is
+        /// rust-analyzer's own diagnosis alone.
+        #[arg(long, conflicts_with_all = ["depth_sweep", "forks"])]
+        no_gap_detectors: bool,
+        /// Print under each run the wall time of each file's diagnosis: the total, the files and
+        /// the slowest five (`  file_ms total <ms> files <n> top <path>=<ms> ...`).
+        #[arg(long, conflicts_with_all = ["depth_sweep", "forks"])]
+        file_times: bool,
         /// Measure each VARIANT as a child of the PARENT overlay, two ways: `rebuilt` (the
         /// parent's and the variant's edits composed and verified from BASE) and `stacked` (the
         /// variant submitted as a job on the parent's Layer of `Forks` at W = 1). Needs
@@ -314,6 +322,8 @@ fn run() -> Result<ExitCode> {
             scope,
             no_proc_macro,
             no_assert_revert,
+            no_gap_detectors,
+            file_times,
             on,
             engine,
             depth_sweep,
@@ -396,6 +406,8 @@ fn run() -> Result<ExitCode> {
                 proc_macro: !no_proc_macro,
                 assert_revert: !no_assert_revert,
                 backend: Backend::of_engine(engine),
+                gap_detectors: !no_gap_detectors,
+                file_times,
             })
             .map(|()| ExitCode::SUCCESS)
         }
@@ -470,6 +482,47 @@ mod tests {
         assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--engine"]).is_err());
         // No second command for the Engine: `--engine` is how a bench runs on it.
         assert!(Cli::try_parse_from(["ryo-v2", "bench-cow", "/b", "/v"]).is_err());
+    }
+
+    /// The controls of gate RS (SEARCH_LEDGER.md, "The search on N forks", gate RS, runs 4 and 5).
+    #[test]
+    fn cli_parses_bench_gap_detectors_and_file_times() {
+        let flags = |args: &[&str]| match Cli::try_parse_from(args)
+            .map_err(|e| e.to_string())
+            .expect("parses")
+            .command
+        {
+            Command::Bench {
+                no_gap_detectors,
+                file_times,
+                ..
+            } => (no_gap_detectors, file_times),
+            _ => panic!("not bench"),
+        };
+        assert_eq!(flags(&["ryo-v2", "bench", "/b", "/v"]), (false, false));
+        assert_eq!(
+            flags(&["ryo-v2", "bench", "/b", "/v", "--no-gap-detectors"]),
+            (true, false)
+        );
+        assert_eq!(
+            flags(&[
+                "ryo-v2",
+                "bench",
+                "/b",
+                "/v",
+                "--file-times",
+                "--no-gap-detectors",
+                "--engine"
+            ]),
+            (true, true)
+        );
+        // Not with the series that load their own analyzer.
+        for other in [["--depth-sweep", "1"], ["--forks", "1"]] {
+            for flag in ["--no-gap-detectors", "--file-times"] {
+                let args = ["ryo-v2", "bench", "/b", other[0], other[1], flag];
+                assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+            }
+        }
     }
 
     #[test]

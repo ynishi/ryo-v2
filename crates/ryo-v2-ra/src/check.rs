@@ -475,6 +475,7 @@ impl RevertAudit for RaAnalyzer {
                     fault: self.detector_fault.as_ref(),
                     panics: &s.detector_panics,
                     probe: self.thread_count.as_deref(),
+                    times: self.file_times.as_deref(),
                 },
             )
         };

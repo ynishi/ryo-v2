@@ -31,7 +31,7 @@ use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{Backend, ForksConfig, LayerStats, RaAnalyzer, RaConfig, RaLayer};
+use ryo_v2_ra::{Backend, FileTimes, ForksConfig, LayerStats, RaAnalyzer, RaConfig, RaLayer};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,6 +56,12 @@ pub struct BenchArgs {
     pub assert_revert: bool,
     /// The backend of the forks (`RaConfig.engine`); every summary line names it.
     pub backend: Backend,
+    /// Whether ryo-v2's gap detectors run beside rust-analyzer's diagnosis
+    /// (`RaConfig.gap_detectors`; `--no-gap-detectors` turns them off).
+    pub gap_detectors: bool,
+    /// Whether each run also prints the wall time of each file's diagnosis (`--file-times`,
+    /// [`file_times_line`]).
+    pub file_times: bool,
 }
 
 /// How a child is brought to its state.
@@ -87,6 +93,47 @@ struct RunStats {
     rss_kb: Option<u64>,
     /// The run's CPU and wall time; measured with `--on` only.
     usage: Option<Usage>,
+    /// Each file's diagnosis and its wall microseconds; recorded with `--file-times` only.
+    file_us: Vec<(RelPath, u64)>,
+}
+
+/// The files a `--file-times` line names, the slowest first.
+const FILE_TIMES_TOP: usize = 5;
+
+/// The line `--file-times` prints under a run: the files its diagnoses covered, each file's
+/// diagnosis wall time summed over the run, their total and the slowest [`FILE_TIMES_TOP`]
+/// files; `None` for a run with no record. A file's time is the wall time of rust-analyzer's
+/// `full_diagnostics` of it and the gap detectors on it, on the thread of its chunk, so the
+/// total may exceed the check's wall time.
+///
+/// # Contract
+/// - C1: `  file_ms total <ms> files <n> top <path>=<ms> ...`, ms with one decimal, the files
+///   summed per path and sorted by time (the slowest first, a tie by path), at most
+///   [`FILE_TIMES_TOP`] of them.
+///   tested: bench::tests::a_file_times_line_names_the_slowest_files
+pub(crate) fn file_times_line(file_us: &[(RelPath, u64)]) -> Option<String> {
+    if file_us.is_empty() {
+        return None;
+    }
+    let mut per: std::collections::BTreeMap<&RelPath, u64> = std::collections::BTreeMap::new();
+    for (path, us) in file_us {
+        *per.entry(path).or_default() += us;
+    }
+    let mut files: Vec<(&RelPath, u64)> = per.into_iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let ms = |us: u64| format!("{:.1}", us as f64 / 1000.0);
+    let total: u64 = files.iter().map(|(_, us)| us).sum();
+    let top: Vec<String> = files
+        .iter()
+        .take(FILE_TIMES_TOP)
+        .map(|(p, us)| format!("{p}={}", ms(*us)))
+        .collect();
+    Some(format!(
+        "  file_ms total {} files {} top {}",
+        ms(total),
+        files.len(),
+        top.join(" ")
+    ))
 }
 
 /// The process CPU time and the wall time of one run, from its write to the end of its revert.
@@ -154,6 +201,9 @@ struct Heading<'a> {
     /// The session's diagnostic threads with `--on`, where each run's usage is measured;
     /// `None` without it.
     threads: Option<usize>,
+    /// The per-file times of `--file-times`, taken at each run's start and end; `None` without
+    /// it.
+    times: Option<&'a FileTimes>,
 }
 
 /// The scope's name, as the bench prints it.
@@ -224,8 +274,12 @@ fn rebuilt_once<A: Analyzer>(
     edits: &[Edit],
     scope: Scope,
     measure: bool,
+    times: Option<&FileTimes>,
 ) -> Result<Once> {
     observer.take();
+    if let Some(times) = times {
+        times.take();
+    }
     let started = if measure {
         Some(start(proc::cpu_ms)?)
     } else {
@@ -239,6 +293,7 @@ fn rebuilt_once<A: Analyzer>(
     sample_memory(observer)?;
     let mut stats = read_events(observer.take());
     stats.usage = usage;
+    stats.file_us = times.map(FileTimes::take).unwrap_or_default();
     let verdict = match result {
         Ok(v) => Some(v),
         Err(AnalyzerError::RevertMismatch) => None,
@@ -278,6 +333,9 @@ impl StackedRecord<'_> {
             // A repeat's events are those from its write on, and so is its usage.
             Point::BeforeWrite => {
                 self.observer.take();
+                if let Some(times) = self.heading.times {
+                    times.take();
+                }
                 if self.heading.threads.is_some() {
                     self.started = Some(start(self.cpu)?);
                 }
@@ -291,6 +349,7 @@ impl StackedRecord<'_> {
                 sample_memory(self.observer)?;
                 let mut stats = read_events(self.observer.take());
                 stats.usage = usage;
+                stats.file_us = self.heading.times.map(FileTimes::take).unwrap_or_default();
                 self.runs += 1;
                 record(
                     self.heading,
@@ -322,6 +381,7 @@ pub(crate) fn with_bench_hook<R>(
         n_edits: 1,
         repeat,
         threads: Some(1),
+        times: None,
     };
     let mut series = Series::default();
     let mut rec = StackedRecord {
@@ -375,6 +435,7 @@ fn record(
         n_edits,
         repeat: total,
         threads,
+        times: _,
     } = *heading;
     let ok = match stats.revert_ok {
         Some(b) => b.to_string(),
@@ -400,6 +461,9 @@ fn record(
         "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}{usage_txt}",
         stats.scope_files, stats.total_files, stats.check_ms, stats.revert_ms,
     );
+    if let Some(line) = file_times_line(&stats.file_us) {
+        println!("{line}");
+    }
     if i == 1
         && let Some(v) = verdict
     {
@@ -444,19 +508,27 @@ pub(crate) fn load_on_threads(
     backend: Backend,
     threads: Option<usize>,
 ) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
+    let config = RaConfig {
+        proc_macro,
+        assert_revert,
+        threads,
+        forks: SERIES_FORKS,
+        ..RaConfig::default()
+    }
+    .with_backend(backend);
+    load_with(base, config, None)
+}
+
+/// [`load`] with the analyzer's whole configuration given, and `times`, the per-file times of
+/// `--file-times` (`RaAnalyzer::with_file_times`).
+pub(crate) fn load_with(
+    base: &std::path::Path,
+    config: RaConfig,
+    times: Option<Arc<FileTimes>>,
+) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
     let observer = Arc::new(RecordingObserver::default());
-    let analyzer = RaAnalyzer::new(
-        RaConfig {
-            proc_macro,
-            assert_revert,
-            threads,
-            forks: SERIES_FORKS,
-            ..RaConfig::default()
-        }
-        .with_backend(backend),
-        Arc::new(MonotonicClock::new()),
-        observer.clone(),
-    );
+    let analyzer = RaAnalyzer::new(config, Arc::new(MonotonicClock::new()), observer.clone())
+        .with_file_times(times);
     let session = analyzer.load(base)?;
     let rss_after_load = proc::vm_rss_kb().context("read the RSS after load")?;
     for event in observer.take() {
@@ -502,12 +574,19 @@ pub fn run(args: &BenchArgs) -> Result<()> {
     if args.on.is_some() {
         require_engine(args.backend, "bench --on (the stacked mode)")?;
     }
-    let (analyzer, observer, mut session) = load(
-        &args.base,
-        args.proc_macro,
-        args.assert_revert,
-        args.backend,
-    )?;
+    let times = args.file_times.then(|| Arc::new(FileTimes::default()));
+    let config = RaConfig {
+        proc_macro: args.proc_macro,
+        assert_revert: args.assert_revert,
+        gap_detectors: args.gap_detectors,
+        forks: SERIES_FORKS,
+        ..RaConfig::default()
+    }
+    .with_backend(args.backend);
+    let (analyzer, observer, mut session) = load_with(&args.base, config, times.clone())?;
+    if !args.gap_detectors {
+        eprintln!("[gap-detectors] off");
+    }
 
     let parent = match &args.on {
         Some(dir) => {
@@ -572,6 +651,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     n_edits: child.len(),
                     repeat: args.repeat,
                     threads,
+                    times: times.as_deref(),
                 };
                 let (reverted, extra) = match (mode, &parent) {
                     (Mode::Stacked, Some(parent)) => {
@@ -613,6 +693,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                                 &child,
                                 scope,
                                 threads.is_some(),
+                                times.as_deref(),
                             )
                         })?;
                         (reverted, mode_txt.clone())
@@ -1110,6 +1191,7 @@ mod tests {
             n_edits: 1,
             repeat: 1,
             threads: Some(2),
+            times: None,
         };
         let mut series = Series::default();
         let mut rec = StackedRecord {
@@ -1186,8 +1268,28 @@ mod tests {
             proc_macro: false,
             assert_revert: false,
             backend: Backend::UndoLog,
+            gap_detectors: true,
+            file_times: false,
         };
         assert!(run(&args).unwrap_err().to_string().contains("--engine"));
+    }
+
+    /// `file_times_line` C1.
+    #[test]
+    fn a_file_times_line_names_the_slowest_files() {
+        let rel = |p: &str| RelPath::parse(p).unwrap();
+        assert_eq!(file_times_line(&[]), None);
+        let mut times: Vec<(RelPath, u64)> = (0..7)
+            .map(|i| (rel(&format!("f{i}.rs")), 1_000 * (i + 1)))
+            .collect();
+        // A file diagnosed twice in one run is summed; a tie goes by path.
+        times.push((rel("f0.rs"), 6_000));
+        times.push((rel("a.rs"), 7_000));
+        let line = file_times_line(&times).unwrap();
+        assert_eq!(
+            line,
+            "  file_ms total 41.0 files 8 top a.rs=7.0 f0.rs=7.0 f6.rs=7.0 f5.rs=6.0 f4.rs=5.0"
+        );
     }
 
     /// `level_stats_line` C1.

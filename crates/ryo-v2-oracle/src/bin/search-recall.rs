@@ -46,7 +46,7 @@ use ryo_v2_oracle::materials::Materials;
 use ryo_v2_oracle::planted::{PlantKind, generate, generate_pair, read_clean, sites, write_case};
 use ryo_v2_oracle::search_recall::{
     ContainedPanics, DecisionRow, OuterSample, PlantedCase, Report, RunInfo, markdown,
-    outer_sample, parse_outer_sample, run_case, terminal,
+    outer_sample, parse_outer_sample, rss_after_close, run_case, terminal,
 };
 use ryo_v2_ra::{Backend, ForksConfig, RaAnalyzer, RaConfig, SyntaxAssessor};
 
@@ -529,6 +529,9 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
                 }
             };
             row.check_ms = checks;
+            // Trigger 3 (D4) reads the RSS here, between decisions: the search has closed its
+            // forks and dropped every Layer.
+            row.rss_after_close_kb = rss_kb();
             if let Some(s) = session.as_ref() {
                 panics.absorb(&case.ws, &s.detector_panics(), &s.expander_panics());
             }
@@ -553,7 +556,7 @@ fn run(root: &str, rest: &[String]) -> Result<()> {
         started.elapsed(),
         outer_ms,
         sample,
-        rss_kb(),
+        rss_after_close(&rows),
         (backend, ran_width),
     );
     let mut text = terminal(&rows, triggers);
