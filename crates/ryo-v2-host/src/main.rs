@@ -16,9 +16,19 @@ mod search_json;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use ryo_v2_core::domain::{Scope, TextRange};
+use ryo_v2_core::app::search::RESERVED_RAM_GB;
+use ryo_v2_core::domain::{RelPath, Scope, TextRange};
 use ryo_v2_host::bench::{self, BenchArgs, DepthArgs};
+use ryo_v2_host::forks_bench::{self, ForksArgs, WidthSpec};
 use ryo_v2_ra::Backend;
+
+/// What `bench --forks` and its options do not go with.
+const FORKS_CONFLICTS: [&str; 4] = ["variants", "on", "large", "depth_sweep"];
+
+/// A `--fork-paths` path: a workspace-relative path.
+fn parse_rel(text: &str) -> Result<RelPath, String> {
+    RelPath::parse(text).map_err(|e| format!("{text:?}: {e}"))
+}
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -43,7 +53,7 @@ enum Command {
         #[arg(required_unless_present = "large")]
         base: Option<PathBuf>,
         /// Overlay dirs; each .rs that differs from (or is missing in) BASE is an edit.
-        #[arg(required_unless_present_any = ["large", "depth_sweep"])]
+        #[arg(required_unless_present_any = ["large", "depth_sweep", "forks"])]
         variants: Vec<PathBuf>,
         /// Large mode: BASE = PATH, VARIANTS = corpus/body-01 corpus/body-02 corpus/body-03 (relative to the cwd).
         #[arg(long, value_name = "PATH", conflicts_with_all = ["base", "variants"])]
@@ -93,6 +103,97 @@ enum Command {
             value_parser = clap::value_parser!(u32).range(1..),
         )]
         depth_files: Option<u32>,
+        /// Run a job tree through the `Forks` port of the fork Engine at each of these widths
+        /// instead of VARIANTS (D11, stage 3b): a seed job, then `--fork-depth` levels of
+        /// `--fork-jobs` sibling jobs, each level on the sealed layer of job 0 of the level
+        /// below. A comma-separated list; `<n>c` counts the caller's thread out of the workers'
+        /// share (`ForksConfig.caller_works`, stage 4's shape). Always on the Engine.
+        #[arg(
+            long,
+            value_name = "WIDTHS",
+            value_delimiter = ',',
+            num_args = 1,
+            value_parser = WidthSpec::parse,
+            conflicts_with_all = FORKS_CONFLICTS,
+        )]
+        forks: Vec<WidthSpec>,
+        // The options of `--forks` repeat its conflicts: clap waives a missing `requires`
+        // target that conflicts with a present argument.
+        /// With `--forks`: the levels of the job tree.
+        #[arg(
+            long,
+            value_name = "D",
+            default_value_t = 4,
+            requires = "forks",
+            conflicts_with_all = FORKS_CONFLICTS,
+            value_parser = clap::value_parser!(u32).range(1..),
+        )]
+        fork_depth: u32,
+        /// With `--forks`: the sibling jobs of each level.
+        #[arg(
+            long,
+            value_name = "J",
+            default_value_t = 12,
+            requires = "forks",
+            conflicts_with_all = FORKS_CONFLICTS,
+            value_parser = clap::value_parser!(u32).range(1..),
+        )]
+        fork_jobs: u32,
+        /// With `--forks`: the number of workspace files (in path order) the jobs rotate over.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 4,
+            requires = "forks",
+            conflicts_with_all = FORKS_CONFLICTS,
+            conflicts_with = "fork_paths",
+            value_parser = clap::value_parser!(u32).range(1..),
+        )]
+        fork_files: u32,
+        /// With `--forks`: the workspace files (relative paths) the jobs rotate over, in this
+        /// order, instead of the first `--fork-files`.
+        #[arg(
+            long,
+            value_name = "PATHS",
+            value_delimiter = ',',
+            requires = "forks",
+            conflicts_with_all = FORKS_CONFLICTS,
+            value_parser = parse_rel,
+        )]
+        fork_paths: Vec<RelPath>,
+        /// With `--forks`: `RaConfig.threads`, T, the threads the widths share [default: the
+        /// available parallelism]; above the cores a width runs oversubscribed.
+        #[arg(
+            long,
+            value_name = "T",
+            requires = "forks",
+            conflicts_with_all = FORKS_CONFLICTS,
+            value_parser = clap::value_parser!(u32).range(1..),
+        )]
+        fork_threads: Option<u32>,
+        /// With `--forks`: the cut-off of a job's check in ms (D1); without it no job is cut
+        /// off, as W4 runs.
+        #[arg(
+            long,
+            value_name = "MS",
+            requires = "forks",
+            conflicts_with_all = FORKS_CONFLICTS,
+            value_parser = clap::value_parser!(u64).range(1..),
+        )]
+        fork_cut_off_ms: Option<u64>,
+        /// With `--forks`: the RAM in GiB the run leaves free; it withdraws its jobs and stops
+        /// when the RSS exceeds the machine's RAM less this.
+        #[arg(
+            long,
+            value_name = "GIB",
+            default_value_t = RESERVED_RAM_GB as f64,
+            requires = "forks",
+            conflicts_with_all = FORKS_CONFLICTS,
+        )]
+        rss_stop_gib: f64,
+        /// With `--forks`: also run the tree serially on one `Stacked` fork, per repeat.
+        #[arg(long, requires = "forks", conflicts_with_all = FORKS_CONFLICTS)]
+        fork_serial: bool,
     },
     /// Verify BLUEPRINTS against the workspace and print the Resolution as JSON (a dry run: nothing is written).
     Apply {
@@ -213,12 +314,39 @@ fn run() -> Result<ExitCode> {
             engine,
             depth_sweep,
             depth_files,
+            forks,
+            fork_depth,
+            fork_jobs,
+            fork_files,
+            fork_paths,
+            fork_threads,
+            fork_cut_off_ms,
+            rss_stop_gib,
+            fork_serial,
         } => {
             let scopes = match scope {
                 ScopeArg::Affected => vec![Scope::Affected],
                 ScopeArg::Workspace => vec![Scope::Workspace],
                 ScopeArg::Both => vec![Scope::Affected, Scope::Workspace],
             };
+            if !forks.is_empty() {
+                return forks_bench::run_forks(&ForksArgs {
+                    base: base.ok_or_else(|| anyhow::anyhow!("BASE is required with --forks"))?,
+                    widths: forks,
+                    depth: fork_depth as usize,
+                    jobs: fork_jobs as usize,
+                    files: fork_files,
+                    paths: fork_paths,
+                    scopes,
+                    repeat,
+                    threads: fork_threads.map(|t| t as usize),
+                    cut_off_ms: fork_cut_off_ms,
+                    rss_reserve_gib: rss_stop_gib,
+                    proc_macro: !no_proc_macro,
+                    serial: fork_serial,
+                })
+                .map(|()| ExitCode::SUCCESS);
+            }
             if !depth_sweep.is_empty() {
                 return bench::run_depth_sweep(&DepthArgs {
                     base: base
@@ -421,6 +549,128 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_parses_bench_forks() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args)
+            .map_err(|e| e.to_string())
+            .expect("parses")
+            .command
+        {
+            Command::Bench {
+                base,
+                variants,
+                forks,
+                fork_depth,
+                fork_jobs,
+                fork_files,
+                fork_paths,
+                fork_threads,
+                fork_cut_off_ms,
+                rss_stop_gib,
+                fork_serial,
+                repeat,
+                ..
+            } => (
+                (base, variants, forks),
+                (fork_depth, fork_jobs, fork_files, fork_paths),
+                (
+                    fork_threads,
+                    fork_cut_off_ms,
+                    rss_stop_gib,
+                    fork_serial,
+                    repeat,
+                ),
+            ),
+            _ => panic!("not bench"),
+        };
+        let ((base, variants, forks), shape, rest) =
+            parse(&["ryo-v2", "bench", "/b", "--forks", "1,4,8,11c,12,16"]);
+        assert_eq!(base, Some(PathBuf::from("/b")));
+        assert!(variants.is_empty());
+        let labels: Vec<String> = forks.iter().map(|w| w.label()).collect();
+        assert_eq!(labels, ["1", "4", "8", "11c", "12", "16"]);
+        assert!(forks[3].caller_works && !forks[4].caller_works);
+        // The defaults: depth 4, 12 jobs a level, the first 4 files, no cut-off, the reserve of
+        // D3 (`RESERVED_RAM_GB`), no serial run.
+        assert_eq!(shape, (4, 12, 4, Vec::new()));
+        assert_eq!(rest, (None, None, 8.0, false, 1));
+        let (_, shape, rest) = parse(&[
+            "ryo-v2",
+            "bench",
+            "/b",
+            "--forks",
+            "12",
+            "--fork-depth",
+            "2",
+            "--fork-jobs",
+            "24",
+            "--fork-paths",
+            "crates/a/src/lib.rs,crates/b/src/main.rs",
+            "--fork-threads",
+            "16",
+            "--fork-cut-off-ms",
+            "5000",
+            "--rss-stop-gib",
+            "10.5",
+            "--fork-serial",
+            "--repeat",
+            "2",
+        ]);
+        assert_eq!((shape.0, shape.1, shape.3.len()), (2, 24, 2));
+        assert_eq!(rest, (Some(16), Some(5000), 10.5, true, 2));
+        // A width is at least 1, a number with an optional `c`.
+        for bad in ["0", "4,0", "x", "1-4", "4d"] {
+            assert!(
+                Cli::try_parse_from(["ryo-v2", "bench", "/b", "--forks", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        // Not with variants, `--on`, `--large` or `--depth-sweep`.
+        for extra in [&["/v"][..], &["--on", "/p"], &["--depth-sweep", "1"]] {
+            let mut args = vec!["ryo-v2", "bench", "/b", "--forks", "4"];
+            args.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&args).is_err(), "{extra:?}");
+        }
+        assert!(Cli::try_parse_from(["ryo-v2", "bench", "--large", "/x", "--forks", "4"]).is_err());
+        // Its options only with it; `--fork-files` and `--fork-paths` not together.
+        for opt in [
+            &["--fork-depth", "2"][..],
+            &["--fork-jobs", "2"],
+            &["--fork-files", "2"],
+            &["--fork-paths", "a.rs"],
+            &["--fork-threads", "2"],
+            &["--fork-cut-off-ms", "5"],
+            &["--rss-stop-gib", "4"],
+            &["--fork-serial"],
+        ] {
+            let mut with_variants = vec!["ryo-v2", "bench", "/b", "/v"];
+            with_variants.extend_from_slice(opt);
+            assert!(Cli::try_parse_from(&with_variants).is_err(), "{opt:?}");
+            let mut alone = vec!["ryo-v2", "bench", "/b"];
+            alone.extend_from_slice(opt);
+            assert!(Cli::try_parse_from(&alone).is_err(), "{opt:?}");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ryo-v2",
+                "bench",
+                "/b",
+                "--forks",
+                "4",
+                "--fork-files",
+                "2",
+                "--fork-paths",
+                "a.rs"
+            ])
+            .is_err()
+        );
+        for bad in [&["--fork-depth", "0"][..], &["--fork-jobs", "0"]] {
+            let mut args = vec!["ryo-v2", "bench", "/b", "--forks", "4"];
+            args.extend_from_slice(bad);
+            assert!(Cli::try_parse_from(&args).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
