@@ -172,9 +172,30 @@ struct ExtractFnSeed {
     name: String,
 }
 
-/// Everything one expansion reads: the analyzer views of the session, with caches.
+/// The facts of a session an expansion reads besides its database and its file list: owned and
+/// `Copy`, so an expansion can run where the session is not, on a worker of a read job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ExpandFacts {
+    /// The edit kind whose every call panics, for the tests of the containment
+    /// (`RaSession::inject_expander_fault`).
+    pub(crate) expander_fault: Option<CommandKind>,
+}
+
+impl ExpandFacts {
+    /// The facts of `sess`.
+    pub(crate) fn of(sess: &RaSession) -> ExpandFacts {
+        ExpandFacts {
+            expander_fault: sess.expander_fault,
+        }
+    }
+}
+
+/// Everything one expansion reads: the analyzer views of a state, the facts and the file list it
+/// is given, with caches; and where the panics it contains go, which [`generate_on`] returns.
 struct Env<'a> {
-    sess: &'a RaSession,
+    facts: &'a ExpandFacts,
+    files: &'a [(FileId, RelPath)],
+    panics: &'a RefCell<BTreeSet<ExpanderPanic>>,
     db: &'a RootDatabase,
     analysis: Analysis,
     sema: Semantics<'a, RootDatabase>,
@@ -398,15 +419,23 @@ fn extract_name(body: &SyntaxNode, lo: u32, hi: u32) -> Option<String> {
 }
 
 impl<'a> Env<'a> {
-    /// The environment of an expansion of `sess` reading the state `host` holds: the session's
-    /// own host, or on the Engine a host over the top level of the live fork.
-    fn new(sess: &'a RaSession, host: &'a AnalysisHost, state_fp: StateFp) -> Env<'a> {
+    /// The environment of an expansion reading the state `host` holds (a session's own host, or
+    /// on the Engine a host over a layer), whose local `.rs` files are `files`.
+    fn new(
+        facts: &'a ExpandFacts,
+        files: &'a [(FileId, RelPath)],
+        panics: &'a RefCell<BTreeSet<ExpanderPanic>>,
+        host: &'a AnalysisHost,
+        state_fp: StateFp,
+    ) -> Env<'a> {
         let db = host.raw_database();
         let mut diag_cfg = diagnostics_config();
         // No diagnostics quick fixes are wanted in `assists_with_fixes`.
         diag_cfg.enabled = false;
         Env {
-            sess,
+            facts,
+            files,
+            panics,
             db,
             analysis: host.analysis(),
             sema: Semantics::new(db),
@@ -414,8 +443,8 @@ impl<'a> Env<'a> {
             assist_cfg: assist_config(),
             diag_cfg,
             rename_cfg: rename_config(),
-            by_path: sess.files.iter().map(|(i, r)| (r.clone(), *i)).collect(),
-            by_file: sess.files.iter().map(|(i, r)| (*i, r.clone())).collect(),
+            by_path: files.iter().map(|(i, r)| (r.clone(), *i)).collect(),
+            by_file: files.iter().map(|(i, r)| (*i, r.clone())).collect(),
             texts: RefCell::default(),
             trees: RefCell::default(),
             modules: RefCell::default(),
@@ -1048,7 +1077,7 @@ impl<'a> Env<'a> {
         }
         let mut by_file = HashMap::new();
         let mut by_path = HashMap::new();
-        for (id, _) in &self.sess.files {
+        for (id, _) in self.files {
             let Some(m) = self.sema.file_to_module_def(*id) else {
                 continue;
             };
@@ -1239,8 +1268,9 @@ impl<'a> Env<'a> {
 
     /// Runs one call unit of `kind` on `file`: the seeds of a target, or a call that reaches
     /// rust-analyzer (`call`: realizing one seed, or the candidates of a target). A panic inside
-    /// it is recorded on the session and gives `T::default()` (no seeds, no candidates), so one
-    /// bad shape costs that unit and not the other kinds' Blueprints nor the whole generation.
+    /// it is recorded in the environment's panics and gives `T::default()` (no seeds, no
+    /// candidates), so one bad shape costs that unit and not the other kinds' Blueprints nor the
+    /// whole generation.
     /// The injected test fault fires only in `call` units.
     fn contained<T: Default>(
         &self,
@@ -1249,7 +1279,7 @@ impl<'a> Env<'a> {
         call: bool,
         f: impl FnOnce() -> T,
     ) -> T {
-        let fault = call && self.sess.expander_fault == Some(kind);
+        let fault = call && self.facts.expander_fault == Some(kind);
         let got = catch_unwind(AssertUnwindSafe(|| {
             assert!(!fault, "expander fault injected on {kind:?}");
             f()
@@ -1257,15 +1287,11 @@ impl<'a> Env<'a> {
         match got {
             Ok(v) => v,
             Err(p) => {
-                self.sess
-                    .expander_panics
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(ExpanderPanic {
-                        kind: Some(kind),
-                        path: self.by_file.get(&file).cloned(),
-                        message: panic_message(p),
-                    });
+                self.panics.borrow_mut().insert(ExpanderPanic {
+                    kind: Some(kind),
+                    path: self.by_file.get(&file).cloned(),
+                    message: panic_message(p),
+                });
                 T::default()
             }
         }
@@ -1538,55 +1564,65 @@ fn parse_crate_use(text: &str) -> Option<(String, Vec<String>, String)> {
 
 /// Runs the generation on the current database state, the top level of the live fork (read on
 /// the Engine through its layer, or a throwaway child of it once it is sealed); the views are
-/// dropped before it returns.
+/// dropped before it returns. The panics it contained are added to `panics`.
 fn generate(
     sess: &RaSession,
     state_fp: StateFp,
     targets: &[Target],
     max: usize,
+    panics: &mut BTreeSet<ExpanderPanic>,
 ) -> Result<Vec<Blueprint>, ExpandError> {
-    crate::fork::with_top_host(sess, |host| generate_on(sess, host, state_fp, targets, max))
-        .unwrap_or_else(|e| {
-            Err(match e {
-                // A top level whose layer a panic poisoned yields nothing, as a panic does.
-                AnalyzerError::Panicked(msg) => ExpandError::Analysis(msg),
-                other => ExpandError::Session(map_error(other, &[])),
-            })
+    let facts = ExpandFacts::of(sess);
+    crate::fork::with_top_host(sess, |host| {
+        let (out, contained) = generate_on(&facts, &sess.files, host, state_fp, targets, max);
+        panics.extend(contained);
+        out
+    })
+    .unwrap_or_else(|e| {
+        Err(match e {
+            // A top level whose layer a panic poisoned yields nothing, as a panic does.
+            AnalyzerError::Panicked(msg) => ExpandError::Analysis(msg),
+            other => ExpandError::Session(map_error(other, &[])),
         })
+    })
 }
 
-/// [`generate`] on the state `host` holds.
+/// [`generate`] on the state `host` holds, whose local `.rs` files are `files`, with the facts
+/// `facts`. It reads no session: it returns the Blueprints (or the failure) together with the
+/// panics it contained, and the caller merges those into the session's record.
 fn generate_on(
-    sess: &RaSession,
+    facts: &ExpandFacts,
+    files: &[(FileId, RelPath)],
     host: &AnalysisHost,
     state_fp: StateFp,
     targets: &[Target],
     max: usize,
-) -> Result<Vec<Blueprint>, ExpandError> {
+) -> (Result<Vec<Blueprint>, ExpandError>, BTreeSet<ExpanderPanic>) {
+    // Outside the unwind boundary, so the units contained before a panic of the whole
+    // generation are kept with it.
+    let panics = RefCell::new(BTreeSet::new());
     let got = catch_unwind(AssertUnwindSafe(|| {
-        let env = Env::new(sess, host, state_fp);
+        let env = Env::new(facts, files, &panics, host, state_fp);
         // hir_ty reads the database through a thread-local that `Analysis` sets for its own
         // queries; the `Semantics` calls of this file need it set too.
         ra_ap_hir::attach_db_allow_change(env.db, || env.run(targets, max))
     }));
-    match got {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(msg)) => Err(ExpandError::Analysis(msg)),
+    let mut panics = panics.into_inner();
+    let out = match got {
+        Ok(out) => out.map_err(ExpandError::Analysis),
         Err(p) => {
             let message = panic_message(p);
-            sess.expander_panics
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(ExpanderPanic {
-                    kind: None,
-                    path: None,
-                    message: message.clone(),
-                });
+            panics.insert(ExpanderPanic {
+                kind: None,
+                path: None,
+                message: message.clone(),
+            });
             Err(ExpandError::Analysis(format!(
                 "rust-analyzer panicked: {message}"
             )))
         }
-    }
+    };
+    (out, panics)
 }
 
 /// The expansion of `state` with a stacked fork live: it is read at the top level, which must be
@@ -1600,6 +1636,7 @@ fn expand_at_top(
     state: &[Edit],
     targets: &[Target],
     max: usize,
+    panics: &mut BTreeSet<ExpanderPanic>,
 ) -> Result<Vec<Blueprint>, ExpandError> {
     let is_top = crate::fork::state_is_top(a, s, state).map_err(|e| {
         ExpandError::Session(CheckError::Load(format!("database read failed: {e}")))
@@ -1616,7 +1653,7 @@ fn expand_at_top(
             crate::fork::NOT_IN_THE_STATE_BELOW,
         ));
     }
-    generate(s, StateFp::of(state), targets, max)
+    generate(s, StateFp::of(state), targets, max, panics)
 }
 
 /// The failure of an expansion whose state a write of it on the base refuses: this parent yields
@@ -1713,48 +1750,69 @@ impl Expander for RaAnalyzer {
         targets: &[Target],
         max: usize,
     ) -> Result<Vec<Blueprint>, ExpandError> {
-        if stack::expand_on(s).map_err(ExpandError::Session)? == stack::ExpandOn::StackedTop {
-            return expand_at_top(self, s, state, targets, max);
-        }
-        if targets.is_empty() || max == 0 {
-            return Ok(Vec::new());
-        }
-        let state_fp = StateFp::of(state);
-        if state.is_empty() {
-            return generate(s, state_fp, targets, max);
-        }
-
-        let mut paths: Vec<RelPath> = state.iter().map(|e| e.path.clone()).collect();
-        paths.sort();
-        paths.dedup();
-        let before = fingerprints(s, &paths);
-        let mut f =
-            Analyzer::fork(self, s).map_err(|e| ExpandError::Session(map_error(e, &paths)))?;
-        let applied = self.apply(s, &mut f, state);
-        let out = applied.is_ok().then(|| generate(s, state_fp, targets, max));
-        let discarded = self.discard(s, f);
-
-        let after = fingerprints(s, &paths);
-        if let Err(bad) = revert_intact(&before, &after) {
-            s.poisoned = Some(format!(
-                "text of {} file(s) differs after revert",
-                bad.len()
-            ));
-            return Err(ExpandError::Session(CheckError::RevertMismatch {
-                paths: bad,
-            }));
-        }
-        if let Err(e) = applied {
-            return Err(match e {
-                AnalyzerError::Edit { path, reason } => state_edit_rejected(&path, &reason),
-                other => ExpandError::Session(map_error(other, &paths)),
-            });
-        }
-        if let Err(e) = discarded {
-            return Err(ExpandError::Session(map_error(e, &paths)));
-        }
-        out.unwrap_or_else(|| Ok(Vec::new()))
+        // The generation reads no session; the panics it contained are merged here, whatever
+        // the expansion's outcome.
+        let mut panics = BTreeSet::new();
+        let out = expand_state(self, s, state, targets, max, &mut panics);
+        s.expander_panics
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(panics);
+        out
     }
+}
+
+/// [`Expander::expand`] of `state`, adding the panics its generation contained to `panics`.
+fn expand_state(
+    a: &RaAnalyzer,
+    s: &mut RaSession,
+    state: &[Edit],
+    targets: &[Target],
+    max: usize,
+    panics: &mut BTreeSet<ExpanderPanic>,
+) -> Result<Vec<Blueprint>, ExpandError> {
+    if stack::expand_on(s).map_err(ExpandError::Session)? == stack::ExpandOn::StackedTop {
+        return expand_at_top(a, s, state, targets, max, panics);
+    }
+    if targets.is_empty() || max == 0 {
+        return Ok(Vec::new());
+    }
+    let state_fp = StateFp::of(state);
+    if state.is_empty() {
+        return generate(s, state_fp, targets, max, panics);
+    }
+
+    let mut paths: Vec<RelPath> = state.iter().map(|e| e.path.clone()).collect();
+    paths.sort();
+    paths.dedup();
+    let before = fingerprints(s, &paths);
+    let mut f = Analyzer::fork(a, s).map_err(|e| ExpandError::Session(map_error(e, &paths)))?;
+    let applied = a.apply(s, &mut f, state);
+    let out = applied
+        .is_ok()
+        .then(|| generate(s, state_fp, targets, max, panics));
+    let discarded = a.discard(s, f);
+
+    let after = fingerprints(s, &paths);
+    if let Err(bad) = revert_intact(&before, &after) {
+        s.poisoned = Some(format!(
+            "text of {} file(s) differs after revert",
+            bad.len()
+        ));
+        return Err(ExpandError::Session(CheckError::RevertMismatch {
+            paths: bad,
+        }));
+    }
+    if let Err(e) = applied {
+        return Err(match e {
+            AnalyzerError::Edit { path, reason } => state_edit_rejected(&path, &reason),
+            other => ExpandError::Session(map_error(other, &paths)),
+        });
+    }
+    if let Err(e) = discarded {
+        return Err(ExpandError::Session(map_error(e, &paths)));
+    }
+    out.unwrap_or_else(|| Ok(Vec::new()))
 }
 
 #[cfg(test)]
