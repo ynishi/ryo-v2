@@ -36,8 +36,8 @@ pub struct ScopedFindings {
     pub findings: Vec<Finding>,
     /// The classes of error this run did not see, though the checker would have looked, each
     /// with the files it was observed on. The one record of what the run observed; `unseen()`
-    /// derives the set of classes from it. A diagnosis of a `Stacked` names at least one file
-    /// for every class (`Stacked::diagnose` C8); a value made otherwise may hold a class with no
+    /// derives the set of classes from it. A diagnosis of a `Forks` job or of a check names at
+    /// least one file for every class (`Forks` C18); a value made otherwise may hold a class with no
     /// file. `within` keeps such a class, because it keeps a diagnosis to the files of its own
     /// check, where the class was observed; `on_top_of` drops one from below, because a level
     /// written on top may have changed the file it was observed on.
@@ -56,7 +56,7 @@ impl ScopedFindings {
 
     /// The findings of the state of a level: its diagnosis (`self`) put on top of the findings of
     /// the state below (`below`), with `deleted` the paths the level deletes. A file the level did
-    /// not diagnose has, at its state, the findings it has below (`Stacked::diagnose` C3).
+    /// not diagnose has, at its state, the findings it has below (`Forks` C15).
     ///
     /// # Contract
     /// - C1: the files are those of `self` and those of `below` that are neither in `self` nor in
@@ -66,7 +66,7 @@ impl ScopedFindings {
     /// - C2: a finding of `below` stays unless its path is a file of `self` or in `deleted`; a
     ///   finding of `self` stays unless its path is in `deleted`, or its path is not a file of
     ///   `self` and a finding of `below` that stays equals it. A finding whose path is in no file
-    ///   of either stays; a diagnosis has none (`Stacked::diagnose` C9). The findings are sorted.
+    ///   of either stays; a diagnosis has none (`Forks` C20). The findings are sorted.
     ///   tested: domain::finding::tests::on_top_of_takes_each_file_from_its_latest_diagnosis
     ///   tested: domain::finding::tests::on_top_of_drops_deleted_files
     /// - C3: `unseen_at` holds every class of `self` with its files, and every class of `below`
@@ -137,7 +137,7 @@ impl ScopedFindings {
     /// # Contract
     /// - C1: the files are those of `self` that are in `files`; a finding stays unless its path is
     ///   a file of `self` that is not in `files`, so a finding whose path is in no file of `self`
-    ///   stays; a diagnosis has none (`Stacked::diagnose` C9, `Verifier::check` C1).
+    ///   stays; a diagnosis has none (`Forks` C20, `Verifier::check` C1).
     ///   tested: domain::finding::tests::within_keeps_the_files_of_the_check
     /// - C2: a class keeps those of its files that are in `files`; a class left with no file is
     ///   dropped, and one that had no file stays.

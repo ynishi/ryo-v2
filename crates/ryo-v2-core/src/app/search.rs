@@ -612,7 +612,7 @@ fn mismatched(what: &str) -> CheckError {
 ///   tested: app::search::tests::the_start_state_is_one_job
 ///   tested: app::search::tests::the_start_job_is_not_cut_off
 ///   tested: app::search::tests::a_failed_start_state_is_a_failed_report_naming_it
-///   tested: ryo-v2-ra tests/stack.rs search_and_apply_give_the_same_verdict_on_a_chain
+///   tested: ryo-v2-ra tests/jobs.rs search_and_apply_give_the_same_verdict_on_a_chain
 ///   tested: ryo-v2-oracle tests/search_recall.rs search_verdicts_equal_the_reference_check
 /// - C14: a failed call of the forks (`open`, `submit`, `expand`, `next`, `cancel`, and
 ///   `layer_files` with reach `Session`) is `SearchError::Fork`, and so is a start job's
@@ -1607,7 +1607,7 @@ mod tests {
     /// A fake `Forks` whose every job runs at its submit: a check job's diagnosis answers from
     /// `rule` of its Layer's composed edits, so a file keeps its findings unless the composed
     /// state changes, and `layer_files` gives the files a check of those edits gives, none for
-    /// none (`Forks` C2, `Stacked::files_of` C1, C2). A job finishes at the first `next` after its
+    /// none (`Forks` C2, `Forks::layer_files` C1, C2). A job finishes at the first `next` after its
     /// submit that is not `Pending`, and outcomes come out of submission order: the newest
     /// first, or in a seeded order. Its faults are refusals the port allows.
     struct FakeV {

@@ -468,6 +468,22 @@ fn expanded(s: &RaSession, outcome: JobOutcome) -> Result<Vec<Blueprint>, Expand
 ///   fork open.
 ///   tested: tests/forks.rs an_expansions_panics_join_the_session_at_next
 ///   tested: tests/forks.rs an_expansion_sees_a_file_the_state_created
+/// - C8: a panic inside a job's layer (its write, its own code, or a query of its diagnosis)
+///   poisons that layer only: the job is a `Next::Done` with `Panicked`, of reach Blueprint, and
+///   no layer. Its parent, a sibling written after it and the session are untouched, and no
+///   write of the base was refused.
+///   tested: tests/jobs.rs a_panic_in_a_layer_poisons_only_that_layer
+/// - C9: while a Layer of the base lives, every operation that writes the base (a check, the
+///   reference check, the revert audit, the memory report, another fork of either port) is
+///   refused with `ForkInUse`, at once, and changes nothing.
+///   tested: tests/jobs.rs a_base_write_with_a_live_layer_is_fork_in_use
+/// - C10: a base text that `layer_files` needs and cannot read (a database read that fails)
+///   makes it `CheckError::Load`, of reach Session; the session is not poisoned, and the Layers
+///   and every text are as before.
+///   tested: tests/jobs.rs a_failed_base_read_is_a_session_error
+/// - C11: a job is one write, as a check is: the paths its edits name, a refused job's included,
+///   join those the revert audit re-diagnoses after the forks are closed.
+///   tested: tests/jobs.rs a_jobs_paths_join_the_revert_audit
 impl Forks for RaAnalyzer {
     type Layer = RaLayer;
 

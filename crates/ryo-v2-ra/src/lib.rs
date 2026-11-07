@@ -2,7 +2,7 @@
 //!
 //! The only crate that depends on the `ra_ap_*` stack. It implements the ports of
 //! `ryo-v2-core::app::ports` named by its `impl` blocks: load a workspace once, fork its in-memory
-//! state per candidate, write text edits (stacked on earlier writes through `Stacked`), collect
+//! state per candidate, write text edits (stacked on earlier writes as jobs of `Forks`), collect
 //! HIR diagnostics, revert. Nothing here runs cargo or rustc per candidate.
 
 mod assess;
@@ -34,7 +34,6 @@ pub use memory::{IngredientRow, MemoRow, MemoryReport};
 /// A layer's own counters on the fork Engine ([`RaSession::level_stats`]).
 pub use ryo_v2_engine::LayerStats;
 pub use session::{DetectorPanic, ExpanderPanic, RaSession};
-pub use stack::RaStack;
 
 /// Configuration of [`RaAnalyzer`].
 #[derive(Debug, Clone)]
@@ -52,14 +51,14 @@ pub struct RaConfig {
     /// item と `use` が同じ module で同じ名前を定義する (E0255)、derive した impl と手書きの
     /// `Copy` impl が field に求める trait (E0204/E0277/E0369)。全ての [`GapDetector`] を一斉に切り替える。以前の名前は `unresolved_paths`(最初の detector の名前)。
     pub gap_detectors: bool,
-    /// Every n-th write (a `Verifier::check` or a `Stacked::write`) is sampled: the end of its
-    /// level checks the isolation of the base (I2). None = never.
+    /// Every n-th write (a `Verifier::check` or a `Forks` job) is sampled: the end of its level checks the
+    /// isolation of the base (I2). None = never.
     ///
     /// # Contract
     /// - C1: `Some(n)` samples every n-th write, a check being one write (the 1st of `Some(2)`
     ///   is not, the 2nd is); `None` never does through this field.
     ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
-    ///   tested: tests/stack.rs writes_count_for_the_sampled_isolation
+    ///   tested: tests/check.rs writes_count_for_the_sampled_isolation
     pub assert_revert_every: Option<std::num::NonZeroU32>,
     /// `CargoConfig::set_test`: `#[cfg(test)]` code of workspace members is enabled, so it is diagnosed.
     ///
@@ -70,9 +69,9 @@ pub struct RaConfig {
     ///   tested: tests/verifier.rs ra_config_default_diagnoses_test_code
     pub cfg_test: bool,
     /// The forks that run side by side on the fork Engine (`Forks`, D11 stage 3b); read at
-    /// `Forks::open`. Every fork of the adapter (`Forks`, `Stacked`, `Analyzer`, and a check,
-    /// which is a one-level fork) is layers over the frozen base, which is never written; the
-    /// stacked undo log was deleted at stage 4, and the flat reference check
+    /// `Forks::open`. Every fork of the adapter (`Forks`, `Analyzer`, and a check, which is a
+    /// one-level fork) is layers over the frozen base, which is never written; the stacked undo
+    /// log and the `Stacked` port were deleted at stage 4, and the flat reference check
     /// (`RaAnalyzer::reference_check`) is the one write of the base left.
     pub forks: ForksConfig,
     /// The proc-macro server processes the load starts (with `proc_macro`), fixed for the
@@ -338,7 +337,7 @@ impl RaAnalyzer {
     /// - C1: with `Some(limit_ms)` a diagnosis of a level, a check's included, that reaches the
     ///   limit ends in `CheckError::TimedOut`; with `None` it never does.
     ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
-    ///   tested: tests/stack.rs a_cut_off_diagnosis_keeps_the_levels
+    ///   tested: tests/jobs.rs a_cut_off_job_keeps_its_parent_usable
     pub fn with_check_timeout(mut self, limit_ms: Option<u64>) -> RaAnalyzer {
         self.check_timeout_ms = limit_ms;
         self
@@ -353,25 +352,26 @@ impl RaAnalyzer {
 ///   tested: tests/verifier.rs a_sampled_discard_reasserts_no_revert
 /// - C2: a `discard` writes nothing back: a fault of the write-back hooks fails none, and every
 ///   text is the base's after it.
-///   tested: tests/stack.rs analyzer_discard_writes_nothing_back
+///   tested: tests/check.rs analyzer_discard_writes_nothing_back
 /// - C3: on a session poisoned while its fork is live, `apply` and `diagnostics` are refused with
 ///   `AnalyzerError::Poisoned` and write nothing; `discard` ends the fork without writing.
-///   tested: tests/stack.rs a_poisoned_fork_is_not_written
+///   tested: tests/check.rs a_poisoned_fork_is_not_written
 /// - C4: `apply`, `diagnostics` and `discard` with a fork that is not the session's live one
 ///   (another session's, or one already discarded) are `ForkInUse` and change nothing.
-///   tested: tests/stack.rs an_analyzer_ticket_of_another_session_is_refused
+///   tested: tests/check.rs an_analyzer_ticket_of_another_session_is_refused
 /// - C5: while a fork is live, `Verifier::check`, `Expander::expand` and
 ///   `RevertAudit::audit_revert` are `ForkInUse`, and `Verifier::text` describes the base.
-///   tested: tests/stack.rs a_live_analyzer_fork_holds_the_session
-/// - C6: the files and findings of `diagnostics` after `apply` are those of `Stacked::diagnose`
-///   after one `Stacked::write` of the same edits, and the texts after the discard are those after
-///   a release, where the diagnosis meets neither the time limit nor a new detector panic.
-///   tested: tests/stack.rs one_level_matches_the_analyzer_path
+///   tested: tests/check.rs a_live_analyzer_fork_holds_the_session
+///   tested: tests/check.rs session_operations_refuse_while_an_analyzer_fork_is_live
+/// - C6: the files and findings of `diagnostics` after `apply` are those of `Verifier::check` of
+///   the same edits at the same scope, and the texts after the discard are those after the check,
+///   where the diagnosis meets neither the time limit nor a new detector panic.
+///   tested: tests/check.rs one_level_matches_the_analyzer_path
 /// - C7: on a poisoned session `fork`, `apply`, `diagnostics` and `discard` are
 ///   `AnalyzerError::Poisoned`, never `Panicked`, so that `app::verify::verify` gives the poison
 ///   as it is and `Expander::expand` gives `ExpandError::Session` with `CheckError::Poisoned`,
 ///   which reaches the session, not one Blueprint.
-///   tested: tests/stack.rs a_poisoned_session_is_poisoned_on_the_analyzer_port
+///   tested: tests/check.rs a_poisoned_session_is_poisoned_on_the_analyzer_port
 impl Analyzer for RaAnalyzer {
     type Session = RaSession;
     type Fork = RaFork;

@@ -7,7 +7,8 @@
 //! layer is open, and in a throwaway child of it once it is sealed (E9). `pop` drops the top
 //! layer and `release` drops them all and thaws the base, so nothing writes the base: the
 //! check that a level's write left the base as it was is the isolation of the Engine (I2), not
-//! a revert.
+//! a revert. Since the `Stacked` port was deleted (stage 4) the forks here, a check's and an
+//! `Analyzer` fork, write one level each; writes stack as jobs of `Forks` (`forks`).
 //!
 //! A panic inside a layer (its write, or a query of its diagnosis) poisons that layer and every
 //! layer above it, never the base, a level below or the session: a write that panics pushes no
@@ -104,14 +105,15 @@ impl LevelLayer {
 }
 
 impl RaSession {
-    /// The counters of each level's layer of the live fork, the lowest level first (the top
-    /// level's layer may still be open); empty with no fork. Reads counters only, runs no query,
-    /// changes nothing.
+    /// The counters of each level's layer of the live fork, the lowest level first (an
+    /// `Analyzer` fork has one level, whose layer is open); empty with no fork. Reads counters
+    /// only, runs no query, changes nothing. The Layers of `Forks` give theirs through
+    /// [`crate::RaLayer::stats`].
     ///
     /// # Contract
-    /// - C1: one row per level, in level order; a level whose top layer ran its diagnosis has
-    ///   memos, and a level below the top that ran none has none.
-    ///   tested: tests/stack.rs level_stats_has_a_row_per_engine_level
+    /// - C1: one row per level, in level order, none with no level; a level whose layer ran its
+    ///   diagnosis has memos.
+    ///   tested: tests/check.rs level_stats_has_a_row_per_engine_level
     pub fn level_stats(&self) -> Vec<LayerStats> {
         self.stack
             .iter()

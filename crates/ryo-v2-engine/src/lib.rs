@@ -816,7 +816,7 @@ pub struct Counters {
 /// # Contract
 /// - C1: a check that runs no layer code leaves every counter as it was, and the database is
 ///   not frozen during it.
-///   tested: ryo-v2-ra tests/stack.rs reference_check_runs_no_layer_code
+///   tested: ryo-v2-ra tests/check.rs reference_check_runs_no_layer_code
 pub fn counters<Db: EngineDb>(db: &Db) -> Counters {
     Counters {
         shared: fork::shared_writes(db),

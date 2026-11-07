@@ -143,7 +143,7 @@ pub enum GapDetector {
     ///   of its findings, with that file; a run that skips none, or that runs no gap detector,
     ///   does not.
     ///   tested: tests/unresolved.rs unexpanded_macro_file_names_the_class
-    ///   tested: tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
+    ///   tested: tests/jobs.rs a_diagnosis_names_where_it_observed_each_unseen_class
     UnresolvedPath,
     /// A name an item and a `use` both define (E0255), `duplicate.rs`.
     DuplicateName,

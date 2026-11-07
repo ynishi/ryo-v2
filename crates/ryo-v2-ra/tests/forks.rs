@@ -7,7 +7,7 @@ use common::{Fixture, rel};
 use ra_ap_base_db::salsa::Cancelled;
 use ryo_v2_core::app::ports::{
     Analyzer, CheckError, Checked, ExpandError, Expander, Forks, JobId, Limit, Next, RevertAudit,
-    Stacked, Verifier,
+    Verifier,
 };
 use ryo_v2_core::domain::{Blueprint, CommandKind, Edit, Scope, ScopedFindings, StateFp, Target};
 use ryo_v2_core::infra::clock::MonotonicClock;
@@ -690,7 +690,6 @@ fn session_operations_refuse_while_forks_are_open() {
             a.check(s, std::slice::from_ref(&edit), Scope::Affected),
             Err(CheckError::ForkInUse)
         );
-        assert!(matches!(Stacked::fork(a, s), Err(CheckError::ForkInUse)));
         assert_eq!(a.audit_revert(s), Err(CheckError::ForkInUse));
         assert!(matches!(a.open(s), Err(CheckError::ForkInUse)));
         assert!(Analyzer::fork(a, s).is_err());
@@ -1323,32 +1322,6 @@ fn an_expansion_sees_a_file_the_state_created() {
     );
     // With no fork open the expansion reads the state's files too.
     assert_eq!(on_layer, reference_expansion(&a, &mut s, &state));
-}
-
-/// The stacked top reads the files of its state too (stage 4, commit 3): before, it listed the
-/// base's files, so a level that created a module gave no child of it.
-#[test]
-fn a_stacked_top_expansion_sees_a_file_the_state_created() {
-    let f = w_fixture("forks_stacked_top_created");
-    let a = analyzer_of(config(1, 2, true));
-    let mut s = Analyzer::load(&a, &f.dir).expect("load W");
-    let base = w_base();
-    let edits = node_edits(&base, "c", 2);
-    let state = applied(&base, &edits);
-    assert!(has(&state, "a/src/m.rs") && !has(&base, "a/src/m.rs"));
-
-    let mut fork = Stacked::fork(&a, &mut s).expect("fork");
-    Stacked::write(&a, &mut s, &mut fork, &edits).expect("write the level");
-    let on_top = Expander::expand(&a, &mut s, &composed(&state), &w_targets(), MAX);
-    Stacked::release(&a, &mut s, fork).expect("release");
-
-    assert!(
-        splices(&on_top, "a/src/m.rs"),
-        "no Blueprint of the created file among {:?}",
-        on_top.as_ref().map(Vec::len)
-    );
-    // The same as with no fork live (`Expander` C1).
-    assert_eq!(on_top, reference_expansion(&a, &mut s, &state));
 }
 
 #[test]

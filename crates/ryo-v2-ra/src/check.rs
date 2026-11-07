@@ -90,9 +90,8 @@ pub(crate) fn base_text_at(
     }
 }
 
-/// Diagnoses the top level as a check does, and as `Stacked::diagnose` does: under the check time
-/// limit, and with a detector that panicked where it did not at the baseline failing the
-/// diagnosis.
+/// Diagnoses the level of a check: under the check time limit, and with a detector that panicked
+/// where it did not at the baseline failing the diagnosis, as a job of `Forks` is diagnosed.
 pub(crate) fn diagnose_for_check(
     a: &RaAnalyzer,
     s: &RaSession,
@@ -333,11 +332,11 @@ impl Verifier for RaAnalyzer {
     /// - C1: the base is never written: after a check every text, the provenance and the
     ///   baseline are the base's, whatever the write-back hooks would have done.
     ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
-    ///   tested: tests/stack.rs text_is_the_base_after_a_poisoned_check
+    ///   tested: tests/check.rs text_is_the_base_after_a_poisoned_check
     /// - C2: the isolation of the base (I2) is checked on every n-th write when
     ///   `assert_revert_every` is `Some(n)`, a check being one write.
     ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
-    ///   tested: tests/stack.rs writes_count_for_the_sampled_isolation
+    ///   tested: tests/check.rs writes_count_for_the_sampled_isolation
     /// - C3: with a cut-off set (`with_check_timeout`) a diagnostics step that is still running
     ///   when the limit is reached ends in `CheckError::TimedOut`; the layer is still dropped and
     ///   the session stays usable. The limit is looked at before each file, so one slow file can
@@ -355,18 +354,32 @@ impl Verifier for RaAnalyzer {
     ///   file.
     ///   tested: tests/unresolved.rs detector_panic_is_contained_per_file
     ///   tested: tests/gap_detectors.rs each_detector_panic_is_contained_on_its_own
-    ///   tested: tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
+    ///   tested: tests/jobs.rs a_diagnosis_names_where_it_observed_each_unseen_class
     /// - C6: `RevertMismatch` and `Poisoned` win over every other error of the check: an `Edit`,
     ///   a `TimedOut`, a `Panicked` and a `DetectorPanicked`; so they do in the flat reference
     ///   check, whose write-back can fail.
     ///   tested: tests/verifier.rs session_errors_win_over_a_detector_panic
-    ///   tested: tests/stack.rs a_session_error_of_the_release_wins_in_a_check
+    ///   tested: tests/check.rs a_session_error_of_the_release_wins_in_a_check
     /// - C7: with no edit the check diagnoses no file at `Scope::Affected` and names no unseen
     ///   class.
-    ///   tested: tests/stack.rs an_empty_check_diagnoses_nothing
+    ///   tested: tests/check.rs an_empty_check_diagnoses_nothing
     /// - C8: a check whose edits are refused records no check or revert event and pushes no
     ///   level.
-    ///   tested: tests/stack.rs a_refused_check_reverts_nothing
+    ///   tested: tests/check.rs a_refused_check_reverts_nothing
+    /// - C9: every check, a refused one included, records its paths for
+    ///   `RevertAudit::audit_revert`.
+    ///   tested: tests/check.rs check_writes_are_audited
+    /// - C10: every unseen class of the result has in `unseen_at` each file it was observed on
+    ///   and no other: the files where the unresolved-path detector was skipped for a macro call
+    ///   that did not expand, and those where a detector panicked as it did at the baseline; no
+    ///   class has an empty set. A job of `Forks` names them alike (`Forks` C18).
+    ///   tested: tests/jobs.rs a_diagnosis_names_where_it_observed_each_unseen_class
+    /// - C11: every finding of the result is on a file the check covers. An error is on the
+    ///   scanned file, or, when rust-analyzer reports its range in another file (code pulled in
+    ///   with `include!`), on that file, which is in the scanned file's crate
+    ///   (`diagnostics::collect_errors` C1, C3 and C4); and every scope holds whole crates. A job
+    ///   of `Forks` keeps it alike (`Forks` C20).
+    ///   tested: tests/jobs.rs a_finding_is_on_a_file_of_its_diagnosis
     fn check(
         &self,
         s: &mut RaSession,
@@ -374,10 +387,10 @@ impl Verifier for RaAnalyzer {
         scope: Scope,
     ) -> Result<ScopedFindings, CheckError> {
         stack::require_free(s)?;
-        // A check is the one-level case of a fork: write, diagnose, release. The release always
-        // runs, and its failure, always about the session, wins; then the write's; then the
-        // diagnosis's.
-        stack::open_fork(s, ForkPort::Stacked).map_err(|e| map_error(e, &[]))?;
+        // A check is a one-level fork private to the adapter: write, diagnose, release, as a
+        // one-job `Forks` session gives (`Forks` C12). The release always runs, and its failure,
+        // always about the session, wins; then the write's; then the diagnosis's.
+        stack::open_fork(s, ForkPort::Check).map_err(|e| map_error(e, &[]))?;
         let outcome =
             stack::write_level(self, s, edits).and_then(|()| diagnose_for_check(self, s, scope));
         crate::engine::release_levels(self, s).map_err(revert_error)?;
@@ -402,7 +415,7 @@ impl RaAnalyzer {
     /// - C1: no layer exists during it and the fork counters of the database (shared writes,
     ///   skipped and refused writes) are as before it; its result equals `check` of the same
     ///   edits, and the session is left at its base.
-    ///   tested: tests/stack.rs reference_check_runs_no_layer_code
+    ///   tested: tests/check.rs reference_check_runs_no_layer_code
     /// - C2: at `Scope::Workspace` its files and findings are those of a fresh load of the state
     ///   the edits give (the workspace with the state written to disk, loaded by a new session of
     ///   the same configuration): the anchor of the flat side of every differential test (R1).
@@ -412,8 +425,8 @@ impl RaAnalyzer {
     ///   a re-assert that cannot run poisons it too (`Poisoned`); a write-back that leaves another
     ///   text is `RevertMismatch` of that path whether or not the re-assert is on. While poisoned,
     ///   `Verifier::text` still describes the base.
-    ///   tested: tests/stack.rs the_flat_reference_reasserts_its_level
-    ///   tested: tests/stack.rs text_is_the_base_after_a_poisoned_check
+    ///   tested: tests/check.rs the_flat_reference_reasserts_its_level
+    ///   tested: tests/check.rs text_is_the_base_after_a_poisoned_check
     #[doc(hidden)]
     pub fn reference_check(
         &self,

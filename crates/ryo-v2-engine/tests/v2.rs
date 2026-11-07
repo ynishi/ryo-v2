@@ -61,7 +61,7 @@ fn analyzer() -> RaAnalyzer {
     )
 }
 
-// W: three crates, `wb` depending on `wa` (as in ryo-v2-ra's tests/stack.rs).
+// W: three crates, `wb` depending on `wa` (as in ryo-v2-ra's tests/jobs.rs).
 const A_LIB: &str = "pub mod x;\npub struct S;\npub fn ga(s: S) {\n    s.missing();\n}\npub fn fa(_x: MissingA) {}\n";
 const A_X: &str = "pub fn xf() -> u32 {\n    1\n}\n";
 const B_LIB: &str = "pub mod y;\npub struct T;\npub fn gb(t: T) {\n    t.missing();\n}\npub fn fb(_x: MissingB) {}\n";

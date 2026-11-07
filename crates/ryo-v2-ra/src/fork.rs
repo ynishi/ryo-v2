@@ -1,11 +1,9 @@
-//! Levels: one write of edits on top of the state below it, diagnosed, and dropped. A fork is a
-//! stack of levels over the session's base state, each a layer of the fork Engine (`engine`);
-//! the functions here are the level operations that the `Analyzer` port, `Stacked` and
-//! `Verifier::check` are built on, and the resolution of a write's edits that `Forks` and the
-//! flat reference check (`flat`) share.
+//! Levels: one write of edits on top of the state below it, diagnosed, and dropped. The fork of
+//! a check or of the `Analyzer` port is one level over the session's base state, a layer of the
+//! fork Engine (`engine`); the functions here are the level operations those two are built on,
+//! and the resolution of a write's edits that `Forks` and the flat reference check (`flat`) share.
 
 use crate::RaAnalyzer;
-use crate::check::base_text;
 use crate::diagnostics::{Deadline, Detector, GapDetector, collect_errors_par, panic_message};
 use crate::rev_deps::{RevDeps, scoped_files};
 use crate::session::{ForkPort, RaSession};
@@ -294,18 +292,6 @@ pub(crate) fn live_below(session: &RaSession) -> &[(FileId, RelPath)] {
     top_state(session).map_or(session.files.as_slice(), |s| s.live.as_slice())
 }
 
-/// The text of `path` at the top level (the base text with no level); `None` when it is not a
-/// file of that state.
-pub(crate) fn text_at_top(
-    session: &RaSession,
-    path: &RelPath,
-) -> Result<Option<String>, AnalyzerError> {
-    match live_below(session).iter().find(|(_, r)| r == path) {
-        Some((id, _)) => top_text(session, *id).map(Some),
-        None => Ok(None),
-    }
-}
-
 /// The refusal of an `Analyzer` operation on a poisoned session: the database is not written or
 /// read again.
 fn refuse_poisoned(session: &RaSession) -> Result<(), AnalyzerError> {
@@ -482,94 +468,9 @@ pub(crate) fn diagnose_on(
     ))
 }
 
-/// The files a one-level check at `scope` covers for the edits that take the base to the top
-/// level's state (`Stacked::files_of`). Those edits' paths are the paths some level edited whose
-/// presence or text at the top level differs from the base: present at the base when a file of
-/// the session, at the top when a file of the top level's state. With no such path a check
-/// diagnoses no file at `Scope::Affected`; at `Scope::Workspace` it diagnoses every file of the
-/// state, the base's with no level. A base text that cannot be read is the error.
-pub(crate) fn files_of(
-    a: &RaAnalyzer,
-    session: &RaSession,
-    scope: Scope,
-) -> Result<Vec<RelPath>, AnalyzerError> {
-    let live = live_below(session);
-    let covered: Vec<(FileId, RelPath)> = match scope {
-        Scope::Workspace => live.to_vec(),
-        Scope::Affected => {
-            let edited: BTreeSet<&RelPath> = session
-                .stack
-                .iter()
-                .flat_map(|l| l.state.edited.iter())
-                .collect();
-            let mut changed: Vec<&RelPath> = Vec::new();
-            for path in edited {
-                if text_at_top(session, path)? != base_text(a, session, path)? {
-                    changed.push(path);
-                }
-            }
-            if changed.is_empty() {
-                Vec::new()
-            } else {
-                scoped_files(live, &session.rev_deps, &changed)
-            }
-        }
-    };
-    let mut files: Vec<RelPath> = covered.into_iter().map(|(_, r)| r).collect();
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-/// Whether `state` (edits over the base) is the state of the top level: every path some level
-/// edited and every path of `state` has, at the top level, the text `state` gives it (the last
-/// edit of the path wins; `None` is absent), or its base text when `state` does not name it.
-/// Every other path no level edited is at its base text at the top level too. A text that cannot
-/// be read, at the top or at the base, is the error.
-pub(crate) fn state_is_top(
-    a: &RaAnalyzer,
-    session: &RaSession,
-    state: &[Edit],
-) -> Result<bool, AnalyzerError> {
-    let mut wanted: BTreeMap<&RelPath, Option<&str>> = BTreeMap::new();
-    for edit in state {
-        wanted.insert(&edit.path, edit.new_text.as_deref());
-    }
-    let edited: BTreeSet<&RelPath> = session
-        .stack
-        .iter()
-        .flat_map(|l| l.state.edited.iter())
-        .chain(wanted.keys().copied())
-        .collect();
-    for path in edited {
-        let at_top = text_at_top(session, path)?;
-        let same = match wanted.get(path) {
-            Some(text) => at_top.as_deref() == *text,
-            None => at_top == base_text(a, session, path)?,
-        };
-        if !same {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 /// Why a write refuses a delete of a path that is not a file of the state it lands on.
 pub(crate) const NOT_IN_THE_STATE_BELOW: &str =
     "cannot delete a file that is not in the state below";
-
-/// The first edit of `state` that a write of it on the base refuses as `resolve_pure` does
-/// there: a delete of a path that is not a file of the base. A write of `state` on the base
-/// refuses nothing else that a level could have written, so with `state` the state of the top
-/// level (`state_is_top`) this is the one refusal left to look for.
-pub(crate) fn refused_delete_at_base<'s>(
-    session: &RaSession,
-    state: &'s [Edit],
-) -> Option<&'s Edit> {
-    state
-        .iter()
-        .find(|e| e.new_text.is_none() && !session.files.iter().any(|(_, r)| *r == e.path))
-}
 
 /// The paths of `edits`, sorted, unique.
 pub(crate) fn edited_paths(edits: &[Edit]) -> Vec<RelPath> {
