@@ -128,7 +128,7 @@ fn solver_cache_does_not_cross_layers() {
 
     let in_f = a.diagnose_database(&s, &f.db()).expect("F");
     let in_g = a.diagnose_database(&s, &g.db()).expect("G");
-    // The flat side is the reference check, on the undo log whatever the default backend is.
+    // The flat side is the reference check, which runs no layer code.
     let flat_f = a
         .reference_check(
             &mut twin,

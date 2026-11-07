@@ -128,7 +128,7 @@ pub struct RaSession {
     /// The one fork that writes into the database now; `None` when the session is at its base.
     pub(crate) live: Option<Live>,
     /// The levels of the live fork, bottom first: each is one write on top of the one before,
-    /// and the undo log of that write.
+    /// in a layer of its own.
     pub(crate) stack: Vec<Level>,
     /// The base text of every load-time file a level modified or deleted, entered before the
     /// level wrote anything. `Verifier::text` and `Verifier::provenance` read it before the
@@ -155,16 +155,14 @@ pub struct RaSession {
     /// When set, every call of that edit kind in the expander panics; for the tests of the
     /// containment.
     pub(crate) expander_fault: Option<CommandKind>,
-    /// Whether forks run on layers of the fork Engine (`RaConfig.engine`, D11), fixed at load.
-    pub(crate) engine: bool,
-    /// The frozen base while a fork lives on the Engine; its database is out of `host`
-    /// meanwhile (`host` holds `spare_db`). `None` with no fork live, and on the undo log.
+    /// The frozen base while a fork lives; its database is out of `host` meanwhile (`host`
+    /// holds `spare_db`). `None` with no fork live.
     pub(crate) frozen: Option<crate::engine::EngineBase>,
     /// The empty database `host` holds while the base is frozen, kept between forks so a freeze
     /// does not build one.
     pub(crate) spare_db: Option<ra_ap_ide_db::RootDatabase>,
     /// Every `FileId` the database's file map holds beyond the files of load time (a file a
-    /// level created, on either backend; the map never forgets one). A layer creating one of
+    /// level or the flat reference check created; the map never forgets one). A layer creating one of
     /// them sets its inputs in the layer instead of creating them.
     pub(crate) created_in_db: BTreeSet<FileId>,
     /// The forks opened by `Forks::open` (`live` is then of `ForkPort::Forks`), until
@@ -411,7 +409,6 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         baseline_panics,
         expander_panics: Mutex::new(BTreeSet::new()),
         expander_fault: None,
-        engine: a.config.engine,
         frozen: None,
         spare_db: None,
         created_in_db: BTreeSet::new(),
@@ -423,9 +420,9 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
 /// bidirectional (postcard) protocol.
 const POSTCARD: &str = "RUST_ANALYZER_USE_POSTCARD";
 
-/// The refusal of a load, on either backend, in an environment where `postcard` (the value of
-/// [`POSTCARD`], if set) switches the proc-macro client to the bidirectional protocol, which runs
-/// salsa queries under a server's lock (`RaConfig.engine` C2).
+/// The refusal of a load in an environment where `postcard` (the value of [`POSTCARD`], if set)
+/// switches the proc-macro client to the bidirectional protocol, which runs salsa queries under
+/// a server's lock (`RaConfig.proc_macro_processes` C1).
 fn refuse_postcard(postcard: Option<&std::ffi::OsStr>) -> Result<(), AnalyzerError> {
     match postcard {
         Some(_) => Err(AnalyzerError::Load(format!(
@@ -443,8 +440,7 @@ mod tests {
 
     #[test]
     fn postcard_protocol_is_refused_at_load() {
-        // Read as rust-analyzer reads it: set at all, whatever the value; on either backend, so
-        // the backend is no argument of the refusal.
+        // Read as rust-analyzer reads it: set at all, whatever the value.
         for value in ["1", "", "0"] {
             let refused = refuse_postcard(Some(OsStr::new(value)));
             assert!(

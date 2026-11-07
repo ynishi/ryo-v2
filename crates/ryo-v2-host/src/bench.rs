@@ -9,10 +9,8 @@
 //! host runs on Linux only. With `--on` every run also prints its process CPU ms, its wall ms
 //! and its core occupancy ([`occupancy`]).
 //!
-//! With `--engine` the checks run on layers of the fork Engine (`RaConfig.engine`, D11) instead
-//! of the stacked undo log; every summary line ends with ` backend engine` or ` backend undo-log`
-//! ([`Backend`]). The stacked mode and `--depth-sweep` run on `Forks`, which need the Engine
-//! (`Forks` C9), so they ask for `--engine` ([`require_engine`]).
+//! Every check runs on layers of the fork Engine (D11): the stacked undo log, which the summary
+//! lines named as their backend, was deleted at stage 4.
 //!
 //! With `--depth-sweep` ([`run_depth_sweep`]) it measures how a diagnosis of the top level grows
 //! with the depth of a stack: per depth K, K one-file levels, each a job on the Layer of the one
@@ -31,7 +29,7 @@ use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{Backend, FileTimes, ForksConfig, LayerStats, RaAnalyzer, RaConfig, RaLayer};
+use ryo_v2_ra::{FileTimes, ForksConfig, LayerStats, RaAnalyzer, RaConfig, RaLayer};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,8 +52,6 @@ pub struct BenchArgs {
     pub proc_macro: bool,
     /// Whether to re-diagnose after the revert and compare with the baseline.
     pub assert_revert: bool,
-    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
-    pub backend: Backend,
     /// Whether ryo-v2's gap detectors run beside rust-analyzer's diagnosis
     /// (`RaConfig.gap_detectors`; `--no-gap-detectors` turns them off).
     pub gap_detectors: bool,
@@ -489,15 +485,14 @@ pub(crate) const SERIES_FORKS: ForksConfig = ForksConfig {
     caller_works: false,
 };
 
-/// Builds the analyzer of a bench on `backend`, loads `base` once and prints the load's lines to
-/// stderr. Its forks are [`SERIES_FORKS`].
+/// Builds the analyzer of a bench, loads `base` once and prints the load's lines to stderr. Its
+/// forks are [`SERIES_FORKS`].
 pub(crate) fn load(
     base: &std::path::Path,
     proc_macro: bool,
     assert_revert: bool,
-    backend: Backend,
 ) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
-    load_on_threads(base, proc_macro, assert_revert, backend, None)
+    load_on_threads(base, proc_macro, assert_revert, None)
 }
 
 /// [`load`] with `RaConfig.threads` set to `threads` (`None`: the available parallelism).
@@ -505,7 +500,6 @@ pub(crate) fn load_on_threads(
     base: &std::path::Path,
     proc_macro: bool,
     assert_revert: bool,
-    backend: Backend,
     threads: Option<usize>,
 ) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
     let config = RaConfig {
@@ -514,8 +508,7 @@ pub(crate) fn load_on_threads(
         threads,
         forks: SERIES_FORKS,
         ..RaConfig::default()
-    }
-    .with_backend(backend);
+    };
     load_with(base, config, None)
 }
 
@@ -554,26 +547,8 @@ pub(crate) fn load_with(
     Ok((analyzer, observer, session))
 }
 
-/// Refuses a run of the series of `stacked.rs` (`what`) on `backend` unless it is the Engine:
-/// they run on `Forks`, which the undo log does not offer (`Forks` C9).
-///
-/// # Contract
-/// - C1: `Ok` on the Engine; on the undo log an error naming `what` and `--engine`, given
-///   before anything is loaded.
-///   tested: bench::tests::the_series_ask_for_the_engine
-pub(crate) fn require_engine(backend: Backend, what: &str) -> Result<()> {
-    anyhow::ensure!(
-        backend == Backend::Engine,
-        "{what} runs on Forks, which need the fork Engine: add --engine"
-    );
-    Ok(())
-}
-
 /// Loads `args.base` once and runs every variant; prints the fixed output format.
 pub fn run(args: &BenchArgs) -> Result<()> {
-    if args.on.is_some() {
-        require_engine(args.backend, "bench --on (the stacked mode)")?;
-    }
     let times = args.file_times.then(|| Arc::new(FileTimes::default()));
     let config = RaConfig {
         proc_macro: args.proc_macro,
@@ -581,8 +556,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
         gap_detectors: args.gap_detectors,
         forks: SERIES_FORKS,
         ..RaConfig::default()
-    }
-    .with_backend(args.backend);
+    };
     let (analyzer, observer, mut session) = load_with(&args.base, config, times.clone())?;
     if !args.gap_detectors {
         eprintln!("[gap-detectors] off");
@@ -699,15 +673,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                         (reverted, mode_txt.clone())
                     }
                 };
-                print_summary(
-                    &name,
-                    sname,
-                    &mode_txt,
-                    &extra,
-                    args.backend,
-                    &series,
-                    &mut worst,
-                );
+                print_summary(&name, sname, &mode_txt, &extra, &series, &mut worst);
                 if !reverted {
                     fail_infra += 1;
                     break 'scopes;
@@ -745,8 +711,6 @@ pub struct DepthArgs {
     /// Whether the writes are sampled (`RaConfig.assert_revert`): on `Forks`, the base's
     /// fingerprint is taken at `open` and compared at `close` (I2).
     pub assert_revert: bool,
-    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
-    pub backend: Backend,
 }
 
 /// What the hook of one depth series measured; durations in microseconds, by wall clock.
@@ -824,14 +788,14 @@ fn triple_ms(us: &[u64]) -> String {
 /// The summary line of one depth: the first diagnosis of the top level, the warm ones (from the
 /// second on) as min/median/max, the writes and pops per level as min/median/max and in total,
 /// the VmRSS after the stack is written and after it is diagnosed, and the last diagnosis'
-/// scope files and findings; ` backend <name>` ends it.
+/// scope files and findings.
 ///
 /// # Contract
 /// - C1: one line per depth and scope, `summary depth-sweep [<scope>] depth <K> files <N>
-///   n=<R>` followed by the figures in the order above, ending with ` backend <name>`; a figure
-///   without a value (no warm diagnosis, no read) prints `-`.
-///   tested: bench::tests::depth_summary_line_ends_with_the_backend
-fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backend) -> String {
+///   n=<R>` followed by the figures in the order above; a figure without a value (no warm
+///   diagnosis, no read) prints `-`.
+///   tested: bench::tests::depth_summary_line_names_each_figure
+fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord) -> String {
     let first = rec.check_us.first().map_or("-".to_string(), |&us| ms(us));
     let warm = rec.check_us.get(1..).unwrap_or(&[]);
     let opt = |x: Option<u64>| x.map_or("-".to_string(), |k| k.to_string());
@@ -845,7 +809,7 @@ fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backe
         "summary depth-sweep [{sname}] depth {} files {files} n={} first_check_ms {first} \
          warm_check_ms {} write_ms_per_level {} write_ms_total {} pop_ms_per_level {} \
          pop_ms_total {} rss_kb_after_stack {} rss_kb_after_diagnose {} scope_files \
-         {scope_files} findings {findings} backend {}",
+         {scope_files} findings {findings}",
         rec.depth,
         rec.check_us.len(),
         triple_ms(warm),
@@ -855,7 +819,6 @@ fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backe
         ms(rec.pop_us.iter().sum()),
         opt(rec.rss_after_stack),
         opt(rec.rss_after_diagnose),
-        backend.name(),
     )
 }
 
@@ -962,13 +925,7 @@ pub(crate) fn depth_files(
 /// the Layer of the one below), diagnoses the top level `args.repeat` times and drops the
 /// Layers; prints a line per diagnosis and a summary per depth.
 pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
-    require_engine(args.backend, "bench --depth-sweep")?;
-    let (analyzer, _observer, mut session) = load(
-        &args.base,
-        args.proc_macro,
-        args.assert_revert,
-        args.backend,
-    )?;
+    let (analyzer, _observer, mut session) = load(&args.base, args.proc_macro, args.assert_revert)?;
     let files = depth_files(&analyzer, &session, &args.base, args.files)?;
     let names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
     eprintln!("[depth-sweep] levels rotate over {}", names.join(", "));
@@ -1004,10 +961,7 @@ pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
                     ms(us),
                 );
             }
-            println!(
-                "{}",
-                depth_summary_line(sname, args.files, &rec, args.backend)
-            );
+            println!("{}", depth_summary_line(sname, args.files, &rec));
             let label = format!("depth-sweep [{sname}] depth {}", rec.depth);
             for (i, stats) in level_stats.iter().enumerate() {
                 println!("{}", level_stats_line(&label, i + 1, stats));
@@ -1030,11 +984,10 @@ fn print_summary(
     sname: &str,
     mode: &str,
     extra: &str,
-    backend: Backend,
     s: &Series,
     worst: &mut Option<(u64, String)>,
 ) {
-    let Some(line) = summary_line(name, sname, extra, backend, s) else {
+    let Some(line) = summary_line(name, sname, extra, s) else {
         return;
     };
     println!("{line}");
@@ -1046,15 +999,13 @@ fn print_summary(
 }
 
 /// The summary line of a series, `None` for a series without runs: `extra` and the warm
-/// occupancy follow the figures, and ` backend <name>` ends the line, so that runs on the two
-/// backends can be told apart.
-fn summary_line(
-    name: &str,
-    sname: &str,
-    extra: &str,
-    backend: Backend,
-    s: &Series,
-) -> Option<String> {
+/// occupancy follow the figures.
+///
+/// # Contract
+/// - C1: `summary <name> [<scope>] n=<R>` followed by the figures, then `extra` and, with an
+///   occupancy, `warm_occupancy_median`; a series without runs has no line.
+///   tested: bench::tests::summary_line_names_each_figure
+fn summary_line(name: &str, sname: &str, extra: &str, s: &Series) -> Option<String> {
     let n = s.check_ms.len();
     if n == 0 {
         return None;
@@ -1084,13 +1035,12 @@ fn summary_line(
         None => String::new(),
     };
     Some(format!(
-        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt} backend {}",
+        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt}",
         s.check_ms[0],
         triple(warm_check),
         triple(warm_revert),
         slope(warm_rss),
         leak_suspect(warm_rss),
-        backend.name(),
     ))
 }
 
@@ -1250,30 +1200,6 @@ mod tests {
         }
     }
 
-    /// `require_engine` C1.
-    #[test]
-    fn the_series_ask_for_the_engine() {
-        assert!(require_engine(Backend::Engine, "bench --on").is_ok());
-        let e = require_engine(Backend::UndoLog, "bench --depth-sweep").unwrap_err();
-        let shown = e.to_string();
-        assert!(shown.contains("bench --depth-sweep"), "{shown}");
-        assert!(shown.contains("--engine"), "{shown}");
-        // `run` refuses before it loads anything: the base need not exist.
-        let args = BenchArgs {
-            base: PathBuf::from("/nonexistent-ryo-v2-base"),
-            variants: Vec::new(),
-            on: Some(PathBuf::from("/nonexistent-ryo-v2-parent")),
-            repeat: 1,
-            scopes: vec![Scope::Affected],
-            proc_macro: false,
-            assert_revert: false,
-            backend: Backend::UndoLog,
-            gap_detectors: true,
-            file_times: false,
-        };
-        assert!(run(&args).unwrap_err().to_string().contains("--engine"));
-    }
-
     /// `file_times_line` C1.
     #[test]
     fn a_file_times_line_names_the_slowest_files() {
@@ -1322,23 +1248,22 @@ mod tests {
         );
     }
 
-    /// `ryo_v2_ra::Backend` C1: the word a summary line ends with.
+    /// `summary_line` C1.
     #[test]
-    fn summary_line_ends_with_the_backend() {
+    fn summary_line_names_each_figure() {
         let series = Series {
             check_ms: vec![10, 20],
             revert_ms: vec![1, 2],
             rss_kb: Vec::new(),
             occupancy: Vec::new(),
         };
-        // Without `--on` and `--engine`: the line of a bench before the backend was named, and
-        // ` backend undo-log` after it.
+        // Without `--on`.
         assert_eq!(
-            summary_line("v", "affected", "", Backend::UndoLog, &series).unwrap(),
+            summary_line("v", "affected", "", &series).unwrap(),
             "summary v [affected] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
-             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false backend undo-log"
+             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false"
         );
-        // With `--on`: the backend follows the mode, the parent's level and the occupancy.
+        // With `--on`: the mode, the parent's level and the occupancy follow the figures.
         let stacked = Series {
             occupancy: vec![0.5, 0.25],
             ..series
@@ -1348,20 +1273,19 @@ mod tests {
                 "v",
                 "workspace",
                 " mode stacked rss_kb_after_parent_level 5",
-                Backend::Engine,
                 &stacked
             )
             .unwrap(),
             "summary v [workspace] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
              2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false mode stacked \
-             rss_kb_after_parent_level 5 warm_occupancy_median 0.25 backend engine"
+             rss_kb_after_parent_level 5 warm_occupancy_median 0.25"
         );
-        assert!(summary_line("v", "affected", "", Backend::Engine, &Series::default()).is_none());
+        assert!(summary_line("v", "affected", "", &Series::default()).is_none());
     }
 
     /// `depth_summary_line` C1.
     #[test]
-    fn depth_summary_line_ends_with_the_backend() {
+    fn depth_summary_line_names_each_figure() {
         let rec = DepthRecord {
             depth: 2,
             repeat: 3,
@@ -1374,18 +1298,17 @@ mod tests {
             ..DepthRecord::default()
         };
         assert_eq!(
-            depth_summary_line("affected", 1, &rec, Backend::Engine),
+            depth_summary_line("affected", 1, &rec),
             "summary depth-sweep [affected] depth 2 files 1 n=3 first_check_ms 9.000 \
              warm_check_ms 3.000/3.000/4.000 write_ms_per_level 1.500/1.500/2.500 \
              write_ms_total 4.000 pop_ms_per_level 0.250/0.250/0.750 pop_ms_total 1.000 \
-             rss_kb_after_stack 100 rss_kb_after_diagnose 120 scope_files 3 findings 1 \
-             backend engine"
+             rss_kb_after_stack 100 rss_kb_after_diagnose 120 scope_files 3 findings 1"
         );
         let empty = DepthRecord::default();
-        let line = depth_summary_line("workspace", 2, &empty, Backend::UndoLog);
+        let line = depth_summary_line("workspace", 2, &empty);
         assert!(line.contains("first_check_ms - warm_check_ms -"), "{line}");
         assert!(line.contains("rss_kb_after_stack - "), "{line}");
-        assert!(line.ends_with(" backend undo-log"), "{line}");
+        assert!(line.ends_with(" scope_files - findings -"), "{line}");
     }
 
     /// The depth hook times between the points and reads VmRSS with the strict reader.

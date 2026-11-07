@@ -18,9 +18,7 @@ use ryo_v2_core::app::ports::{Analyzer, Event, Observer};
 use ryo_v2_core::domain::Scope;
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{
-    Backend, IngredientRow, MemoRow, MemoryReport, RaAnalyzer, RaConfig, RaLayer, RaSession,
-};
+use ryo_v2_ra::{IngredientRow, MemoRow, MemoryReport, RaAnalyzer, RaConfig, RaLayer, RaSession};
 use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
@@ -88,18 +86,14 @@ pub struct ProbeArgs {
     pub idle: bool,
     /// The bench's medians to state the overhead against.
     pub bench_medians: Vec<BenchMedian>,
-    /// The backend of the forks (`RaConfig.engine`); the report names it.
-    pub backend: Backend,
 }
 
 /// What one probe run measured, written as JSON to `--report`.
 ///
 /// # Contract
-/// - C1: the report holds exactly the fields of `ProbeReport` (backend, machine, phases,
-///   composition, checks, overhead), one `checks` entry per diagnosed level with h0, hW, h1, h2,
-///   h3, delta, freed at write, freed at pop and the probe's wall ms; memory in GiB. backend,
-///   the first key, is the run's [`ryo_v2_ra::Backend`] by name, `"undo-log"` or `"engine"`, so that two
-///   runs can be told apart.
+/// - C1: the report holds exactly the fields of `ProbeReport` (machine, phases, composition,
+///   checks, overhead), one `checks` entry per diagnosed level with h0, hW, h1, h2, h3, delta,
+///   freed at write, freed at pop and the probe's wall ms; memory in GiB.
 ///   tested: engine_probe::tests::report_json_keeps_its_keys_and_values
 /// - C2: a check's freed at write is h0 - hW (what the submit of the level's job frees), its
 ///   delta h1 - hW (what the job, its write and its diagnosis, allocates and keeps) and its freed
@@ -112,8 +106,6 @@ pub struct ProbeArgs {
 ///   tested: engine_probe::tests::a_failed_proc_read_is_an_error
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProbeReport {
-    /// The backend the forks ran on (`--engine`).
-    pub backend: Backend,
     /// The machine the run measured on.
     pub machine: Machine,
     /// P0 before load, P1 at `Event::Indexed`, P2 at `Event::Loaded`, P3 after the last check.
@@ -469,9 +461,6 @@ fn composition(session: &mut RaSession, phase: &'static str) -> Result<Compositi
 /// Loads `args.base`, runs every (variant, scope) series on top of the `--on` parent and returns
 /// what it measured; `gauge` is the counting allocator of the process.
 pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeReport> {
-    if args.on.is_some() {
-        crate::bench::require_engine(args.backend, "engine-probe --on (the stacked series)")?;
-    }
     let rss: RssReader = proc::vm_rss_kb;
     let ram_gib = kb_gib(proc::mem_total_kb()?);
     let cores = std::thread::available_parallelism()
@@ -487,8 +476,7 @@ pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeRepor
             assert_revert: true,
             forks: crate::bench::SERIES_FORKS,
             ..RaConfig::default()
-        }
-        .with_backend(args.backend),
+        },
         Arc::new(MonotonicClock::new()),
         observer.clone(),
     );
@@ -560,7 +548,6 @@ pub fn run(args: &ProbeArgs, gauge: &'static dyn HeapGauge) -> Result<ProbeRepor
     phases.push(phase("P3", gauge, rss)?);
     compositions.push(composition(&mut session, "P3")?);
     Ok(ProbeReport {
-        backend: args.backend,
         machine: Machine {
             ram_gib,
             cores,
@@ -597,8 +584,6 @@ pub struct DepthProbeArgs {
     pub scopes: Vec<Scope>,
     /// Whether the person running it kept the machine otherwise idle.
     pub idle: bool,
-    /// The backend of the forks; only the Engine has layer counters.
-    pub backend: Backend,
 }
 
 /// What one `engine-probe --depth` run measured, written as JSON to `--report`: the memory of a
@@ -607,8 +592,6 @@ pub struct DepthProbeArgs {
 /// level's layer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DepthReport {
-    /// The backend the forks ran on.
-    pub backend: Backend,
     /// The machine the run measured on.
     pub machine: Machine,
     /// The levels of each stack.
@@ -632,14 +615,13 @@ pub struct DepthSeries {
     /// Under `fork-probe`: the bytes a flattened chain view of each sealed level would take
     /// (the chain-view design, one view per sealed level that holds a memo, a tracked entry or a tombstone;
     /// the others share their parent's), from the chain's distinct keys
-    /// ([`projected_view_bytes`]), summed over the stack. `None` without the feature or the
-    /// Engine.
+    /// ([`projected_view_bytes`]), summed over the stack. `None` without the feature.
     pub projected_view_bytes: Option<u64>,
     /// `projected_view_bytes` as a percentage of `stack_heap_bytes`.
     pub projected_view_share_pct: Option<f64>,
     /// The bytes of the chain views the stack's layers built (`LayerStats::flat_bytes`, a shared
-    /// view counted once), summed over the stack: the cost gate M2-view bounds. `None` on the
-    /// undo log.
+    /// view counted once), summed over the stack: the cost gate M2-view bounds. `None` with no
+    /// layer counters read.
     pub view_bytes: Option<u64>,
     /// `view_bytes` as a percentage of `stack_heap_bytes` (gate M2-view:
     /// at most [`M2_VIEW_MAX_SHARE_PCT`] at depth 20).
@@ -662,8 +644,8 @@ pub struct DepthLevel {
     pub heap_delta_bytes: i64,
     /// The wall ms of its diagnosis (with the counting allocator's overhead).
     pub check_ms: f64,
-    /// Its layer's counters, read once every level is written and diagnosed; `None` on the undo
-    /// log.
+    /// Its layer's counters, read once every level is written and diagnosed; `None` when they
+    /// were not read.
     pub stats: Option<LevelCounters>,
 }
 
@@ -798,7 +780,7 @@ fn level_counters(level: usize, of: usize, stats: &ryo_v2_ra::LayerStats) -> Lev
 ///   for the top (open) level and for a sealed level with no own memo, tracked entry or
 ///   tombstone; its share is of `stack_heap_bytes`; with no chain counts both are `None`.
 ///   `view_bytes` is the sum of the levels' `flat_bytes`, with its share of `stack_heap_bytes`;
-///   with no layer counters (the undo log) both are `None`.
+///   with no layer counters both are `None`.
 ///   tested: engine_probe::tests::a_depth_series_sums_the_views_of_sealed_levels
 pub fn depth_series_of(
     scope: &'static str,
@@ -851,7 +833,7 @@ pub fn depth_series_of(
 /// # Contract
 /// - C1: `Err` naming the scope, the share and `max_pct` when a series' `view_share_pct` exceeds
 ///   `max_pct`; `Ok` when every measured share is at or below it, and for a series without a
-///   measure (the undo log).
+///   measure.
 ///   tested: engine_probe::tests::the_view_share_gate_fails_above_its_ceiling
 pub fn check_view_share(report: &DepthReport, max_pct: f64) -> Result<()> {
     for series in &report.series {
@@ -873,13 +855,11 @@ pub fn check_view_share(report: &DepthReport, max_pct: f64) -> Result<()> {
 /// the Layer of the one below and so diagnosed once right after its write, reads the counting
 /// allocator at every point and the Layers' counters before the drops, and drops them.
 pub fn run_depth(args: &DepthProbeArgs, gauge: &'static dyn HeapGauge) -> Result<DepthReport> {
-    crate::bench::require_engine(args.backend, "engine-probe --depth")?;
     let ram_gib = kb_gib(proc::mem_total_kb()?);
     let cores = std::thread::available_parallelism()
         .context("the available parallelism")?
         .get();
-    let (analyzer, _observer, mut session) =
-        crate::bench::load(&args.base, true, false, args.backend)?;
+    let (analyzer, _observer, mut session) = crate::bench::load(&args.base, true, false)?;
     let files = crate::bench::depth_files(&analyzer, &session, &args.base, args.files)?;
     let names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
     eprintln!("[depth-probe] levels rotate over {}", names.join(", "));
@@ -954,7 +934,6 @@ pub fn run_depth(args: &DepthProbeArgs, gauge: &'static dyn HeapGauge) -> Result
         series.push(one);
     }
     Ok(DepthReport {
-        backend: args.backend,
         machine: Machine {
             ram_gib,
             cores,
@@ -1074,7 +1053,7 @@ mod tests {
             (series.view_bytes, series.view_share_pct),
             (Some(120), Some(12.0))
         );
-        // On the undo log there are no counters.
+        // With no layer counters read there is no view.
         let undo = depth_series_of("affected", &heap, &[1.0, 2.0, 3.0], 1000, &[]);
         assert!(undo.levels.iter().all(|l| l.stats.is_none()));
         assert_eq!(undo.projected_view_bytes, None);
@@ -1086,7 +1065,6 @@ mod tests {
     fn the_view_share_gate_fails_above_its_ceiling() {
         assert_eq!(M2_VIEW_MAX_SHARE_PCT, 15.0);
         let with = |share: Option<f64>| DepthReport {
-            backend: Backend::Engine,
             machine: Machine {
                 ram_gib: 1.0,
                 cores: 1,
@@ -1159,7 +1137,6 @@ mod tests {
     #[test]
     fn report_json_keeps_its_keys_and_values() {
         let report = ProbeReport {
-            backend: Backend::UndoLog,
             machine: Machine {
                 ram_gib: 64.0,
                 cores: 16,
@@ -1203,27 +1180,10 @@ mod tests {
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(
             keys(&v),
-            set(&[
-                "backend",
-                "machine",
-                "phases",
-                "composition",
-                "checks",
-                "overhead"
-            ])
+            set(&["machine", "phases", "composition", "checks", "overhead"])
         );
-        assert_eq!(v["backend"], json!("undo-log"));
         let text = serde_json::to_string(&report).unwrap();
-        assert!(text.starts_with(r#"{"backend":"undo-log","#), "{text}");
-        // A run on the Engine differs in that key alone.
-        let mut engine = serde_json::to_value(ProbeReport {
-            backend: Backend::Engine,
-            ..report.clone()
-        })
-        .unwrap();
-        assert_eq!(engine["backend"], json!("engine"));
-        engine["backend"] = json!("undo-log");
-        assert_eq!(engine, v);
+        assert!(text.starts_with(r#"{"machine":"#), "{text}");
         assert_eq!(
             v["machine"],
             json!({"ram_gib": 64.0, "cores": 16, "threads": 16, "idle": true})

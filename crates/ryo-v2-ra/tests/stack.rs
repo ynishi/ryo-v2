@@ -37,7 +37,6 @@ fn analyzer(assert_revert: bool) -> (RaAnalyzer, Arc<RecordingObserver>) {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
-            engine: common::engine(),
             ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
@@ -65,10 +64,6 @@ fn checked_or_reverted(events: &[Event]) -> Vec<&Event> {
 
 #[test]
 fn an_empty_check_diagnoses_nothing() {
-    common::both(an_empty_check_diagnoses_nothing_on);
-}
-
-fn an_empty_check_diagnoses_nothing_on() {
     let (a, _) = analyzer(false);
     // Loaded with the fault, so that the baseline holds the panic and a scan of `src/lib.rs`
     // would name the class of the detector.
@@ -103,10 +98,6 @@ fn an_empty_check_diagnoses_nothing_on() {
 
 #[test]
 fn text_is_the_base_after_a_poisoned_check() {
-    common::both(text_is_the_base_after_a_poisoned_check_on);
-}
-
-fn text_is_the_base_after_a_poisoned_check_on() {
     let (a, _) = analyzer(false);
     let a = a.with_revert_fault(Some(lib()));
     let (_f, mut s) = loaded("stack_text_after_poison", &a);
@@ -114,22 +105,22 @@ fn text_is_the_base_after_a_poisoned_check_on() {
     let fp_before = provenance_before.files().get(&lib()).copied();
     assert!(fp_before.is_some(), "src/lib.rs is a fingerprinted file");
 
-    if common::engine() {
-        // The Engine has no revert to get wrong: the check passes, and the session stays usable
-        // and at its base.
-        a.check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected)
-            .expect("a check on the Engine reverts nothing");
-        assert_eq!(a.text(&s, &lib()).as_deref(), Some(UNRESOLVED_LIB));
-        assert_eq!(a.provenance(&s).files().get(&lib()).copied(), fp_before);
-        a.check(&mut s, &[], Scope::Affected)
-            .expect("the session stays usable");
-        return;
-    }
+    // A check has no revert to get wrong: it passes, and the session stays usable and at its
+    // base.
+    a.check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected)
+        .expect("a check writes nothing back");
+    assert_eq!(a.text(&s, &lib()).as_deref(), Some(UNRESOLVED_LIB));
+    assert_eq!(a.provenance(&s).files().get(&lib()).copied(), fp_before);
+    a.check(&mut s, &[], Scope::Affected)
+        .expect("the session stays usable");
+
+    // The flat reference check writes the base and writes it back: a write-back that leaves
+    // another text poisons the session (`reference_check` C3).
     let err = a
-        .check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected)
-        .expect_err("the revert leaves another text");
+        .reference_check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected)
+        .expect_err("the write-back leaves another text");
     assert_eq!(err, CheckError::RevertMismatch { paths: vec![lib()] });
-    // The database holds the wrong text of the revert; the reads still describe the base.
+    // The database holds the wrong text of the write-back; the reads still describe the base.
     assert_eq!(a.text(&s, &lib()).as_deref(), Some(UNRESOLVED_LIB));
     assert_eq!(a.provenance(&s).files().get(&lib()).copied(), fp_before);
     let next = a.check(&mut s, &[], Scope::Affected);
@@ -139,10 +130,6 @@ fn text_is_the_base_after_a_poisoned_check_on() {
 
 #[test]
 fn a_session_error_of_the_release_wins_in_a_check() {
-    common::both(a_session_error_of_the_release_wins_in_a_check_on);
-}
-
-fn a_session_error_of_the_release_wins_in_a_check_on() {
     let (healthy, _) = analyzer(true);
     let (faulty, _) = analyzer(true);
     // The diagnosis is cut off at once, and the re-assert after the revert lacks the finding of
@@ -153,29 +140,27 @@ fn a_session_error_of_the_release_wins_in_a_check_on() {
     let (_f, mut s) = loaded("stack_release_wins", &healthy);
 
     let first = faulty.check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
-    if common::engine() {
-        // The Engine's pop checks the isolation of the base, which a detector fault does not
-        // touch: the release succeeds, and the cut-off of the diagnosis is the result.
-        assert_eq!(first, Err(CheckError::TimedOut { limit_ms: 0 }));
-        healthy
-            .check(&mut s, &[lib_edit("")], Scope::Affected)
-            .expect("the session stays usable");
-        return;
-    }
+    // The pop checks the isolation of the base, which a detector fault does not touch: the
+    // release succeeds, and the cut-off of the diagnosis is the result.
+    assert_eq!(first, Err(CheckError::TimedOut { limit_ms: 0 }));
+    healthy
+        .check(&mut s, &[lib_edit("")], Scope::Affected)
+        .expect("the session stays usable");
+
+    // In the flat reference check the write-back's re-assert lacks the finding of the detector
+    // that the baseline has: that session error wins over the cut-off.
+    let reference =
+        faulty.reference_check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
     assert!(
-        matches!(first, Err(CheckError::RevertMismatch { .. })),
-        "{first:?}"
+        matches!(reference, Err(CheckError::RevertMismatch { .. })),
+        "{reference:?}"
     );
     let second = healthy.check(&mut s, &[lib_edit("")], Scope::Affected);
     assert!(matches!(second, Err(CheckError::Poisoned(_))), "{second:?}");
 }
 
 #[test]
-fn analyzer_discard_compares_texts() {
-    common::both(analyzer_discard_compares_texts_on);
-}
-
-fn analyzer_discard_compares_texts_on() {
+fn analyzer_discard_writes_nothing_back() {
     let (a, _) = analyzer(false);
     let a = a.with_revert_fault(Some(lib()));
     let (_f, mut s) = loaded("stack_discard_texts", &a);
@@ -183,28 +168,15 @@ fn analyzer_discard_compares_texts_on() {
     let mut fork = Analyzer::fork(&a, &mut s).expect("fork");
     Analyzer::apply(&a, &mut s, &mut fork, &[lib_edit("\npub fn h() {}\n")]).expect("apply");
     let discarded = Analyzer::discard(&a, &mut s, fork);
-    if common::engine() {
-        // The Engine has no revert to get wrong: the discard drops the layer.
-        discarded.expect("a discard on the Engine reverts nothing");
-        assert_eq!(a.text(&s, &lib()).as_deref(), Some(UNRESOLVED_LIB));
-        let next = Analyzer::fork(&a, &mut s).expect("the session stays usable");
-        Analyzer::discard(&a, &mut s, next).expect("discard");
-        return;
-    }
-    assert!(
-        matches!(discarded, Err(AnalyzerError::RevertMismatch)),
-        "{discarded:?}"
-    );
-    let next = Analyzer::fork(&a, &mut s);
-    assert!(next.is_err(), "a poisoned session must refuse a fork");
+    // There is no revert to get wrong: the discard drops the layer.
+    discarded.expect("a discard writes nothing back");
+    assert_eq!(a.text(&s, &lib()).as_deref(), Some(UNRESOLVED_LIB));
+    let next = Analyzer::fork(&a, &mut s).expect("the session stays usable");
+    Analyzer::discard(&a, &mut s, next).expect("discard");
 }
 
 #[test]
 fn a_refused_check_reverts_nothing() {
-    common::both(a_refused_check_reverts_nothing_on);
-}
-
-fn a_refused_check_reverts_nothing_on() {
     let (a, obs) = analyzer(false);
     let (_f, mut s) = loaded("stack_refused_check", &a);
     obs.take();
@@ -236,10 +208,6 @@ fn a_refused_check_reverts_nothing_on() {
 
 #[test]
 fn an_analyzer_ticket_of_another_session_is_refused() {
-    common::both(an_analyzer_ticket_of_another_session_is_refused_on);
-}
-
-fn an_analyzer_ticket_of_another_session_is_refused_on() {
     let (a, _) = analyzer(false);
     let (_fa, mut sa) = loaded("stack_ticket_a", &a);
     let (_fb, mut sb) = loaded("stack_ticket_b", &a);
@@ -300,10 +268,6 @@ fn an_analyzer_ticket_of_another_session_is_refused_on() {
 
 #[test]
 fn a_poisoned_fork_is_not_written() {
-    common::both(a_poisoned_fork_is_not_written_on);
-}
-
-fn a_poisoned_fork_is_not_written_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded("stack_poisoned_fork", &a);
     let mut fork = Analyzer::fork(&a, &mut s).expect("fork");
@@ -328,10 +292,6 @@ fn a_poisoned_fork_is_not_written_on() {
 
 #[test]
 fn a_live_analyzer_fork_holds_the_session() {
-    common::both(a_live_analyzer_fork_holds_the_session_on);
-}
-
-fn a_live_analyzer_fork_holds_the_session_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded("stack_live_fork_holds", &a);
     let mut fork = Analyzer::fork(&a, &mut s).expect("fork");
@@ -420,7 +380,6 @@ fn analyzer_every(n: u32) -> (RaAnalyzer, Arc<RecordingObserver>) {
             gap_detectors: true,
             assert_revert_every: std::num::NonZeroU32::new(n),
             cfg_test: false,
-            engine: common::engine(),
             ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
@@ -482,10 +441,6 @@ fn snap(a: &RaAnalyzer, s: &RaSession, f: &RaStack, paths: &[RelPath]) -> Snap {
 
 #[test]
 fn levels_stack_and_pop_back_to_the_level_below() {
-    common::both(levels_stack_and_pop_back_to_the_level_below_on);
-}
-
-fn levels_stack_and_pop_back_to_the_level_below_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_levels", &a);
     let paths = [rel("c/src/lib.rs"), rel("a/src/lib.rs")];
@@ -615,10 +570,6 @@ fn sequences() -> Vec<Vec<Vec<Edit>>> {
 
 #[test]
 fn a_stack_diagnoses_as_its_flat_composition() {
-    common::both(a_stack_diagnoses_as_its_flat_composition_on);
-}
-
-fn a_stack_diagnoses_as_its_flat_composition_on() {
     let (a, _) = analyzer(false);
     let f = w_fixture("stack_flat");
     let mut s = Analyzer::load(&a, &f.dir).expect("load the stacked session");
@@ -658,10 +609,6 @@ fn a_stack_diagnoses_as_its_flat_composition_on() {
 
 #[test]
 fn a_refused_write_pushes_no_level() {
-    common::both(a_refused_write_pushes_no_level_on);
-}
-
-fn a_refused_write_pushes_no_level_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_refused_write", &a);
     let c_text = format!("{C_LIB}{}", err_fn("l1"));
@@ -737,10 +684,6 @@ fn a_refused_write_pushes_no_level_on() {
 
 #[test]
 fn a_level_writes_against_the_state_below() {
-    common::both(a_level_writes_against_the_state_below_on);
-}
-
-fn a_level_writes_against_the_state_below_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_resolution", &a);
     let m = rel("a/src/m.rs");
@@ -835,10 +778,6 @@ fn a_level_writes_against_the_state_below_on() {
 
 #[test]
 fn affected_scope_is_the_top_levels() {
-    common::both(affected_scope_is_the_top_levels_on);
-}
-
-fn affected_scope_is_the_top_levels_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_affected", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -900,10 +839,6 @@ fn affected_scope_is_the_top_levels_on() {
 
 #[test]
 fn files_outside_the_top_scope_keep_the_level_below() {
-    common::both(files_outside_the_top_scope_keep_the_level_below_on);
-}
-
-fn files_outside_the_top_scope_keep_the_level_below_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_outside_scope", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -962,10 +897,6 @@ fn files_outside_the_top_scope_keep_the_level_below_on() {
 
 #[test]
 fn an_empty_write_diagnoses_nothing() {
-    common::both(an_empty_write_diagnoses_nothing_on);
-}
-
-fn an_empty_write_diagnoses_nothing_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_empty_write", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -990,10 +921,6 @@ fn w_paths_sorted() -> Vec<RelPath> {
 
 #[test]
 fn a_cut_off_diagnosis_keeps_the_levels() {
-    common::both(a_cut_off_diagnosis_keeps_the_levels_on);
-}
-
-fn a_cut_off_diagnosis_keeps_the_levels_on() {
     let (a, obs) = analyzer(false);
     let cut = a.with_check_timeout(Some(0));
     let (roomy, _) = analyzer(false);
@@ -1036,10 +963,6 @@ fn a_cut_off_diagnosis_keeps_the_levels_on() {
 
 #[test]
 fn a_level_names_the_unseen_it_observes() {
-    common::both(a_level_names_the_unseen_it_observes_on);
-}
-
-fn a_level_names_the_unseen_it_observes_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_unseen", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -1075,10 +998,6 @@ fn a_level_names_the_unseen_it_observes_on() {
 
 #[test]
 fn a_baseline_detector_panic_is_named_at_every_level() {
-    common::both(a_baseline_detector_panic_is_named_at_every_level_on);
-}
-
-fn a_baseline_detector_panic_is_named_at_every_level_on() {
     let (a, _) = analyzer(false);
     let a = a.with_detector_fault(Some((GapDetector::UnresolvedPath, rel("a/src/x.rs"))));
     let (_f, mut s) = loaded_w("stack_baseline_panic", &a);
@@ -1100,10 +1019,6 @@ fn a_baseline_detector_panic_is_named_at_every_level_on() {
 
 #[test]
 fn a_new_detector_panic_fails_the_diagnose_and_keeps_the_level() {
-    common::both(a_new_detector_panic_fails_the_diagnose_and_keeps_the_level_on);
-}
-
-fn a_new_detector_panic_fails_the_diagnose_and_keeps_the_level_on() {
     let (a, _) = analyzer(false);
     let a = a.with_detector_fault(Some((GapDetector::UnresolvedPath, rel("a/src/m.rs"))));
     let f = w_fixture("stack_new_panic");
@@ -1149,10 +1064,6 @@ fn a_new_detector_panic_fails_the_diagnose_and_keeps_the_level_on() {
 
 #[test]
 fn a_baseline_panic_brought_back_above_is_named() {
-    common::both(a_baseline_panic_brought_back_above_is_named_on);
-}
-
-fn a_baseline_panic_brought_back_above_is_named_on() {
     let (a, _) = analyzer(false);
     let a = a.with_detector_fault(Some((GapDetector::UnresolvedPath, rel("a/src/x.rs"))));
     let f = w_fixture("stack_panic_back");
@@ -1190,11 +1101,7 @@ fn a_baseline_panic_brought_back_above_is_named_on() {
 }
 
 #[test]
-fn pop_compares_texts_and_poisons_on_a_difference() {
-    common::both(pop_compares_texts_and_poisons_on_a_difference_on);
-}
-
-fn pop_compares_texts_and_poisons_on_a_difference_on() {
+fn a_pop_writes_nothing_back() {
     let (a, _) = analyzer(false);
     let a = a.with_revert_fault(Some(rel("a/src/lib.rs")));
     let (_f, mut s) = loaded_w("stack_pop_texts", &a);
@@ -1205,42 +1112,21 @@ fn pop_compares_texts_and_poisons_on_a_difference_on() {
         .expect("L2");
 
     let popped = a.pop(&mut s, &mut fork);
-    if common::engine() {
-        // The Engine has no revert to get wrong: the pop drops the top layer, and the level
-        // below is as it was.
-        assert_eq!(popped, Ok(true));
-        assert_eq!(a.levels(&s, &fork), Ok(1), "the level is removed");
-        assert_eq!(
-            a.fork_text(&s, &fork, &rel("a/src/lib.rs")),
-            Ok(Some(A_LIB.to_owned()))
-        );
-        a.release(&mut s, fork).expect("release");
-        let next = Stacked::fork(&a, &mut s).expect("the session stays usable");
-        a.release(&mut s, next).expect("release");
-        return;
-    }
-    assert_eq!(
-        popped,
-        Err(CheckError::RevertMismatch {
-            paths: vec![rel("a/src/lib.rs")]
-        })
-    );
+    // There is no revert to get wrong: the pop drops the top layer, and the level below is as it
+    // was.
+    assert_eq!(popped, Ok(true));
     assert_eq!(a.levels(&s, &fork), Ok(1), "the level is removed");
-    let released = a.release(&mut s, fork);
-    assert!(
-        matches!(released, Err(CheckError::Poisoned(_))),
-        "{released:?}"
+    assert_eq!(
+        a.fork_text(&s, &fork, &rel("a/src/lib.rs")),
+        Ok(Some(A_LIB.to_owned()))
     );
-    let next = Stacked::fork(&a, &mut s);
-    assert!(matches!(next, Err(CheckError::Poisoned(_))), "{next:?}");
+    a.release(&mut s, fork).expect("release");
+    let next = Stacked::fork(&a, &mut s).expect("the session stays usable");
+    a.release(&mut s, next).expect("release");
 }
 
 #[test]
 fn a_revert_that_cannot_be_confirmed_poisons_the_session() {
-    common::both(a_revert_that_cannot_be_confirmed_poisons_the_session_on);
-}
-
-fn a_revert_that_cannot_be_confirmed_poisons_the_session_on() {
     // Through a check: the texts come back, the re-assert cannot run, and the session stops.
     let (a, _) = analyzer(true);
     let a = a.with_reassert_fault(true);
@@ -1276,10 +1162,6 @@ fn a_revert_that_cannot_be_confirmed_poisons_the_session_on() {
 
 #[test]
 fn a_database_write_that_panics_poisons_the_session() {
-    common::both(a_database_write_that_panics_poisons_the_session_on);
-}
-
-fn a_database_write_that_panics_poisons_the_session_on() {
     // A write: refused as `Poisoned`, no level, the reads at the base.
     let (healthy, _) = analyzer(false);
     let (w, _) = analyzer(false);
@@ -1292,75 +1174,32 @@ fn a_database_write_that_panics_poisons_the_session_on() {
         .write(&mut s, &mut fork, &[w_edit("c/src/lib.rs", &err_fn("l1"))])
         .expect("L1");
     let written = w.write(&mut s, &mut fork, &[w_edit("a/src/lib.rs", &err_fn("l2"))]);
-    if common::engine() {
-        // A panic in the write of a layer poisons that layer only (it is dropped): the error is
-        // of reach Blueprint, no level is pushed, and the level below and the session are as
-        // they were.
-        assert!(
-            matches!(&written, Err(e @ CheckError::Panicked(_)) if e.reach() == CheckReach::Blueprint),
-            "{written:?}"
-        );
-        assert_eq!(healthy.levels(&s, &fork), Ok(1), "no level pushed");
-        assert_eq!(healthy.text(&s, &rel("a/src/lib.rs")), base);
-        assert_eq!(healthy.provenance(&s), provenance);
-        healthy.release(&mut s, fork).expect("release");
-
-        // Through a check: a Blueprint error, and the session is usable.
-        let (c, _) = analyzer(false);
-        let c = c.with_db_write_panic(Some(DbWritePanic::Write));
-        let (_g, mut t) = loaded("stack_db_write_panic_check", &c);
-        let checked = c.check(&mut t, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
-        assert!(
-            matches!(&checked, Err(e @ CheckError::Panicked(_)) if e.reach() == CheckReach::Blueprint),
-            "{checked:?}"
-        );
-        assert_eq!(c.text(&t, &lib()).as_deref(), Some(UNRESOLVED_LIB));
-        healthy
-            .check(&mut t, &[lib_edit("")], Scope::Affected)
-            .expect("the session stays usable");
-
-        // A pop writes nothing on the Engine: the hook of the revert's write has nothing to
-        // make panic.
-        let (r, _) = analyzer(false);
-        let r = r.with_db_write_panic(Some(DbWritePanic::Revert));
-        let (_h, mut u) = loaded_w("stack_db_revert_panic", &healthy);
-        let base = healthy.text(&u, &rel("a/src/lib.rs"));
-        let mut fork = Stacked::fork(&healthy, &mut u).expect("fork");
-        healthy
-            .write(&mut u, &mut fork, &[w_edit("a/src/lib.rs", &err_fn("l1"))])
-            .expect("L1");
-        assert_eq!(r.pop(&mut u, &mut fork), Ok(true));
-        assert_eq!(healthy.levels(&u, &fork), Ok(0), "the level is removed");
-        assert_eq!(healthy.text(&u, &rel("a/src/lib.rs")), base);
-        healthy.release(&mut u, fork).expect("release");
-        return;
-    }
+    // A panic in the write of a layer poisons that layer only (it is dropped): the error is of
+    // reach Blueprint, no level is pushed, and the level below and the session are as they were.
     assert!(
-        matches!(&written, Err(e @ CheckError::Poisoned(_)) if e.reach() == CheckReach::Session),
+        matches!(&written, Err(e @ CheckError::Panicked(_)) if e.reach() == CheckReach::Blueprint),
         "{written:?}"
     );
     assert_eq!(healthy.levels(&s, &fork), Ok(1), "no level pushed");
     assert_eq!(healthy.text(&s, &rel("a/src/lib.rs")), base);
     assert_eq!(healthy.provenance(&s), provenance);
-    let released = healthy.release(&mut s, fork);
-    assert!(
-        matches!(released, Err(CheckError::Poisoned(_))),
-        "{released:?}"
-    );
+    healthy.release(&mut s, fork).expect("release");
 
-    // Through a check: the session error, not a Blueprint error.
+    // Through a check: a Blueprint error, and the session is usable.
     let (c, _) = analyzer(false);
     let c = c.with_db_write_panic(Some(DbWritePanic::Write));
     let (_g, mut t) = loaded("stack_db_write_panic_check", &c);
     let checked = c.check(&mut t, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
     assert!(
-        matches!(&checked, Err(e @ CheckError::Poisoned(_)) if e.reach() == CheckReach::Session),
+        matches!(&checked, Err(e @ CheckError::Panicked(_)) if e.reach() == CheckReach::Blueprint),
         "{checked:?}"
     );
     assert_eq!(c.text(&t, &lib()).as_deref(), Some(UNRESOLVED_LIB));
+    healthy
+        .check(&mut t, &[lib_edit("")], Scope::Affected)
+        .expect("the session stays usable");
 
-    // A revert: `Poisoned`, the level removed, the reads at the base.
-    let (healthy, _) = analyzer(false);
+    // A pop writes nothing: the hook of the write-back has nothing to make panic.
     let (r, _) = analyzer(false);
     let r = r.with_db_write_panic(Some(DbWritePanic::Revert));
     let (_h, mut u) = loaded_w("stack_db_revert_panic", &healthy);
@@ -1369,71 +1208,100 @@ fn a_database_write_that_panics_poisons_the_session_on() {
     healthy
         .write(&mut u, &mut fork, &[w_edit("a/src/lib.rs", &err_fn("l1"))])
         .expect("L1");
-    let popped = r.pop(&mut u, &mut fork);
-    assert!(
-        matches!(&popped, Err(e @ CheckError::Poisoned(_)) if e.reach() == CheckReach::Session),
-        "{popped:?}"
-    );
+    assert_eq!(r.pop(&mut u, &mut fork), Ok(true));
     assert_eq!(healthy.levels(&u, &fork), Ok(0), "the level is removed");
     assert_eq!(healthy.text(&u, &rel("a/src/lib.rs")), base);
-    let next = Stacked::fork(&healthy, &mut u);
-    assert!(matches!(next, Err(CheckError::Poisoned(_))), "{next:?}");
+    healthy.release(&mut u, fork).expect("release");
+
+    // The flat reference check writes the base in place: a panic of its write, or of its
+    // write-back, poisons the session, with the reads at the base.
+    for (at, test) in [
+        (DbWritePanic::Write, "stack_db_write_panic_reference"),
+        (DbWritePanic::Revert, "stack_db_revert_panic_reference"),
+    ] {
+        let (p, _) = analyzer(false);
+        let p = p.with_db_write_panic(Some(at));
+        let (_i, mut v) = loaded(test, &p);
+        let checked = p.reference_check(&mut v, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
+        assert!(
+            matches!(&checked, Err(e @ CheckError::Poisoned(_)) if e.reach() == CheckReach::Session),
+            "{at:?}: {checked:?}"
+        );
+        assert_eq!(
+            p.text(&v, &lib()).as_deref(),
+            Some(UNRESOLVED_LIB),
+            "{at:?}"
+        );
+        let next = healthy.check(&mut v, &[], Scope::Affected);
+        assert!(
+            matches!(next, Err(CheckError::Poisoned(_))),
+            "{at:?}: {next:?}"
+        );
+    }
 }
 
 #[test]
-fn pop_reassert_compares_with_the_level_below() {
-    common::both(pop_reassert_compares_with_the_level_below_on);
-}
-
-fn pop_reassert_compares_with_the_level_below_on() {
+fn the_flat_reference_reasserts_its_level() {
+    // A healthy write-back: the re-assert runs and agrees with the baseline.
     let (healthy, obs) = analyzer(true);
+    let (_f, mut s) = loaded("stack_flat_reassert", &healthy);
+    obs.take();
+    healthy
+        .reference_check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected)
+        .expect("a healthy reference check");
+    assert_eq!(revert_oks(&obs.take()), vec![Some(true)]);
+    // A sampled pop checks the isolation of the base, which a detector fault does not touch.
     let (faulty, _) = analyzer(true);
-    let faulty =
-        faulty.with_detector_fault(Some((GapDetector::UnresolvedPath, rel("a/src/lib.rs"))));
-    let (_f, mut s) = loaded_w("stack_reassert", &healthy);
-    let l1 = w_edit("a/src/lib.rs", &err_fn("l1"));
-    let l2 = w_edit("a/src/x.rs", &err_fn("l2"));
-
+    let faulty = faulty.with_detector_fault(Some((GapDetector::UnresolvedPath, lib())));
     let mut fork = Stacked::fork(&healthy, &mut s).expect("fork");
     healthy
-        .write(&mut s, &mut fork, std::slice::from_ref(&l1))
+        .write(&mut s, &mut fork, &[lib_edit("\npub fn h() {}\n")])
         .expect("L1");
-    healthy
-        .write(&mut s, &mut fork, std::slice::from_ref(&l2))
-        .expect("L2");
-    obs.take();
-    assert!(healthy.pop(&mut s, &mut fork).expect("a healthy pop"));
-    // L1 changed `a/src/lib.rs`, so the level below L2 is not the baseline: a comparison with the
-    // baseline would not be `Some(true)`.
-    assert_eq!(revert_oks(&obs.take()), vec![Some(true)]);
+    assert_eq!(faulty.pop(&mut s, &mut fork), Ok(true));
+    healthy.release(&mut s, fork).expect("release");
 
-    healthy
-        .write(&mut s, &mut fork, std::slice::from_ref(&l2))
-        .expect("L2 again");
-    let popped = faulty.pop(&mut s, &mut fork);
-    if common::engine() {
-        // The Engine's sampled pop checks the isolation of the base, which a detector fault does
-        // not touch: the pop succeeds and records a kept base.
-        assert_eq!(popped, Ok(true));
-        healthy.release(&mut s, fork).expect("release");
-        let next = Stacked::fork(&healthy, &mut s).expect("the session stays usable");
-        healthy.release(&mut s, next).expect("release");
-        return;
-    }
-    assert!(
-        matches!(popped, Err(CheckError::RevertMismatch { .. })),
-        "{popped:?}"
+    // The re-assert lacks the finding of the detector that the baseline has: `RevertMismatch` of
+    // the edited paths, the session poisoned, the reads at the base.
+    let checked = faulty.reference_check(&mut s, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
+    assert_eq!(
+        checked,
+        Err(CheckError::RevertMismatch { paths: vec![lib()] })
     );
-    let next = Stacked::fork(&healthy, &mut s);
+    assert_eq!(healthy.text(&s, &lib()).as_deref(), Some(UNRESOLVED_LIB));
+    let next = healthy.check(&mut s, &[], Scope::Affected);
     assert!(matches!(next, Err(CheckError::Poisoned(_))), "{next:?}");
+
+    // A re-assert that cannot run poisons the session too.
+    let (c, _) = analyzer(true);
+    let c = c.with_reassert_fault(true);
+    let (_g, mut t) = loaded("stack_flat_reassert_cannot_run", &c);
+    let checked = c.reference_check(&mut t, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
+    assert!(
+        matches!(&checked, Err(CheckError::Poisoned(m)) if m.contains("could not run")),
+        "{checked:?}"
+    );
+    assert_eq!(c.text(&t, &lib()).as_deref(), Some(UNRESOLVED_LIB));
+
+    // Without `assert_revert` there is no re-assert: the write-back's texts decide.
+    let (loader, _) = analyzer(false);
+    let (plain, plain_obs) = analyzer(false);
+    let plain = plain.with_detector_fault(Some((GapDetector::UnresolvedPath, lib())));
+    // Loaded healthy, so the detector's panic is new at the check, not one of the baseline.
+    let (_h, mut u) = loaded("stack_flat_no_reassert", &loader);
+    plain_obs.take();
+    let checked = plain.reference_check(&mut u, &[lib_edit("\npub fn h() {}\n")], Scope::Affected);
+    assert!(
+        matches!(checked, Err(CheckError::DetectorPanicked { .. })),
+        "{checked:?}"
+    );
+    assert_eq!(revert_oks(&plain_obs.take()), vec![None]);
+    plain
+        .reference_check(&mut u, &[], Scope::Affected)
+        .expect("the session stays usable");
 }
 
 #[test]
-fn writes_count_for_the_sampled_reassert() {
-    common::both(writes_count_for_the_sampled_reassert_on);
-}
-
-fn writes_count_for_the_sampled_reassert_on() {
+fn writes_count_for_the_sampled_isolation() {
     let (a, obs) = analyzer_every(2);
     let (_f, mut s) = loaded_w("stack_every", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -1463,10 +1331,6 @@ fn writes_count_for_the_sampled_reassert_on() {
 
 #[test]
 fn stacked_writes_are_audited() {
-    common::both(stacked_writes_are_audited_on);
-}
-
-fn stacked_writes_are_audited_on() {
     let (a, _) = analyzer(false);
     let (faulty, _) = analyzer(false);
     let faulty =
@@ -1488,10 +1352,6 @@ fn stacked_writes_are_audited_on() {
 
 #[test]
 fn pop_without_a_level_is_false() {
-    common::both(pop_without_a_level_is_false_on);
-}
-
-fn pop_without_a_level_is_false_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_pop_none", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -1517,10 +1377,6 @@ fn pop_without_a_level_is_false_on() {
 
 #[test]
 fn release_reverts_every_level() {
-    common::both(release_reverts_every_level_on);
-}
-
-fn release_reverts_every_level_on() {
     let (a, obs) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_release", &a);
     let provenance = a.provenance(&s);
@@ -1560,11 +1416,7 @@ fn release_reverts_every_level_on() {
 }
 
 #[test]
-fn release_stops_writing_after_a_failure() {
-    common::both(release_stops_writing_after_a_failure_on);
-}
-
-fn release_stops_writing_after_a_failure_on() {
+fn a_release_writes_nothing_back() {
     let (a, obs) = analyzer(false);
     let a = a.with_revert_fault(Some(rel("a/src/lib.rs")));
     let (_f, mut s) = loaded_w("stack_release_stops", &a);
@@ -1579,39 +1431,17 @@ fn release_stops_writing_after_a_failure_on() {
     obs.take();
 
     let released = a.release(&mut s, fork);
-    if common::engine() {
-        // The Engine has no revert to get wrong: every layer is dropped, each pop recorded.
-        assert_eq!(released, Ok(()));
-        assert_eq!(revert_oks(&obs.take()), vec![None, None, None]);
-        assert_eq!(a.text(&s, &rel("a/src/lib.rs")).as_deref(), Some(A_LIB));
-        assert_eq!(a.provenance(&s), provenance);
-        let next = Stacked::fork(&a, &mut s).expect("the session stays usable");
-        a.release(&mut s, next).expect("release");
-        return;
-    }
-    assert_eq!(
-        released,
-        Err(CheckError::RevertMismatch {
-            paths: vec![rel("a/src/lib.rs")]
-        })
-    );
-    // The top level's revert failed; the two below were not written.
-    assert_eq!(revert_oks(&obs.take()).len(), 1);
-    // The reads still describe the base, though the database holds the levels' texts.
-    assert_eq!(a.text(&s, &rel("c/src/lib.rs")).as_deref(), Some(C_LIB));
-    assert_eq!(a.text(&s, &rel("b/src/lib.rs")).as_deref(), Some(B_LIB));
+    // There is no revert to get wrong: every layer is dropped, each pop recorded.
+    assert_eq!(released, Ok(()));
+    assert_eq!(revert_oks(&obs.take()), vec![None, None, None]);
     assert_eq!(a.text(&s, &rel("a/src/lib.rs")).as_deref(), Some(A_LIB));
     assert_eq!(a.provenance(&s), provenance);
-    let next = Stacked::fork(&a, &mut s);
-    assert!(matches!(next, Err(CheckError::Poisoned(_))), "{next:?}");
+    let next = Stacked::fork(&a, &mut s).expect("the session stays usable");
+    a.release(&mut s, next).expect("release");
 }
 
 #[test]
 fn poisoned_session_refuses_stacked_operations() {
-    common::both(poisoned_session_refuses_stacked_operations_on);
-}
-
-fn poisoned_session_refuses_stacked_operations_on() {
     let (a, obs) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_poisoned_ops", &a);
     let provenance = a.provenance(&s);
@@ -1665,10 +1495,6 @@ fn poisoned_session_refuses_stacked_operations_on() {
 
 #[test]
 fn session_operations_refuse_while_a_fork_is_live() {
-    common::both(session_operations_refuse_while_a_fork_is_live_on);
-}
-
-fn session_operations_refuse_while_a_fork_is_live_on() {
     let target = [Target::new(rel("a/src/lib.rs"), None)];
     let edit = w_edit("a/src/lib.rs", &err_fn("c"));
 
@@ -1749,10 +1575,6 @@ fn session_operations_refuse_while_a_fork_is_live_on() {
 
 #[test]
 fn verifier_reads_describe_the_base_while_a_fork_is_live() {
-    common::both(verifier_reads_describe_the_base_while_a_fork_is_live_on);
-}
-
-fn verifier_reads_describe_the_base_while_a_fork_is_live_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_reads", &a);
     let provenance = a.provenance(&s);
@@ -1794,10 +1616,6 @@ fn verifier_reads_describe_the_base_while_a_fork_is_live_on() {
 
 #[test]
 fn a_ticket_of_another_session_is_refused() {
-    common::both(a_ticket_of_another_session_is_refused_on);
-}
-
-fn a_ticket_of_another_session_is_refused_on() {
     let (a, _) = analyzer(false);
     let (_fa, mut sa) = loaded_w("stack_ticket_wa", &a);
     let (_fb, mut sb) = loaded_w("stack_ticket_wb", &a);
@@ -1854,10 +1672,6 @@ fn a_ticket_of_another_session_is_refused_on() {
 
 #[test]
 fn one_level_matches_the_analyzer_path() {
-    common::both(one_level_matches_the_analyzer_path_on);
-}
-
-fn one_level_matches_the_analyzer_path_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_analyzer_path", &a);
     let edits = vec![
@@ -1941,10 +1755,6 @@ fn w_analyzer(
 
 #[test]
 fn check_is_the_one_level_case() {
-    common::both(check_is_the_one_level_case_on);
-}
-
-fn check_is_the_one_level_case_on() {
     let f = w_fixture("stack_one_level");
     let (healthy, _) = w_analyzer(None, None);
     let mut checked = Analyzer::load(&healthy, &f.dir).expect("load");
@@ -2024,10 +1834,6 @@ fn check_is_the_one_level_case_on() {
 
 #[test]
 fn a_poisoned_session_is_poisoned_on_the_analyzer_port() {
-    common::both(a_poisoned_session_is_poisoned_on_the_analyzer_port_on);
-}
-
-fn a_poisoned_session_is_poisoned_on_the_analyzer_port_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded("stack_poisoned_port", &a);
     let mut fork = Analyzer::fork(&a, &mut s).expect("fork");
@@ -2098,10 +1904,6 @@ impl ryo_v2_core::app::ports::Clock for StepClock {
 
 #[test]
 fn the_diagnoses_of_a_level_do_not_add_up() {
-    common::both(the_diagnoses_of_a_level_do_not_add_up_on);
-}
-
-fn the_diagnoses_of_a_level_do_not_add_up_on() {
     const IDLE: u64 = 100_000;
     let clock = Arc::new(StepClock {
         now: std::sync::atomic::AtomicU64::new(0),
@@ -2116,7 +1918,6 @@ fn the_diagnoses_of_a_level_do_not_add_up_on() {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
-            engine: common::engine(),
             ..Default::default()
         },
         clock.clone(),
@@ -2179,10 +1980,6 @@ fn assert_classes_name_their_files(found: &ScopedFindings, what: &str) {
 
 #[test]
 fn a_diagnosis_names_where_it_observed_each_unseen_class() {
-    common::both(a_diagnosis_names_where_it_observed_each_unseen_class_on);
-}
-
-fn a_diagnosis_names_where_it_observed_each_unseen_class_on() {
     let x = rel("a/src/x.rs");
 
     // A macro call that does not expand: the detector is skipped on that file alone.
@@ -2273,10 +2070,6 @@ fn deleted_by(edits: &[Edit]) -> Vec<RelPath> {
 
 #[test]
 fn files_of_and_of_level_equal_the_check_over_a_stack() {
-    common::both(files_of_and_of_level_equal_the_check_over_a_stack_on);
-}
-
-fn files_of_and_of_level_equal_the_check_over_a_stack_on() {
     let (a, _) = analyzer(false);
     let f = w_fixture("stack_files_of");
     let mut s = Analyzer::load(&a, &f.dir).expect("load the stacked session");
@@ -2360,10 +2153,6 @@ fn assert_findings_on_their_files(found: &ScopedFindings, what: &str) {
 
 #[test]
 fn a_finding_is_on_a_file_of_its_diagnosis() {
-    common::both(a_finding_is_on_a_file_of_its_diagnosis_on);
-}
-
-fn a_finding_is_on_a_file_of_its_diagnosis_on() {
     // Crate a pulls part.rs in with `include!`, and part.rs reads a constant lib.rs defines:
     // removing it from lib.rs gives an error rust-analyzer reports in part.rs, a file no level
     // edits. Crate c is apart from a.
@@ -2478,10 +2267,6 @@ fn a_finding_is_on_a_file_of_its_diagnosis_on() {
 
 #[test]
 fn a_failed_base_read_is_a_session_error() {
-    common::both(a_failed_base_read_is_a_session_error_on);
-}
-
-fn a_failed_base_read_is_a_session_error_on() {
     let z = rel("c/src/z.rs");
     let (a, _) = analyzer(false);
     let a = a.with_db_read_fault(Some(z.clone()));
@@ -2560,10 +2345,6 @@ fn top_of(a: &RaAnalyzer, s: &RaSession, f: &RaStack) -> (usize, Vec<Option<Stri
 
 #[test]
 fn expand_reads_the_top_level_of_a_live_fork() {
-    common::both(expand_reads_the_top_level_of_a_live_fork_on);
-}
-
-fn expand_reads_the_top_level_of_a_live_fork_on() {
     let (a, obs) = analyzer(false);
     let (f, mut s) = loaded_w("stack_expand_top", &a);
     let mut twin = Analyzer::load(&a, &f.dir).expect("load the twin");
@@ -2625,10 +2406,6 @@ fn expand_reads_the_top_level_of_a_live_fork_on() {
 
 #[test]
 fn expand_refuses_a_state_that_is_not_the_top_level() {
-    common::both(expand_refuses_a_state_that_is_not_the_top_level_on);
-}
-
-fn expand_refuses_a_state_that_is_not_the_top_level_on() {
     let (a, obs) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_expand_not_top", &a);
     let targets = [Target::new(rel("a/src/lib.rs"), None)];
@@ -2715,11 +2492,6 @@ fn w_blueprint(
 
 #[test]
 fn search_and_apply_give_the_same_verdict_on_a_chain() {
-    // The search runs on the forks, which need the Engine (Forks C9).
-    common::engine_only(search_and_apply_give_the_same_verdict_on_a_chain_on);
-}
-
-fn search_and_apply_give_the_same_verdict_on_a_chain_on() {
     use ryo_v2_core::app::apply::apply_blueprints;
     use ryo_v2_core::app::memory::MemoryBudget;
     use ryo_v2_core::app::search::{DEFAULT_SEARCH_BUDGET, SearchInput, search_decision};
@@ -2858,10 +2630,6 @@ fn w_mixed() -> Vec<Edit> {
 
 #[test]
 fn reference_check_runs_no_layer_code() {
-    common::both(reference_check_runs_no_layer_code_on);
-}
-
-fn reference_check_runs_no_layer_code_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_reference_check", &a);
     let edits = w_mixed();
@@ -2878,10 +2646,10 @@ fn reference_check_runs_no_layer_code_on() {
     for (path, text) in W_FILES {
         assert_eq!(a.text(&s, &rel(path)).as_deref(), Some(text), "{path}");
     }
-    // Its result is the check's, on this session's backend (the layers' on the Engine).
+    // Its result is the check's, on a layer.
     let checked = a.check(&mut s, &edits, Scope::Affected).expect("the check");
     assert_eq!(checked, reference);
-    // And again after a check of the backend, which leaves the reference as it was.
+    // And again after the check, which leaves the reference as it was.
     let again = a
         .reference_check(&mut s, &edits, Scope::Affected)
         .expect("the reference check again");
@@ -2891,10 +2659,6 @@ fn reference_check_runs_no_layer_code_on() {
 
 #[test]
 fn a_sealed_level_diagnoses_through_a_read_child() {
-    common::both(a_sealed_level_diagnoses_through_a_read_child_on);
-}
-
-fn a_sealed_level_diagnoses_through_a_read_child_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_sealed_level", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -2926,10 +2690,6 @@ fn a_sealed_level_diagnoses_through_a_read_child_on() {
 
 #[test]
 fn level_stats_has_a_row_per_engine_level() {
-    common::both(level_stats_has_a_row_per_engine_level_on);
-}
-
-fn level_stats_has_a_row_per_engine_level_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_level_stats", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -2940,24 +2700,16 @@ fn level_stats_has_a_row_per_engine_level_on() {
         .expect("L2");
     a.diagnose(&s, &fork, Scope::Affected).expect("diagnose");
     let rows = s.level_stats();
-    if common::engine() {
-        // Level 1 ran no query; the top level holds its diagnosis.
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].memos, 0);
-        assert!(rows[1].memos > 0, "{rows:?}");
-    } else {
-        assert!(rows.is_empty(), "the undo log has no layers");
-    }
+    // Level 1 ran no query; the top level holds its diagnosis.
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].memos, 0);
+    assert!(rows[1].memos > 0, "{rows:?}");
     a.release(&mut s, fork).expect("release");
     assert!(s.level_stats().is_empty());
 }
 
 #[test]
 fn a_base_write_with_a_live_layer_is_fork_in_use() {
-    common::engine_only(a_base_write_with_a_live_layer_is_fork_in_use_on);
-}
-
-fn a_base_write_with_a_live_layer_is_fork_in_use_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded_w("stack_base_write_live_layer", &a);
     let mut fork = Stacked::fork(&a, &mut s).expect("fork");
@@ -2998,10 +2750,6 @@ fn a_base_write_with_a_live_layer_is_fork_in_use_on() {
 
 #[test]
 fn a_panic_in_a_layer_poisons_only_that_layer() {
-    common::engine_only(a_panic_in_a_layer_poisons_only_that_layer_on);
-}
-
-fn a_panic_in_a_layer_poisons_only_that_layer_on() {
     let (a, _) = analyzer(false);
     let (w, _) = analyzer(false);
     let w = w.with_db_write_panic(Some(DbWritePanic::Write));
@@ -3055,15 +2803,11 @@ fn a_panic_in_a_layer_poisons_only_that_layer_on() {
     assert_eq!(s.fork_counters().map(|c| c.refused), Some(0), "I2");
 }
 
+/// Every vfs write of a fork drains the change the vfs queues for it (nothing reads them), and a
+/// created file leaves the vfs only at the thaw: the vfs only gains entries while the base is
+/// frozen.
 #[test]
 fn vfs_changes_are_drained() {
-    common::both(vfs_changes_are_drained_on);
-}
-
-/// Every vfs write of a fork drains the change the vfs queues for it (nothing reads them), and a
-/// created file leaves the vfs when its level is popped on the undo log, and only at the thaw on
-/// the Engine, where the vfs only gains entries while the base is frozen.
-fn vfs_changes_are_drained_on() {
     let (a, _) = analyzer(false);
     let (_f, mut s) = loaded("stack_vfs_drained", &a);
     let extra = rel("src/extra.rs");
@@ -3099,9 +2843,23 @@ fn vfs_changes_are_drained_on() {
     assert_eq!(s.take_vfs_changes(), 0, "after the refusal");
 
     assert!(a.pop(&mut s, &mut fork).expect("pop"));
-    assert_eq!(s.vfs_has(&extra), common::engine(), "after the pop");
+    assert!(s.vfs_has(&extra), "after the pop");
     assert_eq!(s.take_vfs_changes(), 0, "after the pop");
     a.release(&mut s, fork).expect("release");
     assert!(!s.vfs_has(&extra), "after the release");
     assert_eq!(s.take_vfs_changes(), 0, "after the release");
+
+    // The flat reference check writes the base itself: the file it creates leaves the vfs at
+    // its write-back.
+    a.reference_check(
+        &mut s,
+        &[
+            Edit::write(lib(), format!("{UNRESOLVED_LIB}pub mod extra;\n")),
+            Edit::write(extra.clone(), "pub fn extra() {}\n"),
+        ],
+        Scope::Affected,
+    )
+    .expect("the reference check that creates a file");
+    assert!(!s.vfs_has(&extra), "after the reference check");
+    assert_eq!(s.take_vfs_changes(), 0, "after the reference check");
 }

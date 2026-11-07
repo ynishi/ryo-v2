@@ -35,7 +35,7 @@ use ryo_v2_core::app::ports::{CheckError, Event, Forks, JobId, Limit, Next, Veri
 use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_ra::{Backend, ForksConfig, RaAnalyzer, RaConfig};
+use ryo_v2_ra::{ForksConfig, RaAnalyzer, RaConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -656,7 +656,7 @@ fn quantiles_txt(q: &Quantiles) -> String {
 ///   <min/p50/p90/max> cut_at_limit <n> scope_lt8 <n> <q> scope_ge8 <n> <q> busy_workers <x.xx>
 ///   occupancy <busy/W, x.xx> cpu_occupancy <x.xx> peak_rss_kb <kb> peak_threads <n> timed_out
 ///   <n> over_5000ms <n> withdrawn <n> rss_stop <b> w4 <equal|DIFF|INCOMPLETE|ref> rows <n>
-///   diffs <n> left_out <n> stopped <n> short <n> backend engine`; `check_ms` and `over_5000ms`
+///   diffs <n> left_out <n> stopped <n> short <n>`; `check_ms` and `over_5000ms`
 ///   count each cut-off job at its cut-off (a lower bound; `cut_at_limit` of them), the scope
 ///   splits leave them out; a set of no checks prints `0 -`, the verdict is [`W4::verdict`], and
 ///   the reference prints `w4 ref rows - diffs - left_out - stopped - short -`.
@@ -686,7 +686,7 @@ pub fn summary_line(s: &WidthSummary) -> String {
          scope_lt{SCOPE_SPLIT} {} \
          scope_ge{SCOPE_SPLIT} {} busy_workers {:.2} occupancy {occupancy:.2} cpu_occupancy {:.2} \
          peak_rss_kb {} peak_threads {} timed_out {} over_{CORE4_MS}ms {} withdrawn {} rss_stop \
-         {} w4 {w4} backend {}",
+         {} w4 {w4}",
         s.scope,
         s.spec.label(),
         s.width,
@@ -709,7 +709,6 @@ pub fn summary_line(s: &WidthSummary) -> String {
         s.over_core4,
         s.withdrawn,
         s.rss_stopped,
-        Backend::Engine.name(),
     )
 }
 
@@ -1115,7 +1114,6 @@ fn config(args: &ForksArgs, spec: Option<WidthSpec>) -> RaConfig {
         }),
         ..RaConfig::default()
     }
-    .with_backend(Backend::Engine)
 }
 
 /// Loads `args.base` on the Engine once and, per scope, repeat and width, runs the job tree
@@ -1132,13 +1130,8 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
     let stop_kb = rss_stop_kb(mem_total_kb, args.rss_reserve_gib);
     // The analyzer of each width is the loader's configuration with its `ForksConfig` and the
     // cut-off, the two things `Forks::open` reads; they share the loader's observer.
-    let (loader, observer, mut session) = crate::bench::load_on_threads(
-        &args.base,
-        args.proc_macro,
-        false,
-        Backend::Engine,
-        args.threads,
-    )?;
+    let (loader, observer, mut session) =
+        crate::bench::load_on_threads(&args.base, args.proc_macro, false, args.threads)?;
     let clock = Arc::new(MonotonicClock::new());
     let threads = session.threads();
     let rss_load = proc::vm_rss_kb().context("read the RSS after load")?;
@@ -1339,7 +1332,7 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
             println!(
                 "summary serial-stacked [{sname}] n={} jobs {jobs} jobs_per_s {:.2} check_ms {} \
                  cut_at_limit {cut} vs_width {ref_label} w4 {} rows {} diffs {} left_out {} \
-                 stopped {} short {} backend {}",
+                 stopped {} short {}",
                 serial_runs.len(),
                 median_or_zero(&rates),
                 quantiles_txt(&Quantiles::of(&checks)),
@@ -1349,7 +1342,6 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
                 sum.left_out,
                 sum.stopped,
                 sum.short,
-                Backend::Engine.name(),
             );
             if !sides.is_empty() {
                 verdict("serial", &sum);
@@ -1714,7 +1706,7 @@ mod tests {
              400/600/6000/6000 cut_at_limit 1 scope_lt8 3 400/500/600/600 scope_ge8 2 \
              900/900/6000/6000 busy_workers 2.75 occupancy 0.69 cpu_occupancy 0.25 peak_rss_kb \
              100 peak_threads 30 timed_out 1 over_5000ms 1 withdrawn 0 rss_stop false w4 equal \
-             rows 8 diffs 0 left_out 0 stopped 0 short 0 backend engine"
+             rows 8 diffs 0 left_out 0 stopped 0 short 0"
         );
         // The reference, a capped width, no checks, a difference.
         let capped = WidthSummary::of(
@@ -1738,7 +1730,7 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains("w4 ref rows - diffs - left_out - stopped - short - backend engine"),
+            line.contains("w4 ref rows - diffs - left_out - stopped - short -"),
             "{line}"
         );
         // Incomplete: fails, and is named, only with the cut-off off.

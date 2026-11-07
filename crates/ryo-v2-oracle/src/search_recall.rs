@@ -38,7 +38,7 @@ use ryo_v2_core::domain::{
     SearchBudget, Stage, Target, TextRange,
 };
 use ryo_v2_core::infra::overlay::{OverlayError, overlay_edits};
-use ryo_v2_ra::{Backend, DetectorPanic, ExpanderPanic};
+use ryo_v2_ra::{DetectorPanic, ExpanderPanic};
 use serde::{Serialize, Serializer};
 
 use crate::planted::{PlantKind, texts_match};
@@ -412,9 +412,8 @@ fn kind_ids<S: Serializer>(kinds: &[PlantKind], serializer: S) -> Result<S::Ok, 
 /// # Contract
 /// - C1: serialized, a row is an object with one key per field, of the field's name and value;
 ///   the kinds are their kebab-case ids. The keys and values of the hand-built row it replaced
-///   are kept, so reports before and after compare key by key. A row has no backend key: the
-///   backend is the run's, named once by the report's backend key (`Report` C1), so the rows of
-///   a run on the undo log and of one on the Engine compare key by key.
+///   are kept, so reports before and after compare key by key. A row has no width key: the
+///   width is the run's, named once by the report's width key (`Report` C1).
 ///   tested: search_recall::tests::row_json_keeps_its_keys_and_values
 ///   tested: search_recall::tests::row_json_carries_the_depth_times
 ///   tested: search_recall::tests::row_json_carries_the_level_writes
@@ -917,9 +916,6 @@ pub struct RunInfo {
     /// The resident set size trigger 3 reads, in kB: the most read after a decision's close,
     /// between decisions ([`rss_after_close`]); `None` when no decision was read.
     pub rss_kb: Option<u64>,
-    /// The backend the run's forks ran on: the Engine, which the search's forks need (D11,
-    /// stage 4).
-    pub backend: Backend,
     /// The jobs the search's forks ran at once (`Forks::width`, `--width`); 0 when unknown.
     pub width: usize,
 }
@@ -962,11 +958,11 @@ pub fn trigger_4_judges(budget: &SearchBudget) -> bool {
 impl RunInfo {
     /// The numbers of one finished `search-recall run`: the budget it searched with, its whole
     /// wall time, the part of it spent in the outer `cargo check`, the sample the outer check
-    /// took, the RSS, the backend its forks ran on and their width.
+    /// took, the RSS and the width its forks ran at.
     ///
     /// # Contract
-    /// - C1: `beam` is `budget.beam`, `budget` is `Some(budget)`, `outer_sample`, `backend` and
-    ///   `width` are the ones given, and both times are whole ms, saturating at `u64::MAX`.
+    /// - C1: `beam` is `budget.beam`, `budget` is `Some(budget)`, `outer_sample` and `width`
+    ///   are the ones given, and both times are whole ms, saturating at `u64::MAX`.
     ///   tested: search_recall::tests::run_info_of_a_run_carries_budget_and_outer_time
     pub fn of_run(
         budget: SearchBudget,
@@ -974,7 +970,7 @@ impl RunInfo {
         outer_check: std::time::Duration,
         outer_sample: OuterSample,
         rss_kb: Option<u64>,
-        (backend, width): (Backend, usize),
+        width: usize,
     ) -> Self {
         let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         RunInfo {
@@ -984,7 +980,6 @@ impl RunInfo {
             outer_sample,
             budget: Some(budget),
             rss_kb,
-            backend,
             width,
         }
     }
@@ -1345,14 +1340,11 @@ fn outer_sample_value<S: Serializer>(
 ///   generated, hit, beam, recall_at_beam, hit_over_all, generation_rate, top3_rate, verdict,
 ///   harness_ms, outer_check_ms, outer_sample, search_ms, rss_kb, triggers and rows with the
 ///   values the hand-built report gave them, and contained_panics, with its detector and expander
-///   entries, when panics are given; rows are as `DecisionRow` C1 says. The key backend, first,
-///   names the backend of the run (`RunInfo::backend`), `"undo-log"` or `"engine"`, so that two
-///   runs on the same cases can be told apart; every other key is the same on both. The key
-///   width, second, is `RunInfo::width`.
+///   entries, when panics are given; rows are as `DecisionRow` C1 says. The key width, first,
+///   is `RunInfo::width`.
 ///   tested: search_recall::tests::report_json_keeps_its_keys_and_values
 #[derive(Debug, Serialize)]
 pub struct Report<'a> {
-    backend: Backend,
     width: usize,
     decisions: usize,
     skipped: usize,
@@ -1385,7 +1377,6 @@ impl<'a> Report<'a> {
     ) -> Report<'a> {
         let all = Counts::of(rows);
         Report {
-            backend: t.backend,
             width: t.width,
             decisions: all.measured,
             skipped: all.skipped,
@@ -1855,7 +1846,7 @@ mod tests {
             Duration::from_millis(634_965),
             OuterSample::Top(NonZeroUsize::new(4).unwrap()),
             Some(7),
-            (Backend::Engine, 4),
+            4,
         );
         assert_eq!(
             t,
@@ -1866,20 +1857,12 @@ mod tests {
                 outer_sample: OuterSample::Top(NonZeroUsize::new(4).unwrap()),
                 budget: Some(b),
                 rss_kb: Some(7),
-                backend: Backend::Engine,
                 width: 4,
             }
         );
         assert_eq!(t.search_ms(), 348_068);
-        let flat = RunInfo::of_run(
-            b,
-            Duration::MAX,
-            Duration::ZERO,
-            OuterSample::Off,
-            None,
-            (Backend::UndoLog, 1),
-        );
-        assert_eq!((flat.backend, flat.width), (Backend::UndoLog, 1));
+        let flat = RunInfo::of_run(b, Duration::MAX, Duration::ZERO, OuterSample::Off, None, 1);
+        assert_eq!(flat.width, 1);
         assert_eq!(flat.harness_ms, u64::MAX);
     }
 
@@ -2039,8 +2022,8 @@ mod tests {
         assert_eq!(got["timed_out"], json!(["b"]));
         assert_eq!(got["stops"], json!(["budget_exhausted"]));
         let object = got.as_object_mut().unwrap();
-        // The backend is the report's key, not the row's.
-        assert!(!object.contains_key("backend"));
+        // The width is the report's key, not the row's.
+        assert!(!object.contains_key("width"));
         assert_eq!(object.remove("rss_after_close_kb"), Some(json!(4321)));
         for key in DEPTH_KEYS {
             assert!(object.remove(key).is_some(), "the row has {key}");
@@ -2129,14 +2112,10 @@ mod tests {
             outer_check_ms: 400,
             outer_sample,
             rss_kb: Some(777),
-            // Named, not the default (the Engine, D11 stage 4): the run below on the Engine
-            // differs from this one in the key backend alone.
-            backend: Backend::UndoLog,
             ..RunInfo::default()
         };
         let all = info(OuterSample::All);
         let expected = json!({
-            "backend": "undo-log",
             "width": 0,
             "decisions": 1,
             "skipped": 1,
@@ -2191,18 +2170,9 @@ mod tests {
         };
         let got = serde_json::to_value(Report::of(&rows, unknown, None)).unwrap();
         assert_eq!(got["rss_kb"], Value::Null);
-        // The backend is the first key, and a run on the Engine differs from the same run on
-        // the undo log in that key alone.
+        // The width is the first key.
         let text = serde_json::to_string(&Report::of(&rows, all, None)).unwrap();
-        assert!(text.starts_with(r#"{"backend":"undo-log","#), "{text}");
-        let engine = RunInfo {
-            backend: Backend::Engine,
-            ..all
-        };
-        let mut got = serde_json::to_value(Report::of(&rows, engine, None)).unwrap();
-        assert_eq!(got["backend"], json!("engine"));
-        got["backend"] = json!("undo-log");
-        assert_eq!(got, without);
+        assert!(text.starts_with(r#"{"width":0,"#), "{text}");
     }
 
     #[test]

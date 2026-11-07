@@ -311,8 +311,10 @@ pub trait Stacked: Verifier {
     /// - C5: a write with no edit pushes a level whose `Scope::Affected` diagnosis covers no file
     ///   and names no unseen class.
     ///   tested: ryo-v2-ra tests/stack.rs an_empty_write_diagnoses_nothing
-    /// - C6: a write the database cannot carry out (its write panics) is `Poisoned`, pushes no
-    ///   level and poisons the session; the reads of `Verifier` still describe the base.
+    /// - C6: a write the database cannot carry out (its write panics) pushes no level and leaves
+    ///   the levels below as they were; the reads of `Verifier` still describe the base. In the
+    ///   rust-analyzer adapter the write is a layer of its own, so it is `Panicked` of reach
+    ///   `Blueprint` and the session stays usable.
     ///   tested: ryo-v2-ra tests/stack.rs a_database_write_that_panics_poisons_the_session
     fn write(
         &self,
@@ -327,7 +329,7 @@ pub trait Stacked: Verifier {
     /// - C1: the number of levels of the live fork, on a poisoned session too; a ticket that is
     ///   not the live fork's is `ForkInUse`.
     ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
-    ///   tested: ryo-v2-ra tests/stack.rs pop_compares_texts_and_poisons_on_a_difference
+    ///   tested: ryo-v2-ra tests/stack.rs a_pop_writes_nothing_back
     ///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
     fn levels(&self, s: &Self::Session, f: &Self::Fork) -> Result<usize, CheckError>;
 
@@ -424,12 +426,11 @@ pub trait Stacked: Verifier {
     /// - C1: reverts the top level and returns `true`: afterwards every text is that of the level
     ///   below and `levels` is one less.
     ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
-    /// - C2: a revert that does not restore the level below (its texts, or the adapter's
-    ///   diagnostic re-assert) is `RevertMismatch`, removes the level and poisons the session; a
-    ///   revert that cannot be carried out or confirmed (a database write panics, or the
-    ///   re-assert cannot run) is `Poisoned`, removes the level and poisons the session.
-    ///   tested: ryo-v2-ra tests/stack.rs pop_compares_texts_and_poisons_on_a_difference
-    ///   tested: ryo-v2-ra tests/stack.rs pop_reassert_compares_with_the_level_below
+    /// - C2: a pop whose check cannot be carried out or confirmed is `Poisoned`, removes the
+    ///   level and poisons the session. In the rust-analyzer adapter a
+    ///   level is a layer over a frozen base: a pop drops it and writes nothing back, so no text
+    ///   can come back wrong, and a sampled pop checks the isolation of the base (I2).
+    ///   tested: ryo-v2-ra tests/stack.rs a_pop_writes_nothing_back
     ///   tested: ryo-v2-ra tests/stack.rs a_revert_that_cannot_be_confirmed_poisons_the_session
     ///   tested: ryo-v2-ra tests/stack.rs a_database_write_that_panics_poisons_the_session
     /// - C3: with no level `pop` changes nothing and returns `Ok(false)`.
@@ -442,11 +443,12 @@ pub trait Stacked: Verifier {
     /// - C1: reverts every level, top first, under the rules of `pop`, and ends the fork: a later
     ///   `fork` is not `ForkInUse`.
     ///   tested: ryo-v2-ra tests/stack.rs release_reverts_every_level
-    /// - C2: every revert failure poisons the session, so from the first failure on, or on a
-    ///   session already poisoned, it writes nothing more: it drops the remaining levels, keeping
-    ///   their base texts for the reads of `Verifier`, ends the fork and returns that failure
-    ///   (`Poisoned` for a session already poisoned).
-    ///   tested: ryo-v2-ra tests/stack.rs release_stops_writing_after_a_failure
+    /// - C2: every pop failure poisons the session, so from the first failure on, or on a session
+    ///   already poisoned, it writes nothing more: it drops the remaining levels, keeping their
+    ///   base texts for the reads of `Verifier`, ends the fork and returns that failure
+    ///   (`Poisoned` for a session already poisoned). In the rust-analyzer adapter no pop writes
+    ///   anything back, so a fault of the write-back hooks fails none.
+    ///   tested: ryo-v2-ra tests/stack.rs a_release_writes_nothing_back
     ///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
     fn release(&self, s: &mut Self::Session, f: Self::Fork) -> Result<(), CheckError>;
 }
@@ -620,10 +622,6 @@ pub enum Limit {
 ///   tested: app::ports::tests::a_refused_close_can_be_retried_on_the_fake
 ///   tested: ryo-v2-ra tests/forks.rs a_refused_close_can_be_retried
 ///   tested: ryo-v2-ra tests/forks.rs isolation_holds_after_parallel_jobs
-/// - C9: `open` on an adapter whose forks write into the session's one database (the undo-log
-///   backend) is `ForkInUse`: forks need the Engine backend.
-///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
-///   tested: ryo-v2-ra tests/forks.rs forks_need_the_engine_backend
 /// - C10: `expand` of a Layer gives, as `Next::Expanded`, what `Expander::expand` gives for the
 ///   Layer's state with no fork open (the same Blueprints, ids included, the files the state
 ///   created among those it reads), whatever ran beside it; it writes nothing and counts in the
@@ -853,11 +851,7 @@ mod tests {
     /// first `next` after its submit, the newest delivered first (completion out of submission
     /// order). It is the test double of the port's consumers, and checks that the clauses fit
     /// together.
-    struct FakeForks {
-        /// Whether its forks are layers of a frozen base (the Engine backend), or would write
-        /// into the session's one database (the undo-log backend).
-        engine: bool,
-    }
+    struct FakeForks;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct FakeLayer {
@@ -1144,7 +1138,7 @@ mod tests {
         type Layer = FakeLayer;
 
         fn open(&self, s: &mut FakeSession) -> Result<FakeLayer, CheckError> {
-            if !self.engine || s.stacked_live {
+            if s.stacked_live {
                 return Err(CheckError::ForkInUse);
             }
             s.refuse_while_open()?;
@@ -1292,7 +1286,7 @@ mod tests {
 
     fn engine_session() -> (FakeForks, FakeSession) {
         (
-            FakeForks { engine: true },
+            FakeForks,
             FakeSession::new(1, &[("src/a.rs", "a"), ("src/b.rs", "b")]),
         )
     }
@@ -1483,15 +1477,6 @@ mod tests {
 
     #[test]
     fn the_fake_refuses_what_forks_refuse() {
-        // C9: the undo-log backend has no forks.
-        let undo_log = FakeForks { engine: false };
-        let mut plain = FakeSession::new(9, &[("src/a.rs", "a")]);
-        assert_eq!(undo_log.open(&mut plain), Err(CheckError::ForkInUse));
-        assert_eq!(
-            undo_log.check(&mut plain, &[], Scope::Affected).map(|_| ()),
-            Ok(())
-        );
-
         // C6: while forks are open the session's other operations refuse and change nothing.
         let (f, mut s) = engine_session();
         let root = f.open(&mut s).unwrap();

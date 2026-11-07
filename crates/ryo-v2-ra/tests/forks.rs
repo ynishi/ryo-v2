@@ -1,6 +1,5 @@
 //! `Forks` on the adapter (D11, stage 3b): N jobs over a frozen base on a pool of workers, on
-//! throwaway workspaces (the corpus is never touched). Every test runs on the Engine, which
-//! `Forks` needs; `forks_need_the_engine_backend` covers the undo log.
+//! throwaway workspaces (the corpus is never touched).
 
 mod common;
 
@@ -25,13 +24,12 @@ const WAIT: Duration = Duration::from_secs(120);
 
 /// The config of the tests: no proc-macro server, gap detectors on, `threads` T, and forks of
 /// width `width` (N) with `caller_works`.
-fn config(width: usize, threads: usize, caller_works: bool, engine: bool) -> RaConfig {
+fn config(width: usize, threads: usize, caller_works: bool) -> RaConfig {
     RaConfig {
         proc_macro: false,
         threads: Some(threads),
         gap_detectors: true,
         cfg_test: false,
-        engine,
         forks: ForksConfig {
             width: NonZeroUsize::new(width),
             caller_works,
@@ -51,7 +49,7 @@ fn analyzer_of(config: RaConfig) -> RaAnalyzer {
 /// An analyzer on the Engine with forks of width `width` over `threads` threads, the caller only
 /// waiting.
 fn analyzer(width: usize, threads: usize) -> RaAnalyzer {
-    analyzer_of(config(width, threads, false, true))
+    analyzer_of(config(width, threads, false))
 }
 
 /// Every outcome until `Idle`, in the order `next` gives them; a wait past [`WAIT`] fails.
@@ -585,7 +583,7 @@ fn job_threads_times_jobs_fit_the_budget() {
     ] {
         let count = Arc::new(ThreadCount::default());
         let met = Arc::new(Rendezvous::new(width));
-        let a = analyzer_of(config(n, 6, caller_works, true))
+        let a = analyzer_of(config(n, 6, caller_works))
             .with_thread_count(Some(Arc::clone(&count)))
             .with_job_hook(Some(Arc::new(move |_| met.meet())));
         assert_eq!(a.width(&s), width, "N = {n}, caller works {caller_works}");
@@ -875,26 +873,6 @@ fn a_refused_close_can_be_retried() {
 }
 
 #[test]
-fn forks_need_the_engine_backend() {
-    let f = w_fixture("forks_undo_log");
-    let a = analyzer_of(config(2, 2, true, false));
-    let mut s = Analyzer::load(&a, &f.dir).expect("load");
-    assert!(matches!(a.open(&mut s), Err(CheckError::ForkInUse)));
-    // Nothing opened: the session works as before.
-    assert_eq!(a.close(&mut s), Err(CheckError::ForkInUse));
-    assert!(matches!(
-        a.next(&mut s, Duration::ZERO),
-        Err(CheckError::ForkInUse)
-    ));
-    a.check(
-        &mut s,
-        &[Edit::write(rel("c/src/z.rs"), C_Z)],
-        Scope::Affected,
-    )
-    .expect("a check on the undo log");
-}
-
-#[test]
 fn sibling_jobs_in_one_query_do_not_block() {
     let f = w_fixture("forks_siblings");
     let mut s = Analyzer::load(&analyzer(2, 2), &f.dir).expect("load");
@@ -1142,7 +1120,7 @@ fn isolation_holds_after_parallel_jobs() {
     // with it once the workers are joined.
     let a = analyzer_of(RaConfig {
         assert_revert_every: std::num::NonZeroU32::new(1),
-        ..config(4, 4, false, true)
+        ..config(4, 4, false)
     })
     .with_job_hook(Some(Arc::new(|id| std::thread::sleep(delay(7, id)))));
     let root = a.open(&mut s).expect("open");
@@ -1348,15 +1326,11 @@ fn an_expansion_sees_a_file_the_state_created() {
 }
 
 /// The stacked top reads the files of its state too (stage 4, commit 3): before, it listed the
-/// base's files, so a level that created a module gave no child of it. On both backends.
+/// base's files, so a level that created a module gave no child of it.
 #[test]
 fn a_stacked_top_expansion_sees_a_file_the_state_created() {
-    common::both(a_stacked_top_expansion_sees_a_file_the_state_created_on);
-}
-
-fn a_stacked_top_expansion_sees_a_file_the_state_created_on() {
     let f = w_fixture("forks_stacked_top_created");
-    let a = analyzer_of(config(1, 2, true, common::engine()));
+    let a = analyzer_of(config(1, 2, true));
     let mut s = Analyzer::load(&a, &f.dir).expect("load W");
     let base = w_base();
     let edits = node_edits(&base, "c", 2);

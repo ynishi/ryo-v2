@@ -23,20 +23,20 @@ pub struct RaStack {
 }
 
 /// Makes a new fork of `port` the live fork of `s` and returns the id of its ticket. The caller
-/// has checked that no fork is live. With `on_engine` the fork's levels are layers: the base is
-/// frozen here and thawed when the fork ends; a base that cannot be frozen (another handle of the
-/// database is alive) is `ForkInUse` and opens no fork.
-pub(crate) fn open_fork(
-    s: &mut RaSession,
-    port: ForkPort,
-    on_engine: bool,
-) -> Result<u64, AnalyzerError> {
-    if on_engine {
-        crate::engine::freeze(s)?;
-    }
+/// has checked that no fork is live. The fork's levels are layers: the base is frozen here and
+/// thawed when the fork ends; a base that cannot be frozen (another handle of the database is
+/// alive) is `ForkInUse` and opens no fork.
+pub(crate) fn open_fork(s: &mut RaSession, port: ForkPort) -> Result<u64, AnalyzerError> {
+    crate::engine::freeze(s)?;
+    Ok(mark_live(s, port))
+}
+
+/// Makes a new fork of `port` the live fork of `s`, whose base the caller has frozen
+/// (`Forks::open`), and returns the id of its ticket.
+pub(crate) fn mark_live(s: &mut RaSession, port: ForkPort) -> u64 {
     let id = NEXT_FORK_ID.fetch_add(1, Ordering::Relaxed);
     s.live = Some(Live { id, port });
-    Ok(id)
+    id
 }
 
 /// Whether `id` is the ticket of the live fork, opened by `port`.
@@ -116,25 +116,21 @@ pub(crate) fn write_level(
         || a.config
             .assert_revert_every
             .is_some_and(|n| s.write_count.is_multiple_of(n.get()));
-    fork::push_level(a, s, edits, edited.clone(), sampled).map_err(|e| match &s.poisoned {
+    crate::engine::push_level(a, s, edits, edited.clone(), sampled).map_err(|e| match &s.poisoned {
         Some(msg) => CheckError::Poisoned(msg.clone()),
         None => map_error(e, &edited),
     })
 }
 
-/// The stacked writes of the adapter. On the undo log the levels are the session's undo log of
-/// its one database; on the fork Engine (`RaConfig.engine`, D11, the default) a level is a layer
-/// over the frozen base, `pop` drops the top layer and `release` drops them all, and a level's
-/// write is checked by the isolation of the base (I2) instead of a revert. The cut-off (D1), the
-/// detector-panic rule (D7) and the unseen classes of a diagnosis are the same on both.
+/// The stacked writes of the adapter, on the fork Engine (D11): a level is a layer over the
+/// frozen base, `pop` drops the top layer and `release` drops them all, and a level's write is
+/// checked by the isolation of the base (I2); nothing is written to revert.
 ///
 /// # Contract
-/// - C1: the diagnostic re-assert of a level runs when its write is sampled (`assert_revert`, or
-///   every `assert_revert_every`-th write, a check being one write) and compares the scope of the
-///   level's edits at the level below with the findings that scope had before the write (the
-///   baseline for the first level).
-///   tested: tests/stack.rs pop_reassert_compares_with_the_level_below
-///   tested: tests/stack.rs writes_count_for_the_sampled_reassert
+/// - C1: the isolation of the base is checked at a level's pop when its write is sampled
+///   (`assert_revert`, or every `assert_revert_every`-th write, a check being one write); a base
+///   that changed poisons the session.
+///   tested: tests/stack.rs writes_count_for_the_sampled_isolation
 /// - C2: every write, a refused one included, is recorded for `RevertAudit::audit_revert`.
 ///   tested: tests/stack.rs stacked_writes_are_audited
 /// - C3: an `Analyzer` fork and a stacked fork share the one live fork of the session.
@@ -173,9 +169,8 @@ impl Stacked for RaAnalyzer {
 
     fn fork(&self, s: &mut RaSession) -> Result<RaStack, CheckError> {
         require_free(s)?;
-        let engine = s.engine;
         Ok(RaStack {
-            id: open_fork(s, ForkPort::Stacked, engine).map_err(|e| map_error(e, &[]))?,
+            id: open_fork(s, ForkPort::Stacked).map_err(|e| map_error(e, &[]))?,
         })
     }
 
@@ -223,11 +218,11 @@ impl Stacked for RaAnalyzer {
 
     fn pop(&self, s: &mut RaSession, f: &mut RaStack) -> Result<bool, CheckError> {
         require_usable(s, f)?;
-        fork::pop_level(self, s).map_err(revert_error)
+        crate::engine::pop_level(self, s).map_err(revert_error)
     }
 
     fn release(&self, s: &mut RaSession, f: RaStack) -> Result<(), CheckError> {
         require_ticket(s, &f)?;
-        fork::release_levels(self, s).map_err(revert_error)
+        crate::engine::release_levels(self, s).map_err(revert_error)
     }
 }

@@ -5,7 +5,7 @@
 //!
 //! The layers sit over the session's own database, lent to the Engine and given back at the end;
 //! the twin is a second session of the same workspace that runs `RaAnalyzer::reference_check`
-//! (write, diagnose, revert on the undo log, whatever `RaConfig.engine` says) with no layer code.
+//! (write, diagnose, write back on the session's own database) with no layer code.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

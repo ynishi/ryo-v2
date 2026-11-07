@@ -423,7 +423,7 @@ fn expanded(s: &RaSession, outcome: JobOutcome) -> Result<Vec<Blueprint>, Expand
     }
 }
 
-/// The adapter's `Forks`, on the fork Engine only (`RaConfig.engine`).
+/// The adapter's `Forks`, on the fork Engine.
 ///
 /// `open` freezes the base and starts the job pool of `RaConfig.forks` (C4). A job's edits are
 /// resolved on the session thread at `submit`; its worker writes them into a child of its parent
@@ -472,10 +472,6 @@ impl Forks for RaAnalyzer {
     type Layer = RaLayer;
 
     fn open(&self, s: &mut RaSession) -> Result<RaLayer, CheckError> {
-        if !s.engine {
-            // C9: on the undo log a fork writes the session's one database.
-            return Err(CheckError::ForkInUse);
-        }
         crate::stack::require_free(s)?;
         engine::freeze(s).map_err(|e| map_error(e, &[]))?;
         let sampled = s.assert_revert || self.config.assert_revert_every.is_some();
@@ -523,8 +519,7 @@ impl Forks for RaAnalyzer {
             keys: HashMap::new(),
             withdrawing: false,
         });
-        let id =
-            crate::stack::open_fork(s, ForkPort::Forks, false).map_err(|e| map_error(e, &[]))?;
+        let id = crate::stack::mark_live(s, ForkPort::Forks);
         debug_assert!(s.live.is_some_and(|l| l.id == id));
         Ok(RaLayer {
             sealed: root,

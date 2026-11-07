@@ -20,7 +20,6 @@ use ryo_v2_core::app::search::RESERVED_RAM_GB;
 use ryo_v2_core::domain::{RelPath, Scope, TextRange};
 use ryo_v2_host::bench::{self, BenchArgs, DepthArgs};
 use ryo_v2_host::forks_bench::{self, ForksArgs, WidthSpec};
-use ryo_v2_ra::Backend;
 
 /// What `bench --forks` and its options do not go with.
 const FORKS_CONFLICTS: [&str; 4] = ["variants", "on", "large", "depth_sweep"];
@@ -80,20 +79,14 @@ enum Command {
         file_times: bool,
         /// Measure each VARIANT as a child of the PARENT overlay, two ways: `rebuilt` (the
         /// parent's and the variant's edits composed and verified from BASE) and `stacked` (the
-        /// variant submitted as a job on the parent's Layer of `Forks` at W = 1). Needs
-        /// `--engine`.
+        /// variant submitted as a job on the parent's Layer of `Forks` at W = 1).
         #[arg(long, value_name = "PARENT")]
         on: Option<PathBuf>,
-        /// Run the checks on layers of the fork Engine instead of the stacked undo log; every
-        /// summary line ends with ` backend engine` (` backend undo-log` without it). `--on` and
-        /// `--depth-sweep` run on `Forks` and need it.
-        #[arg(long)]
-        engine: bool,
         /// Measure stacks of these depths instead of VARIANTS: per depth K, K levels, each a job
         /// of `Forks` at W = 1 on the Layer of the one below (level k appends `fn
         /// __ryo_depth_<k>() -> u32 { <k> }` to a workspace file), diagnose the top level
         /// `--repeat` times (the later times the top level run again on the level below) and drop
-        /// the Layers. Needs `--engine`. A comma-separated list, each >= 1.
+        /// the Layers. A comma-separated list, each >= 1.
         #[arg(
             long,
             value_name = "DEPTHS",
@@ -325,7 +318,6 @@ fn run() -> Result<ExitCode> {
             no_gap_detectors,
             file_times,
             on,
-            engine,
             depth_sweep,
             depth_files,
             forks,
@@ -371,7 +363,6 @@ fn run() -> Result<ExitCode> {
                     scopes,
                     proc_macro: !no_proc_macro,
                     assert_revert: !no_assert_revert,
-                    backend: Backend::of_engine(engine),
                 })
                 .map(|()| ExitCode::SUCCESS);
             }
@@ -405,7 +396,6 @@ fn run() -> Result<ExitCode> {
                 scopes,
                 proc_macro: !no_proc_macro,
                 assert_revert: !no_assert_revert,
-                backend: Backend::of_engine(engine),
                 gap_detectors: !no_gap_detectors,
                 file_times,
             })
@@ -461,29 +451,6 @@ mod tests {
         assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--on"]).is_err());
     }
 
-    #[test]
-    fn cli_parses_bench_engine() {
-        let engine = |args: &[&str]| match Cli::try_parse_from(args)
-            .map_err(|e| e.to_string())
-            .expect("parses")
-            .command
-        {
-            Command::Bench { engine, .. } => engine,
-            _ => panic!("not bench"),
-        };
-        assert!(!engine(&["ryo-v2", "bench", "/b", "/v"]));
-        assert!(engine(&["ryo-v2", "bench", "/b", "/v", "--engine"]));
-        assert!(engine(&[
-            "ryo-v2", "bench", "/b", "/v", "--on", "/p", "--repeat", "2", "--engine"
-        ]));
-        assert!(engine(&["ryo-v2", "bench", "--large", "/x", "--engine"]));
-        // A flag, not an option with a value; and not a flag of the other commands.
-        assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--engine=true"]).is_err());
-        assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--engine"]).is_err());
-        // No second command for the Engine: `--engine` is how a bench runs on it.
-        assert!(Cli::try_parse_from(["ryo-v2", "bench-cow", "/b", "/v"]).is_err());
-    }
-
     /// The controls of gate RS (SEARCH_LEDGER.md, "The search on N forks", gate RS, runs 4 and 5).
     #[test]
     fn cli_parses_bench_gap_detectors_and_file_times() {
@@ -511,8 +478,7 @@ mod tests {
                 "/b",
                 "/v",
                 "--file-times",
-                "--no-gap-detectors",
-                "--engine"
+                "--no-gap-detectors"
             ]),
             (true, true)
         );
@@ -537,13 +503,12 @@ mod tests {
                 variants,
                 depth_sweep,
                 depth_files,
-                engine,
                 repeat,
                 ..
-            } => (base, variants, depth_sweep, depth_files, engine, repeat),
+            } => (base, variants, depth_sweep, depth_files, repeat),
             _ => panic!("not bench"),
         };
-        let (base, variants, depths, files, engine, repeat) = parse(&[
+        let (base, variants, depths, files, repeat) = parse(&[
             "ryo-v2",
             "bench",
             "/b",
@@ -555,8 +520,8 @@ mod tests {
         assert_eq!(base, Some(PathBuf::from("/b")));
         assert!(variants.is_empty());
         assert_eq!(depths, vec![1, 5, 10, 20]);
-        assert_eq!((files, engine, repeat), (None, false, 3));
-        let (_, _, depths, files, engine, _) = parse(&[
+        assert_eq!((files, repeat), (None, 3));
+        let (_, _, depths, files, _) = parse(&[
             "ryo-v2",
             "bench",
             "/b",
@@ -564,11 +529,10 @@ mod tests {
             "2",
             "--depth-files",
             "3",
-            "--engine",
         ]);
-        assert_eq!((depths, files, engine), (vec![2], Some(3), true));
+        assert_eq!((depths, files), (vec![2], Some(3)));
         // Without it a bench still needs its variants, and keeps parsing as before.
-        let (_, variants, depths, files, _, _) = parse(&["ryo-v2", "bench", "/b", "/v"]);
+        let (_, variants, depths, files, _) = parse(&["ryo-v2", "bench", "/b", "/v"]);
         assert_eq!((variants.len(), depths.len(), files), (1, 0, None));
         assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b"]).is_err());
         // A depth is at least 1; a list, not a range.
