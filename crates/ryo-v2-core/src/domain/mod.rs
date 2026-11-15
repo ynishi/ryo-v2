@@ -119,10 +119,8 @@
 //!   classes of a loaded workspace, and a check of edits that leaves no trace.
 //! - Analyzer: the lower port of an analyzer adapter: load a workspace, one fork with one write,
 //!   its diagnostics and its discard; what the oracle's verify and the bench measure.
-//! - Stacked: a verifier whose forks take writes on top of earlier ones, each a level; read and
-//!   diagnosed at the top level, reverted level by level.
-//! - Level: one write of a stacked fork, on top of the level below; the base state is below the
-//!   first.
+//! - Level: one write on top of the state below it; a job of `Forks` writes one on its parent's
+//!   Layer, and the base state is below the first.
 //! - Forks: a verifier whose forks are layers over a frozen base, any number alive at once; a job
 //!   writes edits on top of a finished layer and is checked on a pool of workers, and its outcome
 //!   comes back by its job id, or as a withdrawal. includes: JobId, Checked, Next

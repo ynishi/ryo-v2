@@ -25,7 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Expander, Judge, RevertAudit, Stacked};
+use ryo_v2_core::app::memory::MemoryBudget;
+use ryo_v2_core::app::ports::{Assessor, CheckError, Clock, Forks, Gauge, Judge, RevertAudit};
 use ryo_v2_core::app::search::{
     DEFAULT_SEARCH_BUDGET, Fate, SearchError, SearchInput, SearchReport, TRIGGER_AFTER_CHECKS,
     TRIGGER_CHECK_GROWTH_PERMILLE, TRIGGER_CHECK_MEDIAN_MS, TRIGGER_DECISION_MEDIAN_MS,
@@ -37,7 +38,7 @@ use ryo_v2_core::domain::{
     SearchBudget, Stage, Target, TextRange,
 };
 use ryo_v2_core::infra::overlay::{OverlayError, overlay_edits};
-use ryo_v2_ra::{Backend, DetectorPanic, ExpanderPanic};
+use ryo_v2_ra::{DetectorPanic, ExpanderPanic};
 use serde::{Serialize, Serializer};
 
 use crate::planted::{PlantKind, texts_match};
@@ -411,9 +412,8 @@ fn kind_ids<S: Serializer>(kinds: &[PlantKind], serializer: S) -> Result<S::Ok, 
 /// # Contract
 /// - C1: serialized, a row is an object with one key per field, of the field's name and value;
 ///   the kinds are their kebab-case ids. The keys and values of the hand-built row it replaced
-///   are kept, so reports before and after compare key by key. A row has no backend key: the
-///   backend is the run's, named once by the report's backend key (`Report` C1), so the rows of
-///   a run on the undo log and of one on the Engine compare key by key.
+///   are kept, so reports before and after compare key by key. A row has no width key: the
+///   width is the run's, named once by the report's width key (`Report` C1).
 ///   tested: search_recall::tests::row_json_keeps_its_keys_and_values
 ///   tested: search_recall::tests::row_json_carries_the_depth_times
 ///   tested: search_recall::tests::row_json_carries_the_level_writes
@@ -458,15 +458,26 @@ pub struct DecisionRow {
     pub check_ms: Vec<u64>,
     /// Per depth: the time in the checks of the depth in ms (`DepthStats::check_ms`).
     pub depth_check_ms: Vec<u64>,
-    /// Per depth: the time in the expansions in ms, the fork's writes and pops to each parent's
-    /// path included (`DepthStats::expand_ms`).
+    /// Per depth: the time in the expansions in ms, from the first expansion job's submit to the
+    /// last one's outcome (`DepthStats::expand_ms`).
     pub depth_expand_ms: Vec<u64>,
     /// Per depth: the checks that ran (`DepthStats::checked`).
     pub depth_checked: Vec<u16>,
     /// Per depth: the parents expanded (`DepthStats::parents`).
     pub depth_parents: Vec<u16>,
-    /// Per depth: the level writes on the search's fork (`DepthStats::writes`).
+    /// Per depth: the write jobs of the search's forks (`DepthStats::writes`).
     pub depth_writes: Vec<u32>,
+    /// The Blueprints of the trace whose fate is `TimedOut`, in trace order: the children a
+    /// cut-off, the budget or the memory stop kept from a verdict.
+    pub timed_out: Vec<String>,
+    /// The stops that ended the search, of `budget_exhausted`, `soft_stopped` and
+    /// `memory_stopped`, in that order. With `timed_out`, a row with neither has no wall-clock
+    /// effect.
+    pub stops: Vec<String>,
+    /// The resident set size in kB read once the search returned, its forks closed and every
+    /// Layer dropped: the reading trigger 3 of D4 takes between decisions (filled by the caller
+    /// that reads it, as `check_ms` is); `None` when not read.
+    pub rss_after_close_kb: Option<u64>,
 }
 
 impl DecisionRow {
@@ -496,6 +507,9 @@ impl DecisionRow {
             depth_checked: Vec::new(),
             depth_parents: Vec::new(),
             depth_writes: Vec::new(),
+            timed_out: Vec::new(),
+            stops: Vec::new(),
+            rss_after_close_kb: None,
         }
     }
 }
@@ -563,6 +577,22 @@ pub fn analyze(case: &PlantedCase, truth: &Truth<'_>, report: &SearchReport) -> 
         depth_checked: report.depths.iter().map(|d| d.checked).collect(),
         depth_parents: report.depths.iter().map(|d| d.parents).collect(),
         depth_writes: report.depths.iter().map(|d| d.writes).collect(),
+        timed_out: report
+            .trace
+            .iter()
+            .filter(|t| t.fate == Fate::TimedOut)
+            .map(|t| t.blueprint.to_string())
+            .collect(),
+        stops: [
+            (report.budget_exhausted, "budget_exhausted"),
+            (report.soft_stopped, "soft_stopped"),
+            (report.memory_stopped, "memory_stopped"),
+        ]
+        .into_iter()
+        .filter(|(set, _)| *set)
+        .map(|(_, name)| name.to_owned())
+        .collect(),
+        rss_after_close_kb: None,
     }
 }
 
@@ -636,21 +666,21 @@ pub fn parse_outer_sample(s: &str) -> Result<NonZeroUsize, String> {
 /// ask a search to improve code that does not compile). Then `search_decision` runs from the
 /// planted edits with no roots, at `case.depth`, and the trace is read with [`analyze`].
 /// `NoCandidates` is a measured decision that generated nothing; any other search failure is an
-/// error, after which the session must be reloaded.
+/// error, after which the session must be reloaded. The search runs on `v`'s forks, with the RSS
+/// stop of `memory` read through `gauge`.
 #[allow(clippy::too_many_arguments)]
-pub fn run_case<V, E, A, J>(
+pub fn run_case<V, A, J>(
     v: &V,
-    e: &E,
     a: &A,
     j: &J,
     clock: &dyn Clock,
+    (gauge, memory): (&dyn Gauge, MemoryBudget),
     s: &mut V::Session,
     case: &PlantedCase,
     budget: SearchBudget,
 ) -> Result<CaseRun, RecallError>
 where
-    V: Stacked + RevertAudit,
-    E: Expander<Session = V::Session>,
+    V: Forks + RevertAudit,
     A: Assessor,
     J: Judge,
 {
@@ -692,11 +722,12 @@ where
         probes: &case.probes,
         scope: Scope::Affected,
         budget,
+        memory,
         weights: DEFAULT_WEIGHTS,
         keep_trace_edits: true,
     };
     let t0 = clock.now_ms();
-    let report = match search_decision(v, e, a, j, clock, s, &input) {
+    let report = match search_decision(v, a, j, clock, gauge, s, &input) {
         Ok(r) => r,
         Err(SearchError::NoCandidates) => {
             let mut row = DecisionRow::skipped(case, "");
@@ -882,10 +913,24 @@ pub struct RunInfo {
     pub outer_sample: OuterSample,
     /// The search budget the run used; `None` when unknown, which leaves trigger 4 not measured.
     pub budget: Option<SearchBudget>,
-    /// Resident set size at the end of the run in kB, when known.
+    /// The resident set size trigger 3 reads, in kB: the most read after a decision's close,
+    /// between decisions ([`rss_after_close`]); `None` when no decision was read.
     pub rss_kb: Option<u64>,
-    /// The backend the run's forks ran on; the undo log unless `--engine` was given.
-    pub backend: Backend,
+    /// The jobs the search's forks ran at once (`Forks::width`, `--width`); 0 when unknown.
+    pub width: usize,
+}
+
+/// The RSS trigger 3 of D4 reads for a run of `rows`: the most of the rows'
+/// `rss_after_close_kb`, each read after its search closed its forks, between decisions. A
+/// reading inside a search would count the search's own live Layers, and glibc keeps a peak, so
+/// the trigger reads only between decisions (D11, stage 4).
+///
+/// # Contract
+/// - C1: the largest `rss_after_close_kb` among `rows`, `None` when no row has one; trigger 3
+///   compares it with `TRIGGER_RSS_KB`, which is `SESSION_RAM_GB` GiB in kB.
+///   tested: search_recall::tests::trigger_3_reads_the_rss_after_close
+pub fn rss_after_close(rows: &[DecisionRow]) -> Option<u64> {
+    rows.iter().filter_map(|r| r.rss_after_close_kb).max()
 }
 
 /// Whether a run with `budget` is judged by trigger 4 (decision D4 in SEARCH_LEDGER.md): its
@@ -913,10 +958,10 @@ pub fn trigger_4_judges(budget: &SearchBudget) -> bool {
 impl RunInfo {
     /// The numbers of one finished `search-recall run`: the budget it searched with, its whole
     /// wall time, the part of it spent in the outer `cargo check`, the sample the outer check
-    /// took, the RSS, and the backend its forks ran on.
+    /// took, the RSS and the width its forks ran at.
     ///
     /// # Contract
-    /// - C1: `beam` is `budget.beam`, `budget` is `Some(budget)`, `outer_sample` and `backend`
+    /// - C1: `beam` is `budget.beam`, `budget` is `Some(budget)`, `outer_sample` and `width`
     ///   are the ones given, and both times are whole ms, saturating at `u64::MAX`.
     ///   tested: search_recall::tests::run_info_of_a_run_carries_budget_and_outer_time
     pub fn of_run(
@@ -925,7 +970,7 @@ impl RunInfo {
         outer_check: std::time::Duration,
         outer_sample: OuterSample,
         rss_kb: Option<u64>,
-        backend: Backend,
+        width: usize,
     ) -> Self {
         let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         RunInfo {
@@ -935,7 +980,7 @@ impl RunInfo {
             outer_sample,
             budget: Some(budget),
             rss_kb,
-            backend,
+            width,
         }
     }
 
@@ -958,7 +1003,8 @@ impl RunInfo {
 /// The trigger status (decision D4 in SEARCH_LEDGER.md) lines for `rows` and a run.
 ///
 /// # Contract
-/// - C1: trigger 3 fires when the RSS is above `TRIGGER_RSS_KB` or the check growth is above
+/// - C1: trigger 3 fires when the RSS after a decision's close (`RunInfo::rss_kb`,
+///   [`rss_after_close`]) is above `TRIGGER_RSS_KB` or the check growth is above
 ///   `TRIGGER_CHECK_GROWTH_PERMILLE`, each read only after `TRIGGER_AFTER_CHECKS` checks; the
 ///   line reads FIRED if either half fired, else "not measured" if either half was not
 ///   measured, else "not fired".
@@ -1008,7 +1054,7 @@ pub fn trigger_lines(rows: &[DecisionRow], t: RunInfo) -> Vec<String> {
             status(check.map(|c| c > TRIGGER_CHECK_MEDIAN_MS))
         ),
         format!(
-            "trigger 3, RSS > {TRIGGER_RSS_KB} kB or check time > {TRIGGER_CHECK_GROWTH_PERMILLE} permille of the first {GROWTH_WINDOW} after {TRIGGER_AFTER_CHECKS} checks: RSS {} kB ({}), check time {} permille ({}) after {n_checks} checks ({trigger_3})",
+            "trigger 3, RSS after a decision's close > {TRIGGER_RSS_KB} kB or check time > {TRIGGER_CHECK_GROWTH_PERMILLE} permille of the first {GROWTH_WINDOW} after {TRIGGER_AFTER_CHECKS} checks: RSS {} kB ({}), check time {} permille ({}) after {n_checks} checks ({trigger_3})",
             t.rss_kb.map_or_else(|| "-".to_string(), |v| v.to_string()),
             status(rss_fired),
             growth.map_or_else(|| "-".to_string(), |v| v.to_string()),
@@ -1294,13 +1340,12 @@ fn outer_sample_value<S: Serializer>(
 ///   generated, hit, beam, recall_at_beam, hit_over_all, generation_rate, top3_rate, verdict,
 ///   harness_ms, outer_check_ms, outer_sample, search_ms, rss_kb, triggers and rows with the
 ///   values the hand-built report gave them, and contained_panics, with its detector and expander
-///   entries, when panics are given; rows are as `DecisionRow` C1 says. The key backend, first,
-///   names the backend of the run (`RunInfo::backend`), `"undo-log"` or `"engine"`, so that two
-///   runs on the same cases can be told apart; every other key is the same on both.
+///   entries, when panics are given; rows are as `DecisionRow` C1 says. The key width, first,
+///   is `RunInfo::width`.
 ///   tested: search_recall::tests::report_json_keeps_its_keys_and_values
 #[derive(Debug, Serialize)]
 pub struct Report<'a> {
-    backend: Backend,
+    width: usize,
     decisions: usize,
     skipped: usize,
     generated: usize,
@@ -1332,7 +1377,7 @@ impl<'a> Report<'a> {
     ) -> Report<'a> {
         let all = Counts::of(rows);
         Report {
-            backend: t.backend,
+            width: t.width,
             decisions: all.measured,
             skipped: all.skipped,
             generated: all.generated,
@@ -1358,7 +1403,7 @@ impl<'a> Report<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ryo_v2_core::app::search::{DepthStats, RankedNode};
+    use ryo_v2_core::app::search::{DepthStats, RankedNode, SESSION_RAM_GB};
     use ryo_v2_core::domain::{
         BlueprintId, CommandKind, Fingerprint, Infeasible, Prior, ProposalId, Reward, SearchTree,
         StateFp,
@@ -1475,6 +1520,7 @@ mod tests {
             expand_errors: Vec::new(),
             budget_exhausted: false,
             soft_stopped: false,
+            memory_stopped: false,
             elapsed_ms: 42,
         }
     }
@@ -1800,7 +1846,7 @@ mod tests {
             Duration::from_millis(634_965),
             OuterSample::Top(NonZeroUsize::new(4).unwrap()),
             Some(7),
-            Backend::Engine,
+            4,
         );
         assert_eq!(
             t,
@@ -1811,19 +1857,12 @@ mod tests {
                 outer_sample: OuterSample::Top(NonZeroUsize::new(4).unwrap()),
                 budget: Some(b),
                 rss_kb: Some(7),
-                backend: Backend::Engine,
+                width: 4,
             }
         );
         assert_eq!(t.search_ms(), 348_068);
-        let flat = RunInfo::of_run(
-            b,
-            Duration::MAX,
-            Duration::ZERO,
-            OuterSample::Off,
-            None,
-            Backend::UndoLog,
-        );
-        assert_eq!(flat.backend, Backend::UndoLog);
+        let flat = RunInfo::of_run(b, Duration::MAX, Duration::ZERO, OuterSample::Off, None, 1);
+        assert_eq!(flat.width, 1);
         assert_eq!(flat.harness_ms, u64::MAX);
     }
 
@@ -1856,13 +1895,16 @@ mod tests {
         assert!(markdown(&rows, three).contains("- outer sample: top 3 of each decision\n"));
     }
 
-    /// The five keys a row has beyond the 18 of the hand-built row.
-    const DEPTH_KEYS: [&str; 5] = [
+    /// The seven keys a row has beyond the 18 of the hand-built row: five per depth, and the
+    /// children timed out and the stops (stage 4), each empty for a row that was not measured.
+    const DEPTH_KEYS: [&str; 7] = [
         "depth_check_ms",
         "depth_expand_ms",
         "depth_checked",
         "depth_parents",
         "depth_writes",
+        "timed_out",
+        "stops",
     ];
 
     #[test]
@@ -1887,8 +1929,12 @@ mod tests {
                 ..DepthStats::default()
             },
         ];
+        r.trace.push(entry(2, Fate::TimedOut, None, None, 1));
+        r.memory_stopped = true;
         let row = analyze(&case(), &truth(&p, &c), &r);
         assert_eq!(row.depth_writes, vec![5, 17]);
+        assert_eq!(row.timed_out, vec![r.trace[1].blueprint.to_string()]);
+        assert_eq!(row.stops, vec!["memory_stopped".to_owned()]);
         let json = serde_json::to_value(&row).unwrap();
         assert_eq!(json["depth_writes"], json!([5, 17]));
     }
@@ -1968,11 +2014,17 @@ mod tests {
             depth_checked: vec![3, 4],
             depth_parents: vec![1, 2],
             depth_writes: vec![2, 8],
+            timed_out: vec!["b".into()],
+            stops: vec!["budget_exhausted".into()],
+            rss_after_close_kb: Some(4321),
         };
         let mut got = serde_json::to_value(&row).unwrap();
+        assert_eq!(got["timed_out"], json!(["b"]));
+        assert_eq!(got["stops"], json!(["budget_exhausted"]));
         let object = got.as_object_mut().unwrap();
-        // The backend is the report's key, not the row's.
-        assert!(!object.contains_key("backend"));
+        // The width is the report's key, not the row's.
+        assert!(!object.contains_key("width"));
+        assert_eq!(object.remove("rss_after_close_kb"), Some(json!(4321)));
         for key in DEPTH_KEYS {
             assert!(object.remove(key).is_some(), "the row has {key}");
         }
@@ -2002,6 +2054,7 @@ mod tests {
         // The other shape of every option: a row that was not measured.
         let mut got = serde_json::to_value(DecisionRow::skipped(&case(), "why")).unwrap();
         let object = got.as_object_mut().unwrap();
+        assert_eq!(object.remove("rss_after_close_kb"), Some(Value::Null));
         for key in DEPTH_KEYS {
             assert!(object.remove(key).is_some(), "the row has {key}");
         }
@@ -2063,7 +2116,7 @@ mod tests {
         };
         let all = info(OuterSample::All);
         let expected = json!({
-            "backend": "undo-log",
+            "width": 0,
             "decisions": 1,
             "skipped": 1,
             "generated": 1,
@@ -2117,18 +2170,9 @@ mod tests {
         };
         let got = serde_json::to_value(Report::of(&rows, unknown, None)).unwrap();
         assert_eq!(got["rss_kb"], Value::Null);
-        // The backend is the first key, and a run on the Engine differs from the same run on
-        // the undo log in that key alone.
+        // The width is the first key.
         let text = serde_json::to_string(&Report::of(&rows, all, None)).unwrap();
-        assert!(text.starts_with(r#"{"backend":"undo-log","#), "{text}");
-        let engine = RunInfo {
-            backend: Backend::Engine,
-            ..all
-        };
-        let mut got = serde_json::to_value(Report::of(&rows, engine, None)).unwrap();
-        assert_eq!(got["backend"], json!("engine"));
-        got["backend"] = json!("undo-log");
-        assert_eq!(got, without);
+        assert!(text.starts_with(r#"{"width":0,"#), "{text}");
     }
 
     #[test]
@@ -2188,6 +2232,46 @@ mod tests {
             f(&mut b);
             assert!(!trigger_4_judges(&b), "knob {i} above the default");
         }
+    }
+
+    /// `rss_after_close` C1, and trigger 3 on it (D4 restated with stage 4).
+    #[test]
+    fn trigger_3_reads_the_rss_after_close() {
+        assert_eq!(TRIGGER_RSS_KB, SESSION_RAM_GB * 1024 * 1024);
+        let at = |kb: Option<u64>| {
+            let mut r = row("a", true, true);
+            r.rss_after_close_kb = kb;
+            r
+        };
+        assert_eq!(rss_after_close(&[at(None), at(None)]), None);
+        assert_eq!(
+            rss_after_close(&[at(Some(5)), at(None), at(Some(9))]),
+            Some(9)
+        );
+        // After 1,000 checks the reading after close is compared with the session's memory.
+        let n = TRIGGER_AFTER_CHECKS as usize;
+        let line = |kb: u64| {
+            let mut r = at(Some(kb));
+            r.check_ms = vec![1_000; n];
+            let rows = [r];
+            let lines = trigger_lines(
+                &rows,
+                RunInfo {
+                    rss_kb: rss_after_close(&rows),
+                    ..RunInfo::default()
+                },
+            );
+            lines[2].clone()
+        };
+        let rss_half = |l: String| {
+            l.split(", check time")
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(rss_half(line(TRIGGER_RSS_KB)).contains("(not fired)"));
+        assert!(rss_half(line(TRIGGER_RSS_KB + 1)).contains("(FIRED)"));
+        assert!(line(1).starts_with("trigger 3, RSS after a decision's close > "));
     }
 
     #[test]

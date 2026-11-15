@@ -1,4 +1,5 @@
-//! The forks of a session on the fork Engine (D11, stage 3; `RaConfig.engine`).
+//! The forks of a session on the fork Engine (D11, stage 3; since stage 4 every fork: the flat
+//! reference check, `flat`, is the one write of the base outside it).
 //!
 //! While a fork is live the session's database is the frozen base of the Engine and `host`
 //! holds an empty one. A level is a layer: its write goes into a new layer on the level below
@@ -6,7 +7,8 @@
 //! layer is open, and in a throwaway child of it once it is sealed (E9). `pop` drops the top
 //! layer and `release` drops them all and thaws the base, so nothing writes the base: the
 //! check that a level's write left the base as it was is the isolation of the Engine (I2), not
-//! a revert.
+//! a revert. Since the `Stacked` port was deleted (stage 4) the forks here, a check's and an
+//! `Analyzer` fork, write one level each; writes stack as jobs of `Forks` (`forks`).
 //!
 //! A panic inside a layer (its write, or a query of its diagnosis) poisons that layer and every
 //! layer above it, never the base, a level below or the session: a write that panics pushes no
@@ -64,8 +66,8 @@ enum Handle {
     Taken,
 }
 
-/// A level of a fork on the Engine without its layer, or a fork on the Engine without its frozen
-/// base: a fault of the adapter, which no port operation leads to.
+/// A level whose layer was lost, or a fork without its frozen base: a fault of the adapter, which
+/// no port operation leads to.
 fn lost(what: &str) -> AnalyzerError {
     AnalyzerError::Panicked(format!("fork Engine: {what}"))
 }
@@ -103,34 +105,25 @@ impl LevelLayer {
 }
 
 impl RaSession {
-    /// The counters of each level's layer of the live fork on the Engine, the lowest level first
-    /// (the top level's layer may still be open); empty with no fork on the Engine, whose levels
-    /// are undo-log levels with no layer. Reads counters only, runs no query, changes nothing.
+    /// The counters of each level's layer of the live fork, the lowest level first (an
+    /// `Analyzer` fork has one level, whose layer is open); empty with no fork. Reads counters
+    /// only, runs no query, changes nothing. The Layers of `Forks` give theirs through
+    /// [`crate::RaLayer::stats`].
     ///
     /// # Contract
-    /// - C1: on the Engine, one row per level, in level order; a level whose top layer ran its
-    ///   diagnosis has memos, and a level below the top that ran none has none. On the undo log
-    ///   it is empty.
-    ///   tested: tests/stack.rs level_stats_has_a_row_per_engine_level
+    /// - C1: one row per level, in level order, none with no level; a level whose layer ran its
+    ///   diagnosis has memos.
+    ///   tested: tests/check.rs level_stats_has_a_row_per_engine_level
     pub fn level_stats(&self) -> Vec<LayerStats> {
         self.stack
             .iter()
-            .filter_map(|level| level.layer.as_ref())
-            .filter_map(|layer| match &layer.handle {
+            .filter_map(|level| match &level.layer.handle {
                 Handle::Open(open) => Some(open.stats()),
                 Handle::Sealed(sealed) => Some(sealed.stats()),
                 Handle::Taken => None,
             })
             .collect()
     }
-}
-
-/// The level's layer; every level of a fork on the Engine has one.
-fn layer_of(level: &Level) -> Result<&LevelLayer, AnalyzerError> {
-    level
-        .layer
-        .as_ref()
-        .ok_or_else(|| lost("a level has no layer"))
 }
 
 pub(crate) fn engine_error(e: EngineError) -> AnalyzerError {
@@ -255,7 +248,7 @@ pub(crate) fn try_thaw(s: &mut RaSession) -> bool {
 }
 
 /// Runs `f` with a host of the state of the top level: the session's own host when no fork is
-/// on the Engine; else a host over the top level's layer while it is open, over a throwaway
+/// live; else a host over the top level's layer while it is open, over a throwaway
 /// child of it once it is sealed, or over a throwaway child of the base with no level. The
 /// host lives only for `f`. A poisoned top level is `Panicked` with its poison, and `f` does not
 /// run; a handle that outlives a throwaway child is `ForkInUse`.
@@ -270,7 +263,7 @@ pub(crate) fn with_top_host<R>(
         let host = AnalysisHost::with_database(db.clone());
         f(&host)
     };
-    match s.stack.last().map(layer_of).transpose()? {
+    match s.stack.last().map(|level| &level.layer) {
         None => base.frozen.root().read(on).map_err(engine_error),
         Some(layer) => {
             if let Some(msg) = layer.poison() {
@@ -290,7 +283,7 @@ pub(crate) fn with_top_host<R>(
 /// Records the panic of a diagnosis that ran in the top level's open layer: the layer is
 /// poisoned. A panic in a throwaway child poisons only the child, which is gone.
 pub(crate) fn poison_top_if_open(s: &RaSession, msg: &str) {
-    if let Some(layer) = s.stack.last().and_then(|l| l.layer.as_ref())
+    if let Some(layer) = s.stack.last().map(|l| &l.layer)
         && matches!(layer.handle, Handle::Open(_))
     {
         layer.set_poison(msg);
@@ -300,7 +293,7 @@ pub(crate) fn poison_top_if_open(s: &RaSession, msg: &str) {
 /// The text of `id` at the top level (the base with no level). `Files::file_text` panics on an
 /// unknown id, so the read is wrapped.
 pub(crate) fn top_text(s: &RaSession, id: FileId) -> Result<String, AnalyzerError> {
-    let top = s.stack.last().map(layer_of).transpose()?;
+    let top = s.stack.last().map(|level| &level.layer);
     let base = base(s)?;
     catch_unwind(AssertUnwindSafe(|| {
         let text = match top.map(|layer| &layer.handle) {
@@ -321,10 +314,11 @@ pub(crate) fn base_text(s: &RaSession, id: FileId) -> Result<String, AnalyzerErr
         .map_err(|p| AnalyzerError::Panicked(panic_message(p)))
 }
 
-/// `fork::push_level` on the Engine: resolves `edits` against the top level, seals it, writes
-/// them into a new layer on it and pushes the level. A refused write (`Edit`) or a write that
-/// panicked (`Panicked`; the new layer is poisoned and dropped) pushes no level and leaves the
-/// levels below as they were; neither poisons the session.
+/// Resolves `edits` (whose paths are `edited`, from `fork::edited_paths`) against the top level,
+/// seals it, writes them into a new layer on it and pushes the level; `sampled` makes its pop
+/// check the isolation of the base. A refused write (`Edit`) or a write that panicked
+/// (`Panicked`; the new layer is poisoned and dropped) pushes no level and leaves the levels
+/// below as they were; neither poisons the session.
 pub(crate) fn push_level(
     a: &RaAnalyzer,
     s: &mut RaSession,
@@ -334,13 +328,13 @@ pub(crate) fn push_level(
 ) -> Result<(), AnalyzerError> {
     let write_started_ms = a.clock.now_ms();
     if let Some(top) = s.stack.last()
-        && let Some(msg) = layer_of(top)?.poison()
+        && let Some(msg) = top.layer.poison()
     {
         return Err(AnalyzerError::Panicked(format!(
             "the level below is poisoned by a panic in its layer: {msg}"
         )));
     }
-    let (pure, _) = fork::resolve_pure_at_top(s, edits);
+    let pure = fork::resolve_pure_at_top(s, edits);
     let actions = fork::complete_on_session(s, pure)?;
     if sampled {
         let base = s
@@ -353,11 +347,7 @@ pub(crate) fn push_level(
     }
     let below = fork::top_state(s).cloned();
     let parent = match s.stack.last_mut() {
-        Some(top) => top
-            .layer
-            .as_mut()
-            .ok_or_else(|| lost("a level has no layer"))?
-            .seal()?,
+        Some(top) => top.layer.seal()?,
         None => base(s)?.frozen.root(),
     };
     let mut child = parent.child();
@@ -395,8 +385,9 @@ pub(crate) fn push_level(
 
 /// Writes the resolved actions into `child`, recording created, revived and deleted files in
 /// `state` as each is made. `inject` makes the write panic first (the test hook
-/// `DbWritePanic::Write`). A deleted file loses its text and leaves its source root, as on the
-/// undo log; a created or revived file enters the source root of its sibling or its own.
+/// `DbWritePanic::Write`). A deleted file loses its text and leaves its source root, as in the
+/// flat reference check; a created or revived file enters the source root of its sibling or its
+/// own.
 pub(crate) fn write_actions(
     state: &mut LayerState,
     child: &mut OpenLayer<RootDatabase>,
@@ -468,9 +459,8 @@ fn base_kept(a: &RaAnalyzer, s: &RaSession) -> Result<bool, AnalyzerError> {
     Ok(!refused && kept)
 }
 
-/// `fork::pop_level` on the Engine: drops the top layer and returns `true`; with no level it is
-/// `false`. A sampled level checks the isolation of the base (I2) instead of re-diagnosing a
-/// revert; a base that changed poisons the session and is `Mismatch` of the level's paths, and a
+/// Pops the top level: drops its layer and returns `true`; with no level it is `false`. A
+/// sampled level checks the isolation of the base (I2); nothing was written to revert. A base that changed poisons the session and is `Mismatch` of the level's paths, and a
 /// check that cannot run poisons it too. An `Event::Reverted` records the pop unless the check
 /// could not run.
 pub(crate) fn pop_level(a: &RaAnalyzer, s: &mut RaSession) -> Result<bool, RevertFailure> {
@@ -478,7 +468,7 @@ pub(crate) fn pop_level(a: &RaAnalyzer, s: &mut RaSession) -> Result<bool, Rever
         return Ok(false);
     };
     let t = a.clock.now_ms();
-    let sampled = level.layer.as_ref().is_some_and(|l| l.sampled);
+    let sampled = level.layer.sampled;
     let edited = level.state.edited.clone();
     drop(level);
     let revert_ok = if sampled {
@@ -508,7 +498,7 @@ pub(crate) fn pop_level(a: &RaAnalyzer, s: &mut RaSession) -> Result<bool, Rever
     Ok(true)
 }
 
-/// `fork::release_levels` on the Engine: pops every level, top first, under the rules of
+/// Ends the fork: pops every level, top first, under the rules of
 /// [`pop_level`], then thaws the base. A poisoned session pops nothing (the levels are dropped)
 /// and is `Poisoned`; the first failure stops the pops, the remaining levels are dropped and that
 /// failure is the result. The base is thawed whatever happens.

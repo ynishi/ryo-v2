@@ -230,7 +230,8 @@ pub enum CheckFailure {
         /// Why.
         reason: String,
     },
-    /// The check was cancelled.
+    /// The analyzer cancelled the check by itself; nobody withdrew it (a withdrawal is no fact
+    /// about a Blueprint and never becomes a failure).
     Cancelled,
     /// The analyzer panicked.
     Panicked(String),
@@ -450,6 +451,7 @@ pub struct Infeasible {
     blocking: Vec<Blocking>,
     near_miss: Vec<NearMiss>,
     budget_exhausted: bool,
+    start: Option<CheckFailure>,
 }
 
 impl Infeasible {
@@ -471,7 +473,24 @@ impl Infeasible {
             blocking,
             near_miss,
             budget_exhausted,
+            start: None,
         })
+    }
+
+    /// The failure of a search whose start state could not be checked: no depth ran, and
+    /// `blocking` holds what became of the roots for it.
+    ///
+    /// # Contract
+    /// - C2: `start()` is `Some(failure)`; the failure is a reason of its own, so `blocking` may be
+    ///   empty, and the budget is not exhausted.
+    ///   tested: domain::resolution::tests::infeasible_needs_a_reason
+    pub fn of_start(failure: CheckFailure, blocking: Vec<Blocking>) -> Self {
+        Self {
+            blocking,
+            near_miss: vec![],
+            budget_exhausted: false,
+            start: Some(failure),
+        }
     }
 
     /// A failure with no Blueprint to blame: nothing was explored.
@@ -480,6 +499,7 @@ impl Infeasible {
             blocking: vec![],
             near_miss: vec![],
             budget_exhausted: true,
+            start: None,
         }
     }
 
@@ -497,6 +517,11 @@ impl Infeasible {
     pub fn budget_exhausted(&self) -> bool {
         self.budget_exhausted
     }
+
+    /// Why the search's start state could not be checked, when that ended the search.
+    pub fn start(&self) -> Option<&CheckFailure> {
+        self.start.as_ref()
+    }
 }
 
 impl std::fmt::Display for Infeasible {
@@ -511,7 +536,11 @@ impl std::fmt::Display for Infeasible {
             } else {
                 ""
             }
-        )
+        )?;
+        match &self.start {
+            Some(failure) => write!(f, ", the start state failed: {failure}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1307,5 +1336,10 @@ mod tests {
         assert!(i.near_miss().is_empty());
         assert_eq!(b.blueprint(), bid());
         assert!(!b.to_string().is_empty());
+        assert_eq!(i.start(), None);
+        // A start state that could not be checked is a reason of its own.
+        let start = Infeasible::of_start(CheckFailure::Cancelled, vec![]);
+        assert_eq!(start.start(), Some(&CheckFailure::Cancelled));
+        assert!(start.blocking().is_empty() && !start.budget_exhausted());
     }
 }

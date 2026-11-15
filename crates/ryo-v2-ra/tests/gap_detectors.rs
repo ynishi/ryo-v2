@@ -40,7 +40,6 @@ impl Probe {
                 gap_detectors,
                 assert_revert_every: None,
                 cfg_test: false,
-                engine: false,
                 ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
@@ -493,7 +492,6 @@ pub struct Note {\n    pub text: String,\n}\n";
                 gap_detectors: true,
                 assert_revert_every: None,
                 cfg_test: false,
-                engine: false,
                 ..Default::default()
             },
             Arc::new(MonotonicClock::new()),
@@ -568,7 +566,6 @@ pub struct Note {\n    pub text: String,\n}\n";
                     gap_detectors: true,
                     assert_revert_every: None,
                     cfg_test: false,
-                    engine: false,
                     ..Default::default()
                 },
                 Arc::new(MonotonicClock::new()),

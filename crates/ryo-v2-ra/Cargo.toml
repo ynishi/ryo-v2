@@ -23,7 +23,7 @@ fork-probe = ["ryo-v2-engine/fork-probe"]
 
 [dependencies]
 ryo-v2-core.workspace = true
-# Stacked forks on layers of a frozen base, behind `RaConfig.engine` (D11, stage 3).
+# Every fork of a session is layers of a frozen base (D11).
 ryo-v2-engine.workspace = true
 ra_ap_ide.workspace = true
 ra_ap_hir.workspace = true

@@ -5,8 +5,9 @@
 //! W × transient_peak + Σ over live layers of (kept(class) + view_bytes(depth)) ≤ A
 //! ```
 //!
-//! Per edit class it stacks levels on one fork of the Engine, each written on the one below and
-//! diagnosed once before the next is written (the search's shape), and reads per level:
+//! Per edit class it stacks levels as jobs of `Forks` at W = 1, each a job on the Layer of the one
+//! below, written and diagnosed once before the next is submitted (the search's shape), and
+//! reads per level:
 //! - the heap the level keeps once its write and diagnosis are done (`kept`);
 //! - the most heap live at once during them above what it keeps (`transient`);
 //! - the bytes of the chain view the level builds once it is sealed and has a child
@@ -21,7 +22,6 @@ use crate::proc;
 use crate::stacked::{self, DepthPoint};
 use anyhow::{Context, Result};
 use ryo_v2_core::domain::{Edit, RelPath, Scope};
-use ryo_v2_ra::Backend;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -71,8 +71,6 @@ pub struct LayerCostArgs {
 /// What one `engine-probe --layer-cost` run measured, written as JSON to `--report`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LayerCostReport {
-    /// Always the Engine: only its layers are measured.
-    pub backend: Backend,
     /// The machine the run measured on; `threads` is the threads of one diagnosis.
     pub machine: Machine,
     /// The files the levels rotate over.
@@ -281,10 +279,11 @@ pub fn class_cost_of(
     }
 }
 
-/// Loads `args.base` on the Engine, writes, diagnoses and pops one throwaway level, and then,
-/// per class and scope, stacks one level more than the largest view depth on one fork, each
-/// written and diagnosed once before the next, reading the counting allocator around every level
-/// and the layers' counters once every level is diagnosed; then pops back.
+/// Loads `args.base` on the Engine, runs one throwaway level as a job and drops it, and then,
+/// per class and scope, stacks one level more than the largest view depth as jobs of `Forks` at
+/// W = 1, each a job on the Layer of the one below and so written and diagnosed once before the
+/// next, reading the counting allocator around every level and the Layers' counters once every
+/// level is diagnosed; then drops them.
 pub fn run_layer_cost(
     args: &LayerCostArgs,
     gauge: &'static dyn HeapGauge,
@@ -294,7 +293,7 @@ pub fn run_layer_cost(
         .context("the available parallelism")?
         .get();
     let (analyzer, _observer, mut session) =
-        crate::bench::load_on_threads(&args.base, true, false, Backend::Engine, args.threads)?;
+        crate::bench::load_on_threads(&args.base, true, false, args.threads)?;
     let files = if args.paths.is_empty() {
         crate::bench::depth_files(&analyzer, &session, &args.base, args.files)?
     } else {
@@ -325,9 +324,12 @@ pub fn run_layer_cost(
             scope,
             stacked::DepthShape::EveryLevel,
             &mut |_| Ok(()),
-            &mut |_| {},
+            &mut |_, _| {},
         )?;
-        anyhow::ensure!(reverted, "layer-cost warm-up: the level did not pop");
+        anyhow::ensure!(
+            reverted,
+            "layer-cost warm-up: the base's isolation failed at the close (I2)"
+        );
     }
     let mut series = Vec::new();
     for &class in &args.classes {
@@ -368,18 +370,14 @@ pub fn run_layer_cost(
                     }
                     Ok(())
                 },
-                &mut |s| {
+                &mut |_, layers| {
                     stacked_at = gauge.live_bytes();
-                    flat = s
-                        .level_stats()
-                        .iter()
-                        .map(|st| st.flat_bytes as u64)
-                        .collect();
+                    flat = layers.iter().map(|l| l.stats().flat_bytes as u64).collect();
                 },
             )?;
             anyhow::ensure!(
                 reverted,
-                "layer-cost {} [{}]: a level did not pop",
+                "layer-cost {} [{}]: the base's isolation failed at the close (I2)",
                 class.name(),
                 scope_name(scope)
             );
@@ -410,7 +408,6 @@ pub fn run_layer_cost(
         }
     }
     Ok(LayerCostReport {
-        backend: Backend::Engine,
         machine: Machine {
             ram_gib,
             cores,

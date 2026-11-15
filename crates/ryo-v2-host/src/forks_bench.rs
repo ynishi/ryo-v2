@@ -31,11 +31,11 @@ use crate::bench::scope_name;
 use crate::layer_cost::{EditClass, Quantiles};
 use crate::proc;
 use anyhow::{Context, Result};
-use ryo_v2_core::app::ports::{CheckError, Event, Forks, JobId, Next, Stacked, Verifier};
+use ryo_v2_core::app::ports::{CheckError, Event, Forks, JobId, Limit, Next, Verifier};
 use ryo_v2_core::domain::{Edit, RelPath, Scope, ScopedFindings};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
-use ryo_v2_ra::{Backend, ForksConfig, RaAnalyzer, RaConfig};
+use ryo_v2_ra::{ForksConfig, RaAnalyzer, RaConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -656,7 +656,7 @@ fn quantiles_txt(q: &Quantiles) -> String {
 ///   <min/p50/p90/max> cut_at_limit <n> scope_lt8 <n> <q> scope_ge8 <n> <q> busy_workers <x.xx>
 ///   occupancy <busy/W, x.xx> cpu_occupancy <x.xx> peak_rss_kb <kb> peak_threads <n> timed_out
 ///   <n> over_5000ms <n> withdrawn <n> rss_stop <b> w4 <equal|DIFF|INCOMPLETE|ref> rows <n>
-///   diffs <n> left_out <n> stopped <n> short <n> backend engine`; `check_ms` and `over_5000ms`
+///   diffs <n> left_out <n> stopped <n> short <n>`; `check_ms` and `over_5000ms`
 ///   count each cut-off job at its cut-off (a lower bound; `cut_at_limit` of them), the scope
 ///   splits leave them out; a set of no checks prints `0 -`, the verdict is [`W4::verdict`], and
 ///   the reference prints `w4 ref rows - diffs - left_out - stopped - short -`.
@@ -686,7 +686,7 @@ pub fn summary_line(s: &WidthSummary) -> String {
          scope_lt{SCOPE_SPLIT} {} \
          scope_ge{SCOPE_SPLIT} {} busy_workers {:.2} occupancy {occupancy:.2} cpu_occupancy {:.2} \
          peak_rss_kb {} peak_threads {} timed_out {} over_{CORE4_MS}ms {} withdrawn {} rss_stop \
-         {} w4 {w4} backend {}",
+         {} w4 {w4}",
         s.scope,
         s.spec.label(),
         s.width,
@@ -709,7 +709,6 @@ pub fn summary_line(s: &WidthSummary) -> String {
         s.over_core4,
         s.withdrawn,
         s.rss_stopped,
-        Backend::Engine.name(),
     )
 }
 
@@ -765,7 +764,10 @@ fn seed_layer<A: Forks>(
     seed: &[Edit],
     scope: Scope,
 ) -> Result<A::Layer> {
-    let id = a.submit(s, root, seed, scope).context("submit the seed")?;
+    // The seed is cut off like every job of the bench: the series measures jobs under D1.
+    let id = a
+        .submit(s, root, seed, scope, Limit::Check)
+        .context("submit the seed")?;
     loop {
         match a.next(s, NEXT_TICK).context("wait for the seed")? {
             Next::Done(got, Ok(checked)) if got == id => return Ok(checked.layer),
@@ -775,7 +777,7 @@ fn seed_layer<A: Forks>(
             Next::Withdrawn(got) if got == id => anyhow::bail!("the seed job was withdrawn"),
             Next::Pending => {}
             Next::Idle => anyhow::bail!("the seed job gave no outcome"),
-            Next::Done(..) | Next::Withdrawn(_) => {
+            Next::Done(..) | Next::Expanded(..) | Next::Withdrawn(_) => {
                 anyhow::bail!("an outcome of a job the bench did not submit")
             }
         }
@@ -796,7 +798,7 @@ fn submit_level<A: Forks>(
 ) -> Result<()> {
     for job in tree.levels.get(level - 1).into_iter().flatten() {
         let id = a
-            .submit(s, parent, &job.edits, scope)
+            .submit(s, parent, &job.edits, scope, Limit::Check)
             .with_context(|| format!("submit job {}.{}", job.level, job.index))?;
         inflight.insert(id, (job.level, job.index));
         run.submitted += 1;
@@ -868,6 +870,7 @@ fn drive<A: Forks>(
                     }
                 }
             }
+            Next::Expanded(..) => anyhow::bail!("an expansion the bench did not ask for"),
             Next::Withdrawn(id) => {
                 let node = inflight
                     .remove(&id)
@@ -935,7 +938,8 @@ pub fn run_tree<A: Forks>(
     }
 }
 
-/// What the tree serially on one `Stacked` fork measured: each job's check and outcome.
+/// What the tree run serially, one job at a time at W = 1 ([`serial_tree`]), measured: each
+/// job's check and outcome.
 #[derive(Debug, Clone, Default)]
 pub struct SerialRun {
     /// From the first write of level 1 to the last diagnosis.
@@ -967,41 +971,51 @@ impl SerialRun {
     }
 }
 
-/// The tree serially on one `Stacked` fork: the seed as level 1, then per level its jobs 1.. each
-/// written as a level, diagnosed and popped, and job 0 written and diagnosed last and kept as
-/// the parent of the next level. The fork is released at the end, whatever happened.
-pub fn serial_tree<A: Stacked>(
+/// The tree serially, one job at a time on `Forks` at W = 1 (the analyzer's forks
+/// [`SERIAL_FORKS`]): the seed as level 1, then per level its jobs 1.. each submitted on the
+/// level's parent, waited for and its Layer dropped, and job 0 submitted last and its Layer kept
+/// as the parent of the next level. Every Layer is dropped and the forks are closed at the end,
+/// whatever happened.
+pub fn serial_tree<A: Forks>(
     a: &A,
     s: &mut A::Session,
     tree: &JobTree,
     scope: Scope,
     observer: &RecordingObserver,
 ) -> Result<SerialRun> {
-    let mut f = a.fork(s).context("open the fork")?;
-    let ran = serial_levels(a, s, &mut f, tree, scope, observer);
-    let released = a.release(s, f);
-    match (ran, released) {
+    let root = a.open(s).context("open the forks")?;
+    let ran = serial_levels(a, s, &root, tree, scope, observer);
+    drop(root);
+    let closed = a.close(s);
+    match (ran, closed) {
         (Ok(run), Ok(())) => Ok(run),
-        (Ok(_), Err(e)) => Err(e).context("release the fork"),
+        (Ok(_), Err(e)) => Err(e).context("close the forks"),
         (Err(e), Ok(())) => Err(e),
-        (Err(e), Err(r)) => {
-            eprintln!("[forks] release after a failed serial run: {r}");
+        (Err(e), Err(c)) => {
+            eprintln!("[forks] close after a failed serial run: {c}");
             Err(e)
         }
     }
 }
 
-/// The levels of [`serial_tree`] on the live fork `f`.
-fn serial_levels<A: Stacked>(
+/// The forks of the serial run: one job in flight on all T threads, as a level of the stacked
+/// fork diagnosed on.
+pub const SERIAL_FORKS: WidthSpec = WidthSpec {
+    n: NonZeroUsize::MIN,
+    caller_works: false,
+};
+
+/// The levels of [`serial_tree`] on the open forks, from `root`; every Layer they hold is dropped
+/// when they return.
+fn serial_levels<A: Forks>(
     a: &A,
     s: &mut A::Session,
-    f: &mut A::Fork,
+    root: &A::Layer,
     tree: &JobTree,
     scope: Scope,
     observer: &RecordingObserver,
 ) -> Result<SerialRun> {
-    a.write(s, f, &tree.seed).context("write the seed")?;
-    a.diagnose(s, f, scope).context("diagnose the seed")?;
+    let mut parent = seed_layer(a, s, root, &tree.seed, scope)?;
     observer.take();
     let mut run = SerialRun::default();
     let started = Instant::now();
@@ -1011,31 +1025,35 @@ fn serial_levels<A: Stacked>(
         };
         for job in siblings {
             let node = (job.level, job.index);
-            match a.write(s, f, &job.edits) {
-                Err(e) => {
-                    run.outcomes.insert(node, JobOutcome::of(Err(&e)));
-                }
-                Ok(()) => {
-                    let found = a.diagnose(s, f, scope);
-                    if let Err(CheckError::TimedOut { limit_ms }) = &found {
-                        run.cut_ms.push(*limit_ms);
-                    }
-                    run.outcomes.insert(node, JobOutcome::of(found.as_ref()));
-                    a.pop(s, f)
-                        .with_context(|| format!("pop job {}.{}", job.level, job.index))?;
-                }
+            let id = a
+                .submit(s, &parent, &job.edits, scope, Limit::Check)
+                .with_context(|| format!("submit job {}.{}", job.level, job.index))?;
+            let found = crate::stacked::outcome(a, s, id)
+                .with_context(|| format!("job {}.{}", job.level, job.index))?;
+            if let Err(CheckError::TimedOut { limit_ms }) = &found {
+                run.cut_ms.push(*limit_ms);
             }
+            run.outcomes
+                .insert(node, JobOutcome::of(found.as_ref().map(|c| &c.findings)));
+            // The sibling's Layer is dropped here.
         }
         let node = (first.level, first.index);
-        a.write(s, f, &first.edits)
-            .with_context(|| format!("write job {}.0", first.level))?;
-        let found = a.diagnose(s, f, scope);
+        let id = a
+            .submit(s, &parent, &first.edits, scope, Limit::Check)
+            .with_context(|| format!("submit job {}.0", first.level))?;
+        let found =
+            crate::stacked::outcome(a, s, id).with_context(|| format!("job {}.0", first.level))?;
+        if let Err(e @ CheckError::Edit { .. }) = &found {
+            return Err(e.clone()).with_context(|| format!("write job {}.0", first.level));
+        }
         if let Err(CheckError::TimedOut { limit_ms }) = &found {
             run.cut_ms.push(*limit_ms);
         }
-        run.outcomes.insert(node, JobOutcome::of(found.as_ref()));
-        if found.is_err() {
-            break;
+        run.outcomes
+            .insert(node, JobOutcome::of(found.as_ref().map(|c| &c.findings)));
+        match found {
+            Ok(checked) => parent = checked.layer,
+            Err(_) => break,
         }
     }
     run.wall_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1080,7 +1098,8 @@ pub struct ForksArgs {
     pub rss_reserve_gib: f64,
     /// Whether to start the proc-macro server.
     pub proc_macro: bool,
-    /// Whether to run the tree serially on one `Stacked` fork too, per repeat.
+    /// Whether to run the tree serially too, one job at a time at W = 1 ([`serial_tree`]), per
+    /// repeat.
     pub serial: bool,
 }
 
@@ -1095,13 +1114,13 @@ fn config(args: &ForksArgs, spec: Option<WidthSpec>) -> RaConfig {
         }),
         ..RaConfig::default()
     }
-    .with_backend(Backend::Engine)
 }
 
 /// Loads `args.base` on the Engine once and, per scope, repeat and width, runs the job tree
 /// through `Forks` ([`run_tree`]); prints a line per run, a summary per width
 /// ([`summary_line`]) and the W4 verdict. A difference of W4, of a width or of the serial run
-/// on `Stacked`, is the run's error, after every line is printed.
+/// ([`serial_tree`]), is the run's error, after every line is printed. The serial run's summary
+/// keeps its name, `serial-stacked`, from when it ran on one stacked fork.
 pub fn run_forks(args: &ForksArgs) -> Result<()> {
     anyhow::ensure!(!args.widths.is_empty(), "--forks: no width");
     let cores = std::thread::available_parallelism()
@@ -1111,13 +1130,8 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
     let stop_kb = rss_stop_kb(mem_total_kb, args.rss_reserve_gib);
     // The analyzer of each width is the loader's configuration with its `ForksConfig` and the
     // cut-off, the two things `Forks::open` reads; they share the loader's observer.
-    let (loader, observer, mut session) = crate::bench::load_on_threads(
-        &args.base,
-        args.proc_macro,
-        false,
-        Backend::Engine,
-        args.threads,
-    )?;
+    let (loader, observer, mut session) =
+        crate::bench::load_on_threads(&args.base, args.proc_macro, false, args.threads)?;
     let clock = Arc::new(MonotonicClock::new());
     let threads = session.threads();
     let rss_load = proc::vm_rss_kb().context("read the RSS after load")?;
@@ -1170,8 +1184,12 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
                 .with_check_timeout(args.cut_off_ms)
         })
         .collect();
-    let serial = RaAnalyzer::new(config(args, None), clock.clone(), observer.clone())
-        .with_check_timeout(args.cut_off_ms);
+    let serial = RaAnalyzer::new(
+        config(args, Some(SERIAL_FORKS)),
+        clock.clone(),
+        observer.clone(),
+    )
+    .with_check_timeout(args.cut_off_ms);
     // W = 1, `1` or `1c` (both give W = 1), is the reference of W4 and the base of the
     // speedup; without it the first width is W4's reference and no speedup is given.
     let one_at = args.widths.iter().position(|w| w.n.get() == 1);
@@ -1200,10 +1218,10 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
             args.widths[0].label(),
             warm.wall_ms
         );
-        // The serial run on `Stacked` has its own untimed warm-up.
+        // The serial run has its own untimed warm-up.
         if args.serial {
             let warm = serial_tree(&serial, &mut session, &tree, scope, &observer)
-                .context("the serial warm-up run on Stacked")?;
+                .context("the serial warm-up run")?;
             eprintln!(
                 "[forks] warm-up [{sname}] serial: wall_ms {:.0}",
                 warm.wall_ms
@@ -1214,7 +1232,7 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
         for r in 1..=args.repeat as usize {
             if args.serial {
                 let run = serial_tree(&serial, &mut session, &tree, scope, &observer)
-                    .context("the serial run on Stacked")?;
+                    .context("the serial run")?;
                 println!(
                     "serial [{sname}] {r}/{}: submitted {}/{jobs} wall_ms {:.0} jobs_per_s {:.2}",
                     args.repeat,
@@ -1314,7 +1332,7 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
             println!(
                 "summary serial-stacked [{sname}] n={} jobs {jobs} jobs_per_s {:.2} check_ms {} \
                  cut_at_limit {cut} vs_width {ref_label} w4 {} rows {} diffs {} left_out {} \
-                 stopped {} short {} backend {}",
+                 stopped {} short {}",
                 serial_runs.len(),
                 median_or_zero(&rates),
                 quantiles_txt(&Quantiles::of(&checks)),
@@ -1324,7 +1342,6 @@ pub fn run_forks(args: &ForksArgs) -> Result<()> {
                 sum.left_out,
                 sum.stopped,
                 sum.short,
-                Backend::Engine.name(),
             );
             if !sides.is_empty() {
                 verdict("serial", &sum);
@@ -1689,7 +1706,7 @@ mod tests {
              400/600/6000/6000 cut_at_limit 1 scope_lt8 3 400/500/600/600 scope_ge8 2 \
              900/900/6000/6000 busy_workers 2.75 occupancy 0.69 cpu_occupancy 0.25 peak_rss_kb \
              100 peak_threads 30 timed_out 1 over_5000ms 1 withdrawn 0 rss_stop false w4 equal \
-             rows 8 diffs 0 left_out 0 stopped 0 short 0 backend engine"
+             rows 8 diffs 0 left_out 0 stopped 0 short 0"
         );
         // The reference, a capped width, no checks, a difference.
         let capped = WidthSummary::of(
@@ -1713,7 +1730,7 @@ mod tests {
             "{line}"
         );
         assert!(
-            line.contains("w4 ref rows - diffs - left_out - stopped - short - backend engine"),
+            line.contains("w4 ref rows - diffs - left_out - stopped - short -"),
             "{line}"
         );
         // Incomplete: fails, and is named, only with the cut-off off.

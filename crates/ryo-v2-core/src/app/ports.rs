@@ -2,7 +2,8 @@
 
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, ChangeProbe, CheckFailure, Edit, Finding, JudgeRequest,
-    Judgement, Provenance, RelPath, Scope, ScopedFindings, StaticMetrics, Target, UnseenClass,
+    Judgement, Provenance, RelPath, Scope, ScopedFindings, StateFp, StaticMetrics, Target,
+    UnseenClass,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -56,7 +57,8 @@ pub enum CheckError {
         /// Why.
         reason: String,
     },
-    /// The check was cancelled.
+    /// The analyzer cancelled the check by itself; nobody withdrew it. A withdrawal
+    /// (`Forks::cancel`, the poison of a session) is `Next::Withdrawn`, never this.
     #[error("check cancelled")]
     Cancelled,
     /// The analyzer panicked.
@@ -150,27 +152,29 @@ impl CheckError {
                 blueprint,
                 limit_ms,
             }),
-            CheckError::Edit { path, reason } => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::Edit { path, reason },
-            }),
-            CheckError::Cancelled => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::Cancelled,
-            }),
-            CheckError::Panicked(m) => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::Panicked(m),
-            }),
-            CheckError::DetectorPanicked { detector, file } => Ok(Blocking::CheckFailed {
-                blueprint,
-                failure: CheckFailure::DetectorPanicked { detector, file },
-            }),
-            session @ (CheckError::RevertMismatch { .. }
+            other => other
+                .into_failure()
+                .map(|failure| Blocking::CheckFailed { blueprint, failure }),
+        }
+    }
+
+    /// The `CheckFailure` of an `Edit`, `Cancelled`, `Panicked` or `DetectorPanicked`; the error
+    /// itself for `TimedOut` (a cut-off is no failure of the check) and for a failure of reach
+    /// `Session`.
+    pub fn into_failure(self) -> Result<CheckFailure, CheckError> {
+        match self {
+            CheckError::Edit { path, reason } => Ok(CheckFailure::Edit { path, reason }),
+            CheckError::Cancelled => Ok(CheckFailure::Cancelled),
+            CheckError::Panicked(m) => Ok(CheckFailure::Panicked(m)),
+            CheckError::DetectorPanicked { detector, file } => {
+                Ok(CheckFailure::DetectorPanicked { detector, file })
+            }
+            other @ (CheckError::TimedOut { .. }
+            | CheckError::RevertMismatch { .. }
             | CheckError::Poisoned(_)
             | CheckError::ForkInUse
             | CheckError::AlreadyApplied
-            | CheckError::Load(_)) => Err(session),
+            | CheckError::Load(_)) => Err(other),
         }
     }
 }
@@ -207,7 +211,7 @@ pub trait Verifier {
     /// - C1: every finding of the result is on one of the result's `files`, one the analyzer
     ///   attributes to another file than the one it scanned included; `Verdict::of_check` and so
     ///   `app::verdict_of` and `Verdict::of_level` C3 rest on it.
-    ///   tested: ryo-v2-ra tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
+    ///   tested: ryo-v2-ra tests/jobs.rs a_finding_is_on_a_file_of_its_diagnosis
     fn check(
         &self,
         s: &mut Self::Session,
@@ -221,230 +225,6 @@ pub trait RevertAudit: Verifier {
     /// Re-diagnoses the files edited since the last audit and compares them with the baseline;
     /// a difference poisons the session and is `CheckError::RevertMismatch`.
     fn audit_revert(&self, s: &mut Self::Session) -> Result<(), CheckError>;
-}
-
-/// A [`Verifier`] whose forks take stacked writes: a child state is written on top of its
-/// parent's, never rebuilt from the base.
-///
-/// A fork is a stack of levels over the session's base state. `write` pushes a level whose edits
-/// are written on top of the level below and resolved against that level's state, as a load of
-/// that state would resolve them. `fork_text` and `diagnose` read the top level. `pop` reverts the
-/// top level. `release` reverts every level, top first, and ends the fork.
-///
-/// A level is diagnosed and reverted under the rules of a check:
-/// - the check time limit cuts a diagnosis off;
-/// - a detector panic is judged against the baseline;
-/// - a revert is compared with the level below, and a revert that does not restore it, or that
-///   cannot be carried out or confirmed, poisons the session.
-///
-/// The verdict of a level is against the baseline, like a check's. `diagnose` covers the scope of
-/// the top level's own edits, and a file outside it has the findings it has at the level below.
-/// So a caller that judges the state of a level keeps the findings of the levels below.
-///
-/// The reads of [`Verifier`] describe the base state, never a level: while a fork is live, and
-/// after a release that found the session poisoned.
-///
-/// An adapter whose forks write into the session's one database allows one live fork per
-/// session, and while it is live the session's other operations refuse with `ForkInUse`, except an
-/// expansion of its top level. An adapter whose forks are separate copies may keep several live.
-///
-/// # Contract
-/// - C1: on a poisoned session `fork`, and given the live fork's ticket `write`, `diagnose`,
-///   `files_of`, `fork_text` and `pop`, are `Poisoned`; `levels` still answers; `release` ends
-///   the fork and is `Poisoned`. A ticket that is not the live fork's is `ForkInUse` before the
-///   poison is looked at, and changes nothing.
-///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
-///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
-/// - C2: while a fork of an adapter with one live fork per session is live, `Verifier::check`,
-///   `RevertAudit::audit_revert` and a second `fork` are `ForkInUse`, or `Poisoned` on a poisoned
-///   session, before they change anything, and so is `Expander::expand` (as
-///   `ExpandError::Session`) while that fork is an `Analyzer` fork; an operation given a ticket
-///   that is not the live fork's is `ForkInUse`.
-///   tested: ryo-v2-ra tests/stack.rs session_operations_refuse_while_a_fork_is_live
-///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
-/// - C3: while a fork is live, and after a release that found the session poisoned,
-///   `Verifier::text`, `Verifier::provenance` and `Verifier::baseline` describe the base state,
-///   never a level.
-///   tested: ryo-v2-ra tests/stack.rs verifier_reads_describe_the_base_while_a_fork_is_live
-///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
-/// - C4: `Verifier::check` of edits at a scope gives what `fork`, one `write` of those edits,
-///   `diagnose` at that scope and `release` give; when more than one fails, the failure of
-///   `release` wins, then that of `write`, then that of `diagnose`.
-///   tested: ryo-v2-ra tests/stack.rs check_is_the_one_level_case
-///   tested: ryo-v2-ra tests/stack.rs a_session_error_of_the_release_wins_in_a_check
-pub trait Stacked: Verifier {
-    /// The ticket of a live fork of the session's base state; its levels live behind the
-    /// session.
-    type Fork;
-
-    /// Opens a fork of the session's base state, with no level.
-    ///
-    /// A poisoned session is `Poisoned`; a session on which a fork is live is `ForkInUse`.
-    fn fork(&self, s: &mut Self::Session) -> Result<Self::Fork, CheckError>;
-
-    /// Pushes a level that writes `edits` on top of the top level.
-    ///
-    /// A write that panics the database poisons the session and is `Poisoned`, not `Panicked`, so
-    /// that a failure of reach `Blueprint` always leaves the levels as they were.
-    ///
-    /// # Contract
-    /// - C1: pushes one level on top of the top level: `levels` grows by one, and `fork_text` and
-    ///   `diagnose` read the new level.
-    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
-    /// - C2: edits resolve against the state of the top level: a path that is not a file of that
-    ///   state is created, one a lower level deleted included; a path that is a file of it is
-    ///   modified or deleted; deleting a path that is not a file of it is `Edit`.
-    ///   tested: ryo-v2-ra tests/stack.rs a_level_writes_against_the_state_below
-    /// - C3: a stack diagnoses as its flat composition: at level k, `diagnose` at
-    ///   `Scope::Workspace` gives what `Verifier::check` at `Scope::Workspace` gives for the edits
-    ///   that take the base to the state of level k (the same files, findings and `unseen_at`, or
-    ///   the same failure of its diagnosis), and at `Scope::Affected` its files are the top
-    ///   level's scope and their findings are those that check gives on them.
-    ///   tested: ryo-v2-ra tests/stack.rs a_stack_diagnoses_as_its_flat_composition
-    /// - C4: a refused write (`Edit`, or a failure of the diagnosis it takes of the level below)
-    ///   pushes no level and leaves every text as it was.
-    ///   tested: ryo-v2-ra tests/stack.rs a_refused_write_pushes_no_level
-    /// - C5: a write with no edit pushes a level whose `Scope::Affected` diagnosis covers no file
-    ///   and names no unseen class.
-    ///   tested: ryo-v2-ra tests/stack.rs an_empty_write_diagnoses_nothing
-    /// - C6: a write the database cannot carry out (its write panics) is `Poisoned`, pushes no
-    ///   level and poisons the session; the reads of `Verifier` still describe the base.
-    ///   tested: ryo-v2-ra tests/stack.rs a_database_write_that_panics_poisons_the_session
-    fn write(
-        &self,
-        s: &mut Self::Session,
-        f: &mut Self::Fork,
-        edits: &[Edit],
-    ) -> Result<(), CheckError>;
-
-    /// The number of levels of the live fork.
-    ///
-    /// # Contract
-    /// - C1: the number of levels of the live fork, on a poisoned session too; a ticket that is
-    ///   not the live fork's is `ForkInUse`.
-    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
-    ///   tested: ryo-v2-ra tests/stack.rs pop_compares_texts_and_poisons_on_a_difference
-    ///   tested: ryo-v2-ra tests/stack.rs a_ticket_of_another_session_is_refused
-    fn levels(&self, s: &Self::Session, f: &Self::Fork) -> Result<usize, CheckError>;
-
-    /// The text of `path` at the top level.
-    ///
-    /// # Contract
-    /// - C1: the text of `path` at the top level (the base text with no level); `Ok(None)` when
-    ///   `path` is not a file of that state (not indexed, deleted by a level, never created); an
-    ///   error when the text could not be read.
-    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
-    ///   tested: ryo-v2-ra tests/stack.rs a_level_writes_against_the_state_below
-    fn fork_text(
-        &self,
-        s: &Self::Session,
-        f: &Self::Fork,
-        path: &RelPath,
-    ) -> Result<Option<String>, CheckError>;
-
-    /// Diagnoses the top level at `scope`.
-    ///
-    /// # Contract
-    /// - C1: `Scope::Affected` covers the files of the crates the top level's edits touch and of
-    ///   their dependents, at the top level's state (files it created included, files it deleted
-    ///   excluded); `Scope::Workspace` covers every file of that state.
-    ///   tested: ryo-v2-ra tests/stack.rs affected_scope_is_the_top_levels
-    /// - C2: with no level the result is `ScopedFindings::default()`.
-    ///   tested: ryo-v2-ra tests/stack.rs pop_without_a_level_is_false
-    /// - C3: a file outside the top level's `Scope::Affected` has, at the top level, the findings
-    ///   it has at the level below, and the same files under each class of `unseen_at`.
-    ///   tested: ryo-v2-ra tests/stack.rs files_outside_the_top_scope_keep_the_level_below
-    /// - C4: the adapter's check time limit cuts a diagnosis off with `TimedOut`; the levels stay
-    ///   and the fork stays usable.
-    ///   tested: ryo-v2-ra tests/stack.rs a_cut_off_diagnosis_keeps_the_levels
-    /// - C5: the unseen classes of the result are those this diagnosis observed at the top level;
-    ///   a class observed at a level below and not at the top is not among them.
-    ///   tested: ryo-v2-ra tests/stack.rs a_level_names_the_unseen_it_observes
-    /// - C6: a detector that panics on a file of the diagnosis, where it did not panic on that
-    ///   file at the baseline, makes the result `DetectorPanicked` (the first by detector and
-    ///   file), whatever the levels below had; one that panicked on that file at the baseline too
-    ///   names its class among the unseen classes, whatever the levels below had. Either way the
-    ///   levels stay and the fork stays usable.
-    ///   tested: ryo-v2-ra tests/stack.rs a_new_detector_panic_fails_the_diagnose_and_keeps_the_level
-    ///   tested: ryo-v2-ra tests/stack.rs a_baseline_panic_brought_back_above_is_named
-    ///   tested: ryo-v2-ra tests/stack.rs a_baseline_detector_panic_is_named_at_every_level
-    /// - C7: the `check_ms` of the `Event::Checked` of a diagnosis is the duration of the write of
-    ///   the top level plus the duration of this diagnosis: an earlier diagnosis of the level,
-    ///   the time between calls and the pop that made the level the top are not in it.
-    ///   tested: ryo-v2-ra tests/stack.rs the_diagnoses_of_a_level_do_not_add_up
-    /// - C8: every class of the result's `unseen_at` names at least one file, and only files of
-    ///   the result; by `Stacked` C4 so does every class of a check's findings.
-    ///   tested: ryo-v2-ra tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
-    /// - C9: every finding of the result is on one of the result's `files`, one the analyzer
-    ///   attributes to another file than the one it scanned included; by `Stacked` C4 so is every
-    ///   finding of a check. A finding below is so on a file of its own diagnosis, and a file
-    ///   diagnosed again replaces it (`ScopedFindings::on_top_of`).
-    ///   tested: ryo-v2-ra tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
-    fn diagnose(
-        &self,
-        s: &Self::Session,
-        f: &Self::Fork,
-        scope: Scope,
-    ) -> Result<ScopedFindings, CheckError>;
-
-    /// The files a one-level `Verifier::check` at `scope` covers for the edits that take the base
-    /// to the top level's state. The adapter derives those edits' paths from its own levels, so
-    /// a caller cannot name a wrong set. The caller keeps a composed verdict to these files
-    /// (`Verdict::of_level`).
-    ///
-    /// # Contract
-    /// - C1: the files, sorted, are those of `Verifier::check` at `scope` of the edits that take
-    ///   the base to the top level's state: one edit per path some level edited whose presence or
-    ///   text at the top level differs from the base, and no other.
-    ///   tested: ryo-v2-ra tests/stack.rs files_of_and_of_level_equal_the_check_over_a_stack
-    /// - C2: with no level, or with every path the levels edited back at its base presence and
-    ///   text, the result at `Scope::Affected` is empty, as a check with no edit diagnoses no file
-    ///   there; at `Scope::Workspace` it is every file of the top level's state, as such a check
-    ///   diagnoses every file.
-    ///   tested: ryo-v2-ra tests/stack.rs files_of_and_of_level_equal_the_check_over_a_stack
-    fn files_of(
-        &self,
-        s: &Self::Session,
-        f: &Self::Fork,
-        scope: Scope,
-    ) -> Result<Vec<RelPath>, CheckError>;
-
-    /// Reverts the top level.
-    ///
-    /// Given the live fork's ticket, every error of a pop poisons the session (`RevertMismatch`,
-    /// or `Poisoned`, which is also the answer when the session was poisoned already), so a pop
-    /// never fails with a `CheckError` of reach `Blueprint`. A ticket that is not the live fork's
-    /// is `ForkInUse`.
-    ///
-    /// # Contract
-    /// - C1: reverts the top level and returns `true`: afterwards every text is that of the level
-    ///   below and `levels` is one less.
-    ///   tested: ryo-v2-ra tests/stack.rs levels_stack_and_pop_back_to_the_level_below
-    /// - C2: a revert that does not restore the level below (its texts, or the adapter's
-    ///   diagnostic re-assert) is `RevertMismatch`, removes the level and poisons the session; a
-    ///   revert that cannot be carried out or confirmed (a database write panics, or the
-    ///   re-assert cannot run) is `Poisoned`, removes the level and poisons the session.
-    ///   tested: ryo-v2-ra tests/stack.rs pop_compares_texts_and_poisons_on_a_difference
-    ///   tested: ryo-v2-ra tests/stack.rs pop_reassert_compares_with_the_level_below
-    ///   tested: ryo-v2-ra tests/stack.rs a_revert_that_cannot_be_confirmed_poisons_the_session
-    ///   tested: ryo-v2-ra tests/stack.rs a_database_write_that_panics_poisons_the_session
-    /// - C3: with no level `pop` changes nothing and returns `Ok(false)`.
-    ///   tested: ryo-v2-ra tests/stack.rs pop_without_a_level_is_false
-    fn pop(&self, s: &mut Self::Session, f: &mut Self::Fork) -> Result<bool, CheckError>;
-
-    /// Reverts every level and ends the fork.
-    ///
-    /// # Contract
-    /// - C1: reverts every level, top first, under the rules of `pop`, and ends the fork: a later
-    ///   `fork` is not `ForkInUse`.
-    ///   tested: ryo-v2-ra tests/stack.rs release_reverts_every_level
-    /// - C2: every revert failure poisons the session, so from the first failure on, or on a
-    ///   session already poisoned, it writes nothing more: it drops the remaining levels, keeping
-    ///   their base texts for the reads of `Verifier`, ends the fork and returns that failure
-    ///   (`Poisoned` for a session already poisoned).
-    ///   tested: ryo-v2-ra tests/stack.rs release_stops_writing_after_a_failure
-    ///   tested: ryo-v2-ra tests/stack.rs poisoned_session_refuses_stacked_operations
-    fn release(&self, s: &mut Self::Session, f: Self::Fork) -> Result<(), CheckError>;
 }
 
 /// Failure of an [`Expander`].
@@ -465,16 +245,8 @@ pub trait Expander {
     type Session;
     /// Children of the state `state` (edits over the session base), at most `max`, within
     /// `targets`. Observable session state afterwards = before. Reads and splices are against
-    /// the state's text.
-    ///
-    /// When a stacked fork is live on the session, `state` is the state of its top level, and the
-    /// children are read there: nothing is written.
-    ///
-    /// # Contract
-    /// - C1: with a stacked fork live on the session and `state` the state of its top level, the
-    ///   result is what `expand` gives for `state` with no fork live, and afterwards the fork has
-    ///   the same levels and every text is as before.
-    ///   tested: ryo-v2-ra tests/stack.rs expand_reads_the_top_level_of_a_live_fork
+    /// the state's text. An expansion of a Layer of an open [`Forks`] session is
+    /// `Forks::expand`.
     fn expand(
         &self,
         s: &mut Self::Session,
@@ -517,6 +289,10 @@ pub enum Next<L> {
     /// The job ran: its layer and diagnosis, or why its check could not finish. An error here
     /// reaches the job's Blueprint only.
     Done(JobId, Result<Checked<L>, CheckError>),
+    /// A read job of [`Forks::expand`] ran: the children of its Layer's state, or why that
+    /// parent yields nothing (`ExpandError::Analysis`) or the session cannot go on
+    /// (`ExpandError::Session`).
+    Expanded(JobId, Result<Vec<Blueprint>, ExpandError>),
     /// The caller withdrew the job (`Forks::cancel` returned true), or the session withdrew it
     /// when it was poisoned: no layer, and no fact about its Blueprint. (The jobs `Forks::close`
     /// withdraws are not delivered: `next` is refused after it.)
@@ -527,18 +303,32 @@ pub enum Next<L> {
     Idle,
 }
 
+/// The time limit of a job of [`Forks::submit`].
+///
+/// D1's per-candidate cut-off is for a candidate's check. The search's start state is no
+/// candidate: its job runs to its end, however long it takes (Forks C11).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Limit {
+    /// The adapter's check cut-off (D1), counted from the job's start on a worker.
+    Check,
+    /// No cut-off.
+    None,
+}
+
 /// A [`Verifier`] whose forks run side by side: layers over the session's frozen base, any
 /// number alive at once, each job checked on a pool of workers (D11, stage 3b).
 ///
 /// `open` freezes the base and gives its root as a Layer. A job (`submit`) writes its edits on
-/// top of a Layer, resolved against that Layer's state as `Stacked::write` resolves them against
-/// the top level, diagnoses its scope there, and finishes as a new Layer. `next` gives the
+/// top of a Layer, resolved against that Layer's state as a load of that state would resolve them
+/// (C13), diagnoses its scope there under the rules of a check, and finishes as a new Layer. Writes
+/// stack: a child is a job on its parent's Layer, never rebuilt from the base. `next` gives the
 /// outcomes in the order the jobs finish. A job's parent is always a finished Layer, never one in
-/// flight; siblings are jobs on one parent. `cancel` withdraws a job. `close` ends the pool and
-/// thaws the base.
+/// flight; siblings are jobs on one parent. `expand` queues a read job that proposes the children
+/// of a Layer's state, written nowhere. `cancel` withdraws a job. `close` ends the pool and thaws
+/// the base.
 ///
-/// `open`, `submit`, `next`, `cancel` and `close` take the session mutably: the session belongs to
-/// one thread, while the jobs run on the workers. The reads take it shared.
+/// `open`, `submit`, `expand`, `next`, `cancel` and `close` take the session mutably: the session
+/// belongs to one thread, while the jobs run on the workers. The reads take it shared.
 ///
 /// A withdrawal is no fact about a Blueprint, so it is `Next::Withdrawn`, never a [`CheckError`];
 /// a `CheckError::Cancelled` inside a `Done` means the check could not finish although nobody
@@ -546,12 +336,13 @@ pub enum Next<L> {
 /// session, an id that is unknown or already delivered, forks that are not open, and the
 /// operations refused below; `Poisoned` for a poisoned session.
 ///
-/// While forks are open the reads of [`Verifier`] describe the base, as `Stacked` C3 says.
+/// While forks are open the reads of [`Verifier`] describe the base, never a Layer (C21).
 ///
 /// # Contract
-/// - C1: until `close`, every accepted `submit` yields exactly one `Done` or `Withdrawn` with its
-///   id, ids increasing in submission order; edits are resolved at submit, and a refused edit is a
-///   `Done` with `Edit` and no layer, never an `Err` of `submit`.
+/// - C1: until `close`, every accepted `submit` or `expand` yields exactly one `Done`, `Expanded`
+///   or `Withdrawn` with its id (`Done` for a `submit`, `Expanded` for an `expand`), ids
+///   increasing in submission order; edits are resolved at submit, and a refused edit is a `Done`
+///   with `Edit` and no layer, never an `Err` of `submit`.
 ///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
 ///   tested: ryo-v2-ra tests/forks.rs a_refused_edit_is_a_done_without_a_layer
 ///   tested: ryo-v2-ra tests/forks.rs parallel_jobs_equal_serial_and_the_reference
@@ -561,6 +352,7 @@ pub enum Next<L> {
 ///   them, whatever ran beside it.
 ///   tested: app::ports::tests::a_done_layer_diagnoses_as_its_flat_composition_for_the_fake
 ///   tested: ryo-v2-ra tests/forks.rs parallel_jobs_equal_serial_and_the_reference
+///   tested: ryo-v2-ra tests/jobs.rs a_chain_of_jobs_diagnoses_as_its_flat_composition
 /// - C3: `cancel` returning true makes the job's outcome `Withdrawn`, never a `Done`, and leaves
 ///   the parent and every other job as they were; a job that already finished is not withdrawn
 ///   (false), and its outcome is what it produced.
@@ -577,9 +369,9 @@ pub enum Next<L> {
 ///   poison included, and changes nothing.
 ///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
 ///   tested: ryo-v2-ra tests/forks.rs a_layer_of_another_session_is_refused
-/// - C6: while forks are open, `Verifier::check`, `Stacked::fork` and `RevertAudit::audit_revert`
-///   are `ForkInUse`, `Expander::expand` is `ExpandError::Session` with `ForkInUse`, and a second
-///   `open` is `ForkInUse`; none of them changes anything.
+/// - C6: while forks are open, `Verifier::check` and `RevertAudit::audit_revert` are `ForkInUse`, `Expander::expand` is `ExpandError::Session` with `ForkInUse`, and a second
+///   `open` is `ForkInUse`; none of them changes anything. An expansion of a Layer is
+///   `Forks::expand` (C10).
 ///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
 ///   tested: ryo-v2-ra tests/forks.rs session_operations_refuse_while_forks_are_open
 ///   tested: ryo-v2-ra tests/forks.rs expand_refuses_while_forks_are_open
@@ -595,30 +387,95 @@ pub enum Next<L> {
 ///   tested: app::ports::tests::a_refused_close_can_be_retried_on_the_fake
 ///   tested: ryo-v2-ra tests/forks.rs a_refused_close_can_be_retried
 ///   tested: ryo-v2-ra tests/forks.rs isolation_holds_after_parallel_jobs
-/// - C9: `open` on an adapter whose forks write into the session's one database (the undo-log
-///   backend) is `ForkInUse`: forks need the Engine backend.
-///   tested: app::ports::tests::the_fake_refuses_what_forks_refuse
-///   tested: ryo-v2-ra tests/forks.rs forks_need_the_engine_backend
+/// - C10: `expand` of a Layer gives, as `Next::Expanded`, what `Expander::expand` gives for the
+///   Layer's state with no fork open (the same Blueprints, ids included, the files the state
+///   created among those it reads), whatever ran beside it; it writes nothing and counts in the
+///   width (C4).
+///   tested: app::ports::tests::outcomes_and_withdrawal_hold_for_the_fake
+///   tested: ryo-v2-ra tests/forks.rs an_expansion_of_a_layer_is_that_of_its_state
+///   tested: ryo-v2-ra tests/forks.rs expansions_run_beside_jobs_and_change_no_job
+///   tested: ryo-v2-ra tests/forks.rs an_expansion_sees_a_file_the_state_created
+///   tested: ryo-v2-ra tests/forks.rs an_expansion_counts_in_the_width
+/// - C11: a job submitted with `Limit::None` is not cut off: it runs to its end and its outcome
+///   is what the same job gives with no cut-off configured; with `Limit::Check` the adapter's
+///   cut-off (D1) applies from the job's start on a worker.
+///   tested: ryo-v2-ra tests/forks.rs a_start_job_is_not_cut_off
+/// - C12: with no forks open, `Verifier::check` of edits at a scope gives what a session with one
+///   job gives for the same edits: `open`, a `submit` of them on the root Layer with
+///   `Limit::Check` at that scope, its `Done` (the findings, or the error), and `close`; the texts
+///   after either are the base's.
+///   tested: ryo-v2-ra tests/jobs.rs check_is_a_one_job_session
+/// - C13: a job's edits resolve against its parent's state: a path that is not a file of that
+///   state is created, one an earlier job of the chain deleted included (revived); a path that is
+///   a file of it is modified or deleted; deleting a path that is not a file of it is a `Done`
+///   with `Edit` and no layer. The parent and every Layer below it keep their texts.
+///   tested: ryo-v2-ra tests/jobs.rs a_job_writes_against_its_parents_state
+/// - C14: a job's `Scope::Affected` covers the files of the crates its edits touch and of their
+///   dependents, at its layer's state (files it created included, files it deleted excluded);
+///   `Scope::Workspace` covers every file of that state.
+///   tested: ryo-v2-ra tests/jobs.rs affected_scope_is_the_jobs
+/// - C15: a file outside a job's `Scope::Affected` has, at its layer, the findings it has at its
+///   parent's, and the same files under each class of `unseen_at`.
+///   tested: ryo-v2-ra tests/jobs.rs files_outside_a_jobs_scope_keep_its_parents_findings
+/// - C16: a job with no edit diagnoses no file at `Scope::Affected` and names no unseen class.
+///   tested: ryo-v2-ra tests/jobs.rs an_empty_job_diagnoses_nothing
+/// - C17: a job whose diagnosis the adapter's cut-off reaches is a `Done` with `TimedOut` and no
+///   layer; its parent stays usable.
+///   tested: ryo-v2-ra tests/jobs.rs a_cut_off_job_keeps_its_parent_usable
+/// - C18: the unseen classes of a `Done` are those its diagnosis observed at its layer; a class
+///   observed at a parent's and not there is not among them. Every class of its `unseen_at`, and
+///   of a check's, names at least one file, and only files of the result.
+///   tested: ryo-v2-ra tests/jobs.rs a_job_names_the_unseen_it_observes
+///   tested: ryo-v2-ra tests/jobs.rs a_diagnosis_names_where_it_observed_each_unseen_class
+/// - C19: a detector that panics on a file of a job's diagnosis, where it did not panic on that
+///   file at the baseline, makes the `Done` `DetectorPanicked` (the first by detector and file),
+///   whatever its parents had; one that panicked on that file at the baseline too names its class
+///   among the unseen classes, whatever its parents had. Either way the parent stays usable.
+///   tested: ryo-v2-ra tests/jobs.rs a_new_detector_panic_fails_the_job_and_keeps_its_parent
+///   tested: ryo-v2-ra tests/jobs.rs a_baseline_panic_brought_back_by_a_job_is_named
+///   tested: ryo-v2-ra tests/jobs.rs a_baseline_detector_panic_is_named_at_every_job
+/// - C20: every finding of a `Done`, and of a check, is on one of the result's `files`, one the
+///   analyzer attributes to another file than the one it scanned included. A parent's finding is
+///   so on a file of its own diagnosis, and a file diagnosed again replaces it
+///   (`ScopedFindings::on_top_of`).
+///   tested: ryo-v2-ra tests/jobs.rs a_finding_is_on_a_file_of_its_diagnosis
+/// - C21: while forks are open, `Verifier::text`, `Verifier::provenance` and
+///   `Verifier::baseline` describe the base, never a Layer.
+///   tested: ryo-v2-ra tests/jobs.rs verifier_reads_describe_the_base_while_forks_are_open
 pub trait Forks: Verifier {
     /// A finished job's layer, or the base's root: what a job writes on top of. Holding one
     /// keeps the base frozen (C8).
     type Layer: Clone + Send;
 
-    /// Freezes the session's base and gives its root. A session with forks open, or with a
-    /// `Stacked` fork live, is `ForkInUse`; a poisoned one is `Poisoned`.
+    /// Freezes the session's base and gives its root. A session with forks open, or with another
+    /// fork of the adapter live, is `ForkInUse`; a poisoned one is `Poisoned`.
     fn open(&self, s: &mut Self::Session) -> Result<Self::Layer, CheckError>;
 
     /// The jobs that run at once (C4).
     fn width(&self, s: &Self::Session) -> usize;
 
     /// Resolves `edits` against `parent`'s state and queues a job that writes them on top of it
-    /// and diagnoses `scope` there (C1).
+    /// and diagnoses `scope` there (C1), within `limit` (C11).
     fn submit(
         &self,
         s: &mut Self::Session,
         parent: &Self::Layer,
         edits: &[Edit],
         scope: Scope,
+        limit: Limit,
+    ) -> Result<JobId, CheckError>;
+
+    /// Queues a read job that proposes at most `max` children of `layer`'s state within
+    /// `targets` (C10). `state` is the fingerprint of that state's edits over the base, the
+    /// identity the Blueprints' ids are made of (`Expander` C8): the caller keeps it with the
+    /// Layer, so no edit list has to be handed back.
+    fn expand(
+        &self,
+        s: &mut Self::Session,
+        layer: &Self::Layer,
+        state: StateFp,
+        targets: &[Target],
+        max: usize,
     ) -> Result<JobId, CheckError>;
 
     /// The next outcome, waiting at most `timeout` for one while jobs are in flight. `timeout`
@@ -633,9 +490,21 @@ pub trait Forks: Verifier {
     /// is `ForkInUse`.
     fn cancel(&self, s: &mut Self::Session, job: JobId) -> Result<bool, CheckError>;
 
-    /// The files a one-level `Verifier::check` at `scope` covers for the edits that take the base
-    /// to `layer`'s state, sorted, as `Stacked::files_of` gives them for a top level. (Not named
-    /// `files_of`: an adapter implements `Stacked` too, and one name would need a qualified call.)
+    /// The files a `Verifier::check` at `scope` covers for the edits that take the base to
+    /// `layer`'s state. The adapter derives those edits' paths from the jobs of the Layer's chain,
+    /// so a caller cannot name a wrong set. The caller keeps a composed verdict to these files
+    /// (`Verdict::of_level`).
+    ///
+    /// # Contract
+    /// - C1: the files, sorted, are those of `Verifier::check` at `scope` of the edits that take
+    ///   the base to `layer`'s state: one edit per path some job of the chain edited whose
+    ///   presence or text at `layer` differs from the base, and no other.
+    ///   tested: ryo-v2-ra tests/jobs.rs layer_files_and_of_level_equal_the_check_over_a_chain
+    /// - C2: for the root, or with every path the chain edited back at its base presence and text,
+    ///   the result at `Scope::Affected` is empty, as a check with no edit diagnoses no file there;
+    ///   at `Scope::Workspace` it is every file of `layer`'s state, as such a check diagnoses every
+    ///   file.
+    ///   tested: ryo-v2-ra tests/jobs.rs layer_files_and_of_level_equal_the_check_over_a_chain
     fn layer_files(
         &self,
         s: &Self::Session,
@@ -737,6 +606,15 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
 }
 
+/// Reads the memory of this process, for the RSS stop of a search (`app::memory::RssStop`).
+///
+/// `None` means the figure cannot be read here (no `/proc`): a stop that cannot read never fires,
+/// so a gauge never fails a search.
+pub trait Gauge: Send + Sync {
+    /// The resident set size of this process in kB.
+    fn rss_kb(&self) -> Option<u64>;
+}
+
 /// Receives [`Event`]s.
 pub trait Observer: Send + Sync {
     /// Called once per event.
@@ -792,11 +670,7 @@ mod tests {
     /// first `next` after its submit, the newest delivered first (completion out of submission
     /// order). It is the test double of the port's consumers, and checks that the clauses fit
     /// together.
-    struct FakeForks {
-        /// Whether its forks are layers of a frozen base (the Engine backend), or would write
-        /// into the session's one database (the undo-log backend).
-        engine: bool,
-    }
+    struct FakeForks;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct FakeLayer {
@@ -818,12 +692,11 @@ mod tests {
         id: u64,
         base: BTreeMap<RelPath, String>,
         open: Open,
-        stacked_live: bool,
         poisoned: bool,
         next_id: u64,
         /// Accepted jobs not delivered, with the outcome they will have and whether they
         /// finished.
-        in_flight: BTreeMap<JobId, (bool, Result<Checked<FakeLayer>, CheckError>)>,
+        in_flight: BTreeMap<JobId, (bool, Next<FakeLayer>)>,
         /// Outcomes known at once (refused edits, withdrawals), delivered first.
         ready: VecDeque<Next<FakeLayer>>,
         held: Arc<()>,
@@ -840,7 +713,6 @@ mod tests {
                     .map(|(p, t)| (rel(p), (*t).to_owned()))
                     .collect(),
                 open: Open::No,
-                stacked_live: false,
                 poisoned: false,
                 next_id: 0,
                 in_flight: BTreeMap::new(),
@@ -867,6 +739,19 @@ mod tests {
                 Open::No => Ok(()),
                 Open::Yes | Open::Closing => Err(CheckError::ForkInUse),
             }
+        }
+
+        /// The id of a job on `parent`, when this session takes one (C5 before the poison).
+        fn accept(&mut self, parent: &FakeLayer) -> Result<JobId, CheckError> {
+            if parent.session != self.id || self.open != Open::Yes {
+                return Err(CheckError::ForkInUse);
+            }
+            if self.poisoned {
+                return Err(CheckError::Poisoned("fake".to_owned()));
+            }
+            let id = JobId::new(self.next_id);
+            self.next_id += 1;
+            Ok(id)
         }
 
         fn withdraw_all(&mut self) {
@@ -898,6 +783,18 @@ mod tests {
             }
         }
         Ok(state)
+    }
+
+    /// The fake's expansion of `state`: no Blueprint, and a parent that yields nothing when a
+    /// target is not a file of the state (so a created file is told from a missing one).
+    fn fake_children(
+        state: &BTreeMap<RelPath, String>,
+        targets: &[Target],
+    ) -> Result<Vec<Blueprint>, ExpandError> {
+        match targets.iter().find(|t| !state.contains_key(t.path())) {
+            Some(t) => Err(ExpandError::Analysis(format!("no file {}", t.path()))),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The files of a diagnosis at `scope` of `state`, reached by `edits`.
@@ -996,59 +893,19 @@ mod tests {
         }
     }
 
-    /// Only `fork` and `release` do anything: the fake's stacked forks are here to be refused.
-    impl Stacked for FakeForks {
-        type Fork = ();
-        fn fork(&self, s: &mut FakeSession) -> Result<(), CheckError> {
-            s.refuse_while_open()?;
-            s.stacked_live = true;
-            Ok(())
-        }
-        fn write(&self, _: &mut FakeSession, _: &mut (), _: &[Edit]) -> Result<(), CheckError> {
-            Ok(())
-        }
-        fn levels(&self, _: &FakeSession, _: &()) -> Result<usize, CheckError> {
-            Ok(0)
-        }
-        fn fork_text(
-            &self,
-            _: &FakeSession,
-            _: &(),
-            _: &RelPath,
-        ) -> Result<Option<String>, CheckError> {
-            Ok(None)
-        }
-        fn diagnose(
-            &self,
-            _: &FakeSession,
-            _: &(),
-            _: Scope,
-        ) -> Result<ScopedFindings, CheckError> {
-            Ok(ScopedFindings::default())
-        }
-        fn files_of(&self, _: &FakeSession, _: &(), _: Scope) -> Result<Vec<RelPath>, CheckError> {
-            Ok(Vec::new())
-        }
-        fn pop(&self, _: &mut FakeSession, _: &mut ()) -> Result<bool, CheckError> {
-            Ok(false)
-        }
-        fn release(&self, s: &mut FakeSession, _: ()) -> Result<(), CheckError> {
-            s.stacked_live = false;
-            Ok(())
-        }
-    }
-
     impl Expander for FakeForks {
         type Session = FakeSession;
         fn expand(
             &self,
             s: &mut FakeSession,
-            _: &[Edit],
-            _: &[Target],
+            state: &[Edit],
+            targets: &[Target],
             _: usize,
         ) -> Result<Vec<Blueprint>, ExpandError> {
             s.refuse_while_open().map_err(ExpandError::Session)?;
-            Ok(Vec::new())
+            let state = written(&s.base, state)
+                .map_err(|e| ExpandError::Analysis(format!("state edit rejected: {e}")))?;
+            fake_children(&state, targets)
         }
     }
 
@@ -1056,9 +913,6 @@ mod tests {
         type Layer = FakeLayer;
 
         fn open(&self, s: &mut FakeSession) -> Result<FakeLayer, CheckError> {
-            if !self.engine || s.stacked_live {
-                return Err(CheckError::ForkInUse);
-            }
             s.refuse_while_open()?;
             if s.poisoned {
                 return Err(CheckError::Poisoned("fake".to_owned()));
@@ -1077,24 +931,33 @@ mod tests {
             parent: &FakeLayer,
             edits: &[Edit],
             scope: Scope,
+            _: Limit,
         ) -> Result<JobId, CheckError> {
-            if parent.session != s.id || s.open != Open::Yes {
-                return Err(CheckError::ForkInUse);
-            }
-            if s.poisoned {
-                return Err(CheckError::Poisoned("fake".to_owned()));
-            }
-            let id = JobId::new(s.next_id);
-            s.next_id += 1;
+            let id = s.accept(parent)?;
             match written(&parent.texts, edits) {
                 Err(refused) => s.ready.push_back(Next::Done(id, Err(refused))),
                 Ok(state) => {
                     let findings = diagnose(&state, scope_files(&state, edits, scope));
                     let layer = s.layer(state);
                     s.in_flight
-                        .insert(id, (false, Ok(Checked { layer, findings })));
+                        .insert(id, (false, Next::Done(id, Ok(Checked { layer, findings }))));
                 }
             }
+            Ok(id)
+        }
+
+        fn expand(
+            &self,
+            s: &mut FakeSession,
+            layer: &FakeLayer,
+            _: StateFp,
+            targets: &[Target],
+            _: usize,
+        ) -> Result<JobId, CheckError> {
+            let id = s.accept(layer)?;
+            let children = fake_children(&layer.texts, targets);
+            s.in_flight
+                .insert(id, (false, Next::Expanded(id, children)));
             Ok(id)
         }
 
@@ -1118,7 +981,7 @@ mod tests {
                 *finished = true;
             }
             match s.in_flight.pop_last() {
-                Some((id, (_, outcome))) => Ok(Next::Done(id, outcome)),
+                Some((_, (_, outcome))) => Ok(outcome),
                 None => Ok(Next::Idle),
             }
         }
@@ -1195,7 +1058,7 @@ mod tests {
 
     fn engine_session() -> (FakeForks, FakeSession) {
         (
-            FakeForks { engine: true },
+            FakeForks,
             FakeSession::new(1, &[("src/a.rs", "a"), ("src/b.rs", "b")]),
         )
     }
@@ -1214,7 +1077,7 @@ mod tests {
 
     fn id_of(next: &Next<FakeLayer>) -> JobId {
         match next {
-            Next::Done(id, _) | Next::Withdrawn(id) => *id,
+            Next::Done(id, _) | Next::Expanded(id, _) | Next::Withdrawn(id) => *id,
             Next::Pending | Next::Idle => panic!("no job: {next:?}"),
         }
     }
@@ -1227,7 +1090,7 @@ mod tests {
 
         let write = |text: &str| vec![Edit::write(rel("src/a.rs"), text)];
         let a = f
-            .submit(&mut s, &root, &write("a1"), Scope::Affected)
+            .submit(&mut s, &root, &write("a1"), Scope::Affected, Limit::Check)
             .unwrap();
         let refused = f
             .submit(
@@ -1238,13 +1101,14 @@ mod tests {
                     new_text: None,
                 }],
                 Scope::Affected,
+                Limit::Check,
             )
             .expect("a refused edit is an outcome, not an error of submit");
         let cancelled = f
-            .submit(&mut s, &root, &write("a2"), Scope::Affected)
+            .submit(&mut s, &root, &write("a2"), Scope::Affected, Limit::Check)
             .unwrap();
         let c = f
-            .submit(&mut s, &root, &write("a3"), Scope::Affected)
+            .submit(&mut s, &root, &write("a3"), Scope::Affected, Limit::Check)
             .unwrap();
         assert!(a < refused && refused < cancelled && cancelled < c);
 
@@ -1280,8 +1144,46 @@ mod tests {
             Ok(Some("a".to_owned()))
         );
         assert_eq!(f.cancel(&mut s, a), Err(CheckError::ForkInUse));
-        drop((root, last));
+
+        // An expansion is a job too: one `Expanded` with its id, of the Layer's own state (a file
+        // the state created among its files), and withdrawn like any job.
+        let created = vec![Edit::write(rel("src/c.rs"), "c")];
+        f.submit(&mut s, &root, &created, Scope::Affected, Limit::Check)
+            .unwrap();
+        let Next::Done(_, Ok(child)) = f.next(&mut s, FOREVER).unwrap() else {
+            panic!("the job finishes");
+        };
+        let targets = [Target::new(rel("src/c.rs"), None)];
+        let state = StateFp::of(&created);
+        let on_child = Forks::expand(&f, &mut s, &child.layer, state, &targets, 5).unwrap();
+        let on_root = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &targets, 5).unwrap();
+        let withdrawn = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &targets, 5).unwrap();
+        assert!(on_child < on_root && on_root < withdrawn);
+        assert_eq!(f.cancel(&mut s, withdrawn), Ok(true));
+        let mut expanded = BTreeMap::new();
+        for next in drain(&f, &mut s) {
+            match next {
+                Next::Expanded(id, children) => {
+                    assert!(expanded.insert(id, children).is_none(), "one outcome");
+                }
+                Next::Withdrawn(id) => assert_eq!(id, withdrawn),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(expanded.len(), 2);
+        drop((root, last, child));
         assert_eq!(f.close(&mut s), Ok(()));
+        // C10: what `Expander::expand` gives for the same states with no fork open.
+        assert_eq!(
+            expanded[&on_child],
+            Expander::expand(&f, &mut s, &created, &targets, 5)
+        );
+        assert_eq!(expanded[&on_child], Ok(Vec::new()));
+        assert_eq!(
+            expanded[&on_root],
+            Expander::expand(&f, &mut s, &[], &targets, 5)
+        );
+        assert!(matches!(expanded[&on_root], Err(ExpandError::Analysis(_))));
     }
 
     #[test]
@@ -1293,14 +1195,18 @@ mod tests {
             Edit::write(rel("src/b.rs"), "b2"),
             Edit::write(rel("src/c.rs"), "another error"),
         ];
-        f.submit(&mut s, &root, &first, Scope::Affected).unwrap();
+        f.submit(&mut s, &root, &first, Scope::Affected, Limit::Check)
+            .unwrap();
         let Next::Done(_, Ok(parent)) = f.next(&mut s, FOREVER).unwrap() else {
             panic!("the first job finishes");
         };
         let mut job = |scope: Scope| {
-            let id = f.submit(&mut s, &parent.layer, &second, scope).unwrap();
+            let id = f
+                .submit(&mut s, &parent.layer, &second, scope, Limit::Check)
+                .unwrap();
             // A sibling running beside it changes nothing.
-            f.submit(&mut s, &parent.layer, &first, scope).unwrap();
+            f.submit(&mut s, &parent.layer, &first, scope, Limit::Check)
+                .unwrap();
             let mut done = None;
             for next in drain(&f, &mut s) {
                 if let Next::Done(got, Ok(checked)) = next
@@ -1343,15 +1249,6 @@ mod tests {
 
     #[test]
     fn the_fake_refuses_what_forks_refuse() {
-        // C9: the undo-log backend has no forks.
-        let undo_log = FakeForks { engine: false };
-        let mut plain = FakeSession::new(9, &[("src/a.rs", "a")]);
-        assert_eq!(undo_log.open(&mut plain), Err(CheckError::ForkInUse));
-        assert_eq!(
-            undo_log.check(&mut plain, &[], Scope::Affected).map(|_| ()),
-            Ok(())
-        );
-
         // C6: while forks are open the session's other operations refuse and change nothing.
         let (f, mut s) = engine_session();
         let root = f.open(&mut s).unwrap();
@@ -1359,14 +1256,12 @@ mod tests {
             f.check(&mut s, &[], Scope::Affected),
             Err(CheckError::ForkInUse)
         );
-        assert_eq!(Stacked::fork(&f, &mut s), Err(CheckError::ForkInUse));
         assert_eq!(f.audit_revert(&mut s), Err(CheckError::ForkInUse));
         assert_eq!(
-            f.expand(&mut s, &[], &[], 3),
+            Expander::expand(&f, &mut s, &[], &[], 3),
             Err(ExpandError::Session(CheckError::ForkInUse))
         );
         assert_eq!(f.open(&mut s), Err(CheckError::ForkInUse));
-        assert!(!s.stacked_live);
 
         // C5: a Layer of another session, before the poison is looked at.
         let (other_f, mut other) = engine_session();
@@ -1374,12 +1269,12 @@ mod tests {
         let foreign = other_f.open(&mut other).unwrap();
         s.poisoned = true;
         assert_eq!(
-            f.submit(&mut s, &foreign, &[], Scope::Affected),
+            f.submit(&mut s, &foreign, &[], Scope::Affected, Limit::Check),
             Err(CheckError::ForkInUse)
         );
         assert!(s.in_flight.is_empty() && s.ready.is_empty());
         assert!(matches!(
-            f.submit(&mut s, &root, &[], Scope::Affected),
+            f.submit(&mut s, &root, &[], Scope::Affected, Limit::Check),
             Err(CheckError::Poisoned(_))
         ));
         drop((root, foreign));
@@ -1393,7 +1288,10 @@ mod tests {
         let root = f.open(&mut s).unwrap();
         let edits = [Edit::write(rel("src/a.rs"), "x")];
         let ids: Vec<JobId> = (0..3)
-            .map(|_| f.submit(&mut s, &root, &edits, Scope::Affected).unwrap())
+            .map(|_| {
+                f.submit(&mut s, &root, &edits, Scope::Affected, Limit::Check)
+                    .unwrap()
+            })
             .collect();
         s.refused_write = true;
         for id in &ids {
@@ -1412,11 +1310,14 @@ mod tests {
         let (f, mut s) = engine_session();
         let root = f.open(&mut s).unwrap();
         let edits = [Edit::write(rel("src/a.rs"), "kept")];
-        f.submit(&mut s, &root, &edits, Scope::Affected).unwrap();
+        f.submit(&mut s, &root, &edits, Scope::Affected, Limit::Check)
+            .unwrap();
         let Next::Done(_, Ok(kept)) = f.next(&mut s, FOREVER).unwrap() else {
             panic!("the job finishes");
         };
-        let queued = f.submit(&mut s, &root, &edits, Scope::Affected).unwrap();
+        let queued = f
+            .submit(&mut s, &root, &edits, Scope::Affected, Limit::Check)
+            .unwrap();
         drop(root);
 
         assert_eq!(
@@ -1426,7 +1327,7 @@ mod tests {
         );
         // Closing: the jobs are gone, only reads and `close` are allowed.
         assert_eq!(
-            f.submit(&mut s, &kept.layer, &edits, Scope::Affected),
+            f.submit(&mut s, &kept.layer, &edits, Scope::Affected, Limit::Check),
             Err(CheckError::ForkInUse)
         );
         assert_eq!(f.next(&mut s, FOREVER), Err(CheckError::ForkInUse));

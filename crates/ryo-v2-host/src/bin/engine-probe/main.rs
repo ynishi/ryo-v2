@@ -1,14 +1,15 @@
 //! `engine-probe`: loads a workspace once, takes the memory of the process before the load, at
 //! its indexing, after its baseline and after the last check, with the database's composition,
 //! and runs each variant as a level on the `--on` parent's level through the one stacked
-//! procedure of the host, reading the counting allocator at every point of each repeat. It writes
-//! a `ProbeReport` (`ryo_v2_host::engine_probe`) as JSON to `--report`.
+//! procedure of the host (jobs of `Forks` at W = 1), reading the counting allocator at every
+//! point of each repeat. It writes a `ProbeReport` (`ryo_v2_host::engine_probe`) as JSON to
+//! `--report`.
 //!
 //! The counting allocator makes every allocation slower, so no time figure of this binary stands
 //! for the engine's speed; `bench`, on the system allocator, gives those.
 //!
-//! `--engine` runs the forks on layers of the fork Engine (`RaConfig.engine`, D11) instead of the
-//! stacked undo log; the report's `backend` key names the backend.
+//! Every fork is a layer of the fork Engine (D11); the series of `--on` and `--depth` run on
+//! `Forks`.
 
 mod alloc;
 
@@ -17,7 +18,6 @@ use clap::{Parser, ValueEnum};
 use ryo_v2_core::domain::{RelPath, Scope};
 use ryo_v2_host::engine_probe::{self, BenchMedian, DepthProbeArgs, ProbeArgs};
 use ryo_v2_host::layer_cost::{self, EditClass, LayerCostArgs};
-use ryo_v2_ra::Backend;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -57,10 +57,6 @@ struct Cli {
     /// Where the JSON report is written.
     #[arg(long, value_name = "OUT")]
     report: PathBuf,
-    /// Run the forks on layers of the fork Engine instead of the stacked undo log; the report's
-    /// `backend` key says `engine` (`undo-log` without it).
-    #[arg(long)]
-    engine: bool,
     /// Stack this many levels instead of the variants: level k appends a function to one of
     /// `--depth-files` workspace files (as `bench --depth-sweep`) and is diagnosed once before
     /// level k + 1 is written on it, the search's shape. The report is a `DepthReport`: the
@@ -88,7 +84,7 @@ struct Cli {
     /// quantiles and the view bytes at each view depth.
     #[arg(
         long,
-        conflicts_with_all = ["on", "variants", "bench_median", "depth", "engine"]
+        conflicts_with_all = ["on", "variants", "bench_median", "depth"]
     )]
     layer_cost: bool,
     /// With `--layer-cost`: the edit classes [default: body,item].
@@ -234,7 +230,6 @@ fn run() -> Result<()> {
             files: cli.depth_files.unwrap_or(1),
             scopes,
             idle: cli.idle,
-            backend: Backend::of_engine(cli.engine),
         };
         let report = engine_probe::run_depth(&args, &COUNTING)?;
         engine_probe::write_report(&report, &cli.report)
@@ -259,7 +254,6 @@ fn run() -> Result<()> {
         scopes,
         idle: cli.idle,
         bench_medians: cli.bench_median,
-        backend: Backend::of_engine(cli.engine),
     };
     let report = engine_probe::run(&args, &COUNTING)?;
     engine_probe::write_report(&report, &cli.report)
@@ -300,7 +294,6 @@ mod tests {
         assert_eq!(cli.variants, [PathBuf::from("/v1"), PathBuf::from("/v2")]);
         assert_eq!(cli.on, Some(PathBuf::from("/p")));
         assert_eq!((cli.repeat, cli.idle), (20, true));
-        assert!(!cli.engine);
         assert_eq!(
             cli.bench_median,
             [BenchMedian {
@@ -325,31 +318,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_engine() {
-        let cli = Cli::try_parse_from([
-            "engine-probe",
-            "/b",
-            "--on",
-            "/p",
-            "/v",
-            "--engine",
-            "--report",
-            "/o/probe.json",
-        ])
-        .unwrap();
-        assert!(cli.engine);
-        assert_eq!(cli.variants, [PathBuf::from("/v")]);
-        assert_eq!(Backend::of_engine(cli.engine), Backend::Engine);
-        // Without a parent too: the load and its phases alone, on the Engine.
-        let alone = Cli::try_parse_from(["engine-probe", "/b", "--engine", "--report", "/o"]);
-        assert!(alone.unwrap().engine);
-        // A flag, not an option with a value.
-        assert!(
-            Cli::try_parse_from(["engine-probe", "/b", "--engine=yes", "--report", "/o"]).is_err()
-        );
-    }
-
-    #[test]
     fn cli_parses_depth() {
         let cli = Cli::try_parse_from([
             "engine-probe",
@@ -358,15 +326,11 @@ mod tests {
             "20",
             "--depth-files",
             "4",
-            "--engine",
             "--report",
             "/o/depth.json",
         ])
         .unwrap();
-        assert_eq!(
-            (cli.depth, cli.depth_files, cli.engine),
-            (Some(20), Some(4), true)
-        );
+        assert_eq!((cli.depth, cli.depth_files), (Some(20), Some(4)));
         // A stack of levels, not a parent and variants; at least one level and one file.
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
         assert!(
@@ -458,8 +422,8 @@ mod tests {
             ]
         );
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
-        // Only on the Engine, which it always runs on, and not with another mode.
-        for other in [&["--engine"][..], &["--depth", "2"], &["--on", "/p", "/v"]] {
+        // Not with another mode.
+        for other in [&["--depth", "2"][..], &["--on", "/p", "/v"]] {
             let args = [
                 &["engine-probe", "/b", "--layer-cost", "--report", "/o"][..],
                 other,

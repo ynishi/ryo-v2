@@ -20,7 +20,6 @@ use ryo_v2_core::app::search::RESERVED_RAM_GB;
 use ryo_v2_core::domain::{RelPath, Scope, TextRange};
 use ryo_v2_host::bench::{self, BenchArgs, DepthArgs};
 use ryo_v2_host::forks_bench::{self, ForksArgs, WidthSpec};
-use ryo_v2_ra::Backend;
 
 /// What `bench --forks` and its options do not go with.
 const FORKS_CONFLICTS: [&str; 4] = ["variants", "on", "large", "depth_sweep"];
@@ -70,18 +69,24 @@ enum Command {
         /// Skip the post-revert re-diagnosis (revert_ms then excludes it; revert_ok prints `-`).
         #[arg(long)]
         no_assert_revert: bool,
+        /// Turn ryo-v2's gap detectors off (`RaConfig.gap_detectors`): each check is
+        /// rust-analyzer's own diagnosis alone.
+        #[arg(long, conflicts_with_all = ["depth_sweep", "forks"])]
+        no_gap_detectors: bool,
+        /// Print under each run the wall time of each file's diagnosis: the total, the files and
+        /// the slowest five (`  file_ms total <ms> files <n> top <path>=<ms> ...`).
+        #[arg(long, conflicts_with_all = ["depth_sweep", "forks"])]
+        file_times: bool,
         /// Measure each VARIANT as a child of the PARENT overlay, two ways: `rebuilt` (the
         /// parent's and the variant's edits composed and verified from BASE) and `stacked` (the
-        /// variant written as a level on top of the parent's level of one fork).
+        /// variant submitted as a job on the parent's Layer of `Forks` at W = 1).
         #[arg(long, value_name = "PARENT")]
         on: Option<PathBuf>,
-        /// Run the forks on layers of the fork Engine instead of the stacked undo log; every
-        /// summary line ends with ` backend engine` (` backend undo-log` without it).
-        #[arg(long)]
-        engine: bool,
-        /// Measure stacks of these depths instead of VARIANTS: per depth K, write K levels on one
-        /// fork (level k appends `fn __ryo_depth_<k>() -> u32 { <k> }` to a workspace file),
-        /// diagnose the top level `--repeat` times and pop back. A comma-separated list, each >= 1.
+        /// Measure stacks of these depths instead of VARIANTS: per depth K, K levels, each a job
+        /// of `Forks` at W = 1 on the Layer of the one below (level k appends `fn
+        /// __ryo_depth_<k>() -> u32 { <k> }` to a workspace file), diagnose the top level
+        /// `--repeat` times (the later times the top level run again on the level below) and drop
+        /// the Layers. A comma-separated list, each >= 1.
         #[arg(
             long,
             value_name = "DEPTHS",
@@ -191,7 +196,7 @@ enum Command {
             conflicts_with_all = FORKS_CONFLICTS,
         )]
         rss_stop_gib: f64,
-        /// With `--forks`: also run the tree serially on one `Stacked` fork, per repeat.
+        /// With `--forks`: also run the tree serially, one job at a time at W = 1, per repeat.
         #[arg(long, requires = "forks", conflicts_with_all = FORKS_CONFLICTS)]
         fork_serial: bool,
     },
@@ -310,8 +315,9 @@ fn run() -> Result<ExitCode> {
             scope,
             no_proc_macro,
             no_assert_revert,
+            no_gap_detectors,
+            file_times,
             on,
-            engine,
             depth_sweep,
             depth_files,
             forks,
@@ -357,7 +363,6 @@ fn run() -> Result<ExitCode> {
                     scopes,
                     proc_macro: !no_proc_macro,
                     assert_revert: !no_assert_revert,
-                    backend: Backend::of_engine(engine),
                 })
                 .map(|()| ExitCode::SUCCESS);
             }
@@ -391,7 +396,8 @@ fn run() -> Result<ExitCode> {
                 scopes,
                 proc_macro: !no_proc_macro,
                 assert_revert: !no_assert_revert,
-                backend: Backend::of_engine(engine),
+                gap_detectors: !no_gap_detectors,
+                file_times,
             })
             .map(|()| ExitCode::SUCCESS)
         }
@@ -445,27 +451,44 @@ mod tests {
         assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--on"]).is_err());
     }
 
+    /// The controls of gate RS (SEARCH_LEDGER.md, "The search on N forks", gate RS, runs 4 and 5).
     #[test]
-    fn cli_parses_bench_engine() {
-        let engine = |args: &[&str]| match Cli::try_parse_from(args)
+    fn cli_parses_bench_gap_detectors_and_file_times() {
+        let flags = |args: &[&str]| match Cli::try_parse_from(args)
             .map_err(|e| e.to_string())
             .expect("parses")
             .command
         {
-            Command::Bench { engine, .. } => engine,
+            Command::Bench {
+                no_gap_detectors,
+                file_times,
+                ..
+            } => (no_gap_detectors, file_times),
             _ => panic!("not bench"),
         };
-        assert!(!engine(&["ryo-v2", "bench", "/b", "/v"]));
-        assert!(engine(&["ryo-v2", "bench", "/b", "/v", "--engine"]));
-        assert!(engine(&[
-            "ryo-v2", "bench", "/b", "/v", "--on", "/p", "--repeat", "2", "--engine"
-        ]));
-        assert!(engine(&["ryo-v2", "bench", "--large", "/x", "--engine"]));
-        // A flag, not an option with a value; and not a flag of the other commands.
-        assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b", "/v", "--engine=true"]).is_err());
-        assert!(Cli::try_parse_from(["ryo-v2", "apply", "/ws", "b.json", "--engine"]).is_err());
-        // No second command for the Engine: `--engine` is how a bench runs on it.
-        assert!(Cli::try_parse_from(["ryo-v2", "bench-cow", "/b", "/v"]).is_err());
+        assert_eq!(flags(&["ryo-v2", "bench", "/b", "/v"]), (false, false));
+        assert_eq!(
+            flags(&["ryo-v2", "bench", "/b", "/v", "--no-gap-detectors"]),
+            (true, false)
+        );
+        assert_eq!(
+            flags(&[
+                "ryo-v2",
+                "bench",
+                "/b",
+                "/v",
+                "--file-times",
+                "--no-gap-detectors"
+            ]),
+            (true, true)
+        );
+        // Not with the series that load their own analyzer.
+        for other in [["--depth-sweep", "1"], ["--forks", "1"]] {
+            for flag in ["--no-gap-detectors", "--file-times"] {
+                let args = ["ryo-v2", "bench", "/b", other[0], other[1], flag];
+                assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+            }
+        }
     }
 
     #[test]
@@ -480,13 +503,12 @@ mod tests {
                 variants,
                 depth_sweep,
                 depth_files,
-                engine,
                 repeat,
                 ..
-            } => (base, variants, depth_sweep, depth_files, engine, repeat),
+            } => (base, variants, depth_sweep, depth_files, repeat),
             _ => panic!("not bench"),
         };
-        let (base, variants, depths, files, engine, repeat) = parse(&[
+        let (base, variants, depths, files, repeat) = parse(&[
             "ryo-v2",
             "bench",
             "/b",
@@ -498,8 +520,8 @@ mod tests {
         assert_eq!(base, Some(PathBuf::from("/b")));
         assert!(variants.is_empty());
         assert_eq!(depths, vec![1, 5, 10, 20]);
-        assert_eq!((files, engine, repeat), (None, false, 3));
-        let (_, _, depths, files, engine, _) = parse(&[
+        assert_eq!((files, repeat), (None, 3));
+        let (_, _, depths, files, _) = parse(&[
             "ryo-v2",
             "bench",
             "/b",
@@ -507,11 +529,10 @@ mod tests {
             "2",
             "--depth-files",
             "3",
-            "--engine",
         ]);
-        assert_eq!((depths, files, engine), (vec![2], Some(3), true));
+        assert_eq!((depths, files), (vec![2], Some(3)));
         // Without it a bench still needs its variants, and keeps parsing as before.
-        let (_, variants, depths, files, _, _) = parse(&["ryo-v2", "bench", "/b", "/v"]);
+        let (_, variants, depths, files, _) = parse(&["ryo-v2", "bench", "/b", "/v"]);
         assert_eq!((variants.len(), depths.len(), files), (1, 0, None));
         assert!(Cli::try_parse_from(["ryo-v2", "bench", "/b"]).is_err());
         // A depth is at least 1; a list, not a range.

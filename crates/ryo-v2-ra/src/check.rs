@@ -90,9 +90,8 @@ pub(crate) fn base_text_at(
     }
 }
 
-/// Diagnoses the top level as a check does, and as `Stacked::diagnose` does: under the check time
-/// limit, and with a detector that panicked where it did not at the baseline failing the
-/// diagnosis.
+/// Diagnoses the level of a check: under the check time limit, and with a detector that panicked
+/// where it did not at the baseline failing the diagnosis, as a job of `Forks` is diagnosed.
 pub(crate) fn diagnose_for_check(
     a: &RaAnalyzer,
     s: &RaSession,
@@ -140,7 +139,7 @@ impl RaAnalyzer {
 /// The verdict of a check's diagnosis: the cut-off as `TimedOut`, and a detector that panicked
 /// where it did not at the baseline as `DetectorPanicked` (one that did is a blind spot named in
 /// `unseen_at`).
-fn finish_check(
+pub(crate) fn finish_check(
     a: &RaAnalyzer,
     s: &RaSession,
     deadline: Option<&Deadline>,
@@ -327,44 +326,60 @@ impl Verifier for RaAnalyzer {
             .unwrap_or_else(|_| Provenance::unrecorded())
     }
 
-    /// Applies `edits` to the in-memory state, diagnoses `scope`, and reverts.
+    /// Writes `edits` into a layer over the frozen base, diagnoses `scope`, and drops the layer.
     ///
     /// # Contract
-    /// - C1: the text fingerprints of the edited files are compared before and after; a
-    ///   difference poisons the session and is `RevertMismatch`.
+    /// - C1: the base is never written: after a check every text, the provenance and the
+    ///   baseline are the base's, whatever the write-back hooks would have done.
     ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
-    ///   tested: tests/stack.rs text_is_the_base_after_a_poisoned_check
-    /// - C2: the diagnostic re-assert runs on every n-th write when `assert_revert_every` is
-    ///   `Some(n)`, a check being one write.
+    ///   tested: tests/check.rs text_is_the_base_after_a_poisoned_check
+    /// - C2: the isolation of the base (I2) is checked on every n-th write when
+    ///   `assert_revert_every` is `Some(n)`, a check being one write.
     ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
-    ///   tested: tests/stack.rs writes_count_for_the_sampled_reassert
+    ///   tested: tests/check.rs writes_count_for_the_sampled_isolation
     /// - C3: with a cut-off set (`with_check_timeout`) a diagnostics step that is still running
-    ///   when the limit is reached ends in `CheckError::TimedOut`; the edits are still reverted,
-    ///   the text fingerprints still compared, and the session stays usable. The limit is
-    ///   looked at before each file, so one slow file can overrun it.
+    ///   when the limit is reached ends in `CheckError::TimedOut`; the layer is still dropped and
+    ///   the session stays usable. The limit is looked at before each file, so one slow file can
+    ///   overrun it.
     ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
-    /// - C4: a diagnostic re-assert that differs from the baseline is `RevertMismatch` and
-    ///   poisons the session; the next call is `Poisoned`.
-    ///   tested: tests/verifier.rs reassert_mismatch_poisons_the_session
+    /// - C4: a check re-asserts no revert: with `assert_revert` it checks the isolation of the
+    ///   base, which a detector fault does not touch, so a new detector panic decides (C5) and the
+    ///   session stays usable. The flat reference check's re-assert is `reference_check` C3.
+    ///   tested: tests/verifier.rs a_sampled_check_reasserts_no_revert
     /// - C5: a gap detector that panicked on a file of the scope in this check's own diagnostics,
     ///   where it did not panic at baseline, makes the result `CheckError::DetectorPanicked` (the
-    ///   first by detector and file), with the edits still reverted and the session usable; one
+    ///   first by detector and file), with the layer still dropped and the session usable; one
     ///   that panicked on the same file at baseline too does not fail the check and names the
     ///   detector's class (`GapDetector::unseen_class`) in the findings' `unseen_at`, with that
     ///   file.
     ///   tested: tests/unresolved.rs detector_panic_is_contained_per_file
     ///   tested: tests/gap_detectors.rs each_detector_panic_is_contained_on_its_own
-    ///   tested: tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
+    ///   tested: tests/jobs.rs a_diagnosis_names_where_it_observed_each_unseen_class
     /// - C6: `RevertMismatch` and `Poisoned` win over every other error of the check: an `Edit`,
-    ///   a `TimedOut`, a `Panicked` and a `DetectorPanicked`.
+    ///   a `TimedOut`, a `Panicked` and a `DetectorPanicked`; so they do in the flat reference
+    ///   check, whose write-back can fail.
     ///   tested: tests/verifier.rs session_errors_win_over_a_detector_panic
-    ///   tested: tests/stack.rs a_session_error_of_the_release_wins_in_a_check
+    ///   tested: tests/check.rs a_session_error_of_the_release_wins_in_a_check
     /// - C7: with no edit the check diagnoses no file at `Scope::Affected` and names no unseen
     ///   class.
-    ///   tested: tests/stack.rs an_empty_check_diagnoses_nothing
+    ///   tested: tests/check.rs an_empty_check_diagnoses_nothing
     /// - C8: a check whose edits are refused records no check or revert event and pushes no
     ///   level.
-    ///   tested: tests/stack.rs a_refused_check_reverts_nothing
+    ///   tested: tests/check.rs a_refused_check_reverts_nothing
+    /// - C9: every check, a refused one included, records its paths for
+    ///   `RevertAudit::audit_revert`.
+    ///   tested: tests/check.rs check_writes_are_audited
+    /// - C10: every unseen class of the result has in `unseen_at` each file it was observed on
+    ///   and no other: the files where the unresolved-path detector was skipped for a macro call
+    ///   that did not expand, and those where a detector panicked as it did at the baseline; no
+    ///   class has an empty set. A job of `Forks` names them alike (`Forks` C18).
+    ///   tested: tests/jobs.rs a_diagnosis_names_where_it_observed_each_unseen_class
+    /// - C11: every finding of the result is on a file the check covers. An error is on the
+    ///   scanned file, or, when rust-analyzer reports its range in another file (code pulled in
+    ///   with `include!`), on that file, which is in the scanned file's crate
+    ///   (`diagnostics::collect_errors` C1, C3 and C4); and every scope holds whole crates. A job
+    ///   of `Forks` keeps it alike (`Forks` C20).
+    ///   tested: tests/jobs.rs a_finding_is_on_a_file_of_its_diagnosis
     fn check(
         &self,
         s: &mut RaSession,
@@ -372,31 +387,46 @@ impl Verifier for RaAnalyzer {
         scope: Scope,
     ) -> Result<ScopedFindings, CheckError> {
         stack::require_free(s)?;
-        // A check is the one-level case of a fork: write, diagnose, release. The release always
-        // runs, and its failure, always about the session, wins; then the write's; then the
-        // diagnosis's.
-        let engine = s.engine;
-        stack::open_fork(s, ForkPort::Stacked, engine).map_err(|e| map_error(e, &[]))?;
+        // A check is a one-level fork private to the adapter: write, diagnose, release, as a
+        // one-job `Forks` session gives (`Forks` C12). The release always runs, and its failure,
+        // always about the session, wins; then the write's; then the diagnosis's.
+        stack::open_fork(s, ForkPort::Check).map_err(|e| map_error(e, &[]))?;
         let outcome =
             stack::write_level(self, s, edits).and_then(|()| diagnose_for_check(self, s, scope));
-        fork::release_levels(self, s).map_err(revert_error)?;
+        crate::engine::release_levels(self, s).map_err(revert_error)?;
         outcome
     }
 }
 
 impl RaAnalyzer {
-    /// The flat reference check (D11, 4.3): `check` of `edits` on the undo log whatever
-    /// `RaConfig.engine` says, so it runs no line of the layer code: with no layer live it writes
-    /// the edits with rust-analyzer's own setters (`apply_change`), diagnoses, and writes the
-    /// base texts back, comparing them as `check` does. It is not a write of the sampling (the
-    /// write count does not move); its paths are recorded for the revert audit, since it writes
-    /// the base. The differential tests compare a level on the Engine with it.
+    /// The flat reference check (D11, R1 of stage 4; `flat`): a check of `edits` that runs no
+    /// line of the layer code. With no fork live it writes the edits into the session's own
+    /// database with rust-analyzer's setters (`apply_change`), diagnoses at `scope` under the
+    /// check's cut-off and detector rules, and writes the base texts and source roots back; the
+    /// texts of the files it modified or deleted are then compared with their base texts, and
+    /// with `assert_revert` the scope of the edited paths is diagnosed again and compared with
+    /// the baseline there (the one-level re-assert). A difference poisons the session and is
+    /// `RevertMismatch`, so a write-back that leaves a trace the texts do not show cannot shift
+    /// the base under the next check. It is not a write of the sampling (the write count does
+    /// not move); its paths are recorded for the revert audit, since it writes the base. The
+    /// differential tests compare the Engine's checks and jobs with it.
     ///
     /// # Contract
-    /// - C1: on a session of either backend no layer exists during it and the fork counters of
-    ///   the database (shared writes, skipped and refused writes) are as before it; its result
-    ///   equals `check` of the same edits on the undo log, and the session is left at its base.
-    ///   tested: tests/stack.rs reference_check_runs_no_layer_code
+    /// - C1: no layer exists during it and the fork counters of the database (shared writes,
+    ///   skipped and refused writes) are as before it; its result equals `check` of the same
+    ///   edits, and the session is left at its base.
+    ///   tested: tests/check.rs reference_check_runs_no_layer_code
+    /// - C2: at `Scope::Workspace` its files and findings are those of a fresh load of the state
+    ///   the edits give (the workspace with the state written to disk, loaded by a new session of
+    ///   the same configuration): the anchor of the flat side of every differential test (R1).
+    ///   tested: ryo-v2-oracle tests/search_recall.rs the_reference_check_is_a_fresh_load
+    /// - C3: with `assert_revert` a write-back whose texts are back but whose re-assert differs
+    ///   from the baseline is `RevertMismatch` of the edited paths and poisons the session, and
+    ///   a re-assert that cannot run poisons it too (`Poisoned`); a write-back that leaves another
+    ///   text is `RevertMismatch` of that path whether or not the re-assert is on. While poisoned,
+    ///   `Verifier::text` still describes the base.
+    ///   tested: tests/check.rs the_flat_reference_reasserts_its_level
+    ///   tested: tests/check.rs text_is_the_base_after_a_poisoned_check
     #[doc(hidden)]
     pub fn reference_check(
         &self,
@@ -404,22 +434,7 @@ impl RaAnalyzer {
         edits: &[Edit],
         scope: Scope,
     ) -> Result<ScopedFindings, CheckError> {
-        stack::require_free(s)?;
-        let edited = fork::edited_paths(edits);
-        s.edited_since_audit.extend(edited.iter().cloned());
-        stack::open_fork(s, ForkPort::Stacked, false).map_err(|e| map_error(e, &[]))?;
-        debug_assert!(
-            s.frozen.is_none(),
-            "the reference check runs on the undo log"
-        );
-        let outcome = fork::push_level(self, s, edits, edited.clone(), s.assert_revert)
-            .map_err(|e| match &s.poisoned {
-                Some(msg) => CheckError::Poisoned(msg.clone()),
-                None => map_error(e, &edited),
-            })
-            .and_then(|()| diagnose_for_check(self, s, scope));
-        fork::release_levels(self, s).map_err(revert_error)?;
-        outcome
+        crate::flat::reference_check(self, s, edits, scope)
     }
 }
 
@@ -436,10 +451,9 @@ impl RaAnalyzer {
 ///   to audit, so the next audit diagnoses them; an audit that runs to its end, clean or not,
 ///   forgets the paths it audited.
 ///   tested: tests/timeout.rs a_failed_audit_keeps_its_paths
-/// - C4: on the Engine (`RaConfig.engine`) the audit first checks that the base was never
-///   written (I2): a write the frozen base refused, at any time since load, poisons the session
-///   and is `RevertMismatch` of the paths; then it re-diagnoses as on the undo log, on the
-///   same cadence.
+/// - C4: the audit first checks that the base was never written (I2): a write the frozen base
+///   refused, at any time since load, poisons the session and is `RevertMismatch` of the paths;
+///   then it re-diagnoses, on the same cadence.
 ///   tested: tests/timeout.rs audit_revert_is_ok_after_checks_and_refuses_poisoned
 impl RevertAudit for RaAnalyzer {
     fn audit_revert(&self, s: &mut RaSession) -> Result<(), CheckError> {
@@ -447,7 +461,7 @@ impl RevertAudit for RaAnalyzer {
         if s.edited_since_audit.is_empty() {
             return Ok(());
         }
-        if s.engine && ryo_v2_engine::counters(s.host.raw_database()).refused > 0 {
+        if ryo_v2_engine::counters(s.host.raw_database()).refused > 0 {
             s.poisoned = Some("a layer wrote the base (I2)".to_owned());
             return Err(CheckError::RevertMismatch {
                 paths: s.edited_since_audit.iter().cloned().collect(),
@@ -475,6 +489,7 @@ impl RevertAudit for RaAnalyzer {
                     fault: self.detector_fault.as_ref(),
                     panics: &s.detector_panics,
                     probe: self.thread_count.as_deref(),
+                    times: self.file_times.as_deref(),
                 },
             )
         };

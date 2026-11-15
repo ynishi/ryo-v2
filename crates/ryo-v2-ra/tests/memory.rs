@@ -1,7 +1,7 @@
 //! `RaSession::memory_report` on a corpus base through the real rust-analyzer. Needs a sysroot
 //! and `cargo metadata` (no network).
 
-use ryo_v2_core::app::ports::{Analyzer, CheckError, Event, Stacked, Verifier};
+use ryo_v2_core::app::ports::{Analyzer, CheckError, Event, Verifier};
 use ryo_v2_core::domain::{Edit, RelPath, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -127,15 +127,16 @@ fn memory_report_refuses_while_a_fork_is_live() {
     let (a, mut s, _) = loaded();
     let edits = broken01();
     let path = rel("lib/src/lib.rs");
-    let mut f = Stacked::fork(&a, &mut s).expect("fork");
-    a.write(&mut s, &mut f, &edits).expect("write");
-    let written = a.fork_text(&s, &f, &path).expect("fork text");
+    let text = a.text(&s, &path);
+    let mut f = Analyzer::fork(&a, &mut s).expect("fork");
+    Analyzer::apply(&a, &mut s, &mut f, &edits).expect("apply");
+    let before = Analyzer::diagnostics(&a, &s, &f, Scope::Affected).expect("diagnostics");
     assert_eq!(s.memory_report(), Err(CheckError::ForkInUse));
-    // Nothing changed: the level is there with its text, and the fork goes on.
-    assert_eq!(a.levels(&s, &f), Ok(1));
-    assert_eq!(a.fork_text(&s, &f, &path), Ok(written));
-    a.diagnose(&s, &f, Scope::Affected).expect("diagnose");
-    a.release(&mut s, f).expect("release");
+    // Nothing changed: the fork's level diagnoses as before, and the fork goes on.
+    let after = Analyzer::diagnostics(&a, &s, &f, Scope::Affected).expect("diagnostics");
+    assert_eq!(after, before);
+    Analyzer::discard(&a, &mut s, f).expect("discard");
+    assert_eq!(a.text(&s, &path), text);
     assert!(s.memory_report().is_ok());
 
     s.poison("for the test");

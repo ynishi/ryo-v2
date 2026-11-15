@@ -6,6 +6,7 @@
 //! ports, never the file system, a process or the environment directly.
 
 pub mod apply;
+pub mod memory;
 pub mod ports;
 pub mod search;
 pub mod verify;
@@ -23,7 +24,7 @@ use crate::domain::{Edit, Finding, Scope, Verdict};
 /// - C1: the verdict is `Verdict::of_check` of the check's findings (`Verdict::of_level` with
 ///   nothing below, nothing deleted and the check's files); a check failure is returned as is.
 ///   tested: app::write::tests::decide_and_write_paths_give_the_same_verdict
-///   tested: ryo-v2-ra tests/stack.rs search_and_apply_give_the_same_verdict_on_a_chain
+///   tested: ryo-v2-ra tests/jobs.rs search_and_apply_give_the_same_verdict_on_a_chain
 pub fn verdict_of<V: Verifier>(
     verifier: &V,
     session: &mut V::Session,

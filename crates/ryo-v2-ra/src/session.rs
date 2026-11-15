@@ -88,13 +88,13 @@ fn capture_load_inputs(root: &Path, rev_deps: &RevDeps) -> LoadInputs {
     }
 }
 
-/// Which port opened the live fork. The two ports share the one live fork of a session.
+/// Which port opened the live fork. They share the one live fork of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ForkPort {
     /// `Analyzer::fork`.
     Analyzer,
-    /// `Stacked::fork`, or a fork opened inside the adapter for a `Verifier::check`.
-    Stacked,
+    /// The one-level fork a `Verifier::check` opens inside the adapter, for the call.
+    Check,
     /// `Forks::open`: the base is frozen and jobs write layers over it, until `Forks::close`.
     Forks,
 }
@@ -127,8 +127,8 @@ pub struct RaSession {
     pub(crate) gap_detectors: bool,
     /// The one fork that writes into the database now; `None` when the session is at its base.
     pub(crate) live: Option<Live>,
-    /// The levels of the live fork, bottom first: each is one write on top of the one before,
-    /// and the undo log of that write.
+    /// The levels of the live fork of a check or of `Analyzer`, bottom first: each is one write
+    /// on top of the one before, in a layer of its own (both ports write one level).
     pub(crate) stack: Vec<Level>,
     /// The base text of every load-time file a level modified or deleted, entered before the
     /// level wrote anything. `Verifier::text` and `Verifier::provenance` read it before the
@@ -140,10 +140,10 @@ pub struct RaSession {
     /// Manifests, lock file and toolchain as of load.
     pub(crate) load_inputs: LoadInputs,
     /// Number of writes so far, a refused one included: every `Verifier::check` and every
-    /// `Stacked::write` (an `Analyzer::apply` is not counted). It paces the sampled re-assert.
+    /// `Forks` job (an `Analyzer::apply` is not counted). It paces the sampled re-assert.
     pub(crate) write_count: u32,
-    /// Paths written by every `check` and `Stacked::write` since the last revert audit, a
-    /// refused one included.
+    /// Paths written by every `check`, every `Forks` job (and the flat reference check) since
+    /// the last revert audit, a refused one included.
     pub(crate) edited_since_audit: BTreeSet<RelPath>,
     /// Detector panics contained so far; collects run on several threads and take `&RaSession`.
     pub(crate) detector_panics: Mutex<BTreeSet<DetectorPanic>>,
@@ -155,16 +155,14 @@ pub struct RaSession {
     /// When set, every call of that edit kind in the expander panics; for the tests of the
     /// containment.
     pub(crate) expander_fault: Option<CommandKind>,
-    /// Whether forks run on layers of the fork Engine (`RaConfig.engine`, D11), fixed at load.
-    pub(crate) engine: bool,
-    /// The frozen base while a fork lives on the Engine; its database is out of `host`
-    /// meanwhile (`host` holds `spare_db`). `None` with no fork live, and on the undo log.
+    /// The frozen base while a fork lives; its database is out of `host` meanwhile (`host`
+    /// holds `spare_db`). `None` with no fork live.
     pub(crate) frozen: Option<crate::engine::EngineBase>,
     /// The empty database `host` holds while the base is frozen, kept between forks so a freeze
     /// does not build one.
     pub(crate) spare_db: Option<ra_ap_ide_db::RootDatabase>,
     /// Every `FileId` the database's file map holds beyond the files of load time (a file a
-    /// level created, on either backend; the map never forgets one). A layer creating one of
+    /// level or the flat reference check created; the map never forgets one). A layer creating one of
     /// them sets its inputs in the layer instead of creating them.
     pub(crate) created_in_db: BTreeSet<FileId>,
     /// The forks opened by `Forks::open` (`live` is then of `ForkPort::Forks`), until
@@ -265,13 +263,6 @@ impl RaSession {
             .then(|| ryo_v2_engine::counters(self.host.raw_database()))
     }
 
-    /// Drains the changes the session's vfs has queued and returns how many there were; for the
-    /// tests that every vfs write of a fork drains its change (nothing else reads them).
-    #[doc(hidden)]
-    pub fn take_vfs_changes(&mut self) -> usize {
-        self.vfs.take_changes().len()
-    }
-
     /// Whether the session's vfs holds a file at `path` (as a created file has while it is
     /// registered); for the tests of when a created file leaves the vfs.
     #[doc(hidden)]
@@ -304,7 +295,7 @@ fn rel_of(root: &Path, path: &Path) -> Option<RelPath> {
 
 pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerError> {
     let t0 = a.clock.now_ms();
-    refuse_postcard(a.config.engine, std::env::var_os(POSTCARD).as_deref())?;
+    refuse_postcard(std::env::var_os(POSTCARD).as_deref())?;
     let root = root
         .canonicalize()
         .map_err(|e| AnalyzerError::Load(format!("workspace root {}: {e}", root.display())))?;
@@ -376,6 +367,7 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
             fault: a.detector_fault.as_ref(),
             panics: &detector_panics,
             probe: a.thread_count.as_deref(),
+            times: a.file_times.as_deref(),
         },
     )?;
     let baseline_panics: BTreeSet<(GapDetector, RelPath)> = collected.panics.into_iter().collect();
@@ -410,7 +402,6 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
         baseline_panics,
         expander_panics: Mutex::new(BTreeSet::new()),
         expander_fault: None,
-        engine: a.config.engine,
         frozen: None,
         spare_db: None,
         created_in_db: BTreeSet::new(),
@@ -422,16 +413,16 @@ pub(crate) fn load(a: &RaAnalyzer, root: &Path) -> Result<RaSession, AnalyzerErr
 /// bidirectional (postcard) protocol.
 const POSTCARD: &str = "RUST_ANALYZER_USE_POSTCARD";
 
-/// The refusal of a load on the Engine (`engine`) in an environment where `postcard` (the value
-/// of [`POSTCARD`], if set) switches the proc-macro client to the bidirectional protocol, which
-/// runs salsa queries under a server's lock (`RaConfig.engine` C2).
-fn refuse_postcard(engine: bool, postcard: Option<&std::ffi::OsStr>) -> Result<(), AnalyzerError> {
+/// The refusal of a load in an environment where `postcard` (the value of [`POSTCARD`], if set)
+/// switches the proc-macro client to the bidirectional protocol, which runs salsa queries under
+/// a server's lock (`RaConfig.proc_macro_processes` C1).
+fn refuse_postcard(postcard: Option<&std::ffi::OsStr>) -> Result<(), AnalyzerError> {
     match postcard {
-        Some(_) if engine => Err(AnalyzerError::Load(format!(
+        Some(_) => Err(AnalyzerError::Load(format!(
             "{POSTCARD} is set: its proc-macro protocol runs queries of a layer under a server's \
              lock, which the forks of the Engine can deadlock on; unset it"
         ))),
-        _ => Ok(()),
+        None => Ok(()),
     }
 }
 
@@ -444,14 +435,12 @@ mod tests {
     fn postcard_protocol_is_refused_at_load() {
         // Read as rust-analyzer reads it: set at all, whatever the value.
         for value in ["1", "", "0"] {
-            let refused = refuse_postcard(true, Some(OsStr::new(value)));
+            let refused = refuse_postcard(Some(OsStr::new(value)));
             assert!(
                 matches!(&refused, Err(AnalyzerError::Load(m)) if m.contains(POSTCARD)),
                 "{value:?}: {refused:?}"
             );
-            assert!(refuse_postcard(false, Some(OsStr::new(value))).is_ok());
         }
-        assert!(refuse_postcard(true, None).is_ok());
-        assert!(refuse_postcard(false, None).is_ok());
+        assert!(refuse_postcard(None).is_ok());
     }
 }

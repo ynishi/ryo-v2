@@ -288,6 +288,7 @@ pub(crate) fn report_to_json(r: &SearchReport) -> Value {
         "expand_errors": r.expand_errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "budget_exhausted": r.budget_exhausted,
         "soft_stopped": r.soft_stopped,
+        "memory_stopped": r.memory_stopped,
         "elapsed_ms": r.elapsed_ms,
     })
 }
@@ -380,6 +381,7 @@ mod tests {
             expand_errors: Vec::new(),
             budget_exhausted: false,
             soft_stopped: true,
+            memory_stopped: false,
             elapsed_ms: 12,
         };
         let v = report_to_json(&report);
@@ -394,6 +396,7 @@ mod tests {
         assert_eq!(v["depths"][0]["writes"], 9);
         assert_eq!(v["judge"]["providers"][0], "metric");
         assert_eq!(v["soft_stopped"], true);
+        assert_eq!(v["memory_stopped"], false);
         assert_eq!(v["resolution"]["resolution"], "failed");
     }
 }

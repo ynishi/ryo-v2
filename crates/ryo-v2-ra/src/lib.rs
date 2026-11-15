@@ -2,7 +2,7 @@
 //!
 //! The only crate that depends on the `ra_ap_*` stack. It implements the ports of
 //! `ryo-v2-core::app::ports` named by its `impl` blocks: load a workspace once, fork its in-memory
-//! state per candidate, write text edits (stacked on earlier writes through `Stacked`), collect
+//! state per candidate, write text edits (stacked on earlier writes as jobs of `Forks`), collect
 //! HIR diagnostics, revert. Nothing here runs cargo or rustc per candidate.
 
 mod assess;
@@ -12,6 +12,7 @@ mod duplicate;
 mod engine;
 mod expand;
 mod field_bounds;
+mod flat;
 mod fork;
 mod forks;
 mod memory;
@@ -26,14 +27,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use assess::SyntaxAssessor;
-pub use diagnostics::{GapDetector, ThreadCount};
+pub use diagnostics::{FileTimes, GapDetector, ThreadCount};
 pub use fork::RaFork;
 pub use forks::RaLayer;
 pub use memory::{IngredientRow, MemoRow, MemoryReport};
 /// A layer's own counters on the fork Engine ([`RaSession::level_stats`]).
 pub use ryo_v2_engine::LayerStats;
 pub use session::{DetectorPanic, ExpanderPanic, RaSession};
-pub use stack::RaStack;
 
 /// Configuration of [`RaAnalyzer`].
 #[derive(Debug, Clone)]
@@ -42,22 +42,23 @@ pub struct RaConfig {
     pub proc_macro: bool,
     /// 診断の並列度。None = available_parallelism。
     pub threads: Option<usize>,
-    /// Every revert of a level (a discard, a pop, a check's) re-diagnoses the scope of its edits
-    /// and compares it with the level below.
+    /// Every write is sampled: the end of each level (a discard, a pop, a check's) and of each
+    /// `Forks` job checks the isolation of the base (I2), and every flat reference check
+    /// re-diagnoses the scope of its edits after its write-back and compares it with the
+    /// baseline.
     pub assert_revert: bool,
     /// ra が診断しない error の detector を走らせる: 未解決の型名と path 先頭 (E0405/E0425/E0433)、
     /// item と `use` が同じ module で同じ名前を定義する (E0255)、derive した impl と手書きの
     /// `Copy` impl が field に求める trait (E0204/E0277/E0369)。全ての [`GapDetector`] を一斉に切り替える。以前の名前は `unresolved_paths`(最初の detector の名前)。
     pub gap_detectors: bool,
-    /// Every n-th write (a `Verifier::check` or a `Stacked::write`) re-diagnoses the scope of its
-    /// edits after its revert and compares it with the level below. None = never.
+    /// Every n-th write (a `Verifier::check` or a `Forks` job) is sampled: the end of its level checks the
+    /// isolation of the base (I2). None = never.
     ///
     /// # Contract
-    /// - C1: `Some(n)` makes every n-th write re-diagnose after its revert, a check being one
-    ///   write (the 1st of `Some(2)` does not, the 2nd does); `None` never does through this
-    ///   field.
+    /// - C1: `Some(n)` samples every n-th write, a check being one write (the 1st of `Some(2)`
+    ///   is not, the 2nd is); `None` never does through this field.
     ///   tested: tests/verifier.rs assert_revert_every_samples_the_diagnostic_assert
-    ///   tested: tests/stack.rs writes_count_for_the_sampled_reassert
+    ///   tested: tests/check.rs writes_count_for_the_sampled_isolation
     pub assert_revert_every: Option<std::num::NonZeroU32>,
     /// `CargoConfig::set_test`: `#[cfg(test)]` code of workspace members is enabled, so it is diagnosed.
     ///
@@ -67,34 +68,21 @@ pub struct RaConfig {
     ///   tested: tests/verifier.rs cfg_test_config_diagnoses_test_module
     ///   tested: tests/verifier.rs ra_config_default_diagnoses_test_code
     pub cfg_test: bool,
-    /// The backend of the forks (`Stacked`, `Analyzer`, and a check, which is a one-level fork):
-    /// `false` (the default) writes each level in place and reverts it from its undo log; `true`
-    /// runs it on the fork Engine (D11): the base is frozen while a fork is live, a level is a
-    /// layer over it, `pop` drops the top layer and `release` drops them all, so the base is
-    /// never written.
-    ///
-    /// # Contract
-    /// - C1: every differential and contract test of `Stacked`, `Verifier` and the cut-off gives
-    ///   the same results on both backends, where the Engine has no revert to get wrong (a
-    ///   revert fault, a re-assert of a revert and a database write of a revert have no
-    ///   counterpart there), and except a level's write that panics: on the Engine it poisons
-    ///   only its dropped layer and is of reach Blueprint (`Stacked` C8), where the undo log
-    ///   poisons the session.
-    ///   tested: tests/stack.rs a_stack_diagnoses_as_its_flat_composition
-    ///   tested: tests/verifier.rs check_leaves_text_and_baseline_at_base
-    ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
-    /// - C2: with `engine` on, `load` refuses a process whose environment sets
-    ///   `RUST_ANALYZER_USE_POSTCARD` (`AnalyzerError::Load`), and with it off the variable is
-    ///   no reason to refuse: with it the proc-macro server's bidirectional protocol runs salsa
-    ///   queries of a layer while it holds a server's lock, a lock cycle with the claims of the
-    ///   layer's other threads that salsa cannot see once forks run side by side (D11, 3b).
-    ///   tested: session::tests::postcard_protocol_is_refused_at_load
-    pub engine: bool,
-    /// The forks that run side by side on the Engine (`Forks`, D11 stage 3b); read at
-    /// `Forks::open`.
+    /// The forks that run side by side on the fork Engine (`Forks`, D11 stage 3b); read at
+    /// `Forks::open`. Every fork of the adapter (`Forks`, `Analyzer`, and a check, which is a
+    /// one-level fork) is layers over the frozen base, which is never written; the stacked undo
+    /// log and the `Stacked` port were deleted at stage 4, and the flat reference check
+    /// (`RaAnalyzer::reference_check`) is the one write of the base left.
     pub forks: ForksConfig,
     /// The proc-macro server processes the load starts (with `proc_macro`), fixed for the
     /// session: the jobs of `Forks` share them.
+    ///
+    /// # Contract
+    /// - C1: `load` refuses a process whose environment sets `RUST_ANALYZER_USE_POSTCARD`
+    ///   (`AnalyzerError::Load`): with it the proc-macro server's bidirectional protocol runs
+    ///   salsa queries of a layer while it holds a server's lock, a lock cycle with the claims of
+    ///   the layer's other threads that salsa cannot see once forks run side by side (D11, 3b).
+    ///   tested: session::tests::postcard_protocol_is_refused_at_load
     pub proc_macro_processes: std::num::NonZeroUsize,
 }
 
@@ -138,94 +126,8 @@ impl Default for RaConfig {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: true,
-            engine: false,
             forks: ForksConfig::default(),
             proc_macro_processes: PROC_MACRO_PROCESSES,
-        }
-    }
-}
-
-impl RaConfig {
-    /// This configuration with its forks on `backend`: `engine` is true exactly for
-    /// [`Backend::Engine`].
-    pub fn with_backend(self, backend: Backend) -> RaConfig {
-        RaConfig {
-            engine: backend == Backend::Engine,
-            ..self
-        }
-    }
-
-    /// The backend `engine` selects.
-    pub fn backend(&self) -> Backend {
-        Backend::of_engine(self.engine)
-    }
-}
-
-/// The backend the forks run on, as [`RaConfig::engine`] selects it (D11): the stacked undo log,
-/// the default, or layers of the fork Engine. The one name of the backend for the measurement
-/// commands (`ryo-v2 bench`, `engine-probe`, `search-recall run`) and their reports.
-///
-/// # Contract
-/// - C1: its name, `undo-log` or `engine`, is the value it serializes as and the word a bench
-///   summary line ends with after ` backend `; it is the Engine exactly when `RaConfig.engine`
-///   is true (`RaConfig::with_backend`, `RaConfig::backend`).
-///   tested: tests::backend_names_itself_one_way
-///   tested: ryo-v2-host bench::tests::summary_line_ends_with_the_backend
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Backend {
-    /// The stacked undo log on the one database (`RaConfig.engine` false).
-    #[default]
-    UndoLog,
-    /// Layers of the fork Engine over a frozen base (`RaConfig.engine` true).
-    Engine,
-}
-
-impl Backend {
-    /// The backend of `RaConfig.engine` = `engine`, or of an `--engine` flag.
-    pub fn of_engine(engine: bool) -> Backend {
-        if engine {
-            Backend::Engine
-        } else {
-            Backend::UndoLog
-        }
-    }
-
-    /// The name a summary or header line prints and a report holds.
-    pub fn name(self) -> &'static str {
-        match self {
-            Backend::UndoLog => "undo-log",
-            Backend::Engine => "engine",
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backend_names_itself_one_way() {
-        assert_eq!(Backend::default(), Backend::UndoLog);
-        assert_eq!(RaConfig::default().backend(), Backend::UndoLog);
-        for (flag, b, name) in [
-            (false, Backend::UndoLog, "undo-log"),
-            (true, Backend::Engine, "engine"),
-        ] {
-            assert_eq!(Backend::of_engine(flag), b);
-            assert_eq!(b.name(), name);
-            assert_eq!(serde_json::to_value(b).unwrap(), serde_json::json!(name));
-            let config = RaConfig::default().with_backend(b);
-            assert_eq!(config.engine, flag);
-            assert_eq!(config.backend(), b);
-            // The other fields are kept.
-            let custom = RaConfig {
-                proc_macro: false,
-                threads: Some(3),
-                ..RaConfig::default()
-            }
-            .with_backend(b);
-            assert_eq!((custom.proc_macro, custom.threads), (false, Some(3)));
         }
     }
 }
@@ -255,6 +157,8 @@ pub struct RaAnalyzer {
     pub(crate) diagnose_panic: bool,
     /// Counts the threads diagnosing at once; a test hook.
     pub(crate) thread_count: Option<Arc<ThreadCount>>,
+    /// Records each file's diagnosis time; a measurement hook.
+    pub(crate) file_times: Option<Arc<FileTimes>>,
     /// Runs on a `Forks` job's worker between its writes and its diagnosis; a test hook.
     pub(crate) job_hook: Option<JobHook>,
     /// Whether every `Forks` job writes the frozen base after its own writes; a test hook.
@@ -279,9 +183,9 @@ pub(crate) struct DetectorFault {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DbWritePanic {
-    /// The write of a level's edits.
+    /// The write of a level's edits, or of the flat reference check's.
     Write,
-    /// The write that restores the texts of a reverted level.
+    /// The flat reference check's write-back of the base texts.
     Revert,
 }
 
@@ -301,6 +205,7 @@ impl RaAnalyzer {
             audit_fault: false,
             diagnose_panic: false,
             thread_count: None,
+            file_times: None,
             job_hook: None,
             job_base_write: false,
         }
@@ -312,6 +217,15 @@ impl RaAnalyzer {
     #[doc(hidden)]
     pub fn with_thread_count(mut self, count: Option<Arc<ThreadCount>>) -> RaAnalyzer {
         self.thread_count = count;
+        self
+    }
+
+    /// Records, in `times`, the wall time of each file's diagnosis in every diagnosis this
+    /// analyzer runs (`diagnostics::FileTimes`). For `bench --file-times`, which locates where a
+    /// check's time goes (stage 4 gate RS); it changes no finding.
+    #[doc(hidden)]
+    pub fn with_file_times(mut self, times: Option<Arc<FileTimes>>) -> RaAnalyzer {
+        self.file_times = times;
         self
     }
 
@@ -370,26 +284,28 @@ impl RaAnalyzer {
         self
     }
 
-    /// Makes every revert of a write that modified or deleted `path` restore it with its stored
-    /// text plus one byte, so that the comparison of the texts must catch it.
-    /// For the tests of that comparison; nothing else sets it.
+    /// Makes every write-back of the flat reference check that restores `path` (a file it
+    /// modified or deleted) restore it with its stored text plus one byte, so that the comparison
+    /// of the texts must catch it. For the tests of that comparison; nothing else sets it.
     #[doc(hidden)]
     pub fn with_revert_fault(mut self, path: Option<RelPath>) -> RaAnalyzer {
         self.revert_fault = path;
         self
     }
 
-    /// Makes the diagnostic re-assert of every sampled revert fail to run, after the texts are
-    /// restored. For the tests of a revert that cannot be confirmed; nothing else sets it.
+    /// Makes the check after a write fail to run: the re-assert of every flat reference check
+    /// (with `assert_revert`), after the texts are written back, and the isolation check of the
+    /// base at every sampled pop. For the tests of a write that cannot be confirmed; nothing
+    /// else sets it.
     #[doc(hidden)]
     pub fn with_reassert_fault(mut self, fault: bool) -> RaAnalyzer {
         self.reassert_fault = fault;
         self
     }
 
-    /// Makes that database write of the texts panic on every level, before it changes the
-    /// database. For the tests of a write or a revert the database cannot carry out; nothing else
-    /// sets it.
+    /// Makes that database write of the texts panic, before it changes the database: a level's
+    /// write (`Write`; the flat reference check's too), or the flat reference check's write-back
+    /// (`Revert`). For the tests of a write the database cannot carry out; nothing else sets it.
     #[doc(hidden)]
     pub fn with_db_write_panic(mut self, at: Option<DbWritePanic>) -> RaAnalyzer {
         self.db_write_panic = at;
@@ -421,7 +337,7 @@ impl RaAnalyzer {
     /// - C1: with `Some(limit_ms)` a diagnosis of a level, a check's included, that reaches the
     ///   limit ends in `CheckError::TimedOut`; with `None` it never does.
     ///   tested: tests/timeout.rs check_past_timeout_is_timed_out_and_session_usable
-    ///   tested: tests/stack.rs a_cut_off_diagnosis_keeps_the_levels
+    ///   tested: tests/jobs.rs a_cut_off_job_keeps_its_parent_usable
     pub fn with_check_timeout(mut self, limit_ms: Option<u64>) -> RaAnalyzer {
         self.check_timeout_ms = limit_ms;
         self
@@ -431,30 +347,31 @@ impl RaAnalyzer {
 /// The adapter's `Analyzer`.
 ///
 /// # Contract
-/// - C1: a `discard` whose re-assert differs from the baseline is `RevertMismatch` and poisons
-///   the session; a later `fork` is refused.
-///   tested: tests/verifier.rs discard_reassert_mismatch_poisons_the_session
-/// - C2: a `discard` compares the texts of the files its write modified or deleted with their
-///   texts before; a difference is `RevertMismatch` and poisons the session.
-///   tested: tests/stack.rs analyzer_discard_compares_texts
+/// - C1: a `discard` re-asserts no revert: it drops the fork's layer and, sampled, checks the
+///   isolation of the base, which a detector fault does not touch; the session stays usable.
+///   tested: tests/verifier.rs a_sampled_discard_reasserts_no_revert
+/// - C2: a `discard` writes nothing back: a fault of the write-back hooks fails none, and every
+///   text is the base's after it.
+///   tested: tests/check.rs analyzer_discard_writes_nothing_back
 /// - C3: on a session poisoned while its fork is live, `apply` and `diagnostics` are refused with
 ///   `AnalyzerError::Poisoned` and write nothing; `discard` ends the fork without writing.
-///   tested: tests/stack.rs a_poisoned_fork_is_not_written
+///   tested: tests/check.rs a_poisoned_fork_is_not_written
 /// - C4: `apply`, `diagnostics` and `discard` with a fork that is not the session's live one
 ///   (another session's, or one already discarded) are `ForkInUse` and change nothing.
-///   tested: tests/stack.rs an_analyzer_ticket_of_another_session_is_refused
+///   tested: tests/check.rs an_analyzer_ticket_of_another_session_is_refused
 /// - C5: while a fork is live, `Verifier::check`, `Expander::expand` and
 ///   `RevertAudit::audit_revert` are `ForkInUse`, and `Verifier::text` describes the base.
-///   tested: tests/stack.rs a_live_analyzer_fork_holds_the_session
-/// - C6: the files and findings of `diagnostics` after `apply` are those of `Stacked::diagnose`
-///   after one `Stacked::write` of the same edits, and the texts after the discard are those after
-///   a release, where the diagnosis meets neither the time limit nor a new detector panic.
-///   tested: tests/stack.rs one_level_matches_the_analyzer_path
+///   tested: tests/check.rs a_live_analyzer_fork_holds_the_session
+///   tested: tests/check.rs session_operations_refuse_while_an_analyzer_fork_is_live
+/// - C6: the files and findings of `diagnostics` after `apply` are those of `Verifier::check` of
+///   the same edits at the same scope, and the texts after the discard are those after the check,
+///   where the diagnosis meets neither the time limit nor a new detector panic.
+///   tested: tests/check.rs one_level_matches_the_analyzer_path
 /// - C7: on a poisoned session `fork`, `apply`, `diagnostics` and `discard` are
 ///   `AnalyzerError::Poisoned`, never `Panicked`, so that `app::verify::verify` gives the poison
 ///   as it is and `Expander::expand` gives `ExpandError::Session` with `CheckError::Poisoned`,
 ///   which reaches the session, not one Blueprint.
-///   tested: tests/stack.rs a_poisoned_session_is_poisoned_on_the_analyzer_port
+///   tested: tests/check.rs a_poisoned_session_is_poisoned_on_the_analyzer_port
 impl Analyzer for RaAnalyzer {
     type Session = RaSession;
     type Fork = RaFork;

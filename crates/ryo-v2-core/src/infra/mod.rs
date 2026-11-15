@@ -7,5 +7,6 @@
 
 pub mod clock;
 pub mod judge;
+pub mod memory;
 pub mod observer;
 pub mod overlay;

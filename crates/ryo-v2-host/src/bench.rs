@@ -2,22 +2,22 @@
 //!
 //! With `--on <parent overlay>` it measures one child two ways: `rebuilt`, the parent's edits
 //! composed with the variant's and verified from the base, and `stacked`, the variant's edits
-//! that the parent does not already make, written as a level on top of the parent's level of one
-//! `Stacked` fork, by `stacked::stacked_series`.
+//! that the parent does not already make, submitted as a job on the parent's Layer of `Forks` at
+//! W = 1, by `stacked::stacked_series`.
 //!
 //! Memory and CPU time are read through `proc.rs`: a failed read is an error of the run, so the
 //! host runs on Linux only. With `--on` every run also prints its process CPU ms, its wall ms
 //! and its core occupancy ([`occupancy`]).
 //!
-//! With `--engine` the forks run on layers of the fork Engine (`RaConfig.engine`, D11) instead
-//! of the stacked undo log; every summary line ends with ` backend engine` or ` backend undo-log`
-//! ([`Backend`]).
+//! Every check runs on layers of the fork Engine (D11): the stacked undo log, which the summary
+//! lines named as their backend, was deleted at stage 4.
 //!
 //! With `--depth-sweep` ([`run_depth_sweep`]) it measures how a diagnosis of the top level grows
-//! with the depth of a stack: per depth K, K one-file levels written on one fork by
-//! `stacked::depth_series`, the top level diagnosed `--repeat` times, and the levels popped. On
-//! the Engine it also prints, per level, the counters of the level's layer
-//! ([`level_stats_line`]), with the walk counters of `fork-probe` when built with that feature.
+//! with the depth of a stack: per depth K, K one-file levels, each a job on the Layer of the one
+//! below, by `stacked::depth_series`, the top level diagnosed `--repeat` times (diagnosis 1 its
+//! own job, the later ones the same level run again on the level below), and the Layers dropped.
+//! It also prints, per level, the counters of the level's Layer ([`level_stats_line`]), with the
+//! walk counters of `fork-probe` when built with that feature.
 
 use crate::proc::{self, ProcError};
 use crate::stacked::{self, DepthPoint, DepthShape, Point};
@@ -29,7 +29,8 @@ use ryo_v2_core::domain::{Edit, RelPath, Scope, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_core::infra::overlay::overlay_edits;
-use ryo_v2_ra::{Backend, LayerStats, RaAnalyzer, RaConfig};
+use ryo_v2_ra::{FileTimes, ForksConfig, LayerStats, RaAnalyzer, RaConfig, RaLayer};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,8 +52,12 @@ pub struct BenchArgs {
     pub proc_macro: bool,
     /// Whether to re-diagnose after the revert and compare with the baseline.
     pub assert_revert: bool,
-    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
-    pub backend: Backend,
+    /// Whether ryo-v2's gap detectors run beside rust-analyzer's diagnosis
+    /// (`RaConfig.gap_detectors`; `--no-gap-detectors` turns them off).
+    pub gap_detectors: bool,
+    /// Whether each run also prints the wall time of each file's diagnosis (`--file-times`,
+    /// [`file_times_line`]).
+    pub file_times: bool,
 }
 
 /// How a child is brought to its state.
@@ -84,6 +89,47 @@ struct RunStats {
     rss_kb: Option<u64>,
     /// The run's CPU and wall time; measured with `--on` only.
     usage: Option<Usage>,
+    /// Each file's diagnosis and its wall microseconds; recorded with `--file-times` only.
+    file_us: Vec<(RelPath, u64)>,
+}
+
+/// The files a `--file-times` line names, the slowest first.
+const FILE_TIMES_TOP: usize = 5;
+
+/// The line `--file-times` prints under a run: the files its diagnoses covered, each file's
+/// diagnosis wall time summed over the run, their total and the slowest [`FILE_TIMES_TOP`]
+/// files; `None` for a run with no record. A file's time is the wall time of rust-analyzer's
+/// `full_diagnostics` of it and the gap detectors on it, on the thread of its chunk, so the
+/// total may exceed the check's wall time.
+///
+/// # Contract
+/// - C1: `  file_ms total <ms> files <n> top <path>=<ms> ...`, ms with one decimal, the files
+///   summed per path and sorted by time (the slowest first, a tie by path), at most
+///   [`FILE_TIMES_TOP`] of them.
+///   tested: bench::tests::a_file_times_line_names_the_slowest_files
+pub(crate) fn file_times_line(file_us: &[(RelPath, u64)]) -> Option<String> {
+    if file_us.is_empty() {
+        return None;
+    }
+    let mut per: std::collections::BTreeMap<&RelPath, u64> = std::collections::BTreeMap::new();
+    for (path, us) in file_us {
+        *per.entry(path).or_default() += us;
+    }
+    let mut files: Vec<(&RelPath, u64)> = per.into_iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let ms = |us: u64| format!("{:.1}", us as f64 / 1000.0);
+    let total: u64 = files.iter().map(|(_, us)| us).sum();
+    let top: Vec<String> = files
+        .iter()
+        .take(FILE_TIMES_TOP)
+        .map(|(p, us)| format!("{p}={}", ms(*us)))
+        .collect();
+    Some(format!(
+        "  file_ms total {} files {} top {}",
+        ms(total),
+        files.len(),
+        top.join(" ")
+    ))
 }
 
 /// The process CPU time and the wall time of one run, from its write to the end of its revert.
@@ -151,6 +197,9 @@ struct Heading<'a> {
     /// The session's diagnostic threads with `--on`, where each run's usage is measured;
     /// `None` without it.
     threads: Option<usize>,
+    /// The per-file times of `--file-times`, taken at each run's start and end; `None` without
+    /// it.
+    times: Option<&'a FileTimes>,
 }
 
 /// The scope's name, as the bench prints it.
@@ -221,8 +270,12 @@ fn rebuilt_once<A: Analyzer>(
     edits: &[Edit],
     scope: Scope,
     measure: bool,
+    times: Option<&FileTimes>,
 ) -> Result<Once> {
     observer.take();
+    if let Some(times) = times {
+        times.take();
+    }
     let started = if measure {
         Some(start(proc::cpu_ms)?)
     } else {
@@ -236,6 +289,7 @@ fn rebuilt_once<A: Analyzer>(
     sample_memory(observer)?;
     let mut stats = read_events(observer.take());
     stats.usage = usage;
+    stats.file_us = times.map(FileTimes::take).unwrap_or_default();
     let verdict = match result {
         Ok(v) => Some(v),
         Err(AnalyzerError::RevertMismatch) => None,
@@ -275,6 +329,9 @@ impl StackedRecord<'_> {
             // A repeat's events are those from its write on, and so is its usage.
             Point::BeforeWrite => {
                 self.observer.take();
+                if let Some(times) = self.heading.times {
+                    times.take();
+                }
                 if self.heading.threads.is_some() {
                     self.started = Some(start(self.cpu)?);
                 }
@@ -288,14 +345,15 @@ impl StackedRecord<'_> {
                 sample_memory(self.observer)?;
                 let mut stats = read_events(self.observer.take());
                 stats.usage = usage;
+                stats.file_us = self.heading.times.map(FileTimes::take).unwrap_or_default();
                 self.runs += 1;
                 record(
                     self.heading,
                     self.series,
                     self.runs,
                     &stats,
-                    label_of(verdict),
-                    verdict,
+                    label_of(Some(verdict)),
+                    Some(verdict),
                 );
             }
         }
@@ -319,6 +377,7 @@ pub(crate) fn with_bench_hook<R>(
         n_edits: 1,
         repeat,
         threads: Some(1),
+        times: None,
     };
     let mut series = Series::default();
     let mut rec = StackedRecord {
@@ -372,6 +431,7 @@ fn record(
         n_edits,
         repeat: total,
         threads,
+        times: _,
     } = *heading;
     let ok = match stats.revert_ok {
         Some(b) => b.to_string(),
@@ -397,6 +457,9 @@ fn record(
         "{name} [{scope}] {i}/{total}: {label} edits {n_edits} scope {}/{} check_ms {} revert_ms {} revert_ok {ok} new {new} rss_kb {rss_txt}{mode}{usage_txt}",
         stats.scope_files, stats.total_files, stats.check_ms, stats.revert_ms,
     );
+    if let Some(line) = file_times_line(&stats.file_us) {
+        println!("{line}");
+    }
     if i == 1
         && let Some(v) = verdict
     {
@@ -414,15 +477,22 @@ fn record(
     }
 }
 
-/// Builds the analyzer of a bench on `backend`, loads `base` once and prints the load's lines to
-/// stderr.
+/// The forks of the series of `stacked.rs`: W = 1 with a caller that only waits, so the one job
+/// in flight diagnoses on all T threads, as a check and a level of the stacked fork did
+/// (`ForksConfig`: `T_w = T`, `t = T`).
+pub(crate) const SERIES_FORKS: ForksConfig = ForksConfig {
+    width: Some(NonZeroUsize::MIN),
+    caller_works: false,
+};
+
+/// Builds the analyzer of a bench, loads `base` once and prints the load's lines to stderr. Its
+/// forks are [`SERIES_FORKS`].
 pub(crate) fn load(
     base: &std::path::Path,
     proc_macro: bool,
     assert_revert: bool,
-    backend: Backend,
 ) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
-    load_on_threads(base, proc_macro, assert_revert, backend, None)
+    load_on_threads(base, proc_macro, assert_revert, None)
 }
 
 /// [`load`] with `RaConfig.threads` set to `threads` (`None`: the available parallelism).
@@ -430,21 +500,28 @@ pub(crate) fn load_on_threads(
     base: &std::path::Path,
     proc_macro: bool,
     assert_revert: bool,
-    backend: Backend,
     threads: Option<usize>,
 ) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
+    let config = RaConfig {
+        proc_macro,
+        assert_revert,
+        threads,
+        forks: SERIES_FORKS,
+        ..RaConfig::default()
+    };
+    load_with(base, config, None)
+}
+
+/// [`load`] with the analyzer's whole configuration given, and `times`, the per-file times of
+/// `--file-times` (`RaAnalyzer::with_file_times`).
+pub(crate) fn load_with(
+    base: &std::path::Path,
+    config: RaConfig,
+    times: Option<Arc<FileTimes>>,
+) -> Result<(RaAnalyzer, Arc<RecordingObserver>, ryo_v2_ra::RaSession)> {
     let observer = Arc::new(RecordingObserver::default());
-    let analyzer = RaAnalyzer::new(
-        RaConfig {
-            proc_macro,
-            assert_revert,
-            threads,
-            ..RaConfig::default()
-        }
-        .with_backend(backend),
-        Arc::new(MonotonicClock::new()),
-        observer.clone(),
-    );
+    let analyzer = RaAnalyzer::new(config, Arc::new(MonotonicClock::new()), observer.clone())
+        .with_file_times(times);
     let session = analyzer.load(base)?;
     let rss_after_load = proc::vm_rss_kb().context("read the RSS after load")?;
     for event in observer.take() {
@@ -472,12 +549,18 @@ pub(crate) fn load_on_threads(
 
 /// Loads `args.base` once and runs every variant; prints the fixed output format.
 pub fn run(args: &BenchArgs) -> Result<()> {
-    let (analyzer, observer, mut session) = load(
-        &args.base,
-        args.proc_macro,
-        args.assert_revert,
-        args.backend,
-    )?;
+    let times = args.file_times.then(|| Arc::new(FileTimes::default()));
+    let config = RaConfig {
+        proc_macro: args.proc_macro,
+        assert_revert: args.assert_revert,
+        gap_detectors: args.gap_detectors,
+        forks: SERIES_FORKS,
+        ..RaConfig::default()
+    };
+    let (analyzer, observer, mut session) = load_with(&args.base, config, times.clone())?;
+    if !args.gap_detectors {
+        eprintln!("[gap-detectors] off");
+    }
 
     let parent = match &args.on {
         Some(dir) => {
@@ -542,6 +625,7 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                     n_edits: child.len(),
                     repeat: args.repeat,
                     threads,
+                    times: times.as_deref(),
                 };
                 let (reverted, extra) = match (mode, &parent) {
                     (Mode::Stacked, Some(parent)) => {
@@ -583,20 +667,13 @@ pub fn run(args: &BenchArgs) -> Result<()> {
                                 &child,
                                 scope,
                                 threads.is_some(),
+                                times.as_deref(),
                             )
                         })?;
                         (reverted, mode_txt.clone())
                     }
                 };
-                print_summary(
-                    &name,
-                    sname,
-                    &mode_txt,
-                    &extra,
-                    args.backend,
-                    &series,
-                    &mut worst,
-                );
+                print_summary(&name, sname, &mode_txt, &extra, &series, &mut worst);
                 if !reverted {
                     fail_infra += 1;
                     break 'scopes;
@@ -631,10 +708,9 @@ pub struct DepthArgs {
     pub scopes: Vec<Scope>,
     /// Whether to start the proc-macro server.
     pub proc_macro: bool,
-    /// Whether every level's write is sampled for the re-assert at its pop.
+    /// Whether the writes are sampled (`RaConfig.assert_revert`): on `Forks`, the base's
+    /// fingerprint is taken at `open` and compared at `close` (I2).
     pub assert_revert: bool,
-    /// The backend of the forks (`RaConfig.engine`); every summary line names it.
-    pub backend: Backend,
 }
 
 /// What the hook of one depth series measured; durations in microseconds, by wall clock.
@@ -712,14 +788,14 @@ fn triple_ms(us: &[u64]) -> String {
 /// The summary line of one depth: the first diagnosis of the top level, the warm ones (from the
 /// second on) as min/median/max, the writes and pops per level as min/median/max and in total,
 /// the VmRSS after the stack is written and after it is diagnosed, and the last diagnosis'
-/// scope files and findings; ` backend <name>` ends it.
+/// scope files and findings.
 ///
 /// # Contract
 /// - C1: one line per depth and scope, `summary depth-sweep [<scope>] depth <K> files <N>
-///   n=<R>` followed by the figures in the order above, ending with ` backend <name>`; a figure
-///   without a value (no warm diagnosis, no read) prints `-`.
-///   tested: bench::tests::depth_summary_line_ends_with_the_backend
-fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backend) -> String {
+///   n=<R>` followed by the figures in the order above; a figure without a value (no warm
+///   diagnosis, no read) prints `-`.
+///   tested: bench::tests::depth_summary_line_names_each_figure
+fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord) -> String {
     let first = rec.check_us.first().map_or("-".to_string(), |&us| ms(us));
     let warm = rec.check_us.get(1..).unwrap_or(&[]);
     let opt = |x: Option<u64>| x.map_or("-".to_string(), |k| k.to_string());
@@ -733,7 +809,7 @@ fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backe
         "summary depth-sweep [{sname}] depth {} files {files} n={} first_check_ms {first} \
          warm_check_ms {} write_ms_per_level {} write_ms_total {} pop_ms_per_level {} \
          pop_ms_total {} rss_kb_after_stack {} rss_kb_after_diagnose {} scope_files \
-         {scope_files} findings {findings} backend {}",
+         {scope_files} findings {findings}",
         rec.depth,
         rec.check_us.len(),
         triple_ms(warm),
@@ -743,12 +819,11 @@ fn depth_summary_line(sname: &str, files: u32, rec: &DepthRecord, backend: Backe
         ms(rec.pop_us.iter().sum()),
         opt(rec.rss_after_stack),
         opt(rec.rss_after_diagnose),
-        backend.name(),
     )
 }
 
-/// The line of one level of a stack on the fork Engine: its layer's counters
-/// (`RaSession::level_stats`), read once every level is written and diagnosed, before the pops.
+/// The line of one level of a stack on the fork Engine: its Layer's counters
+/// (`RaLayer::stats`), read once every level is written and diagnosed, before the drops.
 ///
 /// # Contract
 /// - C1: `level <label> level <k>` followed by `memos`, `stamps`, `tracked_entries`,
@@ -844,17 +919,13 @@ pub(crate) fn depth_files(
     Ok(files)
 }
 
-/// Loads `args.base` once and, per scope and depth K, writes K levels on one fork with
-/// `stacked::depth_series` (the levels of `stacked::depth_levels` over the first `args.files`
-/// files of the workspace that the session indexed, in path order), diagnoses the top level
-/// `args.repeat` times and pops back; prints a line per diagnosis and a summary per depth.
+/// Loads `args.base` once and, per scope and depth K, submits K levels as jobs of `Forks` at
+/// W = 1 with `stacked::depth_series` (the levels of `stacked::depth_levels` over the first
+/// `args.files` files of the workspace that the session indexed, in path order, each a job on
+/// the Layer of the one below), diagnoses the top level `args.repeat` times and drops the
+/// Layers; prints a line per diagnosis and a summary per depth.
 pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
-    let (analyzer, _observer, mut session) = load(
-        &args.base,
-        args.proc_macro,
-        args.assert_revert,
-        args.backend,
-    )?;
+    let (analyzer, _observer, mut session) = load(&args.base, args.proc_macro, args.assert_revert)?;
     let files = depth_files(&analyzer, &session, &args.base, args.files)?;
     let names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
     eprintln!("[depth-sweep] levels rotate over {}", names.join(", "));
@@ -878,7 +949,7 @@ pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
                 scope,
                 DepthShape::Top(args.repeat),
                 &mut |point| rec.observe(point),
-                &mut |s| level_stats = s.level_stats(),
+                &mut |_, layers| level_stats = layers.iter().map(RaLayer::stats).collect(),
             )?;
             for (i, (&us, &(scope_files, findings))) in
                 rec.check_us.iter().zip(&rec.diagnosed).enumerate()
@@ -890,10 +961,7 @@ pub fn run_depth_sweep(args: &DepthArgs) -> Result<()> {
                     ms(us),
                 );
             }
-            println!(
-                "{}",
-                depth_summary_line(sname, args.files, &rec, args.backend)
-            );
+            println!("{}", depth_summary_line(sname, args.files, &rec));
             let label = format!("depth-sweep [{sname}] depth {}", rec.depth);
             for (i, stats) in level_stats.iter().enumerate() {
                 println!("{}", level_stats_line(&label, i + 1, stats));
@@ -916,11 +984,10 @@ fn print_summary(
     sname: &str,
     mode: &str,
     extra: &str,
-    backend: Backend,
     s: &Series,
     worst: &mut Option<(u64, String)>,
 ) {
-    let Some(line) = summary_line(name, sname, extra, backend, s) else {
+    let Some(line) = summary_line(name, sname, extra, s) else {
         return;
     };
     println!("{line}");
@@ -932,15 +999,13 @@ fn print_summary(
 }
 
 /// The summary line of a series, `None` for a series without runs: `extra` and the warm
-/// occupancy follow the figures, and ` backend <name>` ends the line, so that runs on the two
-/// backends can be told apart.
-fn summary_line(
-    name: &str,
-    sname: &str,
-    extra: &str,
-    backend: Backend,
-    s: &Series,
-) -> Option<String> {
+/// occupancy follow the figures.
+///
+/// # Contract
+/// - C1: `summary <name> [<scope>] n=<R>` followed by the figures, then `extra` and, with an
+///   occupancy, `warm_occupancy_median`; a series without runs has no line.
+///   tested: bench::tests::summary_line_names_each_figure
+fn summary_line(name: &str, sname: &str, extra: &str, s: &Series) -> Option<String> {
     let n = s.check_ms.len();
     if n == 0 {
         return None;
@@ -970,13 +1035,12 @@ fn summary_line(
         None => String::new(),
     };
     Some(format!(
-        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt} backend {}",
+        "summary {name} [{sname}] n={n} first_check_ms {} warm_check_ms {} warm_revert_ms {} rss_kb {rss_txt} rss_slope_kb_per_iter {:.1} leak_suspect {}{extra}{occ_txt}",
         s.check_ms[0],
         triple(warm_check),
         triple(warm_revert),
         slope(warm_rss),
         leak_suspect(warm_rss),
-        backend.name(),
     ))
 }
 
@@ -1077,6 +1141,7 @@ mod tests {
             n_edits: 1,
             repeat: 1,
             threads: Some(2),
+            times: None,
         };
         let mut series = Series::default();
         let mut rec = StackedRecord {
@@ -1095,7 +1160,8 @@ mod tests {
         }
         rec.observe(Point::AfterDiagnose).unwrap();
         rec.observe(Point::BeforePop).unwrap();
-        rec.observe(Point::AfterPop(None)).unwrap();
+        let verdict = Verdict::from_baseline(&[], &ryo_v2_core::domain::ScopedFindings::default());
+        rec.observe(Point::AfterPop(&verdict)).unwrap();
         assert_eq!(series.occupancy.len(), 1);
         assert!(series.occupancy[0] >= 0.0 && series.occupancy[0].is_finite());
 
@@ -1120,7 +1186,7 @@ mod tests {
             let ended = if fail_at_end {
                 begun.unwrap();
                 rec.cpu = failed_cpu;
-                rec.observe(Point::AfterPop(None))
+                rec.observe(Point::AfterPop(&verdict))
             } else {
                 begun
             };
@@ -1132,6 +1198,24 @@ mod tests {
             }
             assert!(series.occupancy.is_empty());
         }
+    }
+
+    /// `file_times_line` C1.
+    #[test]
+    fn a_file_times_line_names_the_slowest_files() {
+        let rel = |p: &str| RelPath::parse(p).unwrap();
+        assert_eq!(file_times_line(&[]), None);
+        let mut times: Vec<(RelPath, u64)> = (0..7)
+            .map(|i| (rel(&format!("f{i}.rs")), 1_000 * (i + 1)))
+            .collect();
+        // A file diagnosed twice in one run is summed; a tie goes by path.
+        times.push((rel("f0.rs"), 6_000));
+        times.push((rel("a.rs"), 7_000));
+        let line = file_times_line(&times).unwrap();
+        assert_eq!(
+            line,
+            "  file_ms total 41.0 files 8 top a.rs=7.0 f0.rs=7.0 f6.rs=7.0 f5.rs=6.0 f4.rs=5.0"
+        );
     }
 
     /// `level_stats_line` C1.
@@ -1164,23 +1248,22 @@ mod tests {
         );
     }
 
-    /// `ryo_v2_ra::Backend` C1: the word a summary line ends with.
+    /// `summary_line` C1.
     #[test]
-    fn summary_line_ends_with_the_backend() {
+    fn summary_line_names_each_figure() {
         let series = Series {
             check_ms: vec![10, 20],
             revert_ms: vec![1, 2],
             rss_kb: Vec::new(),
             occupancy: Vec::new(),
         };
-        // Without `--on` and `--engine`: the line of a bench before the backend was named, and
-        // ` backend undo-log` after it.
+        // Without `--on`.
         assert_eq!(
-            summary_line("v", "affected", "", Backend::UndoLog, &series).unwrap(),
+            summary_line("v", "affected", "", &series).unwrap(),
             "summary v [affected] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
-             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false backend undo-log"
+             2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false"
         );
-        // With `--on`: the backend follows the mode, the parent's level and the occupancy.
+        // With `--on`: the mode, the parent's level and the occupancy follow the figures.
         let stacked = Series {
             occupancy: vec![0.5, 0.25],
             ..series
@@ -1190,20 +1273,19 @@ mod tests {
                 "v",
                 "workspace",
                 " mode stacked rss_kb_after_parent_level 5",
-                Backend::Engine,
                 &stacked
             )
             .unwrap(),
             "summary v [workspace] n=2 first_check_ms 10 warm_check_ms 20/20/20 warm_revert_ms \
              2/2/2 rss_kb -/-/- rss_slope_kb_per_iter 0.0 leak_suspect false mode stacked \
-             rss_kb_after_parent_level 5 warm_occupancy_median 0.25 backend engine"
+             rss_kb_after_parent_level 5 warm_occupancy_median 0.25"
         );
-        assert!(summary_line("v", "affected", "", Backend::Engine, &Series::default()).is_none());
+        assert!(summary_line("v", "affected", "", &Series::default()).is_none());
     }
 
     /// `depth_summary_line` C1.
     #[test]
-    fn depth_summary_line_ends_with_the_backend() {
+    fn depth_summary_line_names_each_figure() {
         let rec = DepthRecord {
             depth: 2,
             repeat: 3,
@@ -1216,18 +1298,17 @@ mod tests {
             ..DepthRecord::default()
         };
         assert_eq!(
-            depth_summary_line("affected", 1, &rec, Backend::Engine),
+            depth_summary_line("affected", 1, &rec),
             "summary depth-sweep [affected] depth 2 files 1 n=3 first_check_ms 9.000 \
              warm_check_ms 3.000/3.000/4.000 write_ms_per_level 1.500/1.500/2.500 \
              write_ms_total 4.000 pop_ms_per_level 0.250/0.250/0.750 pop_ms_total 1.000 \
-             rss_kb_after_stack 100 rss_kb_after_diagnose 120 scope_files 3 findings 1 \
-             backend engine"
+             rss_kb_after_stack 100 rss_kb_after_diagnose 120 scope_files 3 findings 1"
         );
         let empty = DepthRecord::default();
-        let line = depth_summary_line("workspace", 2, &empty, Backend::UndoLog);
+        let line = depth_summary_line("workspace", 2, &empty);
         assert!(line.contains("first_check_ms - warm_check_ms -"), "{line}");
         assert!(line.contains("rss_kb_after_stack - "), "{line}");
-        assert!(line.ends_with(" backend undo-log"), "{line}");
+        assert!(line.ends_with(" scope_files - findings -"), "{line}");
     }
 
     /// The depth hook times between the points and reads VmRSS with the strict reader.

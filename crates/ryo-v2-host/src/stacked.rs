@@ -1,31 +1,42 @@
-//! The one stacked procedure of the host: a parent's level on a `Stacked` fork, and per repeat a
-//! variant's level written on top of it, diagnosed and popped.
+//! The one stacked procedure of the host, on `Forks` at W = 1: a parent's level is a job on the
+//! base's root, and per repeat a variant's level is a job on the parent's Layer, diagnosed and
+//! dropped (D11 stage 4).
 //!
 //! Every binary of the host that measures the stacked mode runs this function and observes it
 //! through its hook, so that what one measures is exactly the procedure another times.
+//!
+//! A level is one job of [`Forks::submit`] on the Layer of the level below; the series keeps one
+//! job in flight at a time (W = 1) and waits for its outcome before it goes on. The job writes its
+//! edits and diagnoses its scope on a worker, so a level's write and its diagnosis are one step:
+//! the hook's write point is the job's submit (its edits resolved and queued). A pop drops the
+//! level's Layer; nothing is reverted, and the base's isolation (I2) is checked once, at the
+//! `close` that ends every series.
 
 use crate::proc::ProcError;
 use anyhow::{Context, Result};
-use ryo_v2_core::app::ports::{CheckError, Stacked};
+use ryo_v2_core::app::ports::{CheckError, Checked, Forks, JobId, Limit, Next};
 use ryo_v2_core::domain::{Edit, Finding, RelPath, Scope, ScopedFindings, Verdict};
+use std::time::Duration;
+
+/// How long one wait in `Forks::next` lasts before the series asks again.
+const TICK: Duration = Duration::from_millis(100);
 
 /// A point of [`stacked_series`] at which its hook is called.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Point<'a> {
-    /// The parent's level is written and diagnosed; once per series.
+    /// The parent's level is written and diagnosed (its job ran); once per series.
     ParentDiagnosed,
-    /// A repeat is about to write the variant's level.
+    /// A repeat is about to submit the variant's level.
     BeforeWrite,
-    /// The variant's level has been written (its new revision begun) and is about to be
-    /// diagnosed.
+    /// The variant's level is submitted (its edits resolved and queued); its write and its
+    /// diagnosis run together on a worker, which may already have started them.
     AfterWrite,
-    /// The variant's level has been diagnosed (or its diagnosis failed).
+    /// The variant's level has been diagnosed (or its job failed).
     AfterDiagnose,
-    /// The variant's level is about to be popped.
+    /// The variant's level is about to be dropped.
     BeforePop,
-    /// The variant's level has been popped: the level's verdict, `None` when the pop did not
-    /// revert to the parent's state.
-    AfterPop(Option<&'a Verdict>),
+    /// The variant's level has been dropped: the level's verdict.
+    AfterPop(&'a Verdict),
 }
 
 impl Point<'_> {
@@ -55,46 +66,81 @@ pub fn own_edits(parent: &[Edit], edits: &[Edit]) -> Vec<Edit> {
         .collect()
 }
 
-/// The diagnosis of the top level at `scope`, and the files a check of the edits that take the
-/// base to its state covers (`Stacked::files_of`).
-fn diagnose_top<A: Stacked>(
+/// Submits `edits` as a job on `parent` at `scope`, under the adapter's check cut-off (D1).
+fn submit<A: Forks>(
     a: &A,
-    s: &A::Session,
-    f: &A::Fork,
+    s: &mut A::Session,
+    parent: &A::Layer,
+    edits: &[Edit],
     scope: Scope,
-) -> Result<(ScopedFindings, Vec<RelPath>), CheckError> {
-    let found = a.diagnose(s, f, scope)?;
-    Ok((found, a.files_of(s, f, scope)?))
+) -> Result<JobId, CheckError> {
+    a.submit(s, parent, edits, scope, Limit::Check)
 }
 
-/// The repeats of one series on a fork of `a`: `parent` is level 1, written and diagnosed once,
-/// and each of `repeat` repeats writes `variant` as level 2, diagnoses it and pops it. The fork is
-/// released at the end, whatever happened. Returns whether every repeat and the release of the
-/// parent's level reverted; the series stops at the first repeat whose pop did not revert.
+/// Waits for the outcome of `id`, the one job the series has in flight: `Ok` with the job's own
+/// result (an error of reach Blueprint inside it), or the error of the wait (the session's, or an
+/// outcome that is not that job's).
+pub(crate) fn outcome<A: Forks>(
+    a: &A,
+    s: &mut A::Session,
+    id: JobId,
+) -> Result<Result<Checked<A::Layer>, CheckError>> {
+    loop {
+        match a.next(s, TICK).context("wait for the job")? {
+            Next::Done(got, result) if got == id => return Ok(result),
+            Next::Withdrawn(got) if got == id => anyhow::bail!("the job was withdrawn"),
+            Next::Pending => {}
+            Next::Idle => anyhow::bail!("the job gave no outcome"),
+            Next::Done(..) | Next::Expanded(..) | Next::Withdrawn(_) => {
+                anyhow::bail!("an outcome of a job the series did not submit")
+            }
+        }
+    }
+}
+
+/// The error of a level's job that failed: a refused edit names the write, any other failure the
+/// diagnosis.
+fn job_error(e: CheckError, write: String, diagnose: String) -> anyhow::Error {
+    let what = if matches!(e, CheckError::Edit { .. }) {
+        write
+    } else {
+        diagnose
+    };
+    anyhow::Error::from(e).context(what)
+}
+
+/// The repeats of one series on forks of `a`: `parent` is level 1, a job on the base's root,
+/// written and diagnosed once, and each of `repeat` repeats submits `variant` as level 2 on the
+/// parent's Layer, waits for its diagnosis and drops its Layer. The forks are closed at the end,
+/// whatever happened. Returns whether the base's isolation held at that close (I2).
 ///
 /// A level's verdict is formed as the search forms a child's: `Verdict::of_level` of the level's
 /// diagnosis on top of the findings of the parent's level (themselves formed as the search forms
-/// its start state's), kept to the files a check of the composed edits covers. So it is the
-/// verdict a rebuilt check gives for the same state. `name` labels what is printed to stderr.
+/// its start state's), kept to the files a check of the composed edits covers
+/// (`Forks::layer_files`). So it is the verdict a rebuilt check gives for the same state. `name`
+/// labels what is printed to stderr.
 ///
 /// # Contract
-/// - C1: the one procedure of the stacked mode for every binary of the host: it opens the fork,
-///   writes the parent as a level, diagnoses it and calls the hook at ParentDiagnosed; per repeat
-///   it calls the hook at BeforeWrite, writes the variant as a level on the parent's level, calls
-///   it at AfterWrite, diagnoses the level, calls it at AfterDiagnose and BeforePop, pops the
-///   level and calls it at AfterPop, in that order; then it releases the fork. The hook observes
-///   and never changes the session.
+/// - C1: the one procedure of the stacked mode for every binary of the host: it opens the forks,
+///   submits the parent as a job on the root, waits for it and calls the hook at
+///   ParentDiagnosed; per repeat it calls the hook at BeforeWrite, submits the variant as a job
+///   on the parent's Layer, calls it at AfterWrite, waits for the job's diagnosis, calls it at
+///   AfterDiagnose and BeforePop, drops the job's Layer and calls it at AfterPop, in that order;
+///   then it drops every Layer and closes the forks. One job is in flight at a time (W = 1). The
+///   hook observes and never changes the session.
 ///   tested: stacked::tests::probe_and_bench_run_the_same_order
 ///   tested: stacked::tests::a_stacked_verdict_is_formed_as_the_search_forms_it
-/// - C2: a hook error (a failed read of `/proc`) ends the series with that error; the fork is
-///   still released, and a failed release is printed, the series' error being the one returned.
-///   A failure of the repeat that the hook's error cuts short (a failed diagnosis of the
-///   variant's level, a pop that did not revert) is named in that error.
+/// - C2: a hook error (a failed read of `/proc`) ends the series with that error; the forks are
+///   still closed after every Layer is dropped, and a failed close is printed, the series' error
+///   being the one returned. A failure of the repeat that the hook's error cuts short (a failed
+///   diagnosis of the variant's level) is named in that error. A close that finds the base
+///   changed (`Poisoned`) makes the series return `Ok(false)`.
 ///   tested: stacked::tests::a_failed_hook_read_ends_the_series
-///   tested: stacked::tests::a_failed_release_keeps_the_series_error
+///   tested: stacked::tests::a_failed_close_keeps_the_series_error
 ///   tested: stacked::tests::a_hook_error_names_the_failure_it_cuts_short
+///   tested: stacked::tests::a_poisoned_close_is_an_isolation_failure
 #[allow(clippy::too_many_arguments)]
-pub fn stacked_series<A: Stacked>(
+pub fn stacked_series<A: Forks>(
     a: &A,
     s: &mut A::Session,
     name: &str,
@@ -105,65 +151,64 @@ pub fn stacked_series<A: Stacked>(
     hook: &mut Hook<'_>,
 ) -> Result<bool> {
     let baseline = a.baseline(s);
-    let mut f = a.fork(s).context("open the fork")?;
-    let ran = levels(
-        a, s, &mut f, parent, variant, scope, repeat, &baseline, hook,
-    );
-    let released = a.release(s, f);
-    settle(name, ran, released)
+    let root = a.open(s).context("open the forks")?;
+    let ran = levels(a, s, &root, parent, variant, scope, repeat, &baseline, hook);
+    drop(root);
+    let closed = a.close(s);
+    settle(name, ran, closed)
 }
 
-/// The outcome of a series from what its levels returned (`ran`) and what the release of its fork
-/// returned: the series' error wins over the release's, which is printed; a failed release after
-/// a revert failure, or a release whose parent level did not revert, counts as a revert failure.
-fn settle(name: &str, ran: Result<bool>, released: Result<(), CheckError>) -> Result<bool> {
-    let reverted = match ran {
-        Ok(reverted) => reverted,
-        Err(e) => {
-            // The series' error is the one returned; the release's is printed, not lost.
-            if let Err(r) = released {
-                eprintln!("{name}: release after a failed series: {r}");
-            }
-            return Err(e);
+/// The outcome of a series from what its levels returned (`ran`, every Layer of theirs dropped)
+/// and what the close of its forks returned: the series' error wins over the close's, which is
+/// printed; a close that found the base changed (`Poisoned`, I2) counts as an isolation failure
+/// of the series, as a revert that did not restore the base counted before.
+fn settle(name: &str, ran: Result<()>, closed: Result<(), CheckError>) -> Result<bool> {
+    if let Err(e) = ran {
+        // The series' error is the one returned; the close's is printed, not lost.
+        if let Err(c) = closed {
+            eprintln!("{name}: close after a failed series: {c}");
         }
-    };
-    match released {
-        Ok(()) => Ok(reverted),
-        // A failed revert poisoned the session, so its release fails too; the series is
-        // counted as a revert failure, as a rebuilt one is, and the release failure is printed.
-        Err(e) if !reverted => {
-            eprintln!("{name}: release after a failed revert: {e}");
+        return Err(e);
+    }
+    match closed {
+        Ok(()) => Ok(true),
+        Err(e @ CheckError::Poisoned(_)) => {
+            eprintln!("{name}: ISOLATION-FAILED closing the forks (I2): {e}");
             Ok(false)
         }
-        // The parent's level did not revert to the base: a revert failure of the series too.
-        Err(e @ CheckError::RevertMismatch { .. }) => {
-            eprintln!("{name}: REVERT-MISMATCH releasing the parent level: {e}");
-            Ok(false)
-        }
-        Err(e) => Err(e).context("release the fork"),
+        Err(e) => Err(e).context("close the forks"),
     }
 }
 
-/// The levels of [`stacked_series`] on the live fork `f`; the fork is the caller's to release.
+/// The levels of [`stacked_series`] on the open forks, from `root`; every Layer they hold is
+/// dropped when they return, and the forks are the caller's to close.
 #[allow(clippy::too_many_arguments)]
-fn levels<A: Stacked>(
+fn levels<A: Forks>(
     a: &A,
     s: &mut A::Session,
-    f: &mut A::Fork,
+    root: &A::Layer,
     parent: &[Edit],
     variant: &[Edit],
     scope: Scope,
     repeat: u32,
     baseline: &[Finding],
     hook: &mut Hook<'_>,
-) -> Result<bool> {
-    a.write(s, f, parent)
-        .context("write the --on parent as level 1")?;
-    let (found, files) = diagnose_top(a, s, f, scope).context("diagnose the --on parent")?;
+) -> Result<()> {
+    let id = submit(a, s, root, parent, scope).context("submit the --on parent as level 1")?;
+    let level1 = outcome(a, s, id)?.map_err(|e| {
+        job_error(
+            e,
+            "write the --on parent as level 1".to_owned(),
+            "diagnose the --on parent".to_owned(),
+        )
+    })?;
+    let files = a
+        .layer_files(s, &level1.layer, scope)
+        .context("the files of the --on parent")?;
     let (_, below) = Verdict::of_level(
         baseline,
         &ScopedFindings::default(),
-        &found,
+        &level1.findings,
         &Edit::deleted_paths(parent),
         &files,
     );
@@ -171,36 +216,34 @@ fn levels<A: Stacked>(
     let deleted = Edit::deleted_paths(variant);
     for _ in 0..repeat {
         call(hook, Point::BeforeWrite, None)?;
-        // A refused write pushes no level, so there is nothing to pop.
-        a.write(s, f, variant)
-            .context("write the variant as a level")?;
-        // A hook error here leaves the level on the fork; the release reverts it.
+        let id =
+            submit(a, s, &level1.layer, variant, scope).context("submit the variant as a level")?;
+        // A hook error here leaves the job in flight; the close withdraws it.
         call(hook, Point::AfterWrite, None)?;
-        let diagnosed = diagnose_top(a, s, f, scope);
-        // A hook error here leaves the level on the fork; the release reverts it.
+        let diagnosed = outcome(a, s, id)?.and_then(|checked| {
+            let files = a.layer_files(s, &checked.layer, scope)?;
+            Ok((checked, files))
+        });
         call(hook, Point::AfterDiagnose, diagnosed.as_ref().err())?;
         call(hook, Point::BeforePop, diagnosed.as_ref().err())?;
-        let popped = a.pop(s, f);
-        let (verdict, mismatch) = match (diagnosed, popped) {
-            (_, Err(e @ CheckError::RevertMismatch { .. })) => (None, Some(e)),
-            (_, Err(e)) => return Err(e).context("pop the variant's level"),
-            (Err(e), Ok(_)) => return Err(e).context("diagnose the variant's level"),
-            (Ok((found, files)), Ok(_)) => (
-                Some(Verdict::of_level(baseline, &below, &found, &deleted, &files).0),
-                None,
-            ),
-        };
-        call(hook, Point::AfterPop(verdict.as_ref()), mismatch.as_ref())?;
-        if verdict.is_none() {
-            return Ok(false);
-        }
+        let (checked, files) = diagnosed.map_err(|e| {
+            job_error(
+                e,
+                "write the variant as a level".to_owned(),
+                "diagnose the variant's level".to_owned(),
+            )
+        })?;
+        let verdict = Verdict::of_level(baseline, &below, &checked.findings, &deleted, &files).0;
+        // The pop: the level's Layer is dropped.
+        drop(checked);
+        call(hook, Point::AfterPop(&verdict), None)?;
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Calls `hook` at `point`. Its error ends the series; `pending`, a failure the series met before
-/// that point and had not yet reported (a failed diagnosis, a pop that did not revert), is named
-/// in that error, so that ending the series loses neither.
+/// that point and had not yet reported (a failed diagnosis), is named in that error, so that
+/// ending the series loses neither.
 fn call(hook: &mut Hook<'_>, point: Point<'_>, pending: Option<&CheckError>) -> Result<()> {
     let at = point.name();
     hook(point).map_err(|e| {
@@ -215,17 +258,18 @@ fn call(hook: &mut Hook<'_>, point: Point<'_>, pending: Option<&CheckError>) -> 
 /// A point of [`depth_series`] at which its hook is called. Levels and diagnoses count from 1.
 #[derive(Clone, Copy, Debug)]
 pub enum DepthPoint<'a> {
-    /// Level `k` is about to be written.
+    /// Level `k` is about to be submitted.
     BeforeWrite(usize),
-    /// Level `k` has been written.
+    /// Level `k` is written: submitted, and for a level the shape does not diagnose, its job
+    /// done (its write and its diagnosis are one job).
     AfterWrite(usize),
-    /// Diagnosis `r` of the top level is about to run.
+    /// Diagnosis `r` of the top level is about to run (its job is submitted or about to be).
     BeforeDiagnose(u32),
     /// Diagnosis `r` of the top level has run, with its findings.
     AfterDiagnose(u32, &'a ScopedFindings),
-    /// Level `k`, the top one, is about to be popped.
+    /// Level `k`, the top one, is about to be dropped.
     BeforePop(usize),
-    /// Level `k` has been popped and reverted to the level below.
+    /// Level `k`'s Layer has been dropped.
     AfterPop(usize),
 }
 
@@ -245,6 +289,10 @@ impl DepthPoint<'_> {
 
 /// The hook of [`depth_series`]: it observes a point and may end the series with a failed read.
 pub type DepthHook<'h> = dyn FnMut(DepthPoint<'_>) -> Result<(), ProcError> + 'h;
+
+/// What [`depth_series`] calls once every level is written and diagnosed: the session and the
+/// levels' Layers, the lowest first.
+pub type OnStacked<'h, S, L> = dyn FnMut(&S, &[L]) + 'h;
 
 /// The levels of a depth series of `depth` levels over `files` (each a path and its base text).
 /// Level k appends `fn __ryo_depth_<k>() -> u32 { <k> }` to file `(k - 1) % files.len()` and is
@@ -274,43 +322,52 @@ pub fn depth_levels(files: &[(RelPath, String)], depth: usize) -> Vec<Vec<Edit>>
         .collect()
 }
 
-/// Which levels of a [`depth_series`] are diagnosed.
+/// Which levels of a [`depth_series`] are diagnosed, as the hook sees it. On `Forks` every level
+/// is a job, and a job diagnoses its scope; the shape says which of those diagnoses the hook is
+/// shown, and how often the top level is diagnosed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepthShape {
-    /// Only the top level, this many times, once every level is written (`bench --depth-sweep`):
-    /// the levels below run no query.
+    /// The top level, this many times, once every level below is written (`bench
+    /// --depth-sweep`): diagnosis 1 is the top level's own job, and diagnosis r ≥ 2 the same
+    /// level run again as a job on the level below, its Layer dropped. The levels below are jobs
+    /// awaited within their write points.
     Top(u32),
-    /// Every level once, right after its write and before the next level is written on it (the
-    /// search's shape, `engine-probe --depth`): each level below the top holds its own diagnosis.
+    /// Every level once, right after its submit and before the next level is submitted on it
+    /// (the search's shape, `engine-probe --depth`): each level below the top holds its own
+    /// diagnosis.
     EveryLevel,
 }
 
-/// One depth series on a fork of `a`: writes each of `levels` as a level on the one before,
-/// diagnoses at `scope` as `shape` says, calls `on_stacked` with the session once every level is
-/// written and diagnosed, then pops the levels from the top. The fork is released at the end,
-/// whatever happened. Returns whether every pop and the release reverted; the pops stop at the
-/// first that did not revert. `name` labels what is printed to stderr.
+/// One depth series on forks of `a`: submits each of `levels` as a job on the Layer of the one
+/// before (the first on the base's root), waits for each, calls the hook at the diagnoses `shape`
+/// says, calls `on_stacked` with the session and the levels' Layers (the lowest first) once every
+/// level is written and diagnosed, then drops the Layers from the top. The forks are closed at the
+/// end, whatever happened. Returns whether the base's isolation held at that close (I2). `name`
+/// labels what is printed to stderr.
 ///
-/// It shares the port calls of [`stacked_series`] (`fork`, `write`, `diagnose`, `pop`,
-/// `release`) and its handling of a failed release; only the shape of the stack differs.
+/// It shares the port calls of [`stacked_series`] (`open`, `submit`, `next`, `close`) and its
+/// handling of a failed close; only the shape of the stack differs.
 ///
 /// # Contract
-/// - C1: it opens the fork; per level k it calls the hook at BeforeWrite(k), writes the level and
-///   calls it at AfterWrite(k); with `DepthShape::Top(R)`, per diagnosis r of R it calls it at
-///   BeforeDiagnose(r), diagnoses the top level and calls it at AfterDiagnose(r) once every level
-///   is written; with `DepthShape::EveryLevel` it does so for r = k right after AfterWrite(k);
-///   then it calls `on_stacked` once; per level k from the top it calls the hook at
-///   BeforePop(k), pops and calls it at AfterPop(k); then it releases the fork. So K levels are
-///   written in order and K are popped in the reverse order. The hook and `on_stacked` observe
-///   and never change the session.
+/// - C1: it opens the forks; per level k it calls the hook at BeforeWrite(k), submits the level
+///   on the Layer of level k − 1 (the root for k = 1) and calls it at AfterWrite(k); a level the
+///   shape does not diagnose is awaited before AfterWrite(k). With `DepthShape::EveryLevel` the
+///   wait for level k is diagnosis k, between BeforeDiagnose(k) and AfterDiagnose(k), right
+///   after AfterWrite(k); with `DepthShape::Top(R)` the wait for the top level K is diagnosis 1,
+///   and each diagnosis r of 2..=R is the top level's edits submitted again on level K − 1's
+///   Layer and awaited between BeforeDiagnose(r) and AfterDiagnose(r), its Layer dropped. Then it
+///   calls `on_stacked` once with the K Layers; per level k from the top it calls the hook at
+///   BeforePop(k), drops the Layer and calls it at AfterPop(k); then it closes the forks. So K
+///   levels are written in order and K are dropped in the reverse order, one job in flight at a
+///   time (W = 1). The hook and `on_stacked` observe and never change the session.
 ///   tested: stacked::tests::a_depth_series_writes_k_levels_and_pops_k_in_order
 ///   tested: stacked::tests::an_every_level_series_diagnoses_each_level_before_the_next
 /// - C2: a hook error, a refused write or a failed diagnosis ends the series with that error,
-///   `on_stacked` is not called, and the fork is still released; a pop that does not revert ends
-///   the pops and the series returns `Ok(false)`.
-///   tested: stacked::tests::a_depth_series_stops_at_a_failure_and_releases
+///   `on_stacked` is not called, and the forks are still closed after every Layer is dropped; a
+///   close that finds the base changed (`Poisoned`, I2) makes the series return `Ok(false)`.
+///   tested: stacked::tests::a_depth_series_stops_at_a_failure_and_closes
 #[allow(clippy::too_many_arguments)]
-pub fn depth_series<A: Stacked>(
+pub fn depth_series<A: Forks>(
     a: &A,
     s: &mut A::Session,
     name: &str,
@@ -318,74 +375,93 @@ pub fn depth_series<A: Stacked>(
     scope: Scope,
     shape: DepthShape,
     hook: &mut DepthHook<'_>,
-    on_stacked: &mut dyn FnMut(&A::Session),
+    on_stacked: &mut OnStacked<'_, A::Session, A::Layer>,
 ) -> Result<bool> {
-    let mut f = a.fork(s).context("open the fork")?;
-    let ran = depth_levels_on(a, s, &mut f, levels, scope, shape, hook, on_stacked);
-    let released = a.release(s, f);
-    settle(name, ran, released)
+    let root = a.open(s).context("open the forks")?;
+    let ran = depth_levels_on(a, s, &root, levels, scope, shape, hook, on_stacked);
+    drop(root);
+    let closed = a.close(s);
+    settle(name, ran, closed)
 }
 
-/// Diagnosis `r` (of `of`) of the top level of `f`, between the hook's points.
-fn depth_diagnose<A: Stacked>(
-    a: &A,
-    s: &A::Session,
-    f: &A::Fork,
-    scope: Scope,
-    (r, of): (u32, u32),
-    hook: &mut DepthHook<'_>,
-) -> Result<()> {
-    depth_call(hook, DepthPoint::BeforeDiagnose(r))?;
-    let found = a
-        .diagnose(s, f, scope)
-        .with_context(|| format!("diagnose the top level ({r}/{of})"))?;
-    depth_call(hook, DepthPoint::AfterDiagnose(r, &found))
-}
-
-/// The levels of [`depth_series`] on the live fork `f`; the fork is the caller's to release.
+/// The levels of [`depth_series`] on the open forks, from `root`; every Layer they hold is
+/// dropped when they return, and the forks are the caller's to close.
 #[allow(clippy::too_many_arguments)]
-fn depth_levels_on<A: Stacked>(
+fn depth_levels_on<A: Forks>(
     a: &A,
     s: &mut A::Session,
-    f: &mut A::Fork,
+    root: &A::Layer,
     levels: &[Vec<Edit>],
     scope: Scope,
     shape: DepthShape,
     hook: &mut DepthHook<'_>,
-    on_stacked: &mut dyn FnMut(&A::Session),
-) -> Result<bool> {
-    let depth = levels.len() as u32;
+    on_stacked: &mut OnStacked<'_, A::Session, A::Layer>,
+) -> Result<()> {
+    let depth = levels.len();
+    // chain[k - 1] is level k's Layer.
+    let mut chain: Vec<A::Layer> = Vec::with_capacity(depth);
     for (i, edits) in levels.iter().enumerate() {
         let k = i + 1;
+        // Which diagnosis of the shape level k's job is, if the hook is shown it: (r, of).
+        let shown = match shape {
+            DepthShape::EveryLevel => Some((k as u32, depth as u32)),
+            DepthShape::Top(repeat) if k == depth && repeat > 0 => Some((1, repeat)),
+            DepthShape::Top(_) => None,
+        };
         depth_call(hook, DepthPoint::BeforeWrite(k))?;
-        // A refused write pushes no level; the release reverts those below.
-        a.write(s, f, edits)
-            .with_context(|| format!("write level {k}"))?;
-        depth_call(hook, DepthPoint::AfterWrite(k))?;
-        if shape == DepthShape::EveryLevel {
-            depth_diagnose(a, s, f, scope, (k as u32, depth), hook)?;
-        }
-    }
-    if let DepthShape::Top(repeat) = shape {
-        for r in 1..=repeat {
-            depth_diagnose(a, s, f, scope, (r, repeat), hook)?;
-        }
-    }
-    on_stacked(s);
-    for k in (1..=levels.len()).rev() {
-        depth_call(hook, DepthPoint::BeforePop(k))?;
-        match a.pop(s, f) {
-            Ok(true) => {}
-            Ok(false) => anyhow::bail!("pop level {k}: the fork had no level"),
-            Err(e @ CheckError::RevertMismatch { .. }) => {
-                eprintln!("REVERT-MISMATCH popping level {k}: {e}");
-                return Ok(false);
+        let parent = chain.last().unwrap_or(root);
+        let id = submit(a, s, parent, edits, scope).with_context(|| format!("submit level {k}"))?;
+        let checked = match shown {
+            None => {
+                let checked = outcome(a, s, id)?.map_err(|e| {
+                    job_error(e, format!("write level {k}"), format!("diagnose level {k}"))
+                })?;
+                depth_call(hook, DepthPoint::AfterWrite(k))?;
+                checked
             }
-            Err(e) => return Err(e).with_context(|| format!("pop level {k}")),
+            Some((r, of)) => {
+                depth_call(hook, DepthPoint::AfterWrite(k))?;
+                depth_call(hook, DepthPoint::BeforeDiagnose(r))?;
+                let checked = outcome(a, s, id)?.map_err(|e| {
+                    job_error(
+                        e,
+                        format!("write level {k}"),
+                        format!("diagnose the top level ({r}/{of})"),
+                    )
+                })?;
+                depth_call(hook, DepthPoint::AfterDiagnose(r, &checked.findings))?;
+                checked
+            }
+        };
+        chain.push(checked.layer);
+    }
+    if let (DepthShape::Top(repeat), Some(top)) = (shape, levels.last()) {
+        for r in 2..=repeat {
+            depth_call(hook, DepthPoint::BeforeDiagnose(r))?;
+            let below = depth
+                .checked_sub(2)
+                .and_then(|i| chain.get(i))
+                .unwrap_or(root);
+            let id = submit(a, s, below, top, scope)
+                .with_context(|| format!("submit the top level again ({r}/{repeat})"))?;
+            let checked = outcome(a, s, id)?.map_err(|e| {
+                job_error(
+                    e,
+                    format!("write the top level again ({r}/{repeat})"),
+                    format!("diagnose the top level ({r}/{repeat})"),
+                )
+            })?;
+            depth_call(hook, DepthPoint::AfterDiagnose(r, &checked.findings))?;
+            // A sibling of the top level: its Layer is dropped here.
         }
+    }
+    on_stacked(s, &chain);
+    for k in (1..=depth).rev() {
+        depth_call(hook, DepthPoint::BeforePop(k))?;
+        chain.pop();
         depth_call(hook, DepthPoint::AfterPop(k))?;
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Calls `hook` at `point`; its error ends the series, named with the point.
@@ -398,32 +474,72 @@ fn depth_call(hook: &mut DepthHook<'_>, point: DepthPoint<'_>) -> Result<()> {
 mod tests {
     use super::*;
     use ryo_v2_core::app::ports::Verifier;
-    use std::cell::RefCell;
+    use ryo_v2_core::domain::{StateFp, Target};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
-    /// A fork whose diagnosis is `parent` with one level and `top` with more, whose `files_of` is
-    /// `files`, and which logs every `fork`, `write`, `diagnose`, `pop` and `release`.
+    /// The log the fake and its Layers share: the port calls, the drops of Layers, and whatever
+    /// a test's hook adds.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A job of the fake not yet delivered: its id and outcome.
+    type Queued = (JobId, Result<Checked<FakeLayer>, CheckError>);
+
+    /// A Layer of the fake: its depth over the root (0); it logs `drop(<depth>)` when dropped.
+    #[derive(Debug)]
+    struct FakeLayer {
+        depth: usize,
+        log: Log,
+    }
+    impl Clone for FakeLayer {
+        fn clone(&self) -> FakeLayer {
+            panic!("the series never clones a Layer")
+        }
+    }
+    impl Drop for FakeLayer {
+        fn drop(&mut self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("drop({})", self.depth));
+        }
+    }
+
+    /// Forks whose job at depth 1 diagnoses as `parent` and deeper as `top`, whose `layer_files`
+    /// is `files`, with one job in the pool at a time, and which logs every `open`, `submit`,
+    /// `next` and `close`.
     #[derive(Default)]
-    struct FakeStack {
-        levels: RefCell<Vec<Vec<Edit>>>,
+    struct FakeForks {
         parent: ScopedFindings,
         top: ScopedFindings,
         files: Vec<RelPath>,
-        /// The port calls, and whatever a test's hook adds.
-        log: RefCell<Vec<String>>,
-        /// Whether `release` fails, as it does on a poisoned session.
-        fail_release: bool,
-        /// Whether a diagnosis above the parent's level is cut off.
+        log: Log,
+        queue: RefCell<VecDeque<Queued>>,
+        next_id: Cell<u64>,
+        /// Whether `close` fails as on a base a job changed (I2).
+        poison_close: bool,
+        /// Whether `close` fails as a session error.
+        fail_close: bool,
+        /// Whether a job above depth 1 is cut off.
         fail_top_diagnose: bool,
-        /// Whether `pop` does not revert to the level below.
-        mismatch_pop: bool,
     }
-    impl FakeStack {
+    impl FakeForks {
         fn note(&self, entry: impl Into<String>) {
-            self.log.borrow_mut().push(entry.into());
+            self.log.lock().unwrap().push(entry.into());
+        }
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.log.lock().unwrap())
+        }
+        fn layer(&self, depth: usize) -> FakeLayer {
+            FakeLayer {
+                depth,
+                log: self.log.clone(),
+            }
         }
     }
-    impl Verifier for FakeStack {
+    impl Verifier for FakeForks {
         type Session = ();
         fn text(&self, _: &(), _: &RelPath) -> Option<String> {
             None
@@ -450,52 +566,86 @@ mod tests {
             Ok(ScopedFindings::default())
         }
     }
-    impl Stacked for FakeStack {
-        type Fork = ();
-        fn fork(&self, _: &mut ()) -> Result<(), CheckError> {
-            self.note("fork");
-            Ok(())
+    impl Forks for FakeForks {
+        type Layer = FakeLayer;
+        fn open(&self, _: &mut ()) -> Result<FakeLayer, CheckError> {
+            self.note("open");
+            Ok(self.layer(0))
         }
-        fn write(&self, _: &mut (), _: &mut (), edits: &[Edit]) -> Result<(), CheckError> {
+        fn width(&self, _: &()) -> usize {
+            1
+        }
+        fn submit(
+            &self,
+            _: &mut (),
+            parent: &FakeLayer,
+            edits: &[Edit],
+            _: Scope,
+            limit: Limit,
+        ) -> Result<JobId, CheckError> {
+            assert_eq!(limit, Limit::Check, "a level is cut off as a check is");
+            assert!(self.queue.borrow().is_empty(), "one job in flight (W = 1)");
             let paths: Vec<String> = edits.iter().map(|e| e.path.to_string()).collect();
-            self.note(format!("write({})", paths.join(",")));
-            self.levels.borrow_mut().push(edits.to_vec());
-            Ok(())
-        }
-        fn levels(&self, _: &(), _: &()) -> Result<usize, CheckError> {
-            Ok(self.levels.borrow().len())
-        }
-        fn fork_text(&self, _: &(), _: &(), _: &RelPath) -> Result<Option<String>, CheckError> {
-            Ok(None)
-        }
-        fn diagnose(&self, _: &(), _: &(), _: Scope) -> Result<ScopedFindings, CheckError> {
-            self.note("diagnose");
-            if self.levels.borrow().len() == 1 {
+            self.note(format!("submit({})", paths.join(",")));
+            let depth = parent.depth + 1;
+            let found = if depth == 1 {
                 Ok(self.parent.clone())
             } else if self.fail_top_diagnose {
                 Err(CheckError::TimedOut { limit_ms: 7 })
             } else {
                 Ok(self.top.clone())
-            }
+            };
+            let id = JobId::new(self.next_id.get() + 1);
+            self.next_id.set(self.next_id.get() + 1);
+            let result = found.map(|findings| Checked {
+                layer: self.layer(depth),
+                findings,
+            });
+            self.queue.borrow_mut().push_back((id, result));
+            Ok(id)
         }
-        fn files_of(&self, _: &(), _: &(), _: Scope) -> Result<Vec<RelPath>, CheckError> {
+        fn expand(
+            &self,
+            _: &mut (),
+            _: &FakeLayer,
+            _: StateFp,
+            _: &[Target],
+            _: usize,
+        ) -> Result<JobId, CheckError> {
+            Err(CheckError::ForkInUse)
+        }
+        fn next(&self, _: &mut (), _: Duration) -> Result<Next<FakeLayer>, CheckError> {
+            self.note("next");
+            Ok(match self.queue.borrow_mut().pop_front() {
+                Some((id, result)) => Next::Done(id, result),
+                None => Next::Idle,
+            })
+        }
+        fn cancel(&self, _: &mut (), _: JobId) -> Result<bool, CheckError> {
+            Ok(false)
+        }
+        fn layer_files(&self, _: &(), _: &FakeLayer, _: Scope) -> Result<Vec<RelPath>, CheckError> {
             Ok(self.files.clone())
         }
-        fn pop(&self, _: &mut (), _: &mut ()) -> Result<bool, CheckError> {
-            self.note("pop");
-            let popped = self.levels.borrow_mut().pop().is_some();
-            if self.mismatch_pop {
-                return Err(CheckError::RevertMismatch {
-                    paths: vec![rel("a.rs")],
-                });
-            }
-            Ok(popped)
+        fn layer_text(
+            &self,
+            _: &(),
+            _: &FakeLayer,
+            _: &RelPath,
+        ) -> Result<Option<String>, CheckError> {
+            Ok(None)
         }
-        fn release(&self, _: &mut (), _: ()) -> Result<(), CheckError> {
-            self.note("release");
-            self.levels.borrow_mut().clear();
-            if self.fail_release {
-                return Err(CheckError::Poisoned("fake".to_owned()));
+        fn close(&self, _: &mut ()) -> Result<(), CheckError> {
+            // A job still in the pool is withdrawn, its Layer with it.
+            self.queue.borrow_mut().clear();
+            self.note("close");
+            if self.poison_close {
+                return Err(CheckError::Poisoned(
+                    "a job changed the base (I2)".to_owned(),
+                ));
+            }
+            if self.fail_close {
+                return Err(CheckError::ForkInUse);
             }
             Ok(())
         }
@@ -503,14 +653,7 @@ mod tests {
 
     /// The point's name, as the reports and the logs of these tests print it.
     fn name(point: Point<'_>) -> &'static str {
-        match point {
-            Point::ParentDiagnosed => "ParentDiagnosed",
-            Point::BeforeWrite => "BeforeWrite",
-            Point::AfterWrite => "AfterWrite",
-            Point::AfterDiagnose => "AfterDiagnose",
-            Point::BeforePop => "BeforePop",
-            Point::AfterPop(_) => "AfterPop",
-        }
+        point.name()
     }
 
     fn rel(p: &str) -> RelPath {
@@ -523,6 +666,14 @@ mod tests {
             file: PathBuf::from("/proc/self/status"),
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
         }
+    }
+
+    /// Whether every Layer the fake made was dropped before the close: every `drop` precedes the
+    /// last `close`.
+    fn dropped_before_close(log: &[String]) -> bool {
+        let close = log.iter().rposition(|e| e == "close");
+        let last_drop = log.iter().rposition(|e| e.starts_with("drop("));
+        matches!((close, last_drop), (Some(c), Some(d)) if d < c)
     }
 
     #[test]
@@ -538,19 +689,19 @@ mod tests {
             )]),
             ..ScopedFindings::default()
         };
-        let a = FakeStack {
+        let a = FakeForks {
             parent: below.clone(),
             top: ScopedFindings {
                 files: vec![rel("a.rs")],
                 ..ScopedFindings::default()
             },
             files: vec![rel("a.rs"), rel("b.rs")],
-            ..FakeStack::default()
+            ..FakeForks::default()
         };
         let parent = [Edit::write(rel("b.rs"), "fn b() {}")];
         let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
-        let mut seen: Vec<Option<Verdict>> = Vec::new();
-        let reverted = stacked_series(
+        let mut seen: Vec<Verdict> = Vec::new();
+        let isolated = stacked_series(
             &a,
             &mut (),
             "fake",
@@ -560,14 +711,14 @@ mod tests {
             1,
             &mut |point| {
                 if let Point::AfterPop(v) = point {
-                    seen.push(v.cloned());
+                    seen.push(v.clone());
                 }
                 Ok(())
             },
         )
         .unwrap();
-        assert!(reverted);
-        let verdict = seen.pop().flatten();
+        assert!(isolated);
+        let verdict = seen.pop();
         let label = crate::bench::label_of(verdict.as_ref());
         let want = Verdict::of_level(&[], &below, &a.top, &[], &a.files).0;
         assert_eq!(verdict, Some(want));
@@ -576,19 +727,19 @@ mod tests {
         assert_eq!(named, BTreeSet::from([UnseenClass::UnresolvedPath]));
         assert!(Verdict::from_baseline(&[], &a.top).unseen.is_empty());
         assert_eq!(label, "PASS");
-        assert!(a.levels.borrow().is_empty(), "the level is popped");
+        assert!(dropped_before_close(&a.take()), "every level is dropped");
     }
 
     /// The log of one series run with the bench's hook or the probe's: the fake's port calls with
     /// the hook's points between them.
     fn run_logged(observe: &mut dyn FnMut(Point<'_>) -> Result<(), ProcError>) -> Vec<String> {
-        let a = FakeStack {
+        let a = FakeForks {
             files: vec![rel("a.rs"), rel("p.rs")],
-            ..FakeStack::default()
+            ..FakeForks::default()
         };
         let parent = [Edit::write(rel("p.rs"), "fn p() {}")];
         let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
-        let reverted = stacked_series(
+        let isolated = stacked_series(
             &a,
             &mut (),
             "fake",
@@ -602,8 +753,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(reverted);
-        a.log.take()
+        assert!(isolated);
+        a.take()
     }
 
     #[test]
@@ -622,25 +773,25 @@ mod tests {
             readings.push((name(point), crate::proc::vm_rss_kb()?));
             Ok(())
         });
-        let mut want: Vec<String> = ["fork", "write(p.rs)", "diagnose", "ParentDiagnosed"]
+        let mut want: Vec<String> = ["open", "submit(p.rs)", "next", "ParentDiagnosed"]
             .map(String::from)
             .to_vec();
         for _ in 0..2 {
             want.extend(
                 [
                     "BeforeWrite",
-                    "write(a.rs)",
+                    "submit(a.rs)",
                     "AfterWrite",
-                    "diagnose",
+                    "next",
                     "AfterDiagnose",
                     "BeforePop",
-                    "pop",
+                    "drop(2)",
                     "AfterPop",
                 ]
                 .map(String::from),
             );
         }
-        want.push("release".to_owned());
+        want.extend(["drop(1)", "drop(0)", "close"].map(String::from));
         assert_eq!(bench, want);
         assert_eq!(probe, bench);
         assert_eq!(rss.len(), 3);
@@ -655,7 +806,7 @@ mod tests {
 
     #[test]
     fn a_failed_hook_read_ends_the_series() {
-        let a = FakeStack::default();
+        let a = FakeForks::default();
         let parent = [Edit::write(rel("p.rs"), "fn p() {}")];
         let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
         let result = stacked_series(
@@ -676,37 +827,23 @@ mod tests {
             matches!(e.downcast_ref(), Some(ProcError::Read { .. })),
             "{e:#}"
         );
-        let log = a.log.take();
-        assert_eq!(log.last().map(String::as_str), Some("release"));
-        // The first repeat's pop was the last level written: no second repeat ran.
-        assert_eq!(log.iter().filter(|e| *e == "write(a.rs)").count(), 1);
+        let log = a.take();
+        assert_eq!(log.last().map(String::as_str), Some("close"));
+        assert!(dropped_before_close(&log), "{log:?}");
+        // The first repeat's drop was the last level written: no second repeat ran.
+        assert_eq!(log.iter().filter(|e| *e == "submit(a.rs)").count(), 1);
     }
 
     #[test]
     fn a_hook_error_names_the_failure_it_cuts_short() {
         let parent = [Edit::write(rel("p.rs"), "fn p() {}")];
         let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
-        // A cut-off diagnosis met by a hook failing at AfterDiagnose, and a pop that did not
-        // revert met by a hook failing at AfterPop.
-        let cases = [
-            (
-                FakeStack {
-                    fail_top_diagnose: true,
-                    ..FakeStack::default()
-                },
-                "AfterDiagnose",
-                "cut off after 7 ms",
-            ),
-            (
-                FakeStack {
-                    mismatch_pop: true,
-                    ..FakeStack::default()
-                },
-                "AfterPop",
-                "revert did not restore",
-            ),
-        ];
-        for (a, at, met) in cases {
+        // A cut-off diagnosis met by a hook failing at AfterDiagnose, and at BeforePop.
+        for at in ["AfterDiagnose", "BeforePop"] {
+            let a = FakeForks {
+                fail_top_diagnose: true,
+                ..FakeForks::default()
+            };
             let result = stacked_series(
                 &a,
                 &mut (),
@@ -730,16 +867,36 @@ mod tests {
             );
             let shown = format!("{e:#}");
             assert!(shown.contains(at), "{shown}");
-            assert!(shown.contains(met), "{shown}");
-            assert_eq!(a.log.take().last().map(String::as_str), Some("release"));
+            assert!(shown.contains("cut off after 7 ms"), "{shown}");
+            assert_eq!(a.take().last().map(String::as_str), Some("close"));
         }
+        // Without a hook error the failed diagnosis is the series' error.
+        let a = FakeForks {
+            fail_top_diagnose: true,
+            ..FakeForks::default()
+        };
+        let e = stacked_series(
+            &a,
+            &mut (),
+            "fake",
+            &parent,
+            &variant,
+            Scope::Affected,
+            2,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("diagnose the variant's level"),
+            "{e:#}"
+        );
     }
 
     #[test]
-    fn a_failed_release_keeps_the_series_error() {
-        let a = FakeStack {
-            fail_release: true,
-            ..FakeStack::default()
+    fn a_failed_close_keeps_the_series_error() {
+        let a = FakeForks {
+            fail_close: true,
+            ..FakeForks::default()
         };
         let parent = [Edit::write(rel("p.rs"), "fn p() {}")];
         let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
@@ -762,9 +919,59 @@ mod tests {
             "{e:#}"
         );
         assert_eq!(
-            a.log.take(),
-            ["fork", "write(p.rs)", "diagnose", "release"].map(String::from)
+            a.take(),
+            [
+                "open",
+                "submit(p.rs)",
+                "next",
+                "drop(1)",
+                "drop(0)",
+                "close"
+            ]
+            .map(String::from)
         );
+        // With no series error the failed close is the error.
+        let a = FakeForks {
+            fail_close: true,
+            ..FakeForks::default()
+        };
+        let e = stacked_series(
+            &a,
+            &mut (),
+            "fake",
+            &parent,
+            &variant,
+            Scope::Affected,
+            1,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("close the forks"), "{e:#}");
+    }
+
+    #[test]
+    fn a_poisoned_close_is_an_isolation_failure() {
+        let a = FakeForks {
+            poison_close: true,
+            ..FakeForks::default()
+        };
+        let parent = [Edit::write(rel("p.rs"), "fn p() {}")];
+        let variant = [Edit::write(rel("a.rs"), "fn a() {}")];
+        let isolated = stacked_series(
+            &a,
+            &mut (),
+            "fake",
+            &parent,
+            &variant,
+            Scope::Affected,
+            1,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(!isolated);
+        let files = [(rel("a.rs"), String::new())];
+        let (result, _) = depth_logged(&a, &depth_levels(&files, 2), 1);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -801,16 +1008,16 @@ mod tests {
 
     /// The log of one depth series on `a`, with every point the hook sees between the port calls.
     fn depth_logged(
-        a: &FakeStack,
+        a: &FakeForks,
         levels: &[Vec<Edit>],
         repeat: u32,
     ) -> (Result<bool>, Vec<String>) {
         depth_logged_as(a, levels, DepthShape::Top(repeat))
     }
 
-    /// As `depth_logged`, with the shape given; `on_stacked` logs `stacked`.
+    /// As `depth_logged`, with the shape given; `on_stacked` logs `stacked(<Layers>)`.
     fn depth_logged_as(
-        a: &FakeStack,
+        a: &FakeForks,
         levels: &[Vec<Edit>],
         shape: DepthShape,
     ) -> (Result<bool>, Vec<String>) {
@@ -834,39 +1041,43 @@ mod tests {
                 a.note(format!("{}({k})", point.name()));
                 Ok(())
             },
-            &mut |_| a.note("stacked"),
+            &mut |_, layers| {
+                let depths: Vec<String> = layers.iter().map(|l| l.depth.to_string()).collect();
+                a.note(format!("stacked({})", depths.join(",")));
+            },
         );
-        (result, a.log.take())
+        (result, a.take())
     }
 
     #[test]
     fn an_every_level_series_diagnoses_each_level_before_the_next() {
-        let a = FakeStack::default();
+        let a = FakeForks::default();
         let files = [(rel("a.rs"), String::new()), (rel("b.rs"), String::new())];
         let (result, log) = depth_logged_as(&a, &depth_levels(&files, 2), DepthShape::EveryLevel);
         assert!(result.unwrap());
         let want = [
-            "fork",
+            "open",
             "BeforeWrite(1)",
-            "write(a.rs)",
+            "submit(a.rs)",
             "AfterWrite(1)",
             "BeforeDiagnose(1)",
-            "diagnose",
+            "next",
             "AfterDiagnose(1)",
             "BeforeWrite(2)",
-            "write(b.rs)",
+            "submit(b.rs)",
             "AfterWrite(2)",
             "BeforeDiagnose(2)",
-            "diagnose",
+            "next",
             "AfterDiagnose(2)",
-            "stacked",
+            "stacked(1,2)",
             "BeforePop(2)",
-            "pop",
+            "drop(2)",
             "AfterPop(2)",
             "BeforePop(1)",
-            "pop",
+            "drop(1)",
             "AfterPop(1)",
-            "release",
+            "drop(0)",
+            "close",
         ]
         .map(String::from);
         assert_eq!(log, want);
@@ -874,7 +1085,7 @@ mod tests {
 
     #[test]
     fn a_depth_series_writes_k_levels_and_pops_k_in_order() {
-        let a = FakeStack::default();
+        let a = FakeForks::default();
         let files = [
             (rel("a.rs"), String::new()),
             (rel("b.rs"), String::new()),
@@ -884,68 +1095,73 @@ mod tests {
         let (result, log) = depth_logged(&a, &levels, 2);
         assert!(result.unwrap());
         let want = [
-            "fork",
+            "open",
             "BeforeWrite(1)",
-            "write(a.rs)",
+            "submit(a.rs)",
+            "next",
             "AfterWrite(1)",
             "BeforeWrite(2)",
-            "write(b.rs)",
+            "submit(b.rs)",
+            "next",
             "AfterWrite(2)",
             "BeforeWrite(3)",
-            "write(c.rs)",
+            "submit(c.rs)",
             "AfterWrite(3)",
             "BeforeDiagnose(1)",
-            "diagnose",
+            "next",
             "AfterDiagnose(1)",
+            // Diagnosis 2: the top level again, on level 2's Layer, then dropped.
             "BeforeDiagnose(2)",
-            "diagnose",
+            "submit(c.rs)",
+            "next",
             "AfterDiagnose(2)",
-            "stacked",
+            "drop(3)",
+            "stacked(1,2,3)",
             "BeforePop(3)",
-            "pop",
+            "drop(3)",
             "AfterPop(3)",
             "BeforePop(2)",
-            "pop",
+            "drop(2)",
             "AfterPop(2)",
             "BeforePop(1)",
-            "pop",
+            "drop(1)",
             "AfterPop(1)",
-            "release",
+            "drop(0)",
+            "close",
         ]
         .map(String::from);
         assert_eq!(log, want);
-        assert!(a.levels.borrow().is_empty());
         // The levels written are the levels given, in order.
         let (_, log) = depth_logged(&a, &depth_levels(&files[..1], 2), 1);
-        let writes = log.iter().filter(|e| e.starts_with("write(")).count();
-        let pops = log.iter().filter(|e| e.as_str() == "pop").count();
-        assert_eq!((writes, pops), (2, 2));
+        let submits = log.iter().filter(|e| e.starts_with("submit(")).count();
+        let pops = log.iter().filter(|e| e.starts_with("AfterPop(")).count();
+        assert_eq!((submits, pops), (2, 2));
     }
 
     #[test]
-    fn a_depth_series_stops_at_a_failure_and_releases() {
+    fn a_depth_series_stops_at_a_failure_and_closes() {
         let files = [(rel("a.rs"), String::new())];
         let levels = depth_levels(&files, 2);
-        // A failed diagnosis of the top level: no pop, the release reverts the levels.
-        let a = FakeStack {
+        // A failed diagnosis of the top level: no pop, the close follows every drop.
+        let a = FakeForks {
             fail_top_diagnose: true,
-            ..FakeStack::default()
+            ..FakeForks::default()
         };
         let (result, log) = depth_logged(&a, &levels, 3);
-        assert!(result.is_err());
-        assert!(!log.iter().any(|e| e == "pop" || e == "stacked"), "{log:?}");
-        assert_eq!(log.last().map(String::as_str), Some("release"));
-        // A pop that does not revert ends the pops: the series is a revert failure.
-        let a = FakeStack {
-            mismatch_pop: true,
-            ..FakeStack::default()
-        };
-        let (result, log) = depth_logged(&a, &levels, 1);
-        assert!(!result.unwrap());
-        assert_eq!(log.iter().filter(|e| e.as_str() == "pop").count(), 1);
-        assert_eq!(log.last().map(String::as_str), Some("release"));
-        // A hook error ends the series with it; the fork is still released.
-        let a = FakeStack::default();
+        let e = result.unwrap_err();
+        assert!(
+            format!("{e:#}").contains("diagnose the top level (1/3)"),
+            "{e:#}"
+        );
+        assert!(
+            !log.iter()
+                .any(|e| e.starts_with("BeforePop") || e.starts_with("stacked")),
+            "{log:?}"
+        );
+        assert_eq!(log.last().map(String::as_str), Some("close"));
+        assert!(dropped_before_close(&log), "{log:?}");
+        // A hook error ends the series with it; the forks are still closed.
+        let a = FakeForks::default();
         let result = depth_series(
             &a,
             &mut (),
@@ -957,7 +1173,7 @@ mod tests {
                 DepthPoint::AfterWrite(2) => Err(failed_read()),
                 _ => Ok(()),
             },
-            &mut |_| panic!("a series cut short calls no on_stacked"),
+            &mut |_, _| panic!("a series cut short calls no on_stacked"),
         );
         let e = result.unwrap_err();
         assert!(
@@ -965,6 +1181,8 @@ mod tests {
             "{e:#}"
         );
         assert!(format!("{e:#}").contains("AfterWrite"));
-        assert_eq!(a.log.take().last().map(String::as_str), Some("release"));
+        let log = a.take();
+        assert_eq!(log.last().map(String::as_str), Some("close"));
+        assert!(dropped_before_close(&log), "{log:?}");
     }
 }

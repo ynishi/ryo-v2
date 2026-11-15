@@ -21,7 +21,6 @@ fn analyzer(timeout_ms: Option<u64>) -> RaAnalyzer {
             gap_detectors: true,
             assert_revert_every: None,
             cfg_test: false,
-            engine: common::engine(),
             ..Default::default()
         },
         Arc::new(MonotonicClock::new()),
@@ -43,10 +42,6 @@ fn loaded(test: &str) -> (Fixture, RaAnalyzer, RaSession) {
 
 #[test]
 fn check_past_timeout_is_timed_out_and_session_usable() {
-    common::both(check_past_timeout_is_timed_out_and_session_usable_on);
-}
-
-fn check_past_timeout_is_timed_out_and_session_usable_on() {
     let (_f, plain, mut s) = loaded("timeout_cut");
     let base_findings = Verifier::baseline(&plain, &s);
     let edit = lib_edit("\npub fn b() {}\n");
@@ -73,14 +68,10 @@ fn check_past_timeout_is_timed_out_and_session_usable_on() {
     assert_eq!(Verifier::baseline(&plain, &s), base_findings);
 }
 
-#[test]
-fn a_cancel_inside_a_detector_is_cancelled() {
-    common::both(a_cancel_inside_a_detector_is_cancelled_on);
-}
-
 /// A salsa cancellation raised inside a gap detector is the check's `Cancelled`, never
 /// `Panicked`, and the session stays usable at its base.
-fn a_cancel_inside_a_detector_is_cancelled_on() {
+#[test]
+fn a_cancel_inside_a_detector_is_cancelled() {
     let (_f, plain, mut s) = loaded("timeout_detector_cancel");
     let base_findings = Verifier::baseline(&plain, &s);
     let edit = lib_edit("\npub fn b() {}\n");
@@ -102,10 +93,6 @@ fn a_cancel_inside_a_detector_is_cancelled_on() {
 
 #[test]
 fn audit_revert_is_ok_after_checks_and_refuses_poisoned() {
-    common::both(audit_revert_is_ok_after_checks_and_refuses_poisoned_on);
-}
-
-fn audit_revert_is_ok_after_checks_and_refuses_poisoned_on() {
     let (_f, a, mut s) = loaded("timeout_audit");
     // Nothing recorded: Ok.
     a.audit_revert(&mut s).expect("nothing to audit");
@@ -129,10 +116,6 @@ fn audit_revert_is_ok_after_checks_and_refuses_poisoned_on() {
 
 #[test]
 fn a_failed_audit_keeps_its_paths() {
-    common::both(a_failed_audit_keeps_its_paths_on);
-}
-
-fn a_failed_audit_keeps_its_paths_on() {
     let f = Fixture::new(
         "timeout_audit_fault",
         &[

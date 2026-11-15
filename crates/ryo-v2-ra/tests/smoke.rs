@@ -84,6 +84,43 @@ fn indexed_comes_before_loaded() {
     assert!(files > 0);
 }
 
+/// `FileTimes` C1: the measurement hook of `bench --file-times`.
+#[test]
+fn file_times_name_every_file_of_a_check() {
+    use ryo_v2_core::app::ports::Verifier;
+    let build = |times: Option<Arc<ryo_v2_ra::FileTimes>>| {
+        RaAnalyzer::new(
+            RaConfig {
+                cfg_test: false,
+                ..RaConfig::default()
+            },
+            Arc::new(MonotonicClock::new()),
+            Arc::new(RecordingObserver::default()),
+        )
+        .with_file_times(times)
+    };
+    let edits = [corpus_edit("broken-01", "lib/src/lib.rs")];
+    let times = Arc::new(ryo_v2_ra::FileTimes::default());
+    let a = build(Some(times.clone()));
+    let mut s = a
+        .load(&corpus("base/extract-trait-multicrate"))
+        .expect("load fixture");
+    let at_load = times.take();
+    assert!(!at_load.is_empty(), "the baseline diagnosed files");
+    assert!(times.take().is_empty(), "take empties the records");
+    let found = a.check(&mut s, &edits, Scope::Affected).expect("check");
+    let mut timed: Vec<RelPath> = times.take().into_iter().map(|(p, _)| p).collect();
+    timed.sort();
+    assert_eq!(timed, found.files, "each file of the check once");
+
+    // Without the hook the check finds the same.
+    let plain = build(None);
+    let mut s = plain
+        .load(&corpus("base/extract-trait-multicrate"))
+        .expect("load fixture");
+    assert_eq!(plain.check(&mut s, &edits, Scope::Affected), Ok(found));
+}
+
 #[test]
 fn broken01_detected_and_valid_passes() {
     let (a, obs) = analyzer();

@@ -143,7 +143,7 @@ pub enum GapDetector {
     ///   of its findings, with that file; a run that skips none, or that runs no gap detector,
     ///   does not.
     ///   tested: tests/unresolved.rs unexpanded_macro_file_names_the_class
-    ///   tested: tests/stack.rs a_diagnosis_names_where_it_observed_each_unseen_class
+    ///   tested: tests/jobs.rs a_diagnosis_names_where_it_observed_each_unseen_class
     UnresolvedPath,
     /// A name an item and a `use` both define (E0255), `duplicate.rs`.
     DuplicateName,
@@ -235,6 +235,40 @@ pub(crate) struct Detector<'a> {
     pub(crate) panics: &'a Mutex<BTreeSet<DetectorPanic>>,
     /// Counts the threads diagnosing (test hook `RaAnalyzer::with_thread_count`).
     pub(crate) probe: Option<&'a ThreadCount>,
+    /// Records each file's diagnosis time (measurement hook `RaAnalyzer::with_file_times`).
+    pub(crate) times: Option<&'a FileTimes>,
+}
+
+/// The wall time of each file's diagnosis, over every collect of an analyzer: rust-analyzer's
+/// `full_diagnostics` of the file and ryo-v2's gap detectors on it, one file after another on the
+/// thread of its chunk (`RaAnalyzer::with_file_times`, `bench --file-times`). A measurement hook:
+/// it changes no finding and no order.
+///
+/// # Contract
+/// - C1: every file a collect diagnosed is recorded once per collect with its path and its wall
+///   microseconds, a file whose diagnosis failed included; `take` gives the records since the
+///   last `take` and empties them. Without the hook nothing is recorded and the findings are
+///   those with it.
+///   tested: tests/smoke.rs file_times_name_every_file_of_a_check
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct FileTimes {
+    times: Mutex<Vec<(RelPath, u64)>>,
+}
+
+impl FileTimes {
+    /// The files diagnosed since the last `take`, each with its wall microseconds, in the order
+    /// their diagnoses ended.
+    pub fn take(&self) -> Vec<(RelPath, u64)> {
+        std::mem::take(&mut *self.times.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn record(&self, rel: &RelPath, us: u64) {
+        self.times
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((rel.clone(), us));
+    }
 }
 
 /// The threads that diagnose files at once, over every collect of an analyzer, and the most
@@ -338,6 +372,7 @@ fn collect_errors(
         if deadline.is_some_and(Deadline::expired) {
             return Err(AnalyzerError::Cancelled);
         }
+        let started = detector.times.map(|_| std::time::Instant::now());
         let got = catch_unwind(AssertUnwindSafe(|| {
             let diags = analysis
                 .full_diagnostics(&diag_config, AssistResolveStrategy::None, *file_id)
@@ -441,8 +476,11 @@ fn collect_errors(
                 }
             }
             Ok::<_, ()>(found)
-        }))
-        .map_err(caught)?;
+        }));
+        if let (Some(times), Some(started)) = (detector.times, started) {
+            times.record(rel, started.elapsed().as_micros() as u64);
+        }
+        let got = got.map_err(caught)?;
         errors.extend(got.map_err(|()| AnalyzerError::Cancelled)?);
     }
     Ok(errors)

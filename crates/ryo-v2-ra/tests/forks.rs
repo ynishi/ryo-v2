@@ -1,16 +1,15 @@
 //! `Forks` on the adapter (D11, stage 3b): N jobs over a frozen base on a pool of workers, on
-//! throwaway workspaces (the corpus is never touched). Every test runs on the Engine, which
-//! `Forks` needs; `forks_need_the_engine_backend` covers the undo log.
+//! throwaway workspaces (the corpus is never touched).
 
 mod common;
 
 use common::{Fixture, rel};
 use ra_ap_base_db::salsa::Cancelled;
 use ryo_v2_core::app::ports::{
-    Analyzer, CheckError, Checked, ExpandError, Expander, Forks, JobId, Next, RevertAudit, Stacked,
+    Analyzer, CheckError, Checked, ExpandError, Expander, Forks, JobId, Limit, Next, RevertAudit,
     Verifier,
 };
-use ryo_v2_core::domain::{Edit, Scope, ScopedFindings, Target};
+use ryo_v2_core::domain::{Blueprint, CommandKind, Edit, Scope, ScopedFindings, StateFp, Target};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{ForksConfig, GapDetector, RaAnalyzer, RaConfig, RaLayer, RaSession, ThreadCount};
@@ -25,13 +24,12 @@ const WAIT: Duration = Duration::from_secs(120);
 
 /// The config of the tests: no proc-macro server, gap detectors on, `threads` T, and forks of
 /// width `width` (N) with `caller_works`.
-fn config(width: usize, threads: usize, caller_works: bool, engine: bool) -> RaConfig {
+fn config(width: usize, threads: usize, caller_works: bool) -> RaConfig {
     RaConfig {
         proc_macro: false,
         threads: Some(threads),
         gap_detectors: true,
         cfg_test: false,
-        engine,
         forks: ForksConfig {
             width: NonZeroUsize::new(width),
             caller_works,
@@ -51,7 +49,7 @@ fn analyzer_of(config: RaConfig) -> RaAnalyzer {
 /// An analyzer on the Engine with forks of width `width` over `threads` threads, the caller only
 /// waiting.
 fn analyzer(width: usize, threads: usize) -> RaAnalyzer {
-    analyzer_of(config(width, threads, false, true))
+    analyzer_of(config(width, threads, false))
 }
 
 /// Every outcome until `Idle`, in the order `next` gives them; a wait past [`WAIT`] fails.
@@ -71,7 +69,7 @@ fn outcome_of(outcomes: &[Next<RaLayer>], id: JobId) -> &Next<RaLayer> {
     let of: Vec<&Next<RaLayer>> = outcomes
         .iter()
         .filter(|o| match o {
-            Next::Done(i, _) | Next::Withdrawn(i) => *i == id,
+            Next::Done(i, _) | Next::Expanded(i, _) | Next::Withdrawn(i) => *i == id,
             _ => false,
         })
         .collect();
@@ -338,7 +336,9 @@ fn run_tree(a: &RaAnalyzer, s: &mut RaSession) -> (Ran, BTreeMap<Place, State>) 
         } else {
             Scope::Affected
         };
-        let id = a.submit(s, parent, edits, scope).expect("submit");
+        let id = a
+            .submit(s, parent, edits, scope, Limit::Check)
+            .expect("submit");
         assert!(
             pending.insert(id, (place, state, scope)).is_none(),
             "{id:?}"
@@ -400,6 +400,7 @@ fn run_tree(a: &RaAnalyzer, s: &mut RaSession) -> (Ran, BTreeMap<Place, State>) 
                 states.insert(place.clone(), state);
                 assert!(ran.insert(place, summary).is_none());
             }
+            Next::Expanded(id, _) => panic!("{id:?}: no expansion was asked for"),
             Next::Withdrawn(id) => panic!("{id:?} withdrawn though nobody cancelled it"),
             Next::Pending => panic!("no outcome within {WAIT:?}: the jobs are blocked"),
             Next::Idle => break,
@@ -494,7 +495,7 @@ fn a_refused_edit_is_a_done_without_a_layer() {
     // The one worker is held by a job in the pool.
     let edit = Edit::write(rel("a/src/x.rs"), format!("{A_X}{}", err_fn("held")));
     let held_job = a
-        .submit(&mut s, &root, &[edit], Scope::Affected)
+        .submit(&mut s, &root, &[edit], Scope::Affected, Limit::Check)
         .expect("submit");
     // Refused by the resolution: a delete of a path that is not a file of the root's state.
     let refused = a
@@ -503,6 +504,7 @@ fn a_refused_edit_is_a_done_without_a_layer() {
             &root,
             &[Edit::delete(rel("a/src/nothing.rs"))],
             Scope::Affected,
+            Limit::Check,
         )
         .expect("a refused edit is no error of submit");
     assert!(refused > held_job, "ids increase in submission order");
@@ -581,14 +583,14 @@ fn job_threads_times_jobs_fit_the_budget() {
     ] {
         let count = Arc::new(ThreadCount::default());
         let met = Arc::new(Rendezvous::new(width));
-        let a = analyzer_of(config(n, 6, caller_works, true))
+        let a = analyzer_of(config(n, 6, caller_works))
             .with_thread_count(Some(Arc::clone(&count)))
             .with_job_hook(Some(Arc::new(move |_| met.meet())));
         assert_eq!(a.width(&s), width, "N = {n}, caller works {caller_works}");
         let root = a.open(&mut s).expect("open");
         assert_eq!(a.width(&s), width);
         for i in 0..2 * width {
-            a.submit(&mut s, &root, &[edit(i)], Scope::Workspace)
+            a.submit(&mut s, &root, &[edit(i)], Scope::Workspace, Limit::Check)
                 .expect("submit");
         }
         drop(root);
@@ -628,7 +630,7 @@ fn a_layer_of_another_session_is_refused() {
     let edit = [Edit::write(x.clone(), "pub fn xf() -> u32 {\n    7\n}\n")];
 
     assert_eq!(
-        a.submit(&mut s, &foreign, &edit, Scope::Affected),
+        a.submit(&mut s, &foreign, &edit, Scope::Affected, Limit::Check),
         Err(CheckError::ForkInUse)
     );
     assert_eq!(a.layer_text(&s, &foreign, &x), Err(CheckError::ForkInUse));
@@ -639,17 +641,17 @@ fn a_layer_of_another_session_is_refused() {
     // The brand comes before the poison.
     s.poison("test");
     assert_eq!(
-        a.submit(&mut s, &foreign, &edit, Scope::Affected),
+        a.submit(&mut s, &foreign, &edit, Scope::Affected, Limit::Check),
         Err(CheckError::ForkInUse)
     );
     assert!(matches!(
-        a.submit(&mut s, &root, &edit, Scope::Affected),
+        a.submit(&mut s, &root, &edit, Scope::Affected, Limit::Check),
         Err(CheckError::Poisoned(_))
     ));
 
     // The refusals changed nothing: the other session's forks run its own job.
     let id = a
-        .submit(&mut other, &foreign, &edit, Scope::Affected)
+        .submit(&mut other, &foreign, &edit, Scope::Affected, Limit::Check)
         .expect("submit on its own session");
     let outcomes = drain(&a, &mut other);
     match outcome_of(&outcomes, id) {
@@ -688,7 +690,6 @@ fn session_operations_refuse_while_forks_are_open() {
             a.check(s, std::slice::from_ref(&edit), Scope::Affected),
             Err(CheckError::ForkInUse)
         );
-        assert!(matches!(Stacked::fork(a, s), Err(CheckError::ForkInUse)));
         assert_eq!(a.audit_revert(s), Err(CheckError::ForkInUse));
         assert!(matches!(a.open(s), Err(CheckError::ForkInUse)));
         assert!(Analyzer::fork(a, s).is_err());
@@ -701,7 +702,13 @@ fn session_operations_refuse_while_forks_are_open() {
     };
     refusals(&a, &mut s);
     let id = a
-        .submit(&mut s, &root, std::slice::from_ref(&edit), Scope::Affected)
+        .submit(
+            &mut s,
+            &root,
+            std::slice::from_ref(&edit),
+            Scope::Affected,
+            Limit::Check,
+        )
         .expect("submit");
     let outcomes = drain(&a, &mut s);
     assert!(matches!(outcome_of(&outcomes, id), Next::Done(_, Ok(_))));
@@ -721,12 +728,10 @@ fn expand_refuses_while_forks_are_open() {
     let a = analyzer(1, 2);
     let mut s = Analyzer::load(&a, &f.dir).expect("load");
     let targets = [Target::new(rel("a/src/lib.rs"), None)];
-    let before = a
-        .expand(&mut s, &[], &targets, 10)
-        .expect("expand at the base");
+    let before = Expander::expand(&a, &mut s, &[], &targets, 10).expect("expand at the base");
 
     let root = a.open(&mut s).expect("open");
-    let refused = a.expand(&mut s, &[], &targets, 10);
+    let refused = Expander::expand(&a, &mut s, &[], &targets, 10);
     assert!(
         matches!(refused, Err(ExpandError::Session(CheckError::ForkInUse))),
         "{refused:?}"
@@ -738,6 +743,7 @@ fn expand_refuses_while_forks_are_open() {
             &root,
             &[Edit::write(rel("c/src/z.rs"), C_Z)],
             Scope::Affected,
+            Limit::Check,
         )
         .expect("submit");
     let outcomes = drain(&a, &mut s);
@@ -745,7 +751,10 @@ fn expand_refuses_while_forks_are_open() {
     drop(outcomes);
     drop(root);
     a.close(&mut s).expect("close");
-    assert_eq!(a.expand(&mut s, &[], &targets, 10).expect("expand"), before);
+    assert_eq!(
+        Expander::expand(&a, &mut s, &[], &targets, 10).expect("expand"),
+        before
+    );
 }
 
 #[test]
@@ -758,7 +767,7 @@ fn a_refused_base_write_poisons_and_withdraws() {
         .iter()
         .map(|path| {
             let edit = Edit::write(rel(path), "pub fn w() {}\n");
-            a.submit(&mut s, &root, &[edit], Scope::Affected)
+            a.submit(&mut s, &root, &[edit], Scope::Affected, Limit::Check)
                 .expect("submit")
         })
         .collect();
@@ -804,6 +813,7 @@ fn a_refused_close_can_be_retried() {
             &root,
             &[Edit::write(x.clone(), text.clone())],
             Scope::Affected,
+            Limit::Check,
         )
         .expect("submit");
     let queued = a
@@ -812,6 +822,7 @@ fn a_refused_close_can_be_retried() {
             &root,
             &[Edit::write(rel("c/src/z.rs"), C_Z)],
             Scope::Affected,
+            Limit::Check,
         )
         .expect("submit");
     let kept = match a.next(&mut s, WAIT).expect("next") {
@@ -824,7 +835,7 @@ fn a_refused_close_can_be_retried() {
     assert!(s.fork_counters().is_none(), "the base is still frozen");
     // Closing: only the reads and `close`.
     assert_eq!(
-        a.submit(&mut s, &kept, &[], Scope::Affected),
+        a.submit(&mut s, &kept, &[], Scope::Affected, Limit::Check),
         Err(CheckError::ForkInUse)
     );
     assert!(matches!(
@@ -861,26 +872,6 @@ fn a_refused_close_can_be_retried() {
 }
 
 #[test]
-fn forks_need_the_engine_backend() {
-    let f = w_fixture("forks_undo_log");
-    let a = analyzer_of(config(2, 2, true, false));
-    let mut s = Analyzer::load(&a, &f.dir).expect("load");
-    assert!(matches!(a.open(&mut s), Err(CheckError::ForkInUse)));
-    // Nothing opened: the session works as before.
-    assert_eq!(a.close(&mut s), Err(CheckError::ForkInUse));
-    assert!(matches!(
-        a.next(&mut s, Duration::ZERO),
-        Err(CheckError::ForkInUse)
-    ));
-    a.check(
-        &mut s,
-        &[Edit::write(rel("c/src/z.rs"), C_Z)],
-        Scope::Affected,
-    )
-    .expect("a check on the undo log");
-}
-
-#[test]
 fn sibling_jobs_in_one_query_do_not_block() {
     let f = w_fixture("forks_siblings");
     let mut s = Analyzer::load(&analyzer(2, 2), &f.dir).expect("load");
@@ -901,7 +892,7 @@ fn sibling_jobs_in_one_query_do_not_block() {
         format!("{A_X}{}", err_fn("p")),
     )];
     let parent_id = a
-        .submit(&mut s, &root, &parent_edit, Scope::Affected)
+        .submit(&mut s, &root, &parent_edit, Scope::Affected, Limit::Check)
         .expect("submit the parent");
     let parent = match a.next(&mut s, WAIT).expect("next") {
         Next::Done(id, Ok(checked)) if id == parent_id => checked.layer,
@@ -917,7 +908,7 @@ fn sibling_jobs_in_one_query_do_not_block() {
     )];
     let ids: Vec<JobId> = (0..2)
         .map(|_| {
-            a.submit(&mut s, &parent, &sibling, Scope::Workspace)
+            a.submit(&mut s, &parent, &sibling, Scope::Workspace, Limit::Check)
                 .expect("submit a sibling")
         })
         .collect();
@@ -966,7 +957,7 @@ fn a_cancellation_is_cancelled_wherever_a_job_raises_it() {
     ] {
         let root = a.open(&mut s).expect("open");
         let id = a
-            .submit(&mut s, &root, &edit, Scope::Affected)
+            .submit(&mut s, &root, &edit, Scope::Affected, Limit::Check)
             .expect("submit");
         drop(root);
         let outcomes = drain(a, &mut s);
@@ -1000,6 +991,7 @@ fn a_cancel_withdraws_only_its_job() {
             &root,
             &[Edit::write(z.clone(), err_fn("gone"))],
             Scope::Affected,
+            Limit::Check,
         )
         .expect("submit");
     let kept = a
@@ -1008,6 +1000,7 @@ fn a_cancel_withdraws_only_its_job() {
             &root,
             &[Edit::write(z.clone(), text.clone())],
             Scope::Affected,
+            Limit::Check,
         )
         .expect("submit");
     let queued = a
@@ -1016,6 +1009,7 @@ fn a_cancel_withdraws_only_its_job() {
             &root,
             &[Edit::write(z.clone(), err_fn("q"))],
             Scope::Affected,
+            Limit::Check,
         )
         .expect("submit");
     assert_eq!(a.cancel(&mut s, queued), Ok(true));
@@ -1094,7 +1088,7 @@ fn a_worker_reused_across_layers_keeps_e6() {
     let ids: Vec<JobId> = [&f_edit, &g_edit, &f_edit]
         .iter()
         .map(|edit| {
-            a.submit(&mut s, &root, &edit[..], Scope::Workspace)
+            a.submit(&mut s, &root, &edit[..], Scope::Workspace, Limit::Check)
                 .expect("submit")
         })
         .collect();
@@ -1125,7 +1119,7 @@ fn isolation_holds_after_parallel_jobs() {
     // with it once the workers are joined.
     let a = analyzer_of(RaConfig {
         assert_revert_every: std::num::NonZeroU32::new(1),
-        ..config(4, 4, false, true)
+        ..config(4, 4, false)
     })
     .with_job_hook(Some(Arc::new(|id| std::thread::sleep(delay(7, id)))));
     let root = a.open(&mut s).expect("open");
@@ -1136,7 +1130,7 @@ fn isolation_holds_after_parallel_jobs() {
     for c in 0..4 {
         let edits = node_edits(&base, &format!("i{c}"), c);
         let id = a
-            .submit(&mut s, &root, &edits, Scope::Affected)
+            .submit(&mut s, &root, &edits, Scope::Affected, Limit::Check)
             .expect("submit");
         pending.insert(id, (applied(&base, &edits), 1));
     }
@@ -1153,12 +1147,13 @@ fn isolation_holds_after_parallel_jobs() {
                 for c in 0..4 {
                     let edits = node_edits(&state, &format!("i{done}{c}"), c);
                     let child = a
-                        .submit(&mut s, &layer, &edits, Scope::Affected)
+                        .submit(&mut s, &layer, &edits, Scope::Affected, Limit::Check)
                         .expect("submit");
                     pending.insert(child, (applied(&state, &edits), 2));
                 }
             }
             Next::Done(id, Err(e)) => panic!("{id:?}: {e:?}"),
+            Next::Expanded(id, _) => panic!("{id:?}: no expansion was asked for"),
             Next::Withdrawn(id) => panic!("{id:?} withdrawn though nobody cancelled it"),
             Next::Pending => panic!("no outcome within {WAIT:?}: the jobs are blocked"),
             Next::Idle => break,
@@ -1190,4 +1185,367 @@ fn isolation_holds_after_parallel_jobs() {
         before,
         "the base diagnoses as before open"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Expansions of a Layer (C10) and the limit of a job (C11).
+// ---------------------------------------------------------------------------------------------
+
+/// What an expansion gives, or how it failed.
+type Expanded = Result<Vec<Blueprint>, ExpandError>;
+
+/// The targets of the expansions below: every source file W's states can have.
+fn w_targets() -> Vec<Target> {
+    [
+        "a/src/lib.rs",
+        "a/src/x.rs",
+        "a/src/m.rs",
+        "b/src/lib.rs",
+        "b/src/y.rs",
+        "c/src/lib.rs",
+        "c/src/z.rs",
+        "c/src/n.rs",
+    ]
+    .iter()
+    .map(|p| Target::new(rel(p), None))
+    .collect()
+}
+
+/// The most children an expansion below proposes.
+const MAX: usize = 40;
+
+/// The layer of the one job `edits` on `parent`, once it ran.
+fn layer_of(a: &RaAnalyzer, s: &mut RaSession, parent: &RaLayer, edits: &[Edit]) -> RaLayer {
+    let id = a
+        .submit(s, parent, edits, Scope::Affected, Limit::Check)
+        .expect("submit");
+    match a.next(s, WAIT).expect("next") {
+        Next::Done(got, Ok(checked)) if got == id => checked.layer,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The `Expanded` of the one expansion of `layer`'s state `state`.
+fn expansion_of(a: &RaAnalyzer, s: &mut RaSession, layer: &RaLayer, state: &State) -> Expanded {
+    let fp = StateFp::of(&composed(state));
+    let id = Forks::expand(a, s, layer, fp, &w_targets(), MAX).expect("expand");
+    match a.next(s, WAIT).expect("next") {
+        Next::Expanded(got, children) if got == id => children,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `Expander::expand` of `state` with no fork open: the reference of C10.
+fn reference_expansion(a: &RaAnalyzer, s: &mut RaSession, state: &State) -> Expanded {
+    Expander::expand(a, s, &composed(state), &w_targets(), MAX)
+}
+
+/// Whether some Blueprint of `children` splices `path`.
+fn splices(children: &Expanded, path: &str) -> bool {
+    children.as_ref().is_ok_and(|bps| {
+        bps.iter()
+            .any(|b| b.splices().iter().any(|x| x.path() == &rel(path)))
+    })
+}
+
+/// `RaLayer::stats` C1: the counters the host's measurement series read on the Layers they hold.
+#[test]
+fn a_layers_stats_count_its_jobs_memos() {
+    let f = w_fixture("forks_layer_stats");
+    let a = analyzer(1, 2);
+    let mut s = Analyzer::load(&a, &f.dir).expect("load W");
+    let base = w_base();
+    let child_edits = node_edits(&base, "p", 0);
+    let root = a.open(&mut s).expect("open");
+    let child = layer_of(&a, &mut s, &root, &child_edits);
+    let stats = child.stats();
+    assert!(stats.memos > 0, "{stats:?}");
+    drop((root, child));
+    a.close(&mut s).expect("close after the read");
+}
+
+#[test]
+fn an_expansion_of_a_layer_is_that_of_its_state() {
+    let f = w_fixture("forks_expansion");
+    let a = analyzer(2, 2);
+    let mut s = Analyzer::load(&a, &f.dir).expect("load W");
+    // The root, a child (a body edit, a delete) and a grandchild (a created module).
+    let base = w_base();
+    let child_edits = node_edits(&base, "p", 1);
+    let child_state = applied(&base, &child_edits);
+    let grand_edits = node_edits(&child_state, "q", 2);
+    let grand_state = applied(&child_state, &grand_edits);
+
+    let root = a.open(&mut s).expect("open");
+    let child = layer_of(&a, &mut s, &root, &child_edits);
+    let grand = layer_of(&a, &mut s, &child, &grand_edits);
+    let on_layers = [
+        expansion_of(&a, &mut s, &root, &base),
+        expansion_of(&a, &mut s, &child, &child_state),
+        expansion_of(&a, &mut s, &grand, &grand_state),
+    ];
+    drop((root, child, grand));
+    a.close(&mut s).expect("close");
+
+    for (on_layer, state) in on_layers.iter().zip([&base, &child_state, &grand_state]) {
+        let children = on_layer.as_ref().expect("an expansion of a layer");
+        assert!(!children.is_empty(), "the state has children");
+        assert_eq!(
+            on_layer,
+            &reference_expansion(&a, &mut s, state),
+            "the same Blueprints, ids included"
+        );
+    }
+}
+
+#[test]
+fn an_expansion_sees_a_file_the_state_created() {
+    let f = w_fixture("forks_expansion_created");
+    let a = analyzer(1, 2);
+    let mut s = Analyzer::load(&a, &f.dir).expect("load W");
+    // `a/src/m.rs` created, with a function to extract from and a module to move items into.
+    let base = w_base();
+    let edits = node_edits(&base, "c", 2);
+    let state = applied(&base, &edits);
+    assert!(has(&state, "a/src/m.rs") && !has(&base, "a/src/m.rs"));
+
+    let root = a.open(&mut s).expect("open");
+    let layer = layer_of(&a, &mut s, &root, &edits);
+    let on_layer = expansion_of(&a, &mut s, &layer, &state);
+    drop((root, layer));
+    a.close(&mut s).expect("close");
+
+    assert!(
+        splices(&on_layer, "a/src/m.rs"),
+        "no Blueprint of the created file among {:?}",
+        on_layer.as_ref().map(Vec::len)
+    );
+    // With no fork open the expansion reads the state's files too.
+    assert_eq!(on_layer, reference_expansion(&a, &mut s, &state));
+}
+
+#[test]
+fn expansions_run_beside_jobs_and_change_no_job() {
+    let f = w_fixture("forks_expansion_beside");
+    let mut s = Analyzer::load(&analyzer(1, 4), &f.dir).expect("load W");
+    let base = w_base();
+    let parent_edits = node_edits(&base, "p", 0);
+    let parent_state = applied(&base, &parent_edits);
+    let jobs: Vec<Vec<Edit>> = (0..4)
+        .map(|c| node_edits(&parent_state, &format!("k{c}"), c))
+        .collect();
+
+    // Alone, at W = 1: each job, then each expansion.
+    type Checks = Vec<Result<ScopedFindings, Discriminant<CheckError>>>;
+    let alone = analyzer(1, 4);
+    let root = alone.open(&mut s).expect("open");
+    let parent = layer_of(&alone, &mut s, &root, &parent_edits);
+    let mut checks_alone: Checks = Vec::new();
+    for edits in &jobs {
+        let id = alone
+            .submit(&mut s, &parent, edits, Scope::Affected, Limit::Check)
+            .expect("submit");
+        let outcomes = drain(&alone, &mut s);
+        checks_alone.push(match outcome_of(&outcomes, id) {
+            Next::Done(_, Ok(c)) => Ok(c.findings.clone()),
+            Next::Done(_, Err(e)) => Err(std::mem::discriminant(e)),
+            other => panic!("{other:?}"),
+        });
+    }
+    let expanded_alone = [
+        expansion_of(&alone, &mut s, &root, &base),
+        expansion_of(&alone, &mut s, &parent, &parent_state),
+    ];
+    drop((root, parent));
+    alone.close(&mut s).expect("close");
+
+    // Side by side, at W = 4, in seeded orders: the expansions between the jobs.
+    for seed in 0..5u64 {
+        let a = analyzer(4, 4).with_job_hook(Some(Arc::new(move |id| {
+            std::thread::sleep(delay(seed, id))
+        })));
+        let root = a.open(&mut s).expect("open");
+        let parent = layer_of(&a, &mut s, &root, &parent_edits);
+        let targets = w_targets();
+        let mut checks = Vec::new();
+        let mut expansions = Vec::new();
+        for (i, edits) in jobs.iter().enumerate() {
+            checks.push(
+                a.submit(&mut s, &parent, edits, Scope::Affected, Limit::Check)
+                    .expect("submit"),
+            );
+            if i == 0 {
+                let fp = StateFp::of(&composed(&base));
+                expansions
+                    .push(Forks::expand(&a, &mut s, &root, fp, &targets, MAX).expect("expand"));
+            }
+            if i == 2 {
+                let fp = StateFp::of(&composed(&parent_state));
+                expansions
+                    .push(Forks::expand(&a, &mut s, &parent, fp, &targets, MAX).expect("expand"));
+            }
+        }
+        let outcomes = drain(&a, &mut s);
+        assert_eq!(outcomes.len(), 6, "one outcome each");
+        let side_checks: Checks = checks
+            .iter()
+            .map(|id| match outcome_of(&outcomes, *id) {
+                Next::Done(_, Ok(c)) => Ok(c.findings.clone()),
+                Next::Done(_, Err(e)) => Err(std::mem::discriminant(e)),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(side_checks, checks_alone, "seed {seed}: the jobs as alone");
+        for (id, want) in expansions.iter().zip(&expanded_alone) {
+            match outcome_of(&outcomes, *id) {
+                Next::Expanded(_, got) => assert_eq!(got, want, "seed {seed}: the expansion"),
+                other => panic!("{other:?}"),
+            }
+        }
+        drop(outcomes);
+        drop((root, parent));
+        a.close(&mut s).expect("close: an expansion wrote nothing");
+    }
+}
+
+#[test]
+fn an_expansion_counts_in_the_width() {
+    let f = w_fixture("forks_expansion_width");
+    let mut s = Analyzer::load(&analyzer(1, 2), &f.dir).expect("load W");
+    let base = w_base();
+    let edit = [Edit::write(
+        rel("c/src/z.rs"),
+        format!("{C_Z}{}", err_fn("w")),
+    )];
+    let fp = StateFp::of(&composed(&base));
+
+    // Holds the one check job, then expands beside it: the expansion's outcome, and how long it
+    // took to come with the job still held (`None` when it did not come within `wait`).
+    let held_run = |width: usize, s: &mut RaSession, wait: Duration| {
+        let gate = Arc::new(Gate::default());
+        let held = Arc::clone(&gate);
+        let a = analyzer(width, 2).with_job_hook(Some(Arc::new(move |_| held.wait())));
+        let root = a.open(s).expect("open");
+        let job = a
+            .submit(s, &root, &edit, Scope::Affected, Limit::Check)
+            .expect("submit");
+        let started = std::time::Instant::now();
+        let expansion = Forks::expand(&a, s, &root, fp, &w_targets(), MAX).expect("expand");
+        let came = match a.next(s, wait).expect("next") {
+            Next::Expanded(id, _) if id == expansion => Some(started.elapsed()),
+            Next::Pending => None,
+            other => panic!("{other:?}"),
+        };
+        gate.release();
+        let outcomes = drain(&a, s);
+        assert!(matches!(outcome_of(&outcomes, job), Next::Done(_, Ok(_))));
+        if came.is_none() {
+            assert!(matches!(
+                outcome_of(&outcomes, expansion),
+                Next::Expanded(_, Ok(_))
+            ));
+        }
+        drop(outcomes);
+        drop(root);
+        a.close(s).expect("close");
+        came
+    };
+
+    // At W = 2 the expansion runs beside the held job.
+    let beside = held_run(2, &mut s, WAIT).expect("at W = 2 the expansion runs beside the job");
+    // At W = 1 the held job has the one worker: the expansion waits for it, here three times as
+    // long as it took beside it.
+    let wait = (beside * 3).max(Duration::from_secs(1));
+    assert_eq!(
+        held_run(1, &mut s, wait),
+        None,
+        "at W = 1 an expansion is not run beside a running job"
+    );
+}
+
+#[test]
+fn an_expansions_panics_join_the_session_at_next() {
+    let f = w_fixture("forks_expansion_panics");
+    let a = analyzer(1, 2);
+    let mut s = Analyzer::load(&a, &f.dir).expect("load W");
+    let base = w_base();
+    // Every add-derive call panics; the expansion contains it and goes on.
+    s.inject_expander_fault(Some(CommandKind::AddDerive));
+    let root = a.open(&mut s).expect("open");
+    let id = Forks::expand(
+        &a,
+        &mut s,
+        &root,
+        StateFp::of(&composed(&base)),
+        &w_targets(),
+        MAX,
+    )
+    .expect("expand");
+    // Nothing joins the session before `next` delivers the expansion, however far it ran.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(s.expander_panics().is_empty(), "joined before delivery");
+    let children = match a.next(&mut s, WAIT).expect("next") {
+        Next::Expanded(got, children) if got == id => children,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        children.is_ok(),
+        "a contained panic fails no expansion: {children:?}"
+    );
+    let on_layer = s.expander_panics();
+    assert!(
+        !on_layer.is_empty()
+            && on_layer
+                .iter()
+                .all(|p| p.kind == Some(CommandKind::AddDerive)),
+        "{on_layer:?}"
+    );
+    drop(root);
+    a.close(&mut s).expect("close");
+
+    // The same panics as the expansion with no fork open records.
+    let mut fresh = Analyzer::load(&a, &f.dir).expect("load W again");
+    fresh.inject_expander_fault(Some(CommandKind::AddDerive));
+    let reference = reference_expansion(&a, &mut fresh, &base);
+    assert_eq!(children, reference);
+    assert_eq!(on_layer, fresh.expander_panics());
+}
+
+#[test]
+fn a_start_job_is_not_cut_off() {
+    let f = w_fixture("forks_no_limit");
+    let mut s = Analyzer::load(&analyzer(1, 2), &f.dir).expect("load W");
+    let edits = node_edits(&w_base(), "s", 0);
+    // Every job outlasts the cut-off before its diagnosis starts.
+    let slow = |a: RaAnalyzer| {
+        a.with_job_hook(Some(Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(300))
+        })))
+    };
+    let run = |a: &RaAnalyzer, s: &mut RaSession, limit: Limit| {
+        let root = a.open(s).expect("open");
+        let id = a
+            .submit(s, &root, &edits, Scope::Affected, limit)
+            .expect("submit");
+        drop(root);
+        let outcomes = drain(a, s);
+        let got = match outcome_of(&outcomes, id) {
+            Next::Done(_, Ok(c)) => Ok(c.findings.clone()),
+            Next::Done(_, Err(e)) => Err(e.clone()),
+            other => panic!("{other:?}"),
+        };
+        drop(outcomes);
+        a.close(s).expect("close");
+        got
+    };
+    let cut = slow(analyzer(1, 2).with_check_timeout(Some(50)));
+    assert_eq!(
+        run(&cut, &mut s, Limit::Check),
+        Err(CheckError::TimedOut { limit_ms: 50 }),
+        "a check job is cut off"
+    );
+    let unlimited = run(&cut, &mut s, Limit::None).expect("a job with no limit runs to its end");
+    let reference = run(&slow(analyzer(1, 2)), &mut s, Limit::Check)
+        .expect("the same job with no cut-off configured");
+    assert_eq!(unlimited, reference);
 }

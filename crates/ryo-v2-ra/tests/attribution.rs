@@ -42,7 +42,6 @@ impl Probe {
                 gap_detectors,
                 assert_revert_every: None,
                 cfg_test: false,
-                engine: false,
                 ..Default::default()
             },
             Arc::new(MonotonicClock::new()),

@@ -44,12 +44,12 @@ impl Verdict {
     /// put on top of the findings of the state below, kept to `files`, against the baseline. A
     /// flat check is the one-level case (`Verdict::of_check`): nothing below, nothing deleted, and
     /// its own files. `app::verdict_of` forms the verdict of a check of a decision here, and
-    /// `app::verify` that of a verify; a stacked fork forms that of a level here.
+    /// `app::verify` that of a verify; a job of `Forks` on its parent's Layer is a level.
     ///
     /// The composition takes each file from its latest diagnosis, and a finding goes with the
     /// file it is on. A finding on no file of its diagnosis would stay from below after the file
-    /// that produced it was diagnosed again, so a stacked verdict and the flat check would part;
-    /// the port rules such a finding out (`Stacked::diagnose` C9, `Verifier::check` C1).
+    /// that produced it was diagnosed again, so a composed verdict and the flat check would part;
+    /// the port rules such a finding out (`Forks` C20, `Verifier::check` C1).
     ///
     /// # Contract
     /// - C1: the findings are `level.on_top_of(below, deleted).within(files)`, and the verdict is
@@ -58,19 +58,20 @@ impl Verdict {
     /// - C2: with `ScopedFindings::default()` below, nothing deleted and `files` the files of
     ///   `level`, the findings are `level` and the verdict is `Verdict::from_baseline(baseline,
     ///   level)`, for a `level` whose files are sorted and unique, whose findings are sorted and
-    ///   whose classes name only its files (as a diagnosis names them, `Stacked::diagnose` C8).
+    ///   whose classes name only its files (as a diagnosis names them, `Forks` C18).
     ///   tested: domain::verdict::tests::of_level_with_nothing_below_is_the_check
-    /// - C3: for the levels of the fork of any `Stacked`, each diagnosed at one scope and composed
-    ///   from the bottom with the paths each deletes, and `files` the `Stacked::files_of` of the
-    ///   top level at that scope, the findings and the verdict are those of the one-level case of
-    ///   `Verifier::check`, at that scope, of the edits that take the base to the top level's
-    ///   state: the same files, findings and `unseen_at`. It rests on the port's clauses
-    ///   `Stacked::diagnose` C1, C3, C8 and C9, `Stacked::write` C3 and `Stacked::files_of` C1,
-    ///   and, for a search's composed edits to be those edits, on `stage` C3 (a step only writes).
-    ///   tested: ryo-v2-ra tests/stack.rs files_of_and_of_level_equal_the_check_over_a_stack
-    ///   tested: ryo-v2-ra tests/stack.rs a_finding_is_on_a_file_of_its_diagnosis
-    ///   tested: ryo-v2-ra tests/stack.rs search_and_apply_give_the_same_verdict_on_a_chain
-    ///   tested: ryo-v2-oracle tests/search_recall.rs stacked_verdicts_equal_the_flat_check
+    /// - C3: for a chain of jobs of any `Forks`, each a level on its parent's Layer, each
+    ///   diagnosed at one scope and composed from the root with the paths each deletes, and
+    ///   `files` the `Forks::layer_files` of the last job's Layer at that scope, the findings and
+    ///   the verdict are those of the one-level case of `Verifier::check`, at that scope, of the
+    ///   edits that take the base to that Layer's state: the same files, findings and
+    ///   `unseen_at`. It rests on the port's clauses `Forks` C2, C14, C15, C18 and C20 and
+    ///   `Forks::layer_files` C1, and, for a search's composed edits to be those edits, on
+    ///   `stage` C3 (a step only writes).
+    ///   tested: ryo-v2-ra tests/jobs.rs layer_files_and_of_level_equal_the_check_over_a_chain
+    ///   tested: ryo-v2-ra tests/jobs.rs a_finding_is_on_a_file_of_its_diagnosis
+    ///   tested: ryo-v2-ra tests/jobs.rs search_and_apply_give_the_same_verdict_on_a_chain
+    ///   tested: ryo-v2-oracle tests/search_recall.rs search_verdicts_equal_the_reference_check
     pub fn of_level(
         baseline: &[Finding],
         below: &ScopedFindings,

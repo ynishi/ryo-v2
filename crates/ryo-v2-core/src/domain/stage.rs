@@ -123,7 +123,7 @@ pub(crate) fn view_of(edits: &[Edit], base: &View<'_>, path: &RelPath) -> Option
 /// composed edits are the paths whose text differs from the base: `Verdict::of_level` C3 rests on
 /// this. A command that deletes a file would not break the composed edits: `compose` drops a
 /// delete of a path the base lacks (`compose` C1), as a check of the composed edits needs; the
-/// stacked verdict of such a level must then pass the paths it deletes as `deleted`.
+/// composed verdict of such a level must then pass the paths it deletes as `deleted`.
 ///
 /// # Contract
 /// - C1: the stages run in the order file role, freshness (`Basis::check` of `Blueprint::basis`
