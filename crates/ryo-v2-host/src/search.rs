@@ -76,7 +76,7 @@ fn search_with<J: Judge>(args: &SearchArgs, request: &Request, judge: &J) -> Res
     let input = SearchInput {
         start: &[],
         roots: &request.roots,
-        targets: &request.targets,
+        places: &request.places,
         probes: &request.probes,
         scope: args.scope,
         budget: request.budget,

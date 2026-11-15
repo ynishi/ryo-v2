@@ -34,7 +34,7 @@ pub struct DetectorPanic {
 pub struct ExpanderPanic {
     /// The edit kind whose call panicked; `None` when the panic was outside every edit kind.
     pub kind: Option<CommandKind>,
-    /// The file of the target.
+    /// The file of the place.
     pub path: Option<RelPath>,
     /// The panic message.
     pub message: String,
@@ -213,7 +213,7 @@ impl RaSession {
     }
 
     /// Makes every call of `kind` in the expander that reaches rust-analyzer (realizing a seed,
-    /// or the candidates of a target) panic; for the tests of the containment, like `poison`.
+    /// or the candidates of a place) panic; for the tests of the containment, like `poison`.
     /// Nothing in the adapter calls it.
     #[doc(hidden)]
     pub fn inject_expander_fault(&mut self, kind: Option<CommandKind>) {

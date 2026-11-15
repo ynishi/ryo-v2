@@ -4,7 +4,7 @@ overlay = "planted/inline-function-2"
 kinds = ["inline-function"]
 depth = 1
 origin = "planted:inline-function:2"
-targets = [
+places = [
     { path = "geo/src/store.rs", start = 901, end = 1129 },
 ]
 probes = [

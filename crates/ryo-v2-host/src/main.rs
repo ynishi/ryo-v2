@@ -217,7 +217,7 @@ enum Command {
     Search {
         /// The workspace to load.
         workspace: PathBuf,
-        /// The request JSON file: targets, probes, roots, budget, judge.
+        /// The request JSON file: places, probes, roots, budget, judge.
         request: PathBuf,
         /// How far each check reaches.
         #[arg(long, value_enum, default_value_t = ApplyScopeArg::Affected)]

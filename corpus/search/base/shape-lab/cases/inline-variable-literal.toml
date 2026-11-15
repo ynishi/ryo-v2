@@ -4,7 +4,7 @@ overlay = "planted/inline-variable-literal"
 kinds = ["inline-variable"]
 depth = 1
 origin = "hand:inline-variable:inline-variable-literal"
-targets = [
+places = [
     { path = "src/lib.rs", start = 919, end = 986 },
 ]
 probes = [

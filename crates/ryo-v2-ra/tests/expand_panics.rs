@@ -6,7 +6,7 @@ mod common;
 
 use common::{Fixture, rel};
 use ryo_v2_core::app::ports::{Analyzer, Expander, Verifier};
-use ryo_v2_core::domain::{Blueprint, Command, CommandKind, Scope, Target};
+use ryo_v2_core::domain::{Blueprint, Command, CommandKind, Place, Scope};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
@@ -79,9 +79,9 @@ fn load(f: &Fixture) -> (RaAnalyzer, RaSession) {
 fn extract_variable_skips_the_value_of_an_attributed_record_field() {
     let f = gated_fixture("expand-gated-field");
     let (a, mut s) = load(&f);
-    let target = Target::new(rel("src/lib.rs"), None);
+    let place = Place::new(rel("src/lib.rs"), None);
     let bps = a
-        .expand(&mut s, &[], &[target], 200)
+        .expand(&mut s, &[], &[place], 200)
         .expect("expansion of a struct literal with a cfg-gated field");
     let extracted: Vec<String> = bps
         .iter()
@@ -91,7 +91,7 @@ fn extract_variable_skips_the_value_of_an_attributed_record_field() {
         })
         .collect();
     assert!(
-        // `make` is the only function of the target file, so these come from the same function
+        // `make` is the only function of the place file, so these come from the same function
         // as the struct literal.
         !extracted.is_empty(),
         "the expressions after the struct literal, in the same function, are still extracted: {extracted:?} (panics {:?})",
@@ -114,15 +114,15 @@ fn kinds(bps: &[Blueprint]) -> BTreeSet<CommandKind> {
 }
 
 /// A panic in a call of one edit kind that reaches rust-analyzer (realizing a seed, or the
-/// candidates of a target) is contained, for each of the five kinds: the other kinds' Blueprints
+/// candidates of a place) is contained, for each of the five kinds: the other kinds' Blueprints
 /// come back, the panic is recorded with its kind and file, and the session stays usable.
 #[test]
 fn an_expander_panic_is_contained_and_recorded() {
     let f = gated_fixture("expand-fault");
     let (a, mut s) = load(&f);
-    let target = Target::new(rel("src/lib.rs"), None);
+    let place = Place::new(rel("src/lib.rs"), None);
     let all = kinds(
-        &a.expand(&mut s, &[], std::slice::from_ref(&target), 500)
+        &a.expand(&mut s, &[], std::slice::from_ref(&place), 500)
             .expect("expansion without a fault"),
     );
     assert_eq!(
@@ -133,7 +133,7 @@ fn an_expander_panic_is_contained_and_recorded() {
     for kind in CommandKind::ALL {
         s.inject_expander_fault(Some(kind));
         let got = kinds(
-            &a.expand(&mut s, &[], std::slice::from_ref(&target), 500)
+            &a.expand(&mut s, &[], std::slice::from_ref(&place), 500)
                 .unwrap_or_else(|e| {
                     panic!("a contained panic of {kind:?} leaves the expansion Ok: {e}")
                 }),
@@ -161,7 +161,7 @@ fn an_expander_panic_is_contained_and_recorded() {
         .expect("a check works after the panics");
     s.inject_expander_fault(None);
     let back = kinds(
-        &a.expand(&mut s, &[], &[target], 500)
+        &a.expand(&mut s, &[], &[place], 500)
             .expect("expansion without the fault"),
     );
     assert_eq!(back, all, "every kind comes back once the fault is gone");

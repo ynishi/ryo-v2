@@ -151,14 +151,14 @@ fn search_returns_decided_with_rank() {
 }
 
 #[test]
-fn search_without_targets_or_roots_is_error() {
+fn search_without_places_or_roots_is_error() {
     let ws = Ws::new("empty");
     let (code, out, stderr) = search(&ws, &json!({}));
     assert_eq!(code, Some(1), "{stderr}\n{out}");
     assert!(out.is_null(), "no JSON on stdout: {out}");
-    assert!(stderr.contains("no targets and no roots"), "{stderr}");
+    assert!(stderr.contains("no places and no roots"), "{stderr}");
     // Unknown fields are refused before the workspace is loaded.
-    let (code, _, stderr) = search(&ws, &json!({"roots": [], "targets": [], "extra": 1}));
+    let (code, _, stderr) = search(&ws, &json!({"roots": [], "places": [], "extra": 1}));
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("extra"), "{stderr}");
 }

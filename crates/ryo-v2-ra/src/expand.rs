@@ -5,7 +5,7 @@
 //! rust-analyzer does the semantic work (rename, extract assists, names, module paths); this
 //! file reads its text edits as splices and keeps only the Blueprints that the command's
 //! conformance check accepts, so a shape that rust-analyzer produces differently is dropped, not
-//! forced. Candidates are produced lazily, round-robin over the targets and then the kinds, so a
+//! forced. Candidates are produced lazily, round-robin over the places and then the kinds, so a
 //! small `max` costs few analyzer calls.
 //!
 //! Extract-variable offers calls, indexes, binary expressions and fields of fields, and also a
@@ -33,8 +33,8 @@ use ryo_v2_core::app::ports::{Analyzer, AnalyzerError, CheckError, ExpandError, 
 use ryo_v2_core::domain::text::revert_intact;
 use ryo_v2_core::domain::{
     BaseFp, Blueprint, BlueprintId, BlueprintParts, Command, CommandKind, DecisionRecord,
-    DeriveName, Edit, Fingerprint, Ident, NonEmpty, ReadRange, RelPath, Splice, SpliceKind,
-    StateFp, Target, TextRange,
+    DeriveName, Edit, Fingerprint, Ident, NonEmpty, Place, ReadRange, RelPath, Splice, SpliceKind,
+    StateFp, TextRange,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -115,7 +115,7 @@ struct Cand {
     rationale: String,
 }
 
-/// A target resolved to a file of the session.
+/// A place resolved to a file of the session.
 #[derive(Clone)]
 struct TInfo {
     file: FileId,
@@ -123,7 +123,7 @@ struct TInfo {
 }
 
 impl TInfo {
-    /// Whether the byte range `r` meets the target.
+    /// Whether the byte range `r` meets the place.
     fn hits(&self, r: RaRange) -> bool {
         let Some((lo, hi)) = self.range else {
             return true;
@@ -485,14 +485,14 @@ impl<'a> Env<'a> {
         Some(t)
     }
 
-    fn tinfo(&self, t: &Target) -> Option<TInfo> {
+    fn tinfo(&self, t: &Place) -> Option<TInfo> {
         Some(TInfo {
             file: *self.by_path.get(t.path())?,
             range: t.range().map(|r| (r.start(), r.end())),
         })
     }
 
-    /// Functions with a body in the target, outside test code.
+    /// Functions with a body in the place, outside test code.
     fn fns_in(&self, tree: &ast::SourceFile, t: &TInfo) -> Vec<ast::Fn> {
         tree.syntax()
             .descendants()
@@ -1266,8 +1266,8 @@ impl<'a> Env<'a> {
 
     // ---- driver ----
 
-    /// Runs one call unit of `kind` on `file`: the seeds of a target, or a call that reaches
-    /// rust-analyzer (`call`: realizing one seed, or the candidates of a target). A panic inside
+    /// Runs one call unit of `kind` on `file`: the seeds of a place, or a call that reaches
+    /// rust-analyzer (`call`: realizing one seed, or the candidates of a place). A panic inside
     /// it is recorded in the environment's panics and gives `T::default()` (no seeds, no
     /// candidates), so one bad shape costs that unit and not the other kinds' Blueprints nor the
     /// whole generation.
@@ -1341,8 +1341,8 @@ impl<'a> Env<'a> {
         }
     }
 
-    fn run(&self, targets: &[Target], max: usize) -> Result<Vec<Blueprint>, String> {
-        let infos: Vec<TInfo> = targets.iter().filter_map(|t| self.tinfo(t)).collect();
+    fn run(&self, places: &[Place], max: usize) -> Result<Vec<Blueprint>, String> {
+        let infos: Vec<TInfo> = places.iter().filter_map(|t| self.tinfo(t)).collect();
         let mut gens: Vec<Vec<std::iter::Fuse<Box<dyn Iterator<Item = Blueprint> + '_>>>> = infos
             .iter()
             .map(|t| {
@@ -1356,8 +1356,8 @@ impl<'a> Env<'a> {
         let mut seen = BTreeSet::new();
         'rounds: loop {
             let mut progressed = false;
-            for per_target in &mut gens {
-                for it in per_target {
+            for per_place in &mut gens {
+                for it in per_place {
                     if out.len() >= max || self.failed() {
                         break 'rounds;
                     }
@@ -1514,7 +1514,7 @@ fn movable_name(item: &ast::Item) -> Option<String> {
 }
 
 /// `(name, start, end)` of an item move-item may move: on its own lines, no cfg or test attribute,
-/// and hit by the target.
+/// and hit by the place.
 fn movable_item(item: &ast::Item, text: &str, t: &TInfo) -> Option<(String, u32, u32)> {
     let name = movable_name(item)?;
     let node = item.syntax();
@@ -1569,14 +1569,14 @@ fn parse_crate_use(text: &str) -> Option<(String, Vec<String>, String)> {
 fn generate(
     sess: &RaSession,
     state_fp: StateFp,
-    targets: &[Target],
+    places: &[Place],
     max: usize,
     panics: &mut BTreeSet<ExpanderPanic>,
 ) -> Result<Vec<Blueprint>, ExpandError> {
     let facts = ExpandFacts::of(sess);
     let files = crate::fork::live_below(sess);
     crate::fork::with_top_host(sess, |host| {
-        let (out, contained) = generate_on(&facts, files, host, state_fp, targets, max);
+        let (out, contained) = generate_on(&facts, files, host, state_fp, places, max);
         panics.extend(contained);
         out
     })
@@ -1598,7 +1598,7 @@ pub(crate) fn generate_on(
     files: &[(FileId, RelPath)],
     host: &AnalysisHost,
     state_fp: StateFp,
-    targets: &[Target],
+    places: &[Place],
     max: usize,
 ) -> (Result<Vec<Blueprint>, ExpandError>, BTreeSet<ExpanderPanic>) {
     // Outside the unwind boundary, so the units contained before a panic of the whole
@@ -1608,7 +1608,7 @@ pub(crate) fn generate_on(
         let env = Env::new(facts, files, &panics, host, state_fp);
         // hir_ty reads the database through a thread-local that `Analysis` sets for its own
         // queries; the `Semantics` calls of this file need it set too.
-        ra_ap_hir::attach_db_allow_change(env.db, || env.run(targets, max))
+        ra_ap_hir::attach_db_allow_change(env.db, || env.run(places, max))
     }));
     let mut panics = panics.into_inner();
     let out = match got {
@@ -1651,9 +1651,9 @@ fn state_edit_rejected(path: &RelPath, reason: &str) -> ExpandError {
 ///   tested: tests/expand.rs expansion_leaves_session_at_base
 /// - C4: the splices, ranges and reads are those of the text of the state, not of the base.
 ///   tested: tests/expand.rs expansion_reads_the_given_state
-/// - C5: at most `max` Blueprints come back, only within the given targets; no target gives
+/// - C5: at most `max` Blueprints come back, only within the given places; no place gives
 ///   nothing.
-///   tested: tests/expand.rs expansion_respects_max_and_targets
+///   tested: tests/expand.rs expansion_respects_max_and_places
 /// - C6: move-item proposes a move to another module of the crate as a re-export plus the item
 ///   in the destination, and the reverse of such a move; the reverse restores the text byte
 ///   for byte.
@@ -1705,7 +1705,7 @@ fn state_edit_rejected(path: &RelPath, reason: &str) -> ExpandError {
 ///   tested: tests/expand_gen.rs extract_variable_offers_no_path_argument
 ///   tested: expand::tests::a_reference_or_literal_argument_is_a_variable_shape
 /// - C18: the files an expansion reads are those of the state, the ones it created included: a
-///   target in a file the state created is expanded, and move-item may move an item into it.
+///   place in a file the state created is expanded, and move-item may move an item into it.
 ///   tested: tests/forks.rs an_expansion_sees_a_file_the_state_created
 impl Expander for RaAnalyzer {
     type Session = RaSession;
@@ -1714,13 +1714,13 @@ impl Expander for RaAnalyzer {
         &self,
         s: &mut RaSession,
         state: &[Edit],
-        targets: &[Target],
+        places: &[Place],
         max: usize,
     ) -> Result<Vec<Blueprint>, ExpandError> {
         // The generation reads no session; the panics it contained are merged here, whatever
         // the expansion's outcome.
         let mut panics = BTreeSet::new();
-        let out = expand_state(self, s, state, targets, max, &mut panics);
+        let out = expand_state(self, s, state, places, max, &mut panics);
         s.expander_panics
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
@@ -1734,18 +1734,18 @@ fn expand_state(
     a: &RaAnalyzer,
     s: &mut RaSession,
     state: &[Edit],
-    targets: &[Target],
+    places: &[Place],
     max: usize,
     panics: &mut BTreeSet<ExpanderPanic>,
 ) -> Result<Vec<Blueprint>, ExpandError> {
     // A live fork (`Analyzer`, or forks open) is refused, after the poison.
     stack::require_free(s).map_err(ExpandError::Session)?;
-    if targets.is_empty() || max == 0 {
+    if places.is_empty() || max == 0 {
         return Ok(Vec::new());
     }
     let state_fp = StateFp::of(state);
     if state.is_empty() {
-        return generate(s, state_fp, targets, max, panics);
+        return generate(s, state_fp, places, max, panics);
     }
 
     let mut paths: Vec<RelPath> = state.iter().map(|e| e.path.clone()).collect();
@@ -1756,7 +1756,7 @@ fn expand_state(
     let applied = a.apply(s, &mut f, state);
     let out = applied
         .is_ok()
-        .then(|| generate(s, state_fp, targets, max, panics));
+        .then(|| generate(s, state_fp, places, max, panics));
     let discarded = a.discard(s, f);
 
     let after = fingerprints(s, &paths);

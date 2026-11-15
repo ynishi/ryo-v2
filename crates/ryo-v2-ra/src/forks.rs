@@ -32,7 +32,7 @@ use ryo_v2_core::app::ports::{
     AnalyzerError, CheckError, CheckReach, Checked, Clock, Event, ExpandError, Forks, JobId, Limit,
     Next, Observer,
 };
-use ryo_v2_core::domain::{Blueprint, Edit, RelPath, Scope, ScopedFindings, StateFp, Target};
+use ryo_v2_core::domain::{Blueprint, Edit, Place, RelPath, Scope, ScopedFindings, StateFp};
 use ryo_v2_engine::{Budget, Hooks, JobCtx, JobKey, Jobs, OpenLayer, Outcome, Recv, SealedLayer};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -329,7 +329,7 @@ struct ExpandPlan {
     /// The files of the Layer's state, created ones included.
     files: Vec<(FileId, RelPath)>,
     state: StateFp,
-    targets: Vec<Target>,
+    places: Vec<Place>,
     max: usize,
 }
 
@@ -342,7 +342,7 @@ fn run_expansion(plan: ExpandPlan, db: &RootDatabase) -> JobValue {
         &plan.files,
         &host,
         plan.state,
-        &plan.targets,
+        &plan.places,
         plan.max,
     );
     drop(host);
@@ -613,7 +613,7 @@ impl Forks for RaAnalyzer {
         s: &mut RaSession,
         layer: &RaLayer,
         state: StateFp,
-        targets: &[Target],
+        places: &[Place],
         max: usize,
     ) -> Result<JobId, CheckError> {
         brand(s, layer)?;
@@ -625,7 +625,7 @@ impl Forks for RaAnalyzer {
             facts: ExpandFacts::of(s),
             files: layer.live(&s.files).to_vec(),
             state,
-            targets: targets.to_vec(),
+            places: places.to_vec(),
             max,
         };
         let id = JobId::new(NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed));

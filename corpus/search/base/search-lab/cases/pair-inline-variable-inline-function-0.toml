@@ -5,7 +5,7 @@ overlay = "planted/pair-inline-variable-inline-function-0"
 kinds = ["inline-variable", "inline-function"]
 depth = 2
 origin = "planted:inline-variable+inline-function:0"
-targets = [
+places = [
     { path = "app/src/lib.rs", start = 601, end = 765 },
     { path = "geo/src/store.rs", start = 901, end = 1129 },
 ]

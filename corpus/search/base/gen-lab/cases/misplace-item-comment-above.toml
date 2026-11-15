@@ -4,7 +4,7 @@ overlay = "planted/misplace-item-comment-above"
 kinds = ["misplace-item"]
 depth = 1
 origin = "hand:misplace-item:misplace-item-comment-above"
-targets = [
+places = [
     { path = "src/lib.rs", start = 292, end = 319 },
     { path = "src/plan.rs", start = 78, end = 103 },
 ]

@@ -1362,7 +1362,7 @@ fn search_and_apply_give_the_same_verdict_on_a_chain() {
             &SearchInput {
                 start,
                 roots: &roots,
-                targets: &[],
+                places: &[],
                 probes: &[],
                 scope: Scope::Affected,
                 budget,

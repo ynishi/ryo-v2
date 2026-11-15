@@ -15,7 +15,7 @@ cases). The committed small-base cases carry probes since 2026-10-31 (section "P
 ## Definitions
 
 One decision is one planted case: the workspace, the planted edits, the touched functions and
-items as targets, no root Blueprints, and the depth of the best (1 for one plant, 2 for two plants
+items as places, no root Blueprints, and the depth of the best (1 for one plant, 2 for two plants
 in different functions). The search starts from the planted state and runs `max_depth = depth`.
 
 - **best**: the state whose files equal the clean files up to whitespace runs (and, for a folded
@@ -274,7 +274,7 @@ After it all 42 generate the best. The causes, each with a case that fails befor
 | 1. extract-variable read the new variable's name from the first inserted text of rust-analyzer's edit, which is a diff of unpredictable shape. A `let` inserted in front of another `let` lines up on their shared `let `: for `let fitted = fit(needed(v), limit);` the edit replaces `fitted` by `width`, `fit` by `needed`, `needed(v), limit)` by `v)` and inserts `let fitted = fit(width, limit);`, so the name read was `fitted`, the check that the edit writes `let fitted = needed(v);` failed and the candidate was dropped. The seeds were offered; only the name was lost. (The text here before said extract-variable was never proposed for such an expression; it was proposed and dropped.) | the 8 of `search-lab` above | the name is the one of the `let <name> = <expr>;` that applying rust-analyzer's edit adds, read from the edited text (`added_let_name`); exactly one such name, else no candidate | `tests/expand_gen.rs` `extract_variable_restores_a_call_folded_into_a_let_initializer`; `expand::tests::the_added_let_is_read_from_the_edited_text` |
 | 2. the same cause for the value of a struct-literal field (`Slot { width: needed(v) }`): the edit replaces `Slot` by `let` and the rest by `width = needed(v);` plus the statement with the shorthand `Slot { width, .. }`, so no inserted text held `let <name>` (CHECK_LEDGER S-6, now removed). The planter writes no such site (it plants only into a call argument). | `gen-lab/inline-variable-field` | as 1, and a field named like the variable (`k: v` with name `k`) is replaced by the shorthand `k`, as rust-analyzer writes it | `tests/expand_gen.rs` `extract_variable_restores_a_record_field_value_as_the_shorthand` |
 | 3. move-item's reverse move read the `use` with the comment line above it: the planter moves the item's lines and leaves a plain `//` comment above the re-export, and rust-analyzer attaches that comment to the `use` node, so its text did not start with `[pub ]use`. | `gen-lab/misplace-item-comment-above` | the `use` is read after its leading comments, which stay (`after_leading_comments`; a `use` with an attribute first is still refused) | `tests/expand_gen.rs` `move_item_collapses_a_reexport_under_a_comment` |
-| 4. move-item's reverse move required a line end right after the moved item; the planter moves the whole line, and an item whose line ends with a `//` comment has its node end before the comment. | `gen-lab/misplace-item-comment-after` (before: no candidate at all, nothing else in its targets is offered) | the item runs to its line end when the rest of the line is a `//` comment, which moves with it (`line_end_after_comment`) | `tests/expand_gen.rs` `move_item_collapses_an_item_with_a_trailing_comment`; `expand::tests::a_trailing_line_comment_ends_the_item_at_its_line_end` |
+| 4. move-item's reverse move required a line end right after the moved item; the planter moves the whole line, and an item whose line ends with a `//` comment has its node end before the comment. | `gen-lab/misplace-item-comment-after` (before: no candidate at all, nothing else in its places is offered) | the item runs to its line end when the rest of the line is a `//` comment, which moves with it (`line_end_after_comment`) | `tests/expand_gen.rs` `move_item_collapses_an_item_with_a_trailing_comment`; `expand::tests::a_trailing_line_comment_ends_the_item_at_its_line_end` |
 
 Reading the name from the edited text also showed that rust-analyzer names an extracted value
 without regard to the locals of the block: for `let width = ..; Slot { width: needed(v), count:
@@ -582,7 +582,7 @@ panics: 0 detector, 0 expander, in both runs (each run before hit one).
 `inline-variable-0` now has candidates (71; before: none, the panic of CHECK_LEDGER S-3 was in its
 planted state) and its best is generated, but the pruning drops it at depth 1. The four decisions
 still not generated have three causes, each read from the expander's output on the planted state
-of ryo-rs (the expansion of each planted state over the case's targets, every Blueprint applied and
+of ryo-rs (the expansion of each planted state over the case's places, every Blueprint applied and
 compared with the clean text) and each now with a small-base case (section "Generation, second
 round"):
 

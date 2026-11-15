@@ -4,7 +4,7 @@ overlay = "planted/inline-function-0"
 kinds = ["inline-function"]
 depth = 1
 origin = "planted:inline-function:0"
-targets = [
+places = [
     { path = "app/src/lib.rs", start = 601, end = 791 },
 ]
 probes = [

@@ -24,9 +24,10 @@ use crate::domain::search::{prune, rank_final, reward_score, score};
 use crate::domain::stage::{On, Refused, Staged, stage, view_of};
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, Candidate, ChangeProbe, CommandKind, Edit, Evidence,
-    Infeasible, Inserted, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, Prior, Proposal,
-    ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, Scope, ScopedFindings,
-    Scored, SearchBudget, SearchTree, Stage, StateFp, StaticMetrics, Target, Verdict, Weights,
+    Infeasible, Inserted, JudgeRequest, NearMiss, NewNode, NodeId, NonEmpty, Noul, Place, Prior,
+    Proposal, ProposalId, ProviderTag, PruneStage, RelPath, Resolution, Reward, Scope,
+    ScopedFindings, Scored, SearchBudget, SearchTree, Stage, StateFp, StaticMetrics, Verdict,
+    Weights,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU16;
@@ -103,7 +104,7 @@ pub struct SearchInput<'a> {
     /// Blueprints the Main AI proposes for the first depth, tried before any expanded child.
     pub roots: &'a [Blueprint],
     /// Where the expander may look for changes.
-    pub targets: &'a [Target],
+    pub places: &'a [Place],
     /// Shapes the assessor measures extensibility against.
     pub probes: &'a [ChangeProbe],
     /// The scope every check runs at.
@@ -878,7 +879,7 @@ where
                     let Some((layer, state)) = layers.get(&p) else {
                         continue;
                     };
-                    match v.expand(s, layer, *state, input.targets, per_parent) {
+                    match v.expand(s, layer, *state, input.places, per_parent) {
                         Ok(id) => window.push(id, Slot::Expand(p)),
                         Err(e) => break 'search Err(SearchError::Fork(e)),
                     }
@@ -1728,7 +1729,7 @@ mod tests {
             _: &mut (),
             layer: &FakeLayer,
             state: StateFp,
-            _: &[Target],
+            _: &[Place],
             max: usize,
         ) -> Result<JobId, CheckError> {
             self.fail("expand")?;
@@ -2047,7 +2048,7 @@ mod tests {
                 &SearchInput {
                     start: &self.start,
                     roots: &self.roots,
-                    targets: &[],
+                    places: &[],
                     probes: &[],
                     scope: self.scope,
                     budget: self.budget,
@@ -2722,12 +2723,12 @@ mod tests {
         fx.roots = vec![rename(1, "a", "b", BASE)];
         fx.v.e.by_state.insert(
             root_state(),
-            Err(ExpandError::Analysis("no targets".to_owned())),
+            Err(ExpandError::Analysis("no places".to_owned())),
         );
         let r = fx.run().unwrap();
         assert_eq!(
             r.expand_errors,
-            vec![ExpandError::Analysis("no targets".to_owned())]
+            vec![ExpandError::Analysis("no places".to_owned())]
         );
         assert_eq!(decided(&r).len(), 1);
 

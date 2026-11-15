@@ -7,7 +7,7 @@ use common::{Fixture, rel};
 use ryo_v2_core::app::ports::{Analyzer, Expander, Verifier};
 use ryo_v2_core::domain::text::splice;
 use ryo_v2_core::domain::{
-    Blueprint, Command, CommandKind, Edit, Freshness, RelPath, Scope, Splice, Target, TextRange,
+    Blueprint, Command, CommandKind, Edit, Freshness, Place, RelPath, Scope, Splice, TextRange,
 };
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
@@ -125,8 +125,8 @@ fn load(f: &Fixture) -> (RaAnalyzer, RaSession) {
     (a, s)
 }
 
-fn whole(path: &str) -> Target {
-    Target::new(rel(path), None)
+fn whole(path: &str) -> Place {
+    Place::new(rel(path), None)
 }
 
 fn shapes_path() -> RelPath {
@@ -330,7 +330,7 @@ fn expansion_reads_the_given_state() {
 }
 
 #[test]
-fn expansion_respects_max_and_targets() {
+fn expansion_respects_max_and_places() {
     let f = fixture("expand_max");
     let (a, mut s) = load(&f);
     let three = a
@@ -367,7 +367,7 @@ fn expansion_respects_max_and_targets() {
         .expand(
             &mut s,
             &[],
-            &[Target::new(
+            &[Place::new(
                 shapes_path(),
                 Some(TextRange::new(lo, hi).unwrap()),
             )],
@@ -482,9 +482,9 @@ fn extract_function_names_are_not_fun_name() {
 fn blueprint_ids_are_v7_and_deterministic() {
     let f = fixture("expand_ids");
     let (a, mut s) = load(&f);
-    let targets = [whole("geo/src/shapes.rs")];
-    let first = a.expand(&mut s, &[], &targets, 100).expect("expand");
-    let second = a.expand(&mut s, &[], &targets, 100).expect("expand");
+    let places = [whole("geo/src/shapes.rs")];
+    let first = a.expand(&mut s, &[], &places, 100).expect("expand");
+    let second = a.expand(&mut s, &[], &places, 100).expect("expand");
     let ids = |v: &[Blueprint]| v.iter().map(|b| b.id()).collect::<Vec<_>>();
     assert!(!first.is_empty());
     assert_eq!(ids(&first), ids(&second));
@@ -498,7 +498,7 @@ fn blueprint_ids_are_v7_and_deterministic() {
         shapes_path(),
         format!("{}{EXTRA}", texts[&shapes_path()]),
     )];
-    let other = a.expand(&mut s, &state, &targets, 100).expect("expand");
+    let other = a.expand(&mut s, &state, &places, 100).expect("expand");
     let first_ids: std::collections::BTreeSet<_> = ids(&first).into_iter().collect();
     assert!(
         ids(&other).iter().all(|i| !first_ids.contains(i)),

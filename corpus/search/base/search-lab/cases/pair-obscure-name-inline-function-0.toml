@@ -5,7 +5,7 @@ overlay = "planted/pair-obscure-name-inline-function-0"
 kinds = ["obscure-name", "inline-function"]
 depth = 2
 origin = "planted:obscure-name+inline-function:0"
-targets = [
+places = [
     { path = "app/src/lib.rs", start = 601, end = 782 },
     { path = "geo/src/shapes.rs", start = 1724, end = 1893 },
 ]
