@@ -43,7 +43,9 @@ Idle: warm the cache for expected changes;                ^ writes the picked on
 Caller (Main AI or a person) picks one -------------------+
      -> the caller commits -> CI builds once
 
-* hypothesis: a figure from the simulation, the scale the model has to reach; not yet measured
+* hypothesis: a figure from the simulation, the scale the model has to reach; not yet measured,
+  except the forks: widths 1 to 16 are measured in Table F1 (SEARCH_LEDGER.md, D11); the search
+  runs `SEARCH_FORKS = 4`
 ```
 
 - **Search:** Monte Carlo over the speculation graph. A step applies a command. A state that passes

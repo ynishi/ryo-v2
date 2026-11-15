@@ -17,7 +17,9 @@ readme = "README.md"
 ryo-v2-core = { path = "crates/ryo-v2-core", version = "0.1.0" }
 ryo-v2-ra = { path = "crates/ryo-v2-ra", version = "0.1.0" }
 # The fork Engine (D11): `ryo-v2-ra` runs every fork of a session on it. Not
-# published, and nothing that depends on it is (D11: it depends on the unpublished salsa patch in `vendor/`).
+# published, and nothing that depends on it is: not publishing is a decision (D11), and it
+# follows from the patched salsa carried in `vendor/`, which is unpublished, and a published
+# crate cannot depend on an unpublished one.
 ryo-v2-engine = { path = "crates/ryo-v2-engine" }
 arch-lint = "0.11"
 

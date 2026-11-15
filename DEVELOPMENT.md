@@ -31,7 +31,9 @@ promise.
 
 - A decision that outlives a single change: a row of "Decisions in force" (`SEARCH_LEDGER.md` for
   the search), with the measurement that settled it, the guard that fails when it is broken, when
-  to revisit it, and the options rejected.
+  to revisit it, and the options rejected. Every name in the guard column is checked against the
+  code by `crates/ryo-v2-core/tests/ledger_guards.rs`, and `cargo test` fails when one is declared
+  nowhere; a guard recorded as deleted with its code is written `-name`.
 - A promise a caller may rely on: a clause of a contract, below.
 - What a term means: the glossary in `crates/ryo-v2-core/src/domain/mod.rs`. How an adapter
   realises a promise: that module's doc.
