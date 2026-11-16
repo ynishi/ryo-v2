@@ -9,7 +9,7 @@ mod common;
 use common::{Fixture, rel};
 use ryo_v2_core::app::ports::{Analyzer, Expander, Verifier};
 use ryo_v2_core::domain::text::splice;
-use ryo_v2_core::domain::{Blueprint, Command, Edit, RelPath, Splice, SpliceKind, Target};
+use ryo_v2_core::domain::{Blueprint, Command, Edit, Place, RelPath, Splice, SpliceKind};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{RaAnalyzer, RaConfig, RaSession};
@@ -132,9 +132,9 @@ fn expand_planted_in(
         texts.insert(p.clone(), t.clone());
         state.push(Edit::write(p.clone(), t.clone()));
     }
-    let targets = [Target::new(lib(), None), Target::new(plan(), None)];
+    let places = [Place::new(lib(), None), Place::new(plan(), None)];
     let bps = a
-        .expand(&mut s, &state, &targets, 500)
+        .expand(&mut s, &state, &places, 500)
         .expect("expand the planted state");
     assert!(
         s.expander_panics().is_empty(),

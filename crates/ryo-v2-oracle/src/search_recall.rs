@@ -34,8 +34,8 @@ use ryo_v2_core::app::search::{
 };
 use ryo_v2_core::app::verdict_of;
 use ryo_v2_core::domain::{
-    ChangeProbe, DEFAULT_WEIGHTS, DomainError, Edit, Ident, PruneStage, RelPath, Resolution, Scope,
-    SearchBudget, Stage, Target, TextRange,
+    ChangeProbe, DEFAULT_WEIGHTS, DomainError, Edit, Ident, Place, PruneStage, RelPath, Resolution,
+    Scope, SearchBudget, Stage, TextRange,
 };
 use ryo_v2_core::infra::overlay::{OverlayError, overlay_edits};
 use ryo_v2_ra::{DetectorPanic, ExpanderPanic};
@@ -92,10 +92,10 @@ pub enum RecallError {
     Search(#[from] SearchError),
 }
 
-/// A target of a case file: a file and optionally a byte range of its planted text.
+/// A place of a case file: a file and optionally a byte range of its planted text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TargetFile {
+pub struct PlaceFile {
     /// Path relative to the workspace.
     pub path: String,
     /// Start byte, with `end`.
@@ -132,7 +132,7 @@ pub struct PlantedCaseFile {
     /// Where the case came from.
     pub origin: String,
     /// The touched functions and items.
-    pub targets: Vec<TargetFile>,
+    pub places: Vec<PlaceFile>,
     /// The probes the assessor measures extensibility with; filled by hand.
     #[serde(default)]
     pub probes: Vec<ProbeFile>,
@@ -161,8 +161,8 @@ pub struct PlantedCase {
     pub depth: u8,
     /// Where the case came from.
     pub origin: String,
-    /// The targets of the search.
-    pub targets: Vec<Target>,
+    /// The places of the search.
+    pub places: Vec<Place>,
     /// The probes of the assessor.
     pub probes: Vec<ChangeProbe>,
     /// The helper `inline-function` folded.
@@ -284,19 +284,19 @@ fn load_one(file: &Path, ws_dir: &Path, corpus: &Path) -> Result<PlantedCase, Re
         )));
     }
     let dom = |what: &str, e: DomainError| invalid(format!("{what}: {e}"));
-    let mut targets = Vec::new();
-    for t in &cf.targets {
-        let path = RelPath::parse(&t.path).map_err(|e| dom("target path", e))?;
+    let mut places = Vec::new();
+    for t in &cf.places {
+        let path = RelPath::parse(&t.path).map_err(|e| dom("place path", e))?;
         let range = match (t.start, t.end) {
-            (Some(s), Some(e)) => Some(TextRange::new(s, e).map_err(|e| dom("target range", e))?),
+            (Some(s), Some(e)) => Some(TextRange::new(s, e).map_err(|e| dom("place range", e))?),
             (None, None) => None,
             _ => {
                 return Err(invalid(
-                    "a target needs both start and end, or neither".into(),
+                    "a place needs both start and end, or neither".into(),
                 ));
             }
         };
-        targets.push(Target::new(path, range));
+        places.push(Place::new(path, range));
     }
     let mut probes = Vec::new();
     for p in &cf.probes {
@@ -324,7 +324,7 @@ fn load_one(file: &Path, ws_dir: &Path, corpus: &Path) -> Result<PlantedCase, Re
         kinds,
         depth: cf.depth,
         origin: cf.origin,
-        targets,
+        places,
         probes,
         original_fn: cf.original_fn,
         skip: cf.skip,
@@ -718,7 +718,7 @@ where
     let input = SearchInput {
         start: &edits,
         roots: &[],
-        targets: &case.targets,
+        places: &case.places,
         probes: &case.probes,
         scope: Scope::Affected,
         budget,
@@ -1463,7 +1463,7 @@ mod tests {
             kinds: vec![PlantKind::ObscureName],
             depth: 1,
             origin: "test".into(),
-            targets: Vec::new(),
+            places: Vec::new(),
             probes: Vec::new(),
             original_fn: None,
             skip: None,
@@ -1714,10 +1714,10 @@ mod tests {
 
     #[test]
     fn case_toml_rejects_unknown_fields() {
-        let ok = "workspace = \"search/base/search-lab\"\noverlay = \"planted/x\"\nkinds = [\"obscure-name\"]\ndepth = 1\norigin = \"planted:obscure-name:0\"\ntargets = [{ path = \"geo/src/lib.rs\", start = 1, end = 9 }]\nprobes = []\n";
+        let ok = "workspace = \"search/base/search-lab\"\noverlay = \"planted/x\"\nkinds = [\"obscure-name\"]\ndepth = 1\norigin = \"planted:obscure-name:0\"\nplaces = [{ path = \"geo/src/lib.rs\", start = 1, end = 9 }]\nprobes = []\n";
         let parsed = parse_case_file(ok).unwrap();
         assert_eq!(parsed.kinds, ["obscure-name"]);
-        assert_eq!(parsed.targets[0].end, Some(9));
+        assert_eq!(parsed.places[0].end, Some(9));
         assert!(parse_case_file(&format!("{ok}extra = 1\n")).is_err());
         assert!(
             parse_case_file(&ok.replace(

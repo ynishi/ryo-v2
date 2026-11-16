@@ -10,7 +10,7 @@ use ryo_v2_core::app::ports::{
     Verifier,
 };
 use ryo_v2_core::domain::baseline::new_findings;
-use ryo_v2_core::domain::{Edit, RelPath, Scope, Target, UnseenClass, Verdict};
+use ryo_v2_core::domain::{Edit, Place, RelPath, Scope, UnseenClass, Verdict};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{DbWritePanic, GapDetector, RaAnalyzer, RaConfig, RaSession};
@@ -309,7 +309,7 @@ fn a_live_analyzer_fork_holds_the_session() {
     assert_eq!(a.text(&s, &lib()).as_deref(), Some(UNRESOLVED_LIB));
     let checked = a.check(&mut s, &[lib_edit("")], Scope::Affected);
     assert_eq!(checked, Err(CheckError::ForkInUse));
-    let expanded = a.expand(&mut s, &[], &[Target::new(lib(), None)], 10);
+    let expanded = a.expand(&mut s, &[], &[Place::new(lib(), None)], 10);
     assert!(
         matches!(expanded, Err(ExpandError::Session(CheckError::ForkInUse))),
         "{expanded:?}"
@@ -543,9 +543,9 @@ fn a_poisoned_session_is_poisoned_on_the_analyzer_port() {
         "{verified:?}"
     );
     // `expand` reports it as the session's, not as a failure of one Blueprint.
-    let target = [Target::new(lib(), None)];
+    let place = [Place::new(lib(), None)];
     for state in [Vec::new(), vec![lib_edit("\npub fn h() {}\n")]] {
-        let expanded = a.expand(&mut s, &state, &target, 10);
+        let expanded = a.expand(&mut s, &state, &place, 10);
         match expanded {
             Err(ExpandError::Session(e @ CheckError::Poisoned(_))) => {
                 assert_eq!(e.reach(), CheckReach::Session);
@@ -650,7 +650,7 @@ fn w_mixed() -> Vec<Edit> {
 
 #[test]
 fn session_operations_refuse_while_an_analyzer_fork_is_live() {
-    let target = [Target::new(rel("a/src/lib.rs"), None)];
+    let place = [Place::new(rel("a/src/lib.rs"), None)];
     let edit = w_edit("a/src/lib.rs", &err_fn("c"));
 
     // A live `Analyzer` fork, whose write is not counted for the sampling (every 2nd write).
@@ -670,7 +670,7 @@ fn session_operations_refuse_while_an_analyzer_fork_is_live() {
     );
     assert_eq!(a.audit_revert(&mut s), Err(CheckError::ForkInUse));
     for state in [Vec::new(), vec![edit.clone()]] {
-        let expanded = a.expand(&mut s, &state, &target, 10);
+        let expanded = a.expand(&mut s, &state, &place, 10);
         assert!(
             matches!(expanded, Err(ExpandError::Session(CheckError::ForkInUse))),
             "{expanded:?}"

@@ -9,7 +9,7 @@ use ryo_v2_core::app::ports::{
     Analyzer, CheckError, Checked, ExpandError, Expander, Forks, JobId, Limit, Next, RevertAudit,
     Verifier,
 };
-use ryo_v2_core::domain::{Blueprint, CommandKind, Edit, Scope, ScopedFindings, StateFp, Target};
+use ryo_v2_core::domain::{Blueprint, CommandKind, Edit, Place, Scope, ScopedFindings, StateFp};
 use ryo_v2_core::infra::clock::MonotonicClock;
 use ryo_v2_core::infra::observer::RecordingObserver;
 use ryo_v2_ra::{ForksConfig, GapDetector, RaAnalyzer, RaConfig, RaLayer, RaSession, ThreadCount};
@@ -309,25 +309,25 @@ fn composed(state: &State) -> Vec<Edit> {
         .collect()
 }
 
-/// A node of the job tree: its place (child indices from the root) and its scope.
-type Place = Vec<usize>;
+/// A node of the job tree: its position (child indices from the root) and its scope.
+type NodeAt = Vec<usize>;
 
 /// What a run of the job tree gave each node: the diagnosis, or the kind of the failure (its
 /// message and the order of several failures depend on the chunking, F10).
-type Ran = BTreeMap<Place, Result<ScopedFindings, Discriminant<CheckError>>>;
+type Ran = BTreeMap<NodeAt, Result<ScopedFindings, Discriminant<CheckError>>>;
 
 /// The job tree, depth 3 and fan-out 4 (84 jobs), plus one refused job on the root: each job is
 /// submitted as soon as its parent is done. Returns what each node gave, compared by the node,
 /// and the state each node's job wrote.
-fn run_tree(a: &RaAnalyzer, s: &mut RaSession) -> (Ran, BTreeMap<Place, State>) {
+fn run_tree(a: &RaAnalyzer, s: &mut RaSession) -> (Ran, BTreeMap<NodeAt, State>) {
     let root = a.open(s).expect("open");
-    let mut pending: HashMap<JobId, (Place, State, Scope)> = HashMap::new();
-    let mut states: BTreeMap<Place, State> = BTreeMap::new();
+    let mut pending: HashMap<JobId, (NodeAt, State, Scope)> = HashMap::new();
+    let mut states: BTreeMap<NodeAt, State> = BTreeMap::new();
     let submit = |a: &RaAnalyzer,
                   s: &mut RaSession,
-                  pending: &mut HashMap<JobId, (Place, State, Scope)>,
+                  pending: &mut HashMap<JobId, (NodeAt, State, Scope)>,
                   parent: &RaLayer,
-                  place: Place,
+                  place: NodeAt,
                   state: State,
                   edits: &[Edit]| {
         // The root's children diagnose the workspace, the others their own scope.
@@ -727,11 +727,11 @@ fn expand_refuses_while_forks_are_open() {
     let f = w_fixture("forks_expand");
     let a = analyzer(1, 2);
     let mut s = Analyzer::load(&a, &f.dir).expect("load");
-    let targets = [Target::new(rel("a/src/lib.rs"), None)];
-    let before = Expander::expand(&a, &mut s, &[], &targets, 10).expect("expand at the base");
+    let places = [Place::new(rel("a/src/lib.rs"), None)];
+    let before = Expander::expand(&a, &mut s, &[], &places, 10).expect("expand at the base");
 
     let root = a.open(&mut s).expect("open");
-    let refused = Expander::expand(&a, &mut s, &[], &targets, 10);
+    let refused = Expander::expand(&a, &mut s, &[], &places, 10);
     assert!(
         matches!(refused, Err(ExpandError::Session(CheckError::ForkInUse))),
         "{refused:?}"
@@ -752,7 +752,7 @@ fn expand_refuses_while_forks_are_open() {
     drop(root);
     a.close(&mut s).expect("close");
     assert_eq!(
-        Expander::expand(&a, &mut s, &[], &targets, 10).expect("expand"),
+        Expander::expand(&a, &mut s, &[], &places, 10).expect("expand"),
         before
     );
 }
@@ -1194,8 +1194,8 @@ fn isolation_holds_after_parallel_jobs() {
 /// What an expansion gives, or how it failed.
 type Expanded = Result<Vec<Blueprint>, ExpandError>;
 
-/// The targets of the expansions below: every source file W's states can have.
-fn w_targets() -> Vec<Target> {
+/// The places of the expansions below: every source file W's states can have.
+fn w_places() -> Vec<Place> {
     [
         "a/src/lib.rs",
         "a/src/x.rs",
@@ -1207,7 +1207,7 @@ fn w_targets() -> Vec<Target> {
         "c/src/n.rs",
     ]
     .iter()
-    .map(|p| Target::new(rel(p), None))
+    .map(|p| Place::new(rel(p), None))
     .collect()
 }
 
@@ -1228,7 +1228,7 @@ fn layer_of(a: &RaAnalyzer, s: &mut RaSession, parent: &RaLayer, edits: &[Edit])
 /// The `Expanded` of the one expansion of `layer`'s state `state`.
 fn expansion_of(a: &RaAnalyzer, s: &mut RaSession, layer: &RaLayer, state: &State) -> Expanded {
     let fp = StateFp::of(&composed(state));
-    let id = Forks::expand(a, s, layer, fp, &w_targets(), MAX).expect("expand");
+    let id = Forks::expand(a, s, layer, fp, &w_places(), MAX).expect("expand");
     match a.next(s, WAIT).expect("next") {
         Next::Expanded(got, children) if got == id => children,
         other => panic!("{other:?}"),
@@ -1237,7 +1237,7 @@ fn expansion_of(a: &RaAnalyzer, s: &mut RaSession, layer: &RaLayer, state: &Stat
 
 /// `Expander::expand` of `state` with no fork open: the reference of C10.
 fn reference_expansion(a: &RaAnalyzer, s: &mut RaSession, state: &State) -> Expanded {
-    Expander::expand(a, s, &composed(state), &w_targets(), MAX)
+    Expander::expand(a, s, &composed(state), &w_places(), MAX)
 }
 
 /// Whether some Blueprint of `children` splices `path`.
@@ -1366,7 +1366,7 @@ fn expansions_run_beside_jobs_and_change_no_job() {
         })));
         let root = a.open(&mut s).expect("open");
         let parent = layer_of(&a, &mut s, &root, &parent_edits);
-        let targets = w_targets();
+        let places = w_places();
         let mut checks = Vec::new();
         let mut expansions = Vec::new();
         for (i, edits) in jobs.iter().enumerate() {
@@ -1377,12 +1377,12 @@ fn expansions_run_beside_jobs_and_change_no_job() {
             if i == 0 {
                 let fp = StateFp::of(&composed(&base));
                 expansions
-                    .push(Forks::expand(&a, &mut s, &root, fp, &targets, MAX).expect("expand"));
+                    .push(Forks::expand(&a, &mut s, &root, fp, &places, MAX).expect("expand"));
             }
             if i == 2 {
                 let fp = StateFp::of(&composed(&parent_state));
                 expansions
-                    .push(Forks::expand(&a, &mut s, &parent, fp, &targets, MAX).expect("expand"));
+                    .push(Forks::expand(&a, &mut s, &parent, fp, &places, MAX).expect("expand"));
             }
         }
         let outcomes = drain(&a, &mut s);
@@ -1430,7 +1430,7 @@ fn an_expansion_counts_in_the_width() {
             .submit(s, &root, &edit, Scope::Affected, Limit::Check)
             .expect("submit");
         let started = std::time::Instant::now();
-        let expansion = Forks::expand(&a, s, &root, fp, &w_targets(), MAX).expect("expand");
+        let expansion = Forks::expand(&a, s, &root, fp, &w_places(), MAX).expect("expand");
         let came = match a.next(s, wait).expect("next") {
             Next::Expanded(id, _) if id == expansion => Some(started.elapsed()),
             Next::Pending => None,
@@ -1477,7 +1477,7 @@ fn an_expansions_panics_join_the_session_at_next() {
         &mut s,
         &root,
         StateFp::of(&composed(&base)),
-        &w_targets(),
+        &w_places(),
         MAX,
     )
     .expect("expand");

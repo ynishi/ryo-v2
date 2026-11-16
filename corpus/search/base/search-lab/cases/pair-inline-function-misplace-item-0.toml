@@ -5,7 +5,7 @@ overlay = "planted/pair-inline-function-misplace-item-0"
 kinds = ["inline-function", "misplace-item"]
 depth = 2
 origin = "planted:inline-function+misplace-item:0"
-targets = [
+places = [
     { path = "app/src/lib.rs", start = 601, end = 791 },
     { path = "app/src/lib.rs", start = 943, end = 995 },
     { path = "app/src/plan.rs", start = 66, end = 87 },

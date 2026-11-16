@@ -5,7 +5,7 @@ overlay = "planted/pair-misplace-item-misplace-item-0"
 kinds = ["misplace-item", "misplace-item"]
 depth = 2
 origin = "planted:misplace-item+misplace-item:0"
-targets = [
+places = [
     { path = "app/src/lib.rs", start = 98, end = 125 },
     { path = "app/src/plan.rs", start = 827, end = 864 },
     { path = "geo/src/lib.rs", start = 305, end = 334 },

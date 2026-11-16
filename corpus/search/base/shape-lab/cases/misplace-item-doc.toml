@@ -4,7 +4,7 @@ overlay = "planted/misplace-item-doc"
 kinds = ["misplace-item"]
 depth = 1
 origin = "hand:misplace-item:misplace-item-doc"
-targets = [
+places = [
     { path = "src/lib.rs", start = 406, end = 430 },
     { path = "src/plan.rs", start = 78, end = 186 },
 ]

@@ -86,7 +86,7 @@ pub struct PlantedFile {
 
 /// A byte range of the planted text of one file: a function or item a plant touched.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TargetRange {
+pub struct PlaceRange {
     /// Path relative to the workspace root.
     pub path: RelPath,
     /// Start byte (inclusive).
@@ -107,7 +107,7 @@ pub struct Plant {
     /// The files that differ from the clean ones.
     pub files: Vec<PlantedFile>,
     /// The touched functions and items, in the planted text.
-    pub targets: Vec<TargetRange>,
+    pub places: Vec<PlaceRange>,
     /// The helper `inline-function` folded, when one was.
     pub original_fn: Option<String>,
     /// One line per plant describing the edit.
@@ -299,8 +299,8 @@ pub fn render_case(workspace: &str, id: &str, plant: &Plant) -> String {
         "origin = {:?}\n",
         format!("planted:{}:{}", origin_kinds.join("+"), plant.seed)
     ));
-    out.push_str("targets = [\n");
-    for t in &plant.targets {
+    out.push_str("places = [\n");
+    for t in &plant.places {
         out.push_str(&format!(
             "    {{ path = {:?}, start = {}, end = {} }},\n",
             t.path.as_str(),
@@ -539,7 +539,7 @@ fn assemble(
             });
         }
     }
-    let mut targets = Vec::new();
+    let mut places = Vec::new();
     for r in &regions {
         let Some(f) = planted.iter().find(|f| f.path == r.path) else {
             continue;
@@ -553,19 +553,19 @@ fn assemble(
         offsets.push(at);
         let start = offsets.get(r.start).copied().unwrap_or(at);
         let end = offsets.get(r.end).copied().unwrap_or(at);
-        targets.push(TargetRange {
+        places.push(PlaceRange {
             path: r.path.clone(),
             start: start as u32,
             end: end as u32,
         });
     }
-    targets.sort();
+    places.sort();
     Plant {
         kinds,
         seed,
         sites: raws.iter().map(|r| r.site.clone()).collect(),
         files,
-        targets,
+        places,
         original_fn: raws.iter().find_map(|r| r.original_fn.clone()),
         notes: raws.iter().map(|r| r.note.clone()).collect(),
     }
@@ -1944,8 +1944,8 @@ pub fn total(items: &[S]) -> u32 {
         assert!(!t.contains("let area"), "{t}");
         assert!(t.contains("pub fn area(&self)"), "{t}");
         assert_eq!(p.depth(), 1);
-        assert_eq!(p.targets.len(), 1);
-        let range = &p.targets[0];
+        assert_eq!(p.places.len(), 1);
+        let range = &p.places[0];
         let region = &t[range.start as usize..range.end as usize];
         assert!(region.starts_with("pub fn total("), "{region}");
         assert!(region.ends_with("}\n"), "{region}");
@@ -2141,7 +2141,7 @@ pub fn go() -> u32 {
             text_of(&public, "x/src/other.rs"),
             "pub fn helper() -> u32 {\n    7\n}\n\npub const LIMIT: u32 = 10;\n"
         );
-        assert_eq!(public.targets.len(), 2);
+        assert_eq!(public.places.len(), 2);
         let private = (0..3)
             .filter_map(|s| generate(PlantKind::MisplaceItem, s, &fs))
             .find(|p| p.sites[0].line == 4)
@@ -2197,10 +2197,10 @@ pub fn go() -> u32 {
         assert!(t.contains("let v1 = item.area();"), "{t}");
         assert!(!t.contains("fn add("), "{t}");
         assert_eq!(p.original_fn.as_deref(), Some("add"));
-        assert_eq!(p.targets.len(), 2, "{:?}", p.targets);
-        assert!(p.targets[0].end <= p.targets[1].start, "{:?}", p.targets);
-        let first = &t[p.targets[0].start as usize..p.targets[0].end as usize];
-        let second = &t[p.targets[1].start as usize..p.targets[1].end as usize];
+        assert_eq!(p.places.len(), 2, "{:?}", p.places);
+        assert!(p.places[0].end <= p.places[1].start, "{:?}", p.places);
+        let first = &t[p.places[0].start as usize..p.places[0].end as usize];
+        let second = &t[p.places[1].start as usize..p.places[1].end as usize];
         assert!(first.starts_with("pub fn run("), "{first}");
         assert!(second.starts_with("pub fn total_of("), "{second}");
         // Two plants in the same function are refused.

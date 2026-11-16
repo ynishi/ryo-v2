@@ -4,7 +4,7 @@ overlay = "planted/inline-variable-2"
 kinds = ["inline-variable"]
 depth = 1
 origin = "planted:inline-variable:2"
-targets = [
+places = [
     { path = "geo/src/report.rs", start = 1636, end = 1717 },
 ]
 probes = [

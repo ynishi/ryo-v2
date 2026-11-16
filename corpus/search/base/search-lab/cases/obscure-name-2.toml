@@ -4,7 +4,7 @@ overlay = "planted/obscure-name-2"
 kinds = ["obscure-name"]
 depth = 1
 origin = "planted:obscure-name:2"
-targets = [
+places = [
     { path = "app/src/plan.rs", start = 216, end = 390 },
 ]
 probes = [

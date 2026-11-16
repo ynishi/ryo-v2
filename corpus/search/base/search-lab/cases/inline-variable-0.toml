@@ -4,7 +4,7 @@ overlay = "planted/inline-variable-0"
 kinds = ["inline-variable"]
 depth = 1
 origin = "planted:inline-variable:0"
-targets = [
+places = [
     { path = "app/src/lib.rs", start = 601, end = 765 },
 ]
 probes = [

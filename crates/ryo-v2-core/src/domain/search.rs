@@ -96,15 +96,15 @@ pub fn compose(
 
 /// Where a change is wanted: a file and, if known, a range of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Target {
+pub struct Place {
     path: RelPath,
     range: Option<TextRange>,
 }
 
-impl Target {
-    /// A target in `path`, at `range` if given.
-    pub fn new(path: RelPath, range: Option<TextRange>) -> Target {
-        Target { path, range }
+impl Place {
+    /// A place in `path`, at `range` if given.
+    pub fn new(path: RelPath, range: Option<TextRange>) -> Place {
+        Place { path, range }
     }
 
     /// The file.
@@ -1144,10 +1144,10 @@ mod tests {
     }
 
     #[test]
-    fn targets_and_probes_carry_what_they_were_given() {
-        let t = Target::new(rel("a.rs"), Some(tr(1, 2)));
+    fn places_and_probes_carry_what_they_were_given() {
+        let t = Place::new(rel("a.rs"), Some(tr(1, 2)));
         assert_eq!((t.path(), t.range()), (&rel("a.rs"), Some(tr(1, 2))));
-        assert_eq!(Target::new(rel("b.rs"), None).range(), None);
+        assert_eq!(Place::new(rel("b.rs"), None).range(), None);
         let p = ChangeProbe::AddVariant {
             ty: Ident::parse("Kind").unwrap(),
         };

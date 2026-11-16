@@ -227,7 +227,7 @@ fn search_verdicts_at(width: usize) {
         let input = SearchInput {
             start: &edits,
             roots: &[],
-            targets: &case.targets,
+            places: &case.places,
             probes: &case.probes,
             scope: Scope::Affected,
             budget,
@@ -348,7 +348,7 @@ fn the_reference_check_is_a_fresh_load() {
         let input = SearchInput {
             start: &planted,
             roots: &[],
-            targets: &case.targets,
+            places: &case.places,
             probes: &case.probes,
             scope: Scope::Affected,
             budget,

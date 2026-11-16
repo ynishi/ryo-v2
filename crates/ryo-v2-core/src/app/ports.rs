@@ -2,7 +2,7 @@
 
 use crate::domain::{
     Blocking, Blueprint, BlueprintId, ChangeProbe, CheckFailure, Edit, Finding, JudgeRequest,
-    Judgement, Provenance, RelPath, Scope, ScopedFindings, StateFp, StaticMetrics, Target,
+    Judgement, Place, Provenance, RelPath, Scope, ScopedFindings, StateFp, StaticMetrics,
     UnseenClass,
 };
 use std::collections::BTreeSet;
@@ -244,14 +244,14 @@ pub trait Expander {
     /// A loaded workspace.
     type Session;
     /// Children of the state `state` (edits over the session base), at most `max`, within
-    /// `targets`. Observable session state afterwards = before. Reads and splices are against
+    /// `places`. Observable session state afterwards = before. Reads and splices are against
     /// the state's text. An expansion of a Layer of an open [`Forks`] session is
     /// `Forks::expand`.
     fn expand(
         &self,
         s: &mut Self::Session,
         state: &[Edit],
-        targets: &[Target],
+        places: &[Place],
         max: usize,
     ) -> Result<Vec<Blueprint>, ExpandError>;
 }
@@ -466,7 +466,7 @@ pub trait Forks: Verifier {
     ) -> Result<JobId, CheckError>;
 
     /// Queues a read job that proposes at most `max` children of `layer`'s state within
-    /// `targets` (C10). `state` is the fingerprint of that state's edits over the base, the
+    /// `places` (C10). `state` is the fingerprint of that state's edits over the base, the
     /// identity the Blueprints' ids are made of (`Expander` C8): the caller keeps it with the
     /// Layer, so no edit list has to be handed back.
     fn expand(
@@ -474,7 +474,7 @@ pub trait Forks: Verifier {
         s: &mut Self::Session,
         layer: &Self::Layer,
         state: StateFp,
-        targets: &[Target],
+        places: &[Place],
         max: usize,
     ) -> Result<JobId, CheckError>;
 
@@ -786,12 +786,12 @@ mod tests {
     }
 
     /// The fake's expansion of `state`: no Blueprint, and a parent that yields nothing when a
-    /// target is not a file of the state (so a created file is told from a missing one).
+    /// place is not a file of the state (so a created file is told from a missing one).
     fn fake_children(
         state: &BTreeMap<RelPath, String>,
-        targets: &[Target],
+        places: &[Place],
     ) -> Result<Vec<Blueprint>, ExpandError> {
-        match targets.iter().find(|t| !state.contains_key(t.path())) {
+        match places.iter().find(|t| !state.contains_key(t.path())) {
             Some(t) => Err(ExpandError::Analysis(format!("no file {}", t.path()))),
             None => Ok(Vec::new()),
         }
@@ -899,13 +899,13 @@ mod tests {
             &self,
             s: &mut FakeSession,
             state: &[Edit],
-            targets: &[Target],
+            places: &[Place],
             _: usize,
         ) -> Result<Vec<Blueprint>, ExpandError> {
             s.refuse_while_open().map_err(ExpandError::Session)?;
             let state = written(&s.base, state)
                 .map_err(|e| ExpandError::Analysis(format!("state edit rejected: {e}")))?;
-            fake_children(&state, targets)
+            fake_children(&state, places)
         }
     }
 
@@ -951,11 +951,11 @@ mod tests {
             s: &mut FakeSession,
             layer: &FakeLayer,
             _: StateFp,
-            targets: &[Target],
+            places: &[Place],
             _: usize,
         ) -> Result<JobId, CheckError> {
             let id = s.accept(layer)?;
-            let children = fake_children(&layer.texts, targets);
+            let children = fake_children(&layer.texts, places);
             s.in_flight
                 .insert(id, (false, Next::Expanded(id, children)));
             Ok(id)
@@ -1153,11 +1153,11 @@ mod tests {
         let Next::Done(_, Ok(child)) = f.next(&mut s, FOREVER).unwrap() else {
             panic!("the job finishes");
         };
-        let targets = [Target::new(rel("src/c.rs"), None)];
+        let places = [Place::new(rel("src/c.rs"), None)];
         let state = StateFp::of(&created);
-        let on_child = Forks::expand(&f, &mut s, &child.layer, state, &targets, 5).unwrap();
-        let on_root = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &targets, 5).unwrap();
-        let withdrawn = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &targets, 5).unwrap();
+        let on_child = Forks::expand(&f, &mut s, &child.layer, state, &places, 5).unwrap();
+        let on_root = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &places, 5).unwrap();
+        let withdrawn = Forks::expand(&f, &mut s, &root, StateFp::of(&[]), &places, 5).unwrap();
         assert!(on_child < on_root && on_root < withdrawn);
         assert_eq!(f.cancel(&mut s, withdrawn), Ok(true));
         let mut expanded = BTreeMap::new();
@@ -1176,12 +1176,12 @@ mod tests {
         // C10: what `Expander::expand` gives for the same states with no fork open.
         assert_eq!(
             expanded[&on_child],
-            Expander::expand(&f, &mut s, &created, &targets, 5)
+            Expander::expand(&f, &mut s, &created, &places, 5)
         );
         assert_eq!(expanded[&on_child], Ok(Vec::new()));
         assert_eq!(
             expanded[&on_root],
-            Expander::expand(&f, &mut s, &[], &targets, 5)
+            Expander::expand(&f, &mut s, &[], &places, 5)
         );
         assert!(matches!(expanded[&on_root], Err(ExpandError::Analysis(_))));
     }

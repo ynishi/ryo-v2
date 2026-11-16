@@ -89,7 +89,7 @@
 //! - SearchNode: one state of the search tree, with its edits, file roles, metrics, prior and reward.
 //! - NodeId: the position of a node in its search tree; the root is 0.
 //! - StateFp: a fingerprint of the files an edit path leads to; the same files, the same state.
-//! - Target: a file and, if known, a range of it where a change is wanted.
+//! - Place: a file and, if known, a range of it where a change is wanted.
 //! - ChangeProbe: a change a later edit might make, tried to see how easily a state extends.
 //!   includes: AddVariant, AddField, AddMethod
 //! - StaticMetrics: what is known of a candidate's edits before any check: files, crates,
@@ -182,9 +182,9 @@ pub use resolution::{
 };
 pub use scope::Scope;
 pub use search::{
-    ChangeProbe, CleanDelta, DEFAULT_WEIGHTS, ExtDelta, Inserted, NewNode, NodeId, PruneStage,
-    Pruned, Reward, Scored, SearchBudget, SearchNode, SearchTree, StateFp, StaticMetrics, Target,
-    Weights,
+    ChangeProbe, CleanDelta, DEFAULT_WEIGHTS, ExtDelta, Inserted, NewNode, NodeId, Place,
+    PruneStage, Pruned, Reward, Scored, SearchBudget, SearchNode, SearchTree, StateFp,
+    StaticMetrics, Weights,
 };
 pub use splice::{Splice, SpliceKind};
 pub use text::{BaseFp, Fingerprint, FpAlgo, Freshness, ReadRange, SpliceError, TextRange};

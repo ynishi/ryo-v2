@@ -474,7 +474,7 @@ fn depth_call(hook: &mut DepthHook<'_>, point: DepthPoint<'_>) -> Result<()> {
 mod tests {
     use super::*;
     use ryo_v2_core::app::ports::Verifier;
-    use ryo_v2_core::domain::{StateFp, Target};
+    use ryo_v2_core::domain::{Place, StateFp};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -609,7 +609,7 @@ mod tests {
             _: &mut (),
             _: &FakeLayer,
             _: StateFp,
-            _: &[Target],
+            _: &[Place],
             _: usize,
         ) -> Result<JobId, CheckError> {
             Err(CheckError::ForkInUse)

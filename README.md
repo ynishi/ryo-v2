@@ -12,7 +12,7 @@ Nothing is released and no input or output format is stable. [CONCEPT.md](CONCEP
 target the code is brought to, not a description of what runs today. Today the `ryo-v2` command
 line has the commands `bench` (timing and memory of the verifier), `apply` (verify a set of
 Blueprints given as JSON, a dry run), `search` (search the best verified changes of one decision
-from a request JSON of targets, probes, roots, budget and judge, a dry run) and `fingerprint`
+from a request JSON of places, probes, roots, budget and judge, a dry run) and `fingerprint`
 (prints the fingerprints a Blueprint cites). The search is a best-first beam search on N live
 forks of one loaded rust-analyzer database (the core's `Forks` port), with judges that need no
 model. Not yet built: TypeSpec input, Monte Carlo search, a model-backed judge and a verdict

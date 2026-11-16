@@ -6,8 +6,8 @@ use crate::resolution_json::resolution_to_json;
 use anyhow::{Context, Result, anyhow, bail};
 use ryo_v2_core::app::search::{DEFAULT_SEARCH_BUDGET, SearchReport};
 use ryo_v2_core::domain::{
-    Blueprint, BlueprintId, ChangeProbe, Criterion, Ident, Noul, Prior, ProposalId, ProviderTag,
-    RelPath, SearchBudget, Target, TextRange,
+    Blueprint, BlueprintId, ChangeProbe, Criterion, Ident, Noul, Place, Prior, ProposalId,
+    ProviderTag, RelPath, SearchBudget, TextRange,
 };
 use ryo_v2_core::infra::judge::{ReplayEntry, ReplayJudge};
 use serde::Deserialize;
@@ -19,7 +19,7 @@ use std::num::NonZeroU16;
 #[serde(deny_unknown_fields)]
 struct RequestJson {
     #[serde(default)]
-    targets: Vec<TargetJson>,
+    places: Vec<PlaceJson>,
     #[serde(default)]
     probes: Vec<ProbeJson>,
     #[serde(default)]
@@ -32,7 +32,7 @@ struct RequestJson {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TargetJson {
+struct PlaceJson {
     path: String,
     #[serde(default)]
     start: Option<u32>,
@@ -107,7 +107,7 @@ pub(crate) enum JudgeSpec {
 /// A parsed search request.
 #[derive(Debug)]
 pub(crate) struct Request {
-    pub(crate) targets: Vec<Target>,
+    pub(crate) places: Vec<Place>,
     pub(crate) probes: Vec<ChangeProbe>,
     pub(crate) roots: Vec<Blueprint>,
     /// Ids the host filled in for roots without one.
@@ -128,31 +128,31 @@ fn probe(index: usize, p: ProbeJson) -> Result<ChangeProbe> {
     }
 }
 
-fn target(index: usize, t: TargetJson) -> Result<Target> {
-    let path = RelPath::parse(&t.path).map_err(|e| anyhow!("target {index}: path: {e}"))?;
+fn place(index: usize, t: PlaceJson) -> Result<Place> {
+    let path = RelPath::parse(&t.path).map_err(|e| anyhow!("place {index}: path: {e}"))?;
     let range = match (t.start, t.end) {
         (Some(s), Some(e)) => {
-            Some(TextRange::new(s, e).map_err(|e| anyhow!("target {index}: range: {e}"))?)
+            Some(TextRange::new(s, e).map_err(|e| anyhow!("place {index}: range: {e}"))?)
         }
         (None, None) => None,
-        _ => bail!("target {index}: start and end go together"),
+        _ => bail!("place {index}: start and end go together"),
     };
-    Ok(Target::new(path, range))
+    Ok(Place::new(path, range))
 }
 
 /// Parses a search request. Unknown fields are errors; the budget starts from
 /// `DEFAULT_SEARCH_BUDGET` and each given field replaces its number; a request with neither
-/// targets nor roots is an error (the expander would have nowhere to look).
+/// places nor roots is an error (the expander would have nowhere to look).
 pub(crate) fn parse_request(json: &str) -> Result<Request> {
     let req: RequestJson = serde_json::from_str(json).context("search request JSON")?;
-    if req.targets.is_empty() && req.roots.is_empty() {
-        bail!("search request: no targets and no roots; give at least one");
+    if req.places.is_empty() && req.roots.is_empty() {
+        bail!("search request: no places and no roots; give at least one");
     }
-    let targets = req
-        .targets
+    let places = req
+        .places
         .into_iter()
         .enumerate()
-        .map(|(i, t)| target(i, t))
+        .map(|(i, t)| place(i, t))
         .collect::<Result<Vec<_>>>()?;
     let probes = req
         .probes
@@ -188,7 +188,7 @@ pub(crate) fn parse_request(json: &str) -> Result<Request> {
         },
     };
     Ok(Request {
-        targets,
+        places,
         probes,
         roots,
         generated,
@@ -301,30 +301,30 @@ mod tests {
 
     #[test]
     fn request_rejects_unknown_fields() {
-        let ok = "{\"targets\":[{\"path\":\"src/lib.rs\"}]}";
+        let ok = "{\"places\":[{\"path\":\"src/lib.rs\"}]}";
         let req = parse_request(ok).expect("minimal request");
-        assert_eq!(req.targets.len(), 1);
+        assert_eq!(req.places.len(), 1);
         assert_eq!(req.budget, DEFAULT_SEARCH_BUDGET);
         assert_eq!(req.judge, JudgeSpec::Metric);
         for bad in [
-            "{\"targets\":[{\"path\":\"src/lib.rs\"}],\"extra\":1}",
-            "{\"targets\":[{\"path\":\"src/lib.rs\",\"line\":3}]}",
-            "{\"targets\":[{\"path\":\"src/lib.rs\"}],\"budget\":{\"depth\":1}}",
-            "{\"targets\":[{\"path\":\"src/lib.rs\"}],\"probes\":[{\"kind\":\"add-field\",\"type\":\"Rect\",\"x\":1}]}",
+            "{\"places\":[{\"path\":\"src/lib.rs\"}],\"extra\":1}",
+            "{\"places\":[{\"path\":\"src/lib.rs\",\"line\":3}]}",
+            "{\"places\":[{\"path\":\"src/lib.rs\"}],\"budget\":{\"depth\":1}}",
+            "{\"places\":[{\"path\":\"src/lib.rs\"}],\"probes\":[{\"kind\":\"add-field\",\"type\":\"Rect\",\"x\":1}]}",
         ] {
             assert!(parse_request(bad).is_err(), "{bad}");
         }
-        // Neither targets nor roots, a half range, an unknown probe or judge kind.
+        // Neither places nor roots, a half range, an unknown probe or judge kind.
         assert!(parse_request("{}").is_err());
-        assert!(parse_request("{\"targets\":[{\"path\":\"a.rs\",\"start\":1}]}").is_err());
-        assert!(parse_request("{\"targets\":[{\"path\":\"a.rs\"}],\"probes\":[{\"kind\":\"add-x\",\"type\":\"T\"}]}").is_err());
+        assert!(parse_request("{\"places\":[{\"path\":\"a.rs\",\"start\":1}]}").is_err());
+        assert!(parse_request("{\"places\":[{\"path\":\"a.rs\"}],\"probes\":[{\"kind\":\"add-x\",\"type\":\"T\"}]}").is_err());
         assert!(
-            parse_request("{\"targets\":[{\"path\":\"a.rs\"}],\"judge\":{\"kind\":\"llm\"}}")
+            parse_request("{\"places\":[{\"path\":\"a.rs\"}],\"judge\":{\"kind\":\"llm\"}}")
                 .is_err()
         );
         // Overrides replace only the fields given.
         let req = parse_request(
-            "{\"targets\":[{\"path\":\"a.rs\",\"start\":0,\"end\":5}],\"budget\":{\"beam\":5,\"max_depth\":1},\"probes\":[{\"kind\":\"add-variant\",\"type\":\"Shape\"}],\"judge\":{\"kind\":\"replay\",\"file\":\"r.json\"}}",
+            "{\"places\":[{\"path\":\"a.rs\",\"start\":0,\"end\":5}],\"budget\":{\"beam\":5,\"max_depth\":1},\"probes\":[{\"kind\":\"add-variant\",\"type\":\"Shape\"}],\"judge\":{\"kind\":\"replay\",\"file\":\"r.json\"}}",
         )
         .expect("overrides");
         assert_eq!((req.budget.beam, req.budget.max_depth), (5, 1));
