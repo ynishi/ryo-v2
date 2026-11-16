@@ -117,12 +117,12 @@ struct Cand {
 
 /// A place resolved to a file of the session.
 #[derive(Clone)]
-struct TInfo {
+struct PlaceInfo {
     file: FileId,
     range: Option<(u32, u32)>,
 }
 
-impl TInfo {
+impl PlaceInfo {
     /// Whether the byte range `r` meets the place.
     fn hits(&self, r: RaRange) -> bool {
         let Some((lo, hi)) = self.range else {
@@ -485,15 +485,15 @@ impl<'a> Env<'a> {
         Some(t)
     }
 
-    fn tinfo(&self, t: &Place) -> Option<TInfo> {
-        Some(TInfo {
+    fn place_info(&self, t: &Place) -> Option<PlaceInfo> {
+        Some(PlaceInfo {
             file: *self.by_path.get(t.path())?,
             range: t.range().map(|r| (r.start(), r.end())),
         })
     }
 
     /// Functions with a body in the place, outside test code.
-    fn fns_in(&self, tree: &ast::SourceFile, t: &TInfo) -> Vec<ast::Fn> {
+    fn fns_in(&self, tree: &ast::SourceFile, t: &PlaceInfo) -> Vec<ast::Fn> {
         tree.syntax()
             .descendants()
             .filter_map(ast::Fn::cast)
@@ -640,7 +640,7 @@ impl<'a> Env<'a> {
 
     // ---- rename-local ----
 
-    fn rename_seeds(&self, t: &TInfo) -> Vec<RenameSeed> {
+    fn rename_seeds(&self, t: &PlaceInfo) -> Vec<RenameSeed> {
         let Some(tree) = self.tree(t.file) else {
             return Vec::new();
         };
@@ -764,7 +764,7 @@ impl<'a> Env<'a> {
 
     // ---- extract-variable ----
 
-    fn extract_var_seeds(&self, t: &TInfo) -> Vec<ExtractVarSeed> {
+    fn extract_var_seeds(&self, t: &PlaceInfo) -> Vec<ExtractVarSeed> {
         let (Some(tree), Some(text)) = (self.tree(t.file), self.text(t.file)) else {
             return Vec::new();
         };
@@ -886,7 +886,7 @@ impl<'a> Env<'a> {
 
     // ---- extract-function ----
 
-    fn extract_fn_seeds(&self, t: &TInfo) -> Vec<ExtractFnSeed> {
+    fn extract_fn_seeds(&self, t: &PlaceInfo) -> Vec<ExtractFnSeed> {
         let Some(tree) = self.tree(t.file) else {
             return Vec::new();
         };
@@ -993,7 +993,7 @@ impl<'a> Env<'a> {
 
     // ---- add-derive ----
 
-    fn add_derive_cands(&self, t: &TInfo) -> Vec<Cand> {
+    fn add_derive_cands(&self, t: &PlaceInfo) -> Vec<Cand> {
         let (Some(tree), Some(text)) = (self.tree(t.file), self.text(t.file)) else {
             return Vec::new();
         };
@@ -1094,7 +1094,7 @@ impl<'a> Env<'a> {
         map
     }
 
-    fn move_item_cands(&self, t: &TInfo) -> Vec<Cand> {
+    fn move_item_cands(&self, t: &PlaceInfo) -> Vec<Cand> {
         let (Some(tree), Some(text)) = (self.tree(t.file), self.text(t.file)) else {
             return Vec::new();
         };
@@ -1300,7 +1300,7 @@ impl<'a> Env<'a> {
     fn lazy<'e>(
         &'e self,
         kind: CommandKind,
-        t: &TInfo,
+        t: &PlaceInfo,
     ) -> Box<dyn Iterator<Item = Blueprint> + 'e> {
         let file = t.file;
         match kind {
@@ -1342,7 +1342,7 @@ impl<'a> Env<'a> {
     }
 
     fn run(&self, places: &[Place], max: usize) -> Result<Vec<Blueprint>, String> {
-        let infos: Vec<TInfo> = places.iter().filter_map(|t| self.tinfo(t)).collect();
+        let infos: Vec<PlaceInfo> = places.iter().filter_map(|t| self.place_info(t)).collect();
         let mut gens: Vec<Vec<std::iter::Fuse<Box<dyn Iterator<Item = Blueprint> + '_>>>> = infos
             .iter()
             .map(|t| {
@@ -1515,7 +1515,7 @@ fn movable_name(item: &ast::Item) -> Option<String> {
 
 /// `(name, start, end)` of an item move-item may move: on its own lines, no cfg or test attribute,
 /// and hit by the place.
-fn movable_item(item: &ast::Item, text: &str, t: &TInfo) -> Option<(String, u32, u32)> {
+fn movable_item(item: &ast::Item, text: &str, t: &PlaceInfo) -> Option<(String, u32, u32)> {
     let name = movable_name(item)?;
     let node = item.syntax();
     if name == "main" || blocks_move(node) || in_test_code(node) || !t.hits(node.text_range()) {

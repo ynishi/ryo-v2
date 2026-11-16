@@ -593,7 +593,7 @@ round"):
 | `pair-obscure-name-inline-variable-0` | renames a local in one file and folds a literal into a call argument in a bench target (`benches/`) | the bench file is indexed and expanded (its renames and extracts are among the 47 children); extract-variable was never offered a literal. The obscure-name half is generated. |
 
 Why `inline-variable-0` is dropped (from the trace of the same expansion, scored with
-`SyntaxAssessor` and the rule of `prune`): its target function is long (about 200 lines), so its
+`SyntaxAssessor` and the rule of `prune`): its planted function is long (about 200 lines), so its
 71 children fill the beam of 20 already at depth 1, where the small bases never fill it (section
 "Counts", reservation 1). The restore writes one `let` line into a function beyond the 25 lines of
 the long-function cost, so its `clean` is -1, as it is for every extract-variable in that function,
